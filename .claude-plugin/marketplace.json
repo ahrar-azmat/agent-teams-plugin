@@ -1,0 +1,23 @@
+{
+  "name": "agent-teams",
+  "description": "Multi-agent orchestration workflow skills for Claude Code",
+  "owner": {
+    "name": "Ahrar Ahmad"
+  },
+  "plugins": [
+    {
+      "name": "software-workflows",
+      "source": "./plugins/software-workflows",
+      "description": "Agent-teams orchestration skill — spawn, coordinate, and shut down Claude Code agent teams with correct, schema-validated tool signatures (TeamCreate, TaskCreate, TaskUpdate, SendMessage, TeamDelete).",
+      "category": "workflow",
+      "keywords": [
+        "agent-teams",
+        "multi-agent",
+        "orchestration",
+        "subagents",
+        "workflow"
+      ],
+      "license": "PolyForm-Noncommercial-1.0.0"
+    }
+  ]
+}

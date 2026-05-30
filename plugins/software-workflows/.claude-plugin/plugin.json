@@ -1,0 +1,19 @@
+{
+  "name": "software-workflows",
+  "description": "Reusable workflow skills — agent teams orchestration and software development patterns",
+  "version": "1.1.0",
+  "author": {
+    "name": "Ahrar Ahmad"
+  },
+  "homepage": "https://github.com/ahrar-azmat/agent-teams-plugin",
+  "repository": "https://github.com/ahrar-azmat/agent-teams-plugin",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "keywords": [
+    "agent-teams",
+    "multi-agent",
+    "orchestration",
+    "subagents",
+    "workflow",
+    "claude-code"
+  ]
+}
