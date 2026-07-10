@@ -8,7 +8,7 @@
     {
       "name": "software-workflows",
       "source": "./plugins/software-workflows",
-      "description": "Agent-teams orchestration skill — spawn, coordinate, and shut down Claude Code agent teams with correct, schema-validated tool signatures (TeamCreate, TaskCreate, TaskUpdate, SendMessage, TeamDelete).",
+      "description": "Agent-teams orchestration skill — spawn, coordinate, and shut down Claude Code implicit agent teams with correct, schema-validated tool signatures (Agent, TaskCreate, TaskUpdate, SendMessage). Antigravity + Codex multi-model integration.",
       "category": "workflow",
       "keywords": [
         "agent-teams",
