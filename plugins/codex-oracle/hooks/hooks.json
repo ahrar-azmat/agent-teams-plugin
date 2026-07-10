@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "EnterPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"PLANNING GATE: Before entering plan mode, ensure you have multi-model advisory context. If you have NOT yet consulted Codex architect_review or Gemini gemini_brainstorm in this session for the current task, call them NOW (they work in plan mode since plan mode supports all tools except Write/Edit). If multi-model advisory has already run, proceed into plan mode.\"}}'"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "COMMAND=$(jq -r '.tool_input.command // empty'); if echo \"$COMMAND\" | grep -qE '^\\s*git\\s+(push|commit)'; then TRANSCRIPT=$(jq -r '.transcript_path // empty'); if [ -n \"$TRANSCRIPT\" ] && [ -f \"$TRANSCRIPT\" ] && grep -q 'code_review' \"$TRANSCRIPT\" 2>/dev/null; then exit 0; else echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"PUSH GATE: You are about to git push/commit but Codex code_review has NOT been run in this session. Per multi-model workflow, you MUST run Codex code_review and Gemini gemini_review_pr on the diff before pushing. If the user explicitly said skip review, proceed. Otherwise, STOP and run both reviews first.\"}}'; fi; else exit 0; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

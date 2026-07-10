@@ -1,0 +1,8 @@
+{
+  "name": "codex-oracle",
+  "description": "Cross-model advisory system — Codex (OpenAI) + Gemini (Google) as senior architects and reviewers. Hooks enforce multi-model review at planning and push time.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Ahrar"
+  }
+}

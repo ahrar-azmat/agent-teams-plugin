@@ -1,6 +1,6 @@
 {
   "name": "agent-teams",
-  "description": "Multi-agent orchestration workflow skills for Claude Code",
+  "description": "Multi-agent orchestration for Claude Code — agent-teams workflow skill plus the Codex Oracle and Antigravity cross-model advisory MCPs it integrates with",
   "owner": {
     "name": "Ahrar Ahmad"
   },
@@ -16,6 +16,34 @@
         "orchestration",
         "subagents",
         "workflow"
+      ],
+      "license": "PolyForm-Noncommercial-1.0.0"
+    },
+    {
+      "name": "codex-oracle",
+      "source": "./plugins/codex-oracle",
+      "description": "Cross-model advisory MCP — Codex (strongest configured OpenAI model at max reasoning, auto-detected from the Codex CLI config) as senior architect/reviewer: architect_review, code_review, research, codex_query; opt-in infra mode for read-only live-infrastructure investigation. Ships hooks that gate plan mode and git push on multi-model review.",
+      "category": "workflow",
+      "keywords": [
+        "codex",
+        "cross-model",
+        "review",
+        "mcp",
+        "advisory"
+      ],
+      "license": "PolyForm-Noncommercial-1.0.0"
+    },
+    {
+      "name": "antigravity",
+      "source": "./plugins/antigravity",
+      "description": "Antigravity MCP — Gemini as an independent critical advisor via the Antigravity CLI (agy). Auto-selects the deepest-thinking Gemini Pro model (Flash fallback only on capacity errors); query, brainstorm, code analysis, PR review, agentic tools. Requires an authenticated agy install.",
+      "category": "workflow",
+      "keywords": [
+        "antigravity",
+        "gemini",
+        "cross-model",
+        "review",
+        "mcp"
       ],
       "license": "PolyForm-Noncommercial-1.0.0"
     }
