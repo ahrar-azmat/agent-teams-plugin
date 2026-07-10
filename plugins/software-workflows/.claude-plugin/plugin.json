@@ -1,7 +1,7 @@
 {
   "name": "software-workflows",
   "description": "Reusable workflow skills — agent teams orchestration and software development patterns",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": {
     "name": "Ahrar Ahmad"
   },
