@@ -4,8 +4,10 @@ Codex Oracle MCP Server
 Exposes OpenAI Codex CLI as MCP tools for Claude Code.
 Codex runs in headless mode (codex exec) with maximum reasoning power.
 
-Auto-detects model and reasoning effort from ~/.codex/config.toml.
-All tools use deep analysis with extended timeouts.
+Auto-detects the model from ~/.codex/config.toml; reasoning effort is
+PINNED to "max" (the desktop-app slider rewrites the config file and had
+silently downgraded the oracle to xhigh). All tools use deep analysis with
+extended timeouts.
 
 Roles:
 - Senior Architect: architecture & design review
@@ -122,8 +124,14 @@ def _get_codex_model() -> str:
 
 
 def _get_reasoning_effort() -> str:
-    """Auto-detect reasoning effort from Codex config."""
-    return _read_codex_config().get("model_reasoning_effort", "max")
+    """Reasoning effort — PINNED to max, never read from config.
+
+    The Codex desktop app slider rewrites model_reasoning_effort in
+    ~/.codex/config.toml (observed drift: max -> xhigh), so trusting the
+    file silently downgrades the oracle. "ultra" stays deliberately
+    avoided: it delegates to auto-picked subagents we can't control.
+    """
+    return "max"
 
 
 def _get_cwd() -> str:
