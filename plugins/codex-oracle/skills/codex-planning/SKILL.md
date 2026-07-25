@@ -9,7 +9,7 @@ When planning any non-trivial feature, fix, or architectural change, you MUST ga
 
 ## Step 1: Launch all advisors in parallel (SAME tool call batch)
 - **Codex Oracle**: `architect_review` with the proposed approach and relevant file paths
-- **Gemini**: `gemini_brainstorm` or `gemini_analyze_code` for alternative perspectives
+- **Antigravity (Gemini)**: `antigravity_brainstorm` or `antigravity_analyze_code` for alternative perspectives
 - **Your own agents**: Explore/Plan subagents for codebase investigation
 
 ## Step 2: Synthesize findings

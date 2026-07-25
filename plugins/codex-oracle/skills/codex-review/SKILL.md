@@ -12,7 +12,7 @@ Run `git diff` to collect all staged and unstaged changes.
 
 ## Step 2: Launch both reviewers in parallel
 - **Codex Oracle**: `code_review` with the diff and relevant context
-- **Gemini**: `gemini_review_pr` or `gemini_analyze_code` with the same diff
+- **Antigravity (Gemini)**: `antigravity_review_pr` (strictness: `strict`) or `antigravity_analyze_code` with the same diff
 
 ## Step 3: Process findings
 1. Collect all findings from both models
