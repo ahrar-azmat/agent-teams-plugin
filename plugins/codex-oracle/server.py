@@ -23,10 +23,11 @@ import asyncio
 import contextlib
 import os
 import tempfile
+import time
 import tomllib
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 # Safety-net truncation. Claude Code's MAX_MCP_OUTPUT_TOKENS is set to
 # 150K tokens (~600K chars). When multiple MCP tools run in the same
@@ -48,6 +49,17 @@ SUBPROCESS_BUFFER_LIMIT = 4 * 1024 * 1024  # 4 MiB
 # instead of readline() avoids LimitOverrunError entirely — read() never
 # searches for a separator so it cannot overflow regardless of line length.
 READ_CHUNK_SIZE = 65_536  # 64 KiB per read
+
+# Progress heartbeat interval. Claude Code aborts any MCP tool call that
+# produces no response AND no progress notification for 30 minutes
+# ("idle timeout 1800s") — long max-effort runs and laptop-sleep gaps both
+# crossed it (2026-07-27: a review was killed at 5929s idle after a ~94-min
+# lid-close; the 60-min MAX_RUNTIME budget was unreachable through MCP
+# without progress). Heartbeats reset the client's idle timer and surface
+# liveness (elapsed time + output bytes). Env knob exists for the selftest.
+PROGRESS_INTERVAL_SECONDS = float(
+    os.environ.get("CODEX_ORACLE_PROGRESS_INTERVAL", "10")
+)
 
 # ---------------------------------------------------------------------------
 # Timeouts
@@ -143,7 +155,9 @@ def _get_cwd() -> str:
 # Codex runner
 # ---------------------------------------------------------------------------
 
-async def _run_codex(prompt: str, infra: bool = False) -> str:
+async def _run_codex(
+    prompt: str, infra: bool = False, ctx: Context | None = None
+) -> str:
     """Run codex exec headlessly with clean final-message extraction.
 
     Uses codex-cli 0.118.0 features:
@@ -262,9 +276,35 @@ async def _run_codex(prompt: str, infra: bool = False) -> str:
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
 
+    async def _heartbeat() -> None:
+        """Emit MCP progress every PROGRESS_INTERVAL_SECONDS while codex runs.
+
+        Resets Claude Code's 30-min idle-abort timer (the cause of the
+        2026-07-27 "hangs") and gives the operator a live elapsed/output
+        signal. A failed notification must never affect the run itself.
+        """
+        assert ctx is not None
+        started = time.monotonic()
+        while True:
+            await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
+            elapsed = time.monotonic() - started
+            out_kib = (
+                sum(map(len, stdout_chunks)) + sum(map(len, stderr_chunks))
+            ) // 1024
+            with contextlib.suppress(Exception):
+                await ctx.report_progress(
+                    min(elapsed, MAX_RUNTIME_SECONDS),
+                    MAX_RUNTIME_SECONDS,
+                    f"codex {model} running: {int(elapsed)}s elapsed, "
+                    f"{out_kib} KiB output",
+                )
+
     stdout_task = asyncio.create_task(_consume(proc.stdout, stdout_chunks))
     stderr_task = asyncio.create_task(_consume(proc.stderr, stderr_chunks))
     probe_task = asyncio.create_task(_startup_probe())
+    heartbeat_task = (
+        asyncio.create_task(_heartbeat()) if ctx is not None else None
+    )
 
     try:
         # Wall-clock timeout prevents zombie processes that start but never
@@ -282,17 +322,20 @@ async def _run_codex(prompt: str, infra: bool = False) -> str:
             proc.kill()
         with contextlib.suppress(Exception):
             await proc.wait()
+        output_file.unlink(missing_ok=True)
         raise
     finally:
-        # Always ensure process is reaped and probe is cancelled.
+        # Always ensure process is reaped and watchdog tasks are cancelled.
         if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
         with contextlib.suppress(Exception):
             await proc.wait()
-        probe_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await probe_task
+        for _task in (probe_task, heartbeat_task):
+            if _task is not None:
+                _task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _task
 
     # On timeout, salvage whatever the output file has (codex may have
     # written a partial or complete answer before we killed it).
@@ -398,6 +441,7 @@ async def architect_review(
     files: str = "",
     concerns: str = "",
     infra: bool = False,
+    ctx: Context = None,
 ) -> str:
     """
     Senior architect review of a design, approach, or implementation.
@@ -438,7 +482,7 @@ async def architect_review(
         "Skip sections with zero findings. Do not repeat yourself."
     )
 
-    return await _run_codex("\n".join(prompt_parts), infra=infra)
+    return await _run_codex("\n".join(prompt_parts), infra=infra, ctx=ctx)
 
 
 @mcp.tool()
@@ -447,6 +491,7 @@ async def code_review(
     context: str = "",
     focus: str = "",
     infra: bool = False,
+    ctx: Context = None,
 ) -> str:
     """
     Deep critical code review from Codex at maximum reasoning power.
@@ -487,7 +532,7 @@ async def code_review(
         "Skip sections with zero findings. Do not repeat yourself."
     )
 
-    return await _run_codex("\n".join(prompt_parts), infra=infra)
+    return await _run_codex("\n".join(prompt_parts), infra=infra, ctx=ctx)
 
 
 @mcp.tool()
@@ -495,6 +540,7 @@ async def research(
     topic: str,
     constraints: str = "",
     infra: bool = False,
+    ctx: Context = None,
 ) -> str:
     """
     Deep technical research using Codex's web access and full reasoning.
@@ -528,13 +574,14 @@ async def research(
         "Do not repeat yourself."
     )
 
-    return await _run_codex("\n".join(prompt_parts), infra=infra)
+    return await _run_codex("\n".join(prompt_parts), infra=infra, ctx=ctx)
 
 
 @mcp.tool()
 async def codex_query(
     prompt: str,
     infra: bool = False,
+    ctx: Context = None,
 ) -> str:
     """
     Freeform deep query to Codex at maximum reasoning power.
@@ -553,7 +600,7 @@ async def codex_query(
         "Provide your analysis with evidence and reasoning. "
         "Keep your response concise — under 1500 words. No filler or preamble.\n\n"
     )
-    return await _run_codex(preamble + prompt, infra=infra)
+    return await _run_codex(preamble + prompt, infra=infra, ctx=ctx)
 
 
 # ---------------------------------------------------------------------------
