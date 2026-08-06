@@ -1,7 +1,7 @@
 {
   "name": "antigravity",
   "description": "Antigravity MCP \u2014 Gemini as an independent critical advisor via the Antigravity CLI (agy). Auto-selects the deepest-thinking Gemini Pro model with Flash fallback on capacity errors; query, brainstorm, code analysis, PR review, agentic tools.",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "author": {
     "name": "Ahrar Ahmad"
   }
