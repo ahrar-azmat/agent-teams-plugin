@@ -604,6 +604,35 @@ _WEB_RESEARCH_DIRECTIVE = (
     "- End with a Sources list of every URL used, or 'no external claims made'.\n"
 )
 
+_CAPABILITY_HUNT = (
+    "## Runtime capability check (present is not supported)\n"
+    "A missing method fails at lint time — found in seconds. A "
+    "PRESENT-BUT-UNSUPPORTED method fails in production, on a real customer's "
+    "data. Type stubs, autocomplete, `hasattr`, and a clean import describe the "
+    "UNION of every backend a library supports — not the one this code actually "
+    "runs on. Hunt for it explicitly:\n"
+    "- For every call crossing into a SWAPPABLE backend — browser engine, DB "
+    "driver/dialect, storage/LLM/queue provider, cloud SDK against a "
+    "compatible-but-not-identical endpoint, container-provided binary, any "
+    "vendor SDK whose implementation is configurable — ask: WHICH backend "
+    "implements this, and is that the backend deployed? Check the vendor's "
+    "compatibility matrix, not the type signature. Say so when the diff does "
+    "not let you tell which engine is configured.\n"
+    "- Engine/driver/provider/version SWAPS are where this bug is born. If the "
+    "diff changes one, treat every call into that surface as suspect.\n"
+    "- A `try`/`except` (or `catch`) around such a call that degrades to a "
+    "no-op, a default, or a skipped write is the worst form: it converts a "
+    "loud failure into silent data loss. Flag it unless the handler "
+    "DISTINGUISHES the capability miss from a genuine failure and RECORDS "
+    "which occurred.\n"
+    "- Same defect in other clothes: a parameter accepted then ignored, "
+    "clamped, or silently downgraded; a config key that parses but no longer "
+    "exists in the installed version; an instruction with no mechanism behind "
+    "it. Accepted-but-ignored is worse than rejected.\n"
+    "- A test that passes on the library's DEFAULT backend proves nothing "
+    "about the deployed one. Flag missing coverage on the real engine.\n"
+)
+
 # Conclusion language in a neutral scoping field means the caller anchored the
 # advisor. Reported LOUDLY back to the caller — never silently stripped (silent
 # mutation of a caller's prompt is its own defect) and never blocked (that would
@@ -1209,7 +1238,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 + "For code specifically: verify library/API usage against "
                 "current upstream docs rather than memory — signatures, "
                 "deprecations and security guidance move. Check whether any "
-                "dependency touched here has a known CVE."
+                "dependency touched here has a known CVE.\n\n"
+                + _CAPABILITY_HUNT
             )
             result = await gemini.query(
                 prompt=(
@@ -1353,6 +1383,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 + "For code specifically: verify library/API usage against "
                 "current upstream docs rather than memory, and check whether "
                 "any dependency touched here has a known CVE.\n\n"
+                + _CAPABILITY_HUNT
+                + "\n"
                 "Output sections, in order: 1. Verdict (Ship it / Needs "
                 "changes / Do not ship) 2. Findings, highest severity first, "
                 "one line each as [CRITICAL/HIGH/MEDIUM/LOW] file:line — issue "

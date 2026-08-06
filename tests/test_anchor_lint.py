@@ -201,7 +201,20 @@ def main() -> int:
         print("✗ _ANCHOR_PATTERNS has DRIFTED between the two plugin copies")
         failures += 1
 
-    checked = len(servers) * (len(MUST_FLAG) + len(MUST_PASS) + 13) + 1
+    # The Runtime Capability hunt is duplicated for the same reason and must
+    # not drift either — a review dimension that exists in one advisor and not
+    # the other produces exactly the false "both models agreed" this release
+    # is about.
+    hunts = {name: mod._CAPABILITY_HUNT for name, mod in servers.items()}
+    if len(set(hunts.values())) != 1:
+        print("✗ _CAPABILITY_HUNT has DRIFTED between the two plugin copies")
+        failures += 1
+    for name, hunt in hunts.items():
+        if "present is not supported" not in hunt or "swappable" not in hunt.lower():
+            print(f"✗ [{name}] _CAPABILITY_HUNT lost its core directive")
+            failures += 1
+
+    checked = len(servers) * (len(MUST_FLAG) + len(MUST_PASS) + 13) + 3
     if failures:
         print(f"\n{failures} FAILURE(S) across {checked} checks")
         return 1

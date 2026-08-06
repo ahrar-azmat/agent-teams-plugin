@@ -27,6 +27,7 @@ If arguments were provided: "$ARGUMENTS" — use this as the task description an
 12. **Never be conservative** — all prompts must push for the best possible solution. Never include language like "the current approach is fine", "keep the existing pattern", or "maintain backward compatibility unless necessary". Always critically evaluate what exists and propose improvements.
 13. **Dispatch cross-model calls BLIND** — send the evidence and the question, never your own diagnosis. Anchoring an advisor with your conclusion turns an independent review into an echo. If you have a hypothesis, pass it in the `caller_hypothesis` parameter so it gets refuted, not confirmed. See **The Independence Protocol** below.
 14. **Demand live web research** — both advisors have live web search. Version/API/CVE/best-practice claims must be checked against primary sources with URLs, not recalled from training data. See **Mandatory web research** below.
+15. **"Present" is not "supported"** — a missing method fails at lint time in seconds; a present-but-unsupported one fails in production on a real customer's data. At every call into a swappable backend, verify the *deployed* engine implements it, not that the type stub declares it. See **The Runtime Capability Law** below.
 
 ## Tool Signatures — Exact Parameters (do NOT improvise)
 
@@ -343,6 +344,7 @@ After implementation tasks are marked complete, reviewers MUST:
 - Run `mcp__antigravity__antigravity_analyze_code` on critical sections with `focus: "performance"` and `focus: "security"`
 - **Send the diff, not the story.** `context` carries factual background only — what the feature does, which invariants hold. It must NOT say "this fixes the race" or "I believe this is correct": that is the claim under review, and stating it as fact is how a real defect gets waved through by two models at once. Put it in `caller_hypothesis` and get a CONFIRMED/REFUTED/UNPROVEN verdict instead
 - **Require the API/CVE check** — both advisors have live web search; a review that never verified whether a used API is deprecated or a touched dependency has a CVE is incomplete
+- **Run the Runtime Capability check** — for every call into a swappable backend, is the method supported by the engine we actually deploy, or merely present in the type stub? Present-but-unsupported is the expensive failure; see **The Runtime Capability Law** above
 - **Any CRITICAL/HIGH findings must be addressed before the team wraps up**
 
 **Reviewer prompt template:**
@@ -445,6 +447,49 @@ recall:
   passing it to the user as fact.
 - This applies to research *and* review: a code review that doesn't check whether the API being
   used was deprecated, or whether a touched dependency has a CVE, is an incomplete review.
+
+### The Runtime Capability Law — "present" is not "supported"
+
+> **A missing method fails at lint time — you find out in seconds. A present-but-unsupported
+> method fails in production, on a real portal, on a real customer's document.**
+
+That asymmetry decides how much verification a call is worth. Absence is loud, instant, free.
+Presence-without-support is silent, late, and paid for in lost customer data. **The further a
+failure can travel before it surfaces, the more you must spend up front to pull it earlier.**
+
+Type stubs, autocomplete, `hasattr`, and a clean import describe the **union of every backend a
+library supports** — never the one you actually run. A call can be present, type-clean,
+lint-clean, import-clean, and still be unimplemented by the engine underneath.
+
+**The case that named this law:** Playwright's `page.pdf()` is Headless-Chromium-only. A project
+switched its browser engine to Camoufox, which **is Firefox**. The method still existed and still
+type-checked — and raised *"PDF generation is only supported for Headless Chromium"* on **every
+page**, silently costing runs their bill evidence **for a month** before anyone noticed. No
+amount of static checking would have caught it. Running it once on the real engine would have.
+
+**Every teammate — researcher, architect, implementer, reviewer — applies this:**
+
+1. **At every call crossing into a swappable backend** — browser engine, DB driver/dialect,
+   storage/LLM/queue provider, cloud SDK against a compatible-but-not-identical endpoint,
+   container-provided binary, any vendor SDK whose implementation is configurable — ask *which
+   backend implements this, and is that the backend we deploy?* Not "does this method exist".
+2. **Verify against the vendor's compatibility matrix**, never the type signature and never
+   autocomplete.
+3. **Prove it with a runtime probe on the real engine.** A green suite on the library's *default*
+   backend proves nothing about the deployed one.
+4. **Engine/driver/provider/version swaps are where this bug is born.** After any such swap,
+   sweep every call into that surface. The swap commit is the crime scene.
+5. **Never let `try`/`except` degrade it to a silent no-op.** If you catch, *distinguish* the
+   capability miss from a genuine failure and **record which happened** — a reviewer reading the
+   artifact later must be able to tell them apart. Silent degradation of evidence, money, or
+   customer data is a defect no matter how neatly it is "handled".
+6. **Same defect in other clothes:** a parameter accepted then ignored, clamped, or silently
+   downgraded; a config key that parses but no longer exists in the installed version; an
+   instruction with no mechanism behind it. **Accepted-but-ignored is worse than rejected** —
+   the caller stops checking. Reject loudly or honour it.
+
+Both MCP servers inject this hunt into every `code_review` / `analyze_code` / `review_pr` /
+`architect_review` automatically, so the advisors look for it whether or not you remember to ask.
 
 ### How to treat multi-model output
 - Codex and Antigravity are **critical advisors** — take findings seriously and verify against your own analysis
@@ -573,6 +618,9 @@ Before starting a team:
 - [ ] Cross-model prompts are **blind**: evidence + question, NO caller diagnosis. Any hypothesis rides in `caller_hypothesis`, never in `context`/`concerns`/`focus`/`topic`
 - [ ] Codex + Antigravity are dispatched **in the same message** (parallel, neither sees the other's answer)
 - [ ] Advisor answers carrying external claims came back **with URLs**; unsourced version/API/CVE claims were re-asked, not repeated
+- [ ] Calls into swappable backends (browser engine, DB driver, storage/LLM provider, cloud SDK, container binary) were checked for **present-but-unsupported** — verified against the vendor compatibility matrix and probed on the engine actually deployed, not the library default
+- [ ] Any engine/driver/provider/version **swap** in the diff triggered a sweep of every call into that surface
+- [ ] No `try`/`except` degrades a capability miss into a silent no-op without recording which failure occurred
 - [ ] No result arrived with a **⚠️ ANCHORING WARNING** banner (if one did, it was re-dispatched blind before being trusted)
 
 Before wrapping up:

@@ -44,6 +44,20 @@ whether an API used here is deprecated upstream and whether a touched dependency
 CVE. Both servers require a **Sources** section — an unsourced version or API claim was answered
 from memory, so re-ask instead of repeating it.
 
+## The Runtime Capability check (the finding fast reviewers miss)
+
+> **A missing method fails at lint time — you find out in seconds. A present-but-unsupported
+> method fails in production, on a real portal, on a real customer's document.**
+
+Type stubs describe the union of every backend a library supports, not the deployed one. For every
+call crossing into a swappable backend (browser engine, DB driver/dialect, storage/LLM/queue
+provider, cloud SDK against a compatible endpoint, container binary): which backend implements it,
+and is that the one deployed? Treat any engine/driver/provider/version **swap** in the diff as
+making every call into that surface suspect. Flag any `try`/`except` that degrades such a call to a
+silent no-op without recording whether it was a capability miss or a real failure. Flag any
+parameter accepted then ignored, clamped, or downgraded. Flag tests that only exercise the
+library's default backend.
+
 ## Output Format
 
 Synthesize findings from both models into ONE compact report. Do NOT dump raw output from each

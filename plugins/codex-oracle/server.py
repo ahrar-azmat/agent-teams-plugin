@@ -172,6 +172,35 @@ _WEB_RESEARCH_DIRECTIVE = (
     "'UNVERIFIED' next to it rather than presenting it as fact.\n"
 )
 
+_CAPABILITY_HUNT = (
+    "## Runtime capability check (present is not supported)\n"
+    "A missing method fails at lint time — found in seconds. A "
+    "PRESENT-BUT-UNSUPPORTED method fails in production, on a real customer's "
+    "data. Type stubs, autocomplete, `hasattr`, and a clean import describe the "
+    "UNION of every backend a library supports — not the one this code actually "
+    "runs on. Hunt for it explicitly:\n"
+    "- For every call crossing into a SWAPPABLE backend — browser engine, DB "
+    "driver/dialect, storage/LLM/queue provider, cloud SDK against a "
+    "compatible-but-not-identical endpoint, container-provided binary, any "
+    "vendor SDK whose implementation is configurable — ask: WHICH backend "
+    "implements this, and is that the backend deployed? Check the vendor's "
+    "compatibility matrix, not the type signature. Say so when the diff does "
+    "not let you tell which engine is configured.\n"
+    "- Engine/driver/provider/version SWAPS are where this bug is born. If the "
+    "diff changes one, treat every call into that surface as suspect.\n"
+    "- A `try`/`except` (or `catch`) around such a call that degrades to a "
+    "no-op, a default, or a skipped write is the worst form: it converts a "
+    "loud failure into silent data loss. Flag it unless the handler "
+    "DISTINGUISHES the capability miss from a genuine failure and RECORDS "
+    "which occurred.\n"
+    "- Same defect in other clothes: a parameter accepted then ignored, "
+    "clamped, or silently downgraded; a config key that parses but no longer "
+    "exists in the installed version; an instruction with no mechanism behind "
+    "it. Accepted-but-ignored is worse than rejected.\n"
+    "- A test that passes on the library's DEFAULT backend proves nothing "
+    "about the deployed one. Flag missing coverage on the real engine.\n"
+)
+
 # Conclusion language in a scoping field means the caller anchored the advisor.
 # Detected and reported LOUDLY back to the caller — never silently stripped,
 # never blocked: silent mutation of a caller's prompt is its own defect, and a
@@ -757,6 +786,12 @@ async def architect_review(
         "requirement. 'This is how the codebase already does it' is not a "
         "justification — if a materially better design exists, say so.",
         "",
+        _CAPABILITY_HUNT,
+        "If the design swaps or abstracts over an engine/driver/provider, the "
+        "capability surface of EVERY candidate backend is part of the design, "
+        "not an implementation detail — an abstraction that assumes the union "
+        "of all backends breaks on whichever one lacks a method.",
+        "",
         _WEB_RESEARCH_DIRECTIVE,
         "",
         f"## Review request\n{description}",
@@ -864,6 +899,8 @@ async def code_review(
         "upstream docs rather than memory — signatures, deprecations, and "
         "security guidance move. Check whether any dependency touched here "
         "has a known CVE.",
+        "",
+        _CAPABILITY_HUNT,
         "",
         f"## Code to review\n```\n{code_or_diff}\n```",
     ]

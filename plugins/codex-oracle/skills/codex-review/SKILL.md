@@ -52,7 +52,30 @@ complete review checks the *current* upstream reality, not remembered API shapes
 Both servers require a **Sources** section. An external claim with no source was answered from
 memory — push back and re-ask rather than acting on it.
 
-## Step 4: Process findings
+## Step 4: Run the Runtime Capability check
+
+> **A missing method fails at lint time — you find out in seconds. A present-but-unsupported
+> method fails in production, on a real portal, on a real customer's document.**
+
+Static checks cannot see this one. Type stubs describe the union of every backend a library
+supports, not the one you deploy — a call can be present, type-clean and lint-clean while being
+unimplemented by the engine underneath. (Playwright's `page.pdf()` is Headless-Chromium-only; on
+a Firefox-based engine it failed on every page for a month, silently costing real evidence.)
+
+Ask of this diff:
+- Does it call into a **swappable backend** — browser engine, DB driver/dialect, storage/LLM/queue
+  provider, cloud SDK against a compatible-but-not-identical endpoint, container-provided binary?
+  If so: which backend implements each call, and is that the one deployed?
+- Does it **swap** an engine/driver/provider/version? Then every call into that surface is suspect.
+- Does any `try`/`except` degrade such a call into a no-op, a default, or a skipped write **without
+  recording** whether it was a capability miss or a genuine failure?
+- Is any parameter **accepted then ignored, clamped, or silently downgraded**?
+- Does the test coverage run on the **production engine**, or only on the library's default?
+
+Both servers inject this hunt into `code_review` and `review_pr` automatically — but check it
+yourself too, since it is the finding a fast reviewer most reliably misses.
+
+## Step 5: Process findings
 1. Collect all findings from both models
 2. Categorize by severity: CRITICAL > HIGH > MEDIUM > LOW
 3. Any CRITICAL or HIGH finding MUST be addressed or explicitly acknowledged to the user
@@ -64,12 +87,12 @@ memory — push back and re-ask rather than acting on it.
 6. Verify file:line citations in the tree that is canon for this task — Codex reads the whole
    workspace and can cite a sibling checkout.
 
-## Step 5: Optional round 2 — adversarial
+## Step 6: Optional round 2 — adversarial
 Once both have answered blind, it is legitimate to go back with your hypothesis and ask them to
 refute it, or to put one model's finding to the other. Order matters: independent first,
 adversarial second.
 
-## Step 6: Present to user
+## Step 7: Present to user
 Summarize:
 - What Codex found
 - What Antigravity found
