@@ -12,16 +12,34 @@ extended timeouts.
 Roles:
 - Senior Architect: architecture & design review
 - Code Reviewer: critical code analysis
-- Research Analyst: deep research with web access
+- Research Analyst: deep research with LIVE web access
 - General Oracle: freeform queries to Codex
 
 All outputs are treated as authoritative second opinions that should be
 critically verified — not blindly followed.
+
+Two properties are enforced by this server rather than left to the caller
+(see the INDEPENDENCE / WEB RESEARCH section below):
+
+1. INDEPENDENCE. The value of a second opinion is that it was formed
+   independently. A caller who states their own diagnosis and asks Codex to
+   react to it has not bought a second opinion — they have bought an echo.
+   Every prompt this server builds instructs Codex to reach its own
+   conclusion from primary evidence BEFORE weighing anything the caller
+   asserted, treats caller framing as a claim under test, and flags callers
+   whose "context" smuggled in a conclusion.
+
+2. LIVE WEB RESEARCH. Codex defaults to ``web_search = "cached"`` (an
+   OpenAI-maintained snapshot index). Every invocation here forces
+   ``web_search = "live"`` so version numbers, APIs, CVEs and best-practice
+   claims are checked against the real web instead of recalled from
+   training data.
 """
 
 import asyncio
 import contextlib
 import os
+import re
 import tempfile
 import time
 import tomllib
@@ -79,13 +97,231 @@ mcp = FastMCP(
     "codex-oracle",
     instructions=(
         "Codex Oracle provides a second-opinion from OpenAI's latest Codex model "
-        "running at maximum reasoning power. Use these tools when you need an "
-        "independent critical review, architecture guidance, or deep research "
-        "from a different AI perspective. Codex responses are authoritative "
-        "expert opinions — take them seriously, cross-reference with your own "
-        "analysis, and flag any disagreements to the user."
+        "running at maximum reasoning power, with LIVE web search enabled. Use "
+        "these tools when you need an independent critical review, architecture "
+        "guidance, or deep research from a different AI perspective. Codex "
+        "responses are authoritative expert opinions — take them seriously, "
+        "cross-reference with your own analysis, and flag any disagreements to "
+        "the user.\n\n"
+        "DISPATCH BLIND. Send the EVIDENCE (diff, files, symptoms, logs, the "
+        "question) and NOT your conclusion about it. Do not write 'the root "
+        "cause is X, confirm', 'I fixed this by Y, does that look right', or "
+        "'this is safe because Z'. Framing Codex with your own diagnosis "
+        "produces agreement that is an echo of you, not evidence. If you DO "
+        "have a hypothesis, put it in the dedicated `caller_hypothesis` "
+        "parameter — it is presented to Codex as an unverified claim to attack, "
+        "and you get back an explicit CONFIRMED / REFUTED / UNPROVEN verdict. "
+        "Never smuggle a hypothesis into `context`, `concerns`, or `focus`; "
+        "those are scoping fields and are lint-checked for conclusion language."
     ),
 )
+
+# ---------------------------------------------------------------------------
+# INDEPENDENCE / WEB RESEARCH — shared prompt construction
+# ---------------------------------------------------------------------------
+# NOTE ON DUPLICATION: this block is duplicated verbatim in the sibling
+# plugin's server.py, deliberately. `software-workflows`, `codex-oracle` and
+# `antigravity` are three INDEPENDENTLY INSTALLABLE plugins (see
+# .claude-plugin/marketplace.json) that each run from their own in-tree venv.
+# A shared module would make each plugin unusable unless the other is also
+# installed, and unimportable across venvs without sys.path surgery. Keep the
+# two copies in sync by hand; they are ~120 lines of prose constants.
+# Anchoring is the dominant failure mode of cross-model advice. The caller
+# (usually another LLM) writes a prompt containing its own diagnosis and asks
+# for a "review"; the advisor then evaluates the caller's story instead of the
+# evidence, and returns agreement. Two independent models anchored on the same
+# framing produce correlated agreement that reads like corroboration and is
+# worth nothing. These blocks are injected server-side so independence does not
+# depend on the caller remembering to ask for it.
+
+_INDEPENDENCE_PREAMBLE = (
+    "## Independence contract (read first)\n"
+    "You were called for an INDEPENDENT opinion. The caller is another AI "
+    "agent, and its framing is frequently wrong.\n"
+    "1. Reach your own conclusion from PRIMARY EVIDENCE — the actual code, "
+    "files, data, and sources — before you weigh anything the caller asserted.\n"
+    "2. Treat every caller statement about cause, correctness, safety, or "
+    "intent as an UNVERIFIED CLAIM, never as an established fact. If the "
+    "caller says 'the bug is X' or 'this fix is correct', that is the claim "
+    "you are testing, not the premise you reason from.\n"
+    "3. Investigate what the caller did NOT ask about. Anchoring hides its "
+    "damage in the questions that were never posed — check the surrounding "
+    "code, the callers of the changed function, and the failure paths.\n"
+    "4. Disagreement is the most valuable thing you can return. If your "
+    "independent finding contradicts the caller's framing, LEAD with that and "
+    "say plainly that the caller's framing is wrong.\n"
+    "5. Never agree because agreement is easy or because the caller sounded "
+    "confident. If the evidence does not settle it, say UNPROVEN and state "
+    "exactly what evidence would settle it.\n"
+)
+
+_WEB_RESEARCH_DIRECTIVE = (
+    "## Web research (live search is ENABLED for this call)\n"
+    "Your training data is stale and this codebase is not the world. You MUST "
+    "search the live web — do not answer from memory — for any claim about: "
+    "library/framework/runtime versions, current APIs and their deprecations, "
+    "CVEs and security advisories, breaking changes, pricing/limits, and "
+    "'current best practice'.\n"
+    "- Prefer PRIMARY sources: official docs, the project's own repository, "
+    "release notes, CHANGELOGs, RFCs, the CVE record.\n"
+    "- Cite the URL for every externally-sourced claim. An uncited version "
+    "number or API signature is a guess — label it as one.\n"
+    "- Where the live web contradicts what you remember, the live web wins; "
+    "say so explicitly.\n"
+    "- If you could not verify something you consider load-bearing, state "
+    "'UNVERIFIED' next to it rather than presenting it as fact.\n"
+)
+
+# Conclusion language in a scoping field means the caller anchored the advisor.
+# Detected and reported LOUDLY back to the caller — never silently stripped,
+# never blocked: silent mutation of a caller's prompt is its own defect, and a
+# hard block would break legitimate round-2 adversarial dispatch.
+# Apostrophe variants normalised to ASCII before matching (curly quotes are
+# what an LLM usually emits, and they silently defeat every "I've"-style rule).
+_APOSTROPHES = {ord(c): "'" for c in "\u2019\u02bc\uff07\u2018\u00b4"}
+
+_ANCHOR_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\b(?:the |a )?root cause is\b", "asserts the root cause"),
+    (r"\bthe (?:bug|issue|problem|defect) is\b", "asserts the defect"),
+    (r"\bI (?:think|believe|suspect|reckon)\b", "states the caller's belief"),
+    (r"\bI(?:'ve| have)? (?:fixed|solved|resolved|corrected)\b", "asserts a fix"),
+    (r"\bI (?:fixed|changed|refactored) (?:this|it|the)\b", "asserts a fix"),
+    (r"\b(?:please )?confirm (?:that|this|my|the)\b", "requests confirmation"),
+    (r"\b(?:can you )?verify (?:that )?my\b", "requests confirmation"),
+    (r"\bdoes (?:this|that) look (?:right|good|correct|ok)\b", "requests approval"),
+    (r"\bis (?:this|that) (?:correct|right|safe|fine|ok)\b", "requests approval"),
+    (r"\bmake sure (?:this|that|it) (?:is|looks)\b", "requests approval"),
+    (r"\bshould be (?:safe|fine|correct|ok)\b", "pre-judges the answer"),
+    (r"\bobviously\b", "pre-judges the answer"),
+    (r"\bas expected\b", "pre-judges the answer"),
+    (r"\bthe (?:correct|right|best) (?:approach|fix|solution) is\b", "asserts the answer"),
+    (r"\bthis is (?:safe|correct|fine) because\b", "asserts the answer"),
+    (r"\b(?:I'm|I am) (?:pretty |fairly |quite )?(?:sure|certain)\b", "states the caller's belief"),
+    (r"\bclearly (?:the|a|an|this|it)\b", "pre-judges the answer"),
+    (r"\bjust (?:a|an) (?:typo|oversight|nit)\b", "pre-judges severity"),
+    (r"\bnothing (?:else )?(?:to worry about|wrong)\b", "pre-judges the answer"),
+    (r"\bsanity[- ]check\b", "requests approval"),
+    (r"\bmy (?:diagnosis|read|take|theory|conclusion) is\b", "states the caller's belief"),
+    (r"\broot cause\s*[::]", "asserts the root cause"),
+    (r"\bthe (?:bug|issue|problem|defect)\s*[::]", "asserts the defect"),
+    (r"\blooks (?:fine|correct|right|good) to me\b", "pre-judges the answer"),
+)
+
+
+def _detect_anchoring(fields: dict[str, str]) -> list[str]:
+    """Return human-readable anchoring hits found in caller scoping fields.
+
+    ``fields`` maps parameter name -> caller-supplied text. Only the NEUTRAL
+    scoping parameters are linted; ``caller_hypothesis`` is exempt by design,
+    since that parameter exists precisely to carry a conclusion safely.
+    """
+    hits: list[str] = []
+    for param, text in fields.items():
+        if not text:
+            continue
+        # Normalise the apostrophe variants a model actually emits. Without
+        # this, "I’ve fixed" (curly quote) walks straight past the
+        # "I've fixed" pattern — a one-character bypass of the whole lint.
+        probe = text.translate(_APOSTROPHES)
+        for pattern, why in _ANCHOR_PATTERNS:
+            m = re.search(pattern, probe, re.IGNORECASE)
+            if m:
+                hits.append(f"`{param}`: \"{m.group(0)}\" ({why})")
+                break  # one hit per field is enough to make the point
+    return hits
+
+
+def _neutralizer(hits: list[str]) -> str:
+    """Extra counter-anchoring text injected when the caller anchored."""
+    if not hits:
+        return ""
+    return (
+        "\n## ⚠️ Caller anchoring detected\n"
+        "The caller's scoping text contains conclusion language: "
+        + "; ".join(hits)
+        + ".\n"
+        "Discount it. Those statements are the caller's guesses, and this "
+        "server flags them because callers routinely state a wrong diagnosis "
+        "as fact. Derive your findings from the primary evidence alone, then "
+        "state explicitly whether the caller's implied conclusion survives.\n"
+    )
+
+
+def _hypothesis_block(hypothesis: str) -> str:
+    """Render the caller's hypothesis as a claim under test, never as fact."""
+    if not hypothesis:
+        return ""
+    return (
+        "\n## Caller's hypothesis — UNVERIFIED CLAIM UNDER TEST\n"
+        "The following is what the caller BELIEVES. It is not evidence, it is "
+        "not background, and it may be entirely wrong. Do not adopt its "
+        "vocabulary or its framing. Form your own findings FIRST, then "
+        "adversarially test this claim — actively try to REFUTE it:\n"
+        f"<caller_hypothesis>\n{hypothesis}\n</caller_hypothesis>\n"
+        "Required in your output — a dedicated line:\n"
+        "**Hypothesis verdict**: CONFIRMED / REFUTED / UNPROVEN — the specific "
+        "evidence (file:line, source URL, observed behaviour) that decided it. "
+        "If CONFIRMED, name the evidence that would have refuted it and say "
+        "why it is absent. 'It sounds plausible' is not a verdict.\n"
+    )
+
+
+def _anchor_warning_banner(hits: list[str]) -> str:
+    """Loud, visible notice prepended to the RESULT the caller receives."""
+    if not hits:
+        return ""
+    return (
+        "⚠️ ANCHORING WARNING — read before trusting this answer\n"
+        "Your scoping fields contained conclusion language: "
+        + "; ".join(hits)
+        + ".\n"
+        "Codex was instructed to discount it and reason from primary evidence, "
+        "but you biased the sample. If this answer AGREES with you, treat that "
+        "agreement as WEAK evidence — it may be an echo of your own framing, "
+        "not independent corroboration. Disagreement below is still strong "
+        "evidence.\n"
+        "Fix: send only the evidence and the question; put any diagnosis in the "
+        "`caller_hypothesis` parameter, which is presented as a claim to refute "
+        "and returns an explicit CONFIRMED/REFUTED/UNPROVEN verdict.\n"
+        + "─" * 72
+        + "\n\n"
+    )
+
+# Reserve for the "[TRUNCATED: ...]" line that is appended AFTER slicing, so a
+# single oversized result cannot push the final payload past MAX_OUTPUT_CHARS.
+_TRUNC_NOTICE_ALLOWANCE = 128
+
+_VERDICT_TOKENS = ("CONFIRMED", "REFUTED", "UNPROVEN")
+
+
+def _verdict_missing_notice(hypothesis: str, result: str) -> str:
+    """Loud notice when a hypothesis was sent but no verdict came back.
+
+    The CONFIRMED/REFUTED/UNPROVEN requirement is a PROMPT instruction; this
+    server cannot force the model to honour it. When it is ignored, say so —
+    a caller who reads silence as confirmation has been misled by the very
+    mechanism meant to protect them.
+    """
+    if not hypothesis:
+        return ""
+    upper = result.upper()
+    if any(token in upper for token in _VERDICT_TOKENS):
+        return ""
+    return (
+        "\u26a0\ufe0f NO HYPOTHESIS VERDICT RETURNED\n"
+        "You supplied `caller_hypothesis`, but the answer below contains no "
+        "CONFIRMED / REFUTED / UNPROVEN verdict. That verdict is a prompt "
+        "requirement this server cannot enforce on the model. Do NOT read the "
+        "silence as confirmation — your hypothesis was not adjudicated. "
+        "Re-ask with the hypothesis alone if you need it settled.\n"
+        + "\u2500" * 72
+        + "\n\n"
+    )
+
+
+# Fixed-length (no interpolation), so its cost can be reserved up front.
+_VERDICT_NOTICE_LEN = len(_verdict_missing_notice("x", ""))
+
 
 # ---------------------------------------------------------------------------
 # Config reader — proper TOML parsing with mtime-based caching
@@ -156,7 +392,11 @@ def _get_cwd() -> str:
 # ---------------------------------------------------------------------------
 
 async def _run_codex(
-    prompt: str, infra: bool = False, ctx: Context | None = None
+    prompt: str,
+    infra: bool = False,
+    ctx: Context | None = None,
+    reserve: int = 0,
+    web_search: bool = True,
 ) -> str:
     """Run codex exec headlessly with clean final-message extraction.
 
@@ -165,8 +405,22 @@ async def _run_codex(
     - ``-c approval_policy=never`` — prevents blocking on approval prompts.
     - ``-c mcp_servers={}`` — disables codex's built-in MCP servers
       (default mode only; ``infra=True`` keeps them and lifts the sandbox).
+    - ``-c web_search=live`` — LIVE web search (see below).
     - ``--color never`` — strips ANSI sequences.
     - ``stdin=DEVNULL`` — prevents reading the parent's MCP JSON-RPC stdin.
+
+    Web search (2026-08-07, verified against codex-cli 0.144.1 + the current
+    config reference at learn.chatgpt.com/docs/config-file/config-reference):
+    the top-level ``web_search`` key takes ``disabled`` | ``cached`` |
+    ``indexed`` | ``live``, and DEFAULTS TO ``cached`` — an OpenAI-maintained
+    snapshot index, not the live web. Every tool here asks for current
+    versions/APIs/CVEs, so ``live`` is forced on every invocation, including
+    under ``--sandbox read-only``: web search is a native Responses tool and
+    does not go through the shell sandbox (empirically confirmed — a read-only
+    run retrieved a same-day GitHub release tag). Do NOT switch to
+    ``tools.web_search`` (legacy boolean; superseded by the table form) or
+    ``features.web_search_request`` (rejected as deprecated by 0.144.1);
+    ``tools.web_search_request`` is not a valid key at all.
 
     Key fix (2026-04-09): subprocess stdout/stderr are consumed with
     ``read(READ_CHUNK_SIZE)`` instead of ``readline()``. The old
@@ -224,6 +478,10 @@ async def _run_codex(
         "--output-last-message", str(output_file),
         "-c", "approval_policy=never",
         "-c", f"model_reasoning_effort={reasoning}",
+        # Live web, not the cached snapshot index. See the docstring.
+        # "disabled" removes the tool outright rather than falling back to the
+        # cached index — an offline call must be genuinely offline.
+        "-c", f"web_search={'live' if web_search else 'disabled'}",
         prompt,
     ]
 
@@ -416,16 +674,20 @@ async def _run_codex(
         if stderr_lines:
             result += "\n\n[stderr]\n" + "\n".join(stderr_lines)
 
-    # Truncate to avoid exceeding Claude Code's MCP result limit.
-    if len(result) > MAX_OUTPUT_CHARS:
-        truncated = result[:MAX_OUTPUT_CHARS]
+    # Truncate to avoid exceeding Claude Code's MCP result limit. ``reserve``
+    # is the length of text the CALLER will prepend (the anchoring banner) —
+    # taken out of the budget rather than added on top of it, so the warning
+    # survives truncation without pushing the total past the cap.
+    budget = MAX_OUTPUT_CHARS - reserve - _TRUNC_NOTICE_ALLOWANCE
+    if len(result) > budget:
+        truncated = result[:budget]
         last_nl = truncated.rfind("\n")
-        if last_nl > MAX_OUTPUT_CHARS * 0.8:
+        if last_nl > budget * 0.8:
             truncated = truncated[:last_nl]
         result = (
             f"{truncated}\n\n"
             f"[TRUNCATED: output was {len(result):,} chars, "
-            f"capped at {MAX_OUTPUT_CHARS:,}]"
+            f"capped at {budget:,}]"
         )
 
     return result
@@ -440,22 +702,47 @@ async def architect_review(
     description: str,
     files: str = "",
     concerns: str = "",
+    caller_hypothesis: str = "",
+    web_search: bool = True,
     infra: bool = False,
     ctx: Context = None,
 ) -> str:
     """
     Senior architect review of a design, approach, or implementation.
-    Runs Codex at maximum reasoning depth. Use for architecture decisions,
-    system design, API contracts, data modeling, or structural patterns.
+    Runs Codex at maximum reasoning depth with LIVE web search. Use for
+    architecture decisions, system design, API contracts, data modeling,
+    or structural patterns.
+
+    DISPATCH BLIND: `description` should state WHAT is being built and the
+    constraints — not which design you already favour. Put any preferred
+    design or predicted verdict in `caller_hypothesis` so Codex attacks it
+    instead of absorbing it.
 
     Args:
-        description: What to review — the architecture, approach, or decision
+        description: What to review — the problem, the constraints, the
+            design under consideration. State the requirement, not your
+            preferred answer.
         files: Comma-separated file paths for Codex to examine
-        concerns: Specific concerns or trade-offs to evaluate
+        concerns: Specific trade-off axes to evaluate (e.g. "write
+            throughput vs read consistency"). A neutral scoping field —
+            lint-checked for conclusion language; do NOT put a verdict here.
+        caller_hypothesis: OPTIONAL. Your own design preference or predicted
+            verdict, stated plainly. Presented to Codex as an unverified
+            claim to REFUTE, and answered with an explicit
+            CONFIRMED/REFUTED/UNPROVEN verdict. Use this instead of leaking
+            your view into `description`/`concerns`.
+        web_search: Live web search, ON by default so version/API/CVE claims
+            are checked against the real web instead of recalled. Set False
+            to keep the call fully offline — use it when the material is
+            sensitive enough that outbound search queries are themselves a
+            disclosure risk. Turning it off means version and API claims come
+            from stale training data; treat them as unverified.
         infra: Enable live-infrastructure access (SSH, live DB, Dokploy,
             logs, MCP tools) for read-only investigation. Slower startup;
             use only when live state matters to the review.
     """
+    hits = _detect_anchoring({"description": description, "concerns": concerns})
+
     prompt_parts = [
         "You are a principal software architect with 20+ years of experience.",
         "Perform a deep, critical architecture review. Think step by step.",
@@ -463,26 +750,49 @@ async def architect_review(
         "Flag every risk, anti-pattern, and scalability concern you find.",
         "Suggest concrete alternatives with trade-off analysis.",
         "",
-        f"## Review Request\n{description}",
+        _INDEPENDENCE_PREAMBLE,
+        "Design review specifics: evaluate from FIRST PRINCIPLES. Do not "
+        "treat the existing architecture, the caller's chosen pattern, or the "
+        "framing of the request as a constraint unless it is a stated hard "
+        "requirement. 'This is how the codebase already does it' is not a "
+        "justification — if a materially better design exists, say so.",
+        "",
+        _WEB_RESEARCH_DIRECTIVE,
+        "",
+        f"## Review request\n{description}",
     ]
     if files:
         prompt_parts.append(f"\n## Files to examine (read these files)\n{files}")
     if concerns:
-        prompt_parts.append(f"\n## Specific concerns\n{concerns}")
+        prompt_parts.append(f"\n## Trade-off axes to evaluate\n{concerns}")
+
+    prompt_parts.append(_hypothesis_block(caller_hypothesis))
+    prompt_parts.append(_neutralizer(hits))
 
     prompt_parts.append(
         "\n## Required output format (CONCISE — under 1500 words total)\n"
         "No preamble, no filler. Get straight to findings.\n\n"
         "1. **Verdict**: APPROVE / CONCERNS / REJECT\n"
         "2. **Executive summary**: 2-3 sentences\n"
-        "3. **Critical findings**: Severity-ranked list\n"
-        "4. **Recommendations**: Concrete, actionable changes\n"
-        "5. **Risks**: What happens if current approach ships as-is\n"
-        "6. **Alternative approaches**: If CONCERNS/REJECT, suggest alternatives\n\n"
-        "Skip sections with zero findings. Do not repeat yourself."
+        "3. **Where I disagree with the caller's framing**: state it here or "
+        "write 'none — framing held up' (do not omit this section)\n"
+        "4. **Critical findings**: Severity-ranked list\n"
+        "5. **Recommendations**: Concrete, actionable changes\n"
+        "6. **Risks**: What happens if this approach ships as-is\n"
+        "7. **Alternative approaches**: If CONCERNS/REJECT, suggest alternatives\n"
+        "8. **Sources**: URLs for every externally-sourced claim, or "
+        "'no external claims made'\n\n"
+        "Skip sections 4-7 if they have zero findings. Sections 3 and 8 are "
+        "mandatory. Do not repeat yourself."
     )
 
-    return await _run_codex("\n".join(prompt_parts), infra=infra, ctx=ctx)
+    banner = _anchor_warning_banner(hits)
+    reserve = len(banner) + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0)
+    result = await _run_codex(
+        "\n".join(prompt_parts), infra=infra, ctx=ctx,
+        web_search=web_search, reserve=reserve,
+    )
+    return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
 
 @mcp.tool()
@@ -490,22 +800,47 @@ async def code_review(
     code_or_diff: str,
     context: str = "",
     focus: str = "",
+    caller_hypothesis: str = "",
+    web_search: bool = True,
     infra: bool = False,
     ctx: Context = None,
 ) -> str:
     """
-    Deep critical code review from Codex at maximum reasoning power.
-    Use for independent review of code changes, diffs, or implementations.
-    Codex will read files in the working directory if given paths.
+    Deep critical code review from Codex at maximum reasoning power, with
+    LIVE web search. Use for independent review of code changes, diffs, or
+    implementations. Codex will read files in the working directory if given
+    paths.
+
+    DISPATCH BLIND: send the diff and let Codex find the problems. Do NOT
+    write "I fixed the race by adding a lock, does that look right" — that
+    buys agreement, not review. If you have a belief about what the code
+    does or whether it is correct, put it in `caller_hypothesis`.
 
     Args:
         code_or_diff: Code snippet, diff, or file paths to review
-        context: Background context about the codebase or feature
-        focus: Areas to focus on (security, performance, correctness, etc.)
+        context: Factual background only — what the feature does, which
+            invariants the codebase guarantees, how to run it. A neutral
+            scoping field, lint-checked for conclusion language. Do NOT put
+            "the bug is X" or "this fix is correct" here.
+        focus: Areas to weight (security, performance, correctness, ...).
+            Also lint-checked — it scopes attention, it does not state answers.
+        caller_hypothesis: OPTIONAL. What you believe about this code — your
+            diagnosis, your claim that a fix is correct, your reason for
+            thinking it is safe. Presented to Codex as an unverified claim to
+            REFUTE, answered with an explicit CONFIRMED/REFUTED/UNPROVEN
+            verdict backed by file:line evidence.
+        web_search: Live web search, ON by default so version/API/CVE claims
+            are checked against the real web instead of recalled. Set False
+            to keep the call fully offline — use it when the material is
+            sensitive enough that outbound search queries are themselves a
+            disclosure risk. Turning it off means version and API claims come
+            from stale training data; treat them as unverified.
         infra: Enable live-infrastructure access (SSH, live DB, Dokploy,
             logs, MCP tools) for read-only investigation. Slower startup;
             use only when live state matters to the review.
     """
+    hits = _detect_anchoring({"context": context, "focus": focus})
+
     prompt_parts = [
         "You are an elite code reviewer who has prevented production outages.",
         "Perform a deep, line-by-line review. Think step by step.",
@@ -515,12 +850,30 @@ async def code_review(
         "and violations of clean code principles.",
         "Do NOT compliment the code. Find real problems.",
         "",
+        _INDEPENDENCE_PREAMBLE,
+        "Code review specifics: read the code before you read the caller's "
+        "description of it, and trust the code where they conflict. A diff "
+        "that 'fixes' something is a claim — verify the bug existed, verify "
+        "the fix closes it, and verify it did not open another. Check the "
+        "paths the caller did not mention: error branches, concurrent "
+        "callers, empty/null inputs, and the callers of every changed "
+        "signature.",
+        "",
+        _WEB_RESEARCH_DIRECTIVE,
+        "Additionally, for code: verify library/API usage against current "
+        "upstream docs rather than memory — signatures, deprecations, and "
+        "security guidance move. Check whether any dependency touched here "
+        "has a known CVE.",
+        "",
         f"## Code to review\n```\n{code_or_diff}\n```",
     ]
     if context:
-        prompt_parts.append(f"\n## Context\n{context}")
+        prompt_parts.append(f"\n## Background (factual context, not findings)\n{context}")
     if focus:
         prompt_parts.append(f"\n## Focus areas\n{focus}")
+
+    prompt_parts.append(_hypothesis_block(caller_hypothesis))
+    prompt_parts.append(_neutralizer(hits))
 
     prompt_parts.append(
         "\n## Required output format (CONCISE — under 1500 words total)\n"
@@ -528,79 +881,176 @@ async def code_review(
         "**Verdict**: Ship it / Needs changes / Do not ship\n"
         "**Findings** (highest severity first, one per line):\n"
         "  [CRITICAL/HIGH/MEDIUM/LOW] file:line — issue → fix\n"
-        "  (include code snippets only for CRITICAL/HIGH fixes)\n\n"
-        "Skip sections with zero findings. Do not repeat yourself."
+        "  (include code snippets only for CRITICAL/HIGH fixes)\n"
+        "**Where I disagree with the caller's framing**: mandatory — state "
+        "it, or write 'none — framing held up'\n"
+        "**Sources**: URLs for every externally-sourced claim (API docs, "
+        "CVEs, version claims), or 'no external claims made'\n\n"
+        "Skip the findings section only if there are genuinely zero findings. "
+        "Do not repeat yourself."
     )
 
-    return await _run_codex("\n".join(prompt_parts), infra=infra, ctx=ctx)
+    banner = _anchor_warning_banner(hits)
+    reserve = len(banner) + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0)
+    result = await _run_codex(
+        "\n".join(prompt_parts), infra=infra, ctx=ctx,
+        web_search=web_search, reserve=reserve,
+    )
+    return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
 
 @mcp.tool()
 async def research(
     topic: str,
     constraints: str = "",
+    caller_hypothesis: str = "",
+    web_search: bool = True,
     infra: bool = False,
     ctx: Context = None,
 ) -> str:
     """
-    Deep technical research using Codex's web access and full reasoning.
-    Always runs at maximum depth. Use for up-to-date information,
-    library comparisons, best practices, or technical investigation.
+    Deep technical research using Codex's LIVE web search and full reasoning.
+    Always runs at maximum depth. Use for up-to-date information, library
+    comparisons, best practices, or technical investigation.
+
+    DISPATCH BLIND: ask the open question ("which X should we use for Y, and
+    why") rather than seeking support for an answer you already picked. A
+    leading question returns a supporting brief, not research. Put your
+    current pick in `caller_hypothesis` and it gets stress-tested instead.
 
     Args:
-        topic: What to research — be specific
-        constraints: Specific versions, frameworks, date ranges, etc.
+        topic: What to research — be specific. Phrase it as an open question.
+        constraints: Hard constraints that bound the answer — versions,
+            frameworks, platforms, licence limits, date ranges. Neutral
+            scoping field, lint-checked for conclusion language.
+        caller_hypothesis: OPTIONAL. The answer you currently expect or the
+            option you are leaning toward. Presented as an unverified claim
+            to REFUTE, with a required CONFIRMED/REFUTED/UNPROVEN verdict.
+        web_search: Live web search, ON by default so version/API/CVE claims
+            are checked against the real web instead of recalled. Set False
+            to keep the call fully offline — use it when the material is
+            sensitive enough that outbound search queries are themselves a
+            disclosure risk. Turning it off means version and API claims come
+            from stale training data; treat them as unverified.
         infra: Enable live-infrastructure access (SSH, live DB, Dokploy,
             logs, MCP tools) for read-only investigation.
     """
+    hits = _detect_anchoring({"topic": topic, "constraints": constraints})
+
     prompt_parts = [
-        "You are a senior technical researcher with web access.",
+        "You are a senior technical researcher with LIVE web access.",
         "Search the web extensively for current, accurate information.",
-        "Think deeply. Cross-reference multiple sources.",
+        "Think deeply. Cross-reference multiple INDEPENDENT sources.",
         "Cite URLs for every claim. Distinguish facts from opinions.",
         "Flag anything uncertain or conflicting.",
+        "",
+        _INDEPENDENCE_PREAMBLE,
+        "Research specifics: run the search you would run if the caller had "
+        "expressed no preference at all. Actively search for evidence AGAINST "
+        "the option the question seems to favour — known failure reports, "
+        "migration-away posts, open issues, benchmark rebuttals. A research "
+        "answer that found no downsides for its recommendation is an "
+        "incomplete search, not a clean result.",
+        "",
+        _WEB_RESEARCH_DIRECTIVE,
+        "Research-grade sourcing: a blog post is weaker than the project's "
+        "own docs; a docs page is weaker than the release notes or source. "
+        "Where sources conflict, say so and say which you trust and why. "
+        "Give the retrieval date for anything version- or price-sensitive.",
         "",
         f"## Research topic\n{topic}",
     ]
     if constraints:
-        prompt_parts.append(f"\n## Constraints\n{constraints}")
+        prompt_parts.append(f"\n## Hard constraints\n{constraints}")
+
+    prompt_parts.append(_hypothesis_block(caller_hypothesis))
+    prompt_parts.append(_neutralizer(hits))
 
     prompt_parts.append(
         "\n## Required output format (CONCISE — under 1500 words total)\n"
         "No preamble, no filler. Lead with the answer.\n\n"
         "**Recommendation**: Your pick + reasoning (HIGH/MEDIUM/LOW confidence)\n"
         "**Key findings**: Bulleted, one line each — with source URLs\n"
-        "**Trade-offs**: Brief pros/cons per approach\n\n"
+        "**Trade-offs**: Brief pros/cons per approach\n"
+        "**Evidence against my own recommendation**: mandatory — the "
+        "strongest counter-case you found, or state that you searched for one "
+        "and what you searched\n"
+        "**Sources**: every URL used, with retrieval date for version/price "
+        "claims\n\n"
         "Do not repeat yourself."
     )
 
-    return await _run_codex("\n".join(prompt_parts), infra=infra, ctx=ctx)
+    banner = _anchor_warning_banner(hits)
+    reserve = len(banner) + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0)
+    result = await _run_codex(
+        "\n".join(prompt_parts), infra=infra, ctx=ctx,
+        web_search=web_search, reserve=reserve,
+    )
+    return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
 
 @mcp.tool()
 async def codex_query(
     prompt: str,
+    caller_hypothesis: str = "",
+    web_search: bool = True,
     infra: bool = False,
     ctx: Context = None,
 ) -> str:
     """
-    Freeform deep query to Codex at maximum reasoning power.
-    Use for anything — explanations, comparisons, debugging hypotheses,
-    or any task where a second AI perspective is valuable.
+    Freeform deep query to Codex at maximum reasoning power, with LIVE web
+    search. Use for anything — explanations, comparisons, debugging
+    hypotheses, or any task where a second AI perspective is valuable.
     Codex can read files in the current working directory.
 
+    DISPATCH BLIND: ask the question, don't pitch the answer. "Why does X
+    fail under Y?" gets you analysis; "X fails because of Z, right?" gets you
+    agreement with Z. Put your theory in `caller_hypothesis` to have it
+    attacked rather than confirmed.
+
     Args:
-        prompt: The question or task for Codex
+        prompt: The question or task for Codex. Phrase it neutrally — this
+            field is lint-checked for conclusion language.
+        caller_hypothesis: OPTIONAL. Your current theory or expected answer.
+            Presented as an unverified claim to REFUTE, with a required
+            CONFIRMED/REFUTED/UNPROVEN verdict.
+        web_search: Live web search, ON by default so version/API/CVE claims
+            are checked against the real web instead of recalled. Set False
+            to keep the call fully offline — use it when the material is
+            sensitive enough that outbound search queries are themselves a
+            disclosure risk. Turning it off means version and API claims come
+            from stale training data; treat them as unverified.
         infra: Enable live-infrastructure access (SSH, live DB, Dokploy,
             logs, MCP tools) for read-only investigation.
     """
+    hits = _detect_anchoring({"prompt": prompt})
+
     preamble = (
         "Think deeply and step by step. Be thorough and precise. "
         "If you need to read files, do so. If you need to search the web, do so. "
         "Provide your analysis with evidence and reasoning. "
         "Keep your response concise — under 1500 words. No filler or preamble.\n\n"
+        + _INDEPENDENCE_PREAMBLE
+        + "\n"
+        + _WEB_RESEARCH_DIRECTIVE
+        + "\n## Question\n"
     )
-    return await _run_codex(preamble + prompt, infra=infra, ctx=ctx)
+    body = (
+        prompt
+        + _hypothesis_block(caller_hypothesis)
+        + _neutralizer(hits)
+        + "\n\nEnd your answer with a **Sources** line: every URL used, or "
+        "'no external claims made'. If your conclusion contradicts what the "
+        "question presupposed, say so explicitly rather than answering "
+        "around it."
+    )
+    banner = _anchor_warning_banner(hits)
+    reserve = len(banner) + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0)
+    result = await _run_codex(
+        preamble + body, infra=infra, ctx=ctx,
+        web_search=web_search, reserve=reserve,
+    )
+    return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
 
 # ---------------------------------------------------------------------------

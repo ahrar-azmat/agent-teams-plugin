@@ -545,6 +545,221 @@ def get_client() -> AntigravityCLIClient:
     return client
 
 
+# ---------------------------------------------------------------------------
+# INDEPENDENCE / WEB RESEARCH — shared prompt construction
+# ---------------------------------------------------------------------------
+# NOTE ON DUPLICATION: this block is duplicated verbatim in the sibling
+# plugin's server.py, deliberately. `software-workflows`, `codex-oracle` and
+# `antigravity` are three INDEPENDENTLY INSTALLABLE plugins (see
+# .claude-plugin/marketplace.json) that each run from their own in-tree venv.
+# A shared module would make each plugin unusable unless the other is also
+# installed, and unimportable across venvs without sys.path surgery. Keep the
+# two copies in sync by hand; they are ~120 lines of prose constants.
+# Mirrors the same block in the codex-oracle plugin. Both advisors are dispatched
+# in parallel precisely so their opinions are INDEPENDENT; that guarantee is void
+# if the caller hands both the same diagnosis to react to. Two models anchored on
+# one framing agree with each other for reasons that have nothing to do with the
+# code, and their agreement reads — falsely — like corroboration.
+#
+# Web research: agy exposes a built-in `search_web` tool, auto-approved here by
+# `--dangerously-skip-permissions` (see `_build_query_cmd`). It is available on
+# every query but only USED when the prompt asks for it, so the directive below
+# is what turns latent capability into actual research (verified 2026-08-07:
+# a plain agy query returned a current version string sourced via `search_web`).
+
+_INDEPENDENCE_PREAMBLE = (
+    "INDEPENDENCE CONTRACT (read first). You were called for an INDEPENDENT "
+    "opinion. The caller is another AI agent and its framing is frequently "
+    "wrong.\n"
+    "1. Reach your own conclusion from PRIMARY EVIDENCE — the actual code, "
+    "files, data and sources — before weighing anything the caller asserted.\n"
+    "2. Treat every caller statement about cause, correctness, safety or "
+    "intent as an UNVERIFIED CLAIM, never an established fact.\n"
+    "3. Investigate what the caller did NOT ask about — error branches, "
+    "concurrent callers, empty/null inputs, the callers of changed signatures. "
+    "Anchoring hides its damage in the questions never posed.\n"
+    "4. Disagreement is the most valuable thing you can return. If your "
+    "finding contradicts the caller's framing, LEAD with that and say plainly "
+    "that the framing is wrong.\n"
+    "5. Never agree because agreement is easy or the caller sounded confident. "
+    "If the evidence does not settle it, say UNPROVEN and state what would.\n"
+    "6. Do not open with praise. Skip 'what's good' unless a specific strength "
+    "is load-bearing for a decision.\n"
+)
+
+_WEB_RESEARCH_DIRECTIVE = (
+    "WEB RESEARCH (required). You have a live `search_web` tool — USE IT. Your "
+    "training data is stale. Do not answer from memory for any claim about "
+    "library/framework/runtime versions, current APIs and deprecations, CVEs "
+    "and security advisories, breaking changes, pricing/limits, or 'current "
+    "best practice'.\n"
+    "- Prefer PRIMARY sources: official docs, the project's own repository, "
+    "release notes, CHANGELOGs, RFCs, the CVE record.\n"
+    "- Cite the URL for every externally-sourced claim. An uncited version "
+    "number or API signature is a guess — label it as one.\n"
+    "- Where the live web contradicts what you remember, the live web wins; "
+    "say so explicitly.\n"
+    "- If you could not verify something load-bearing, mark it 'UNVERIFIED' "
+    "rather than presenting it as fact.\n"
+    "- End with a Sources list of every URL used, or 'no external claims made'.\n"
+)
+
+# Conclusion language in a neutral scoping field means the caller anchored the
+# advisor. Reported LOUDLY back to the caller — never silently stripped (silent
+# mutation of a caller's prompt is its own defect) and never blocked (that would
+# break legitimate round-2 adversarial dispatch).
+# Apostrophe variants normalised to ASCII before matching (curly quotes are
+# what an LLM usually emits, and they silently defeat every "I've"-style rule).
+_APOSTROPHES = {ord(c): "'" for c in "\u2019\u02bc\uff07\u2018\u00b4"}
+
+_ANCHOR_PATTERNS: tuple[tuple[str, str], ...] = (
+    (r"\b(?:the |a )?root cause is\b", "asserts the root cause"),
+    (r"\bthe (?:bug|issue|problem|defect) is\b", "asserts the defect"),
+    (r"\bI (?:think|believe|suspect|reckon)\b", "states the caller's belief"),
+    (r"\bI(?:'ve| have)? (?:fixed|solved|resolved|corrected)\b", "asserts a fix"),
+    (r"\bI (?:fixed|changed|refactored) (?:this|it|the)\b", "asserts a fix"),
+    (r"\b(?:please )?confirm (?:that|this|my|the)\b", "requests confirmation"),
+    (r"\b(?:can you )?verify (?:that )?my\b", "requests confirmation"),
+    (r"\bdoes (?:this|that) look (?:right|good|correct|ok)\b", "requests approval"),
+    (r"\bis (?:this|that) (?:correct|right|safe|fine|ok)\b", "requests approval"),
+    (r"\bmake sure (?:this|that|it) (?:is|looks)\b", "requests approval"),
+    (r"\bshould be (?:safe|fine|correct|ok)\b", "pre-judges the answer"),
+    (r"\bobviously\b", "pre-judges the answer"),
+    (r"\bas expected\b", "pre-judges the answer"),
+    (r"\bthe (?:correct|right|best) (?:approach|fix|solution) is\b", "asserts the answer"),
+    (r"\bthis is (?:safe|correct|fine) because\b", "asserts the answer"),
+    (r"\b(?:I'm|I am) (?:pretty |fairly |quite )?(?:sure|certain)\b", "states the caller's belief"),
+    (r"\bclearly (?:the|a|an|this|it)\b", "pre-judges the answer"),
+    (r"\bjust (?:a|an) (?:typo|oversight|nit)\b", "pre-judges severity"),
+    (r"\bnothing (?:else )?(?:to worry about|wrong)\b", "pre-judges the answer"),
+    (r"\bsanity[- ]check\b", "requests approval"),
+    (r"\bmy (?:diagnosis|read|take|theory|conclusion) is\b", "states the caller's belief"),
+    (r"\broot cause\s*[::]", "asserts the root cause"),
+    (r"\bthe (?:bug|issue|problem|defect)\s*[::]", "asserts the defect"),
+    (r"\blooks (?:fine|correct|right|good) to me\b", "pre-judges the answer"),
+)
+
+_HYPOTHESIS_PARAM_DESC = (
+    "OPTIONAL. Your own diagnosis, theory, or expected answer. Presented to "
+    "Antigravity as an UNVERIFIED claim to actively REFUTE, and answered with "
+    "an explicit CONFIRMED / REFUTED / UNPROVEN verdict backed by evidence. "
+    "Use this instead of leaking your conclusion into the neutral scoping "
+    "fields — those are lint-checked and will trigger an anchoring warning."
+)
+
+
+def _detect_anchoring(fields: dict[str, str]) -> list[str]:
+    """Return human-readable anchoring hits in caller scoping fields.
+
+    ``caller_hypothesis`` is exempt by design — that parameter exists
+    precisely to carry a conclusion safely.
+    """
+    hits: list[str] = []
+    for param, text in fields.items():
+        if not text:
+            continue
+        # Normalise the apostrophe variants a model actually emits. Without
+        # this, "I’ve fixed" (curly quote) walks straight past the
+        # "I've fixed" pattern — a one-character bypass of the whole lint.
+        probe = text.translate(_APOSTROPHES)
+        for pattern, why in _ANCHOR_PATTERNS:
+            m = re.search(pattern, probe, re.IGNORECASE)
+            if m:
+                hits.append(f"`{param}`: \"{m.group(0)}\" ({why})")
+                break
+    return hits
+
+
+def _neutralizer(hits: list[str]) -> str:
+    """Extra counter-anchoring text injected when the caller anchored."""
+    if not hits:
+        return ""
+    return (
+        "\n\n⚠️ CALLER ANCHORING DETECTED. The caller's scoping text contains "
+        "conclusion language: " + "; ".join(hits) + ". Discount it — those are "
+        "the caller's guesses, and callers routinely state a wrong diagnosis "
+        "as fact. Derive your findings from the primary evidence alone, then "
+        "state explicitly whether the caller's implied conclusion survives."
+    )
+
+
+def _hypothesis_block(hypothesis: str) -> str:
+    """Render the caller's hypothesis as a claim under test, never as fact."""
+    if not hypothesis:
+        return ""
+    return (
+        "\n\n## Caller's hypothesis — UNVERIFIED CLAIM UNDER TEST\n"
+        "The following is what the caller BELIEVES. It is not evidence, not "
+        "background, and may be entirely wrong. Do not adopt its vocabulary or "
+        "framing. Form your own findings FIRST, then adversarially test it — "
+        "actively try to REFUTE it:\n"
+        f"<caller_hypothesis>\n{hypothesis}\n</caller_hypothesis>\n"
+        "Required in your output, on its own line:\n"
+        "**Hypothesis verdict**: CONFIRMED / REFUTED / UNPROVEN — with the "
+        "specific evidence (file:line, source URL, observed behaviour) that "
+        "decided it. If CONFIRMED, name the evidence that would have refuted "
+        "it and why it is absent. 'It sounds plausible' is not a verdict."
+    )
+
+
+def _anchor_warning_banner(hits: list[str]) -> str:
+    """Loud, visible notice prepended to the RESULT the caller receives."""
+    if not hits:
+        return ""
+    return (
+        "⚠️ ANCHORING WARNING — read before trusting this answer\n"
+        "Your scoping fields contained conclusion language: "
+        + "; ".join(hits)
+        + ".\n"
+        "Antigravity was instructed to discount it and reason from primary "
+        "evidence, but you biased the sample. If this answer AGREES with you, "
+        "treat that agreement as WEAK evidence — it may be an echo of your own "
+        "framing, not independent corroboration. Disagreement below is still "
+        "strong evidence.\n"
+        "Fix: send only the evidence and the question; put any diagnosis in the "
+        "`caller_hypothesis` parameter, which is presented as a claim to refute "
+        "and returns an explicit CONFIRMED/REFUTED/UNPROVEN verdict.\n"
+        + "─" * 72
+        + "\n\n"
+    )
+
+
+# Reserve for the "[TRUNCATED: ...]" line that is appended AFTER slicing, so a
+# single oversized result cannot push the final payload past MAX_OUTPUT_CHARS.
+_TRUNC_NOTICE_ALLOWANCE = 128
+
+_VERDICT_TOKENS = ("CONFIRMED", "REFUTED", "UNPROVEN")
+
+
+def _verdict_missing_notice(hypothesis: str, result: str) -> str:
+    """Loud notice when a hypothesis was sent but no verdict came back.
+
+    The CONFIRMED/REFUTED/UNPROVEN requirement is a PROMPT instruction; this
+    server cannot force the model to honour it. When it is ignored, say so —
+    a caller who reads silence as confirmation has been misled by the very
+    mechanism meant to protect them.
+    """
+    if not hypothesis:
+        return ""
+    upper = result.upper()
+    if any(token in upper for token in _VERDICT_TOKENS):
+        return ""
+    return (
+        "\u26a0\ufe0f NO HYPOTHESIS VERDICT RETURNED\n"
+        "You supplied `caller_hypothesis`, but the answer below contains no "
+        "CONFIRMED / REFUTED / UNPROVEN verdict. That verdict is a prompt "
+        "requirement this server cannot enforce on the model. Do NOT read the "
+        "silence as confirmation — your hypothesis was not adjudicated. "
+        "Re-ask with the hypothesis alone if you need it settled.\n"
+        + "\u2500" * 72
+        + "\n\n"
+    )
+
+
+# Fixed-length (no interpolation), so its cost can be reserved up front.
+_VERDICT_NOTICE_LEN = len(_verdict_missing_notice("x", ""))
+
+
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available Antigravity tools (backed by Antigravity `agy`).
@@ -569,15 +784,25 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="antigravity_query",
             description=(
-                f"Ask Antigravity a question or send a prompt. Uses your authenticated "
-                f"Google account via the Antigravity CLI (agy). {model_policy}"
+                f"Ask Antigravity a question or send a prompt, with live web research. "
+                f"Uses your authenticated Google account via the Antigravity CLI (agy). "
+                f"DISPATCH BLIND — ask the question, do not pitch the answer; put any "
+                f"theory of your own in `caller_hypothesis` so it gets attacked rather "
+                f"than confirmed. {model_policy}"
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "The prompt or question to send to Antigravity"
+                        "description": (
+                            "The prompt or question to send to Antigravity. Phrase it "
+                            "neutrally — lint-checked for conclusion language."
+                        )
+                    },
+                    "caller_hypothesis": {
+                        "type": "string",
+                        "description": _HYPOTHESIS_PARAM_DESC
                     },
                     "system_instruction": {
                         "type": "string",
@@ -603,6 +828,10 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "Tool names to suggest (e.g., ['read_file', 'write_file'])"
                     },
+                    "caller_hypothesis": {
+                        "type": "string",
+                        "description": _HYPOTHESIS_PARAM_DESC
+                    },
                     "system_instruction": {
                         "type": "string",
                         "description": "Optional system instruction"
@@ -614,7 +843,12 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="antigravity_analyze_code",
-            description="Analyze code for quality, security, performance, or bugs using Antigravity.",
+            description=(
+                "Analyze code for quality, security, performance, or bugs using "
+                "Antigravity, with live web research on APIs/CVEs. DISPATCH BLIND — "
+                "send the code and let it find the problems; put your own diagnosis "
+                "in `caller_hypothesis` to have it refuted rather than echoed."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -631,32 +865,60 @@ async def list_tools() -> list[Tool]:
                         "enum": ["quality", "security", "performance", "bugs", "all"],
                         "default": "all",
                         "description": "What aspect to focus the analysis on"
+                    },
+                    "caller_hypothesis": {
+                        "type": "string",
+                        "description": _HYPOTHESIS_PARAM_DESC
                     }
                 },
-                "required": ["code"]
+                "required": ["code"],
+                "additionalProperties": False
             }
         ),
         Tool(
             name="antigravity_brainstorm",
-            description="Brainstorm ideas with Antigravity. Provide context and get creative suggestions.",
+            description=(
+                "Brainstorm ideas with Antigravity, with live web research for prior "
+                "art. State the PROBLEM, not your preferred solution — a topic that "
+                "names the answer returns variations on it instead of alternatives."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "topic": {
                         "type": "string",
-                        "description": "The topic or problem to brainstorm about"
+                        "description": (
+                            "The problem to brainstorm about. Phrase as the problem "
+                            "and its constraints, not as the solution you favour."
+                        )
                     },
                     "context": {
                         "type": "string",
-                        "description": "Additional context (e.g., constraints, existing ideas, goals)"
+                        "description": (
+                            "Hard constraints and goals (neutral scoping field — "
+                            "lint-checked for conclusion language)"
+                        )
                     },
                     "num_ideas": {
                         "type": "integer",
                         "default": 5,
                         "description": "Number of ideas to generate"
+                    },
+                    "caller_hypothesis": {
+                        "type": "string",
+                        "description": (
+                            "OPTIONAL. The approach you are already leaning toward. "
+                            "Held back from idea generation entirely: the ideas are "
+                            "produced in one call that never sees this, then a "
+                            "SECOND isolated call critiques your leaning against "
+                            "that frozen set and returns a CONFIRMED/REFUTED/"
+                            "UNPROVEN verdict. Supplying it therefore costs two "
+                            "model calls instead of one."
+                        )
                     }
                 },
-                "required": ["topic"]
+                "required": ["topic"],
+                "additionalProperties": False
             }
         ),
         Tool(
@@ -712,7 +974,13 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="antigravity_review_pr",
-            description="Review code changes like a pull request reviewer.",
+            description=(
+                "Review code changes like a pull request reviewer, with live web "
+                "research on APIs/CVEs. DISPATCH BLIND — send the diff and let it "
+                "find the problems. Do not write 'I fixed X by doing Y, does that "
+                "look right'; that buys agreement, not review. Put your belief in "
+                "`caller_hypothesis` for an explicit refute-first verdict."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -722,16 +990,31 @@ async def list_tools() -> list[Tool]:
                     },
                     "context": {
                         "type": "string",
-                        "description": "Context about the changes (what they're for, related files, etc.)"
+                        "description": (
+                            "FACTUAL background only — what the feature does, which "
+                            "invariants hold, how to run it. Neutral scoping field, "
+                            "lint-checked: do NOT put 'the bug is X' or 'this fix is "
+                            "correct' here."
+                        )
                     },
                     "strictness": {
                         "type": "string",
                         "enum": ["lenient", "balanced", "strict"],
-                        "default": "balanced",
-                        "description": "How strict the review should be"
+                        "default": "strict",
+                        "description": (
+                            "Severity threshold for what gets reported (NOT a tone "
+                            "dial — the review is blunt at every level). lenient = "
+                            "CRITICAL/HIGH only; balanced = adds MEDIUM; strict = "
+                            "everything including style. Default strict."
+                        )
+                    },
+                    "caller_hypothesis": {
+                        "type": "string",
+                        "description": _HYPOTHESIS_PARAM_DESC
                     }
                 },
-                "required": ["diff"]
+                "required": ["diff"],
+                "additionalProperties": False
             }
         ),
         Tool(
@@ -848,54 +1131,168 @@ def _reject_model_selection(arguments: dict[str, Any], gemini: "AntigravityCLICl
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle tool calls."""
     gemini = get_client()
+    # Set by the advisory tools when the caller's scoping fields carried a
+    # conclusion; prepended to the final result so the warning is impossible
+    # to miss and survives truncation.
+    anchor_banner = ""
+    # The hypothesis the caller sent, if any — used at the end to check that a
+    # CONFIRMED/REFUTED/UNPROVEN verdict actually came back.
+    hypothesis_sent = ""
 
     try:
         if name == "antigravity_query":
             rejection = _reject_model_selection(arguments, gemini)
             if rejection is not None:
                 return [TextContent(type="text", text=rejection)]
+            hits = _detect_anchoring({"prompt": arguments["prompt"]})
+            anchor_banner = _anchor_warning_banner(hits)
+            hypothesis_sent = arguments.get("caller_hypothesis", "")
+            caller_system = arguments.get("system_instruction") or ""
+            system = (
+                _INDEPENDENCE_PREAMBLE
+                + "\n"
+                + _WEB_RESEARCH_DIRECTIVE
+                + ("\n" + caller_system if caller_system else "")
+            )
             result = await gemini.query(
-                prompt=arguments["prompt"],
+                prompt=(
+                    arguments["prompt"]
+                    + _hypothesis_block(arguments.get("caller_hypothesis", ""))
+                    + _neutralizer(hits)
+                    + "\n\nIf your conclusion contradicts what the question "
+                    "presupposed, say so explicitly rather than answering around it."
+                ),
                 model=None,  # always wrapper-decided
-                system_instruction=arguments.get("system_instruction"),
+                system_instruction=system,
             )
 
         elif name == "antigravity_with_tools":
             rejection = _reject_model_selection(arguments, gemini)
             if rejection is not None:
                 return [TextContent(type="text", text=rejection)]
+            hits = _detect_anchoring({"prompt": arguments["prompt"]})
+            anchor_banner = _anchor_warning_banner(hits)
+            hypothesis_sent = arguments.get("caller_hypothesis", "")
+            caller_system = arguments.get("system_instruction") or ""
             result = await gemini.query_with_tools(
-                prompt=arguments["prompt"],
+                prompt=(
+                    arguments["prompt"]
+                    + _hypothesis_block(arguments.get("caller_hypothesis", ""))
+                    + _neutralizer(hits)
+                ),
                 model=None,  # always wrapper-decided
-                system_instruction=arguments.get("system_instruction"),
+                system_instruction=(
+                    _INDEPENDENCE_PREAMBLE
+                    + "\n"
+                    + _WEB_RESEARCH_DIRECTIVE
+                    + ("\n" + caller_system if caller_system else "")
+                ),
                 allowed_tools=arguments.get("allowed_tools", []),
             )
 
         elif name == "antigravity_analyze_code":
             focus = arguments.get("focus", "all")
             language = arguments.get("language", "unknown")
+            hits = _detect_anchoring({"focus": focus})
+            anchor_banner = _anchor_warning_banner(hits)
+            hypothesis_sent = arguments.get("caller_hypothesis", "")
             system = (
                 f"You are an expert code reviewer. Analyze the following {language} code. "
                 f"Focus on: {focus if focus != 'all' else 'quality, security, performance, and potential bugs'}. "
-                f"Provide specific, actionable feedback with line references where applicable."
+                f"Provide specific, actionable feedback with line references where applicable.\n\n"
+                + _INDEPENDENCE_PREAMBLE
+                + "Read the code before you read any description of it, and "
+                "trust the code where they conflict. Check the paths nobody "
+                "asked about: error branches, concurrent callers, empty/null "
+                "inputs, and every caller of a changed signature.\n\n"
+                + _WEB_RESEARCH_DIRECTIVE
+                + "For code specifically: verify library/API usage against "
+                "current upstream docs rather than memory — signatures, "
+                "deprecations and security guidance move. Check whether any "
+                "dependency touched here has a known CVE."
             )
             result = await gemini.query(
-                prompt=f"```{language}\n{arguments['code']}\n```",
+                prompt=(
+                    f"```{language}\n{arguments['code']}\n```"
+                    + _hypothesis_block(arguments.get("caller_hypothesis", ""))
+                    + _neutralizer(hits)
+                ),
                 system_instruction=system,
             )
 
         elif name == "antigravity_brainstorm":
             context = arguments.get("context", "")
             num_ideas = arguments.get("num_ideas", 5)
+            hits = _detect_anchoring({"topic": arguments["topic"], "context": context})
+            anchor_banner = _anchor_warning_banner(hits)
+            hypothesis = arguments.get("caller_hypothesis", "")
             system = (
                 f"You are a creative brainstorming partner. Generate {num_ideas} diverse, innovative ideas. "
                 f"For each idea, provide: 1. A clear title 2. Brief description (2-3 sentences) "
-                f"3. Potential challenges 4. Why it could work"
+                f"3. Potential challenges 4. Why it could work\n\n"
+                "INDEPENDENCE: the caller is another AI agent whose framing is "
+                "often narrower than the problem. Generate ideas that span "
+                "genuinely different approaches — not variations on one theme, "
+                "and not variations on whatever the topic seems to favour. At "
+                "least two ideas must challenge an assumption embedded in the "
+                "way the problem was posed; name the assumption you are "
+                "dropping.\n\n"
+                + _WEB_RESEARCH_DIRECTIVE
+                + "Search for PRIOR ART before generating: how have others "
+                "solved this, and what did they report going wrong? An idea "
+                "list with no reference to how this has been tried before is "
+                "speculation, not brainstorming."
             )
-            prompt = f"Topic: {arguments['topic']}"
+            prompt = f"Problem: {arguments['topic']}"
             if context:
-                prompt += f"\n\nContext: {context}"
+                prompt += f"\n\nConstraints and goals: {context}"
+            prompt += _neutralizer(hits)
+
+            # TWO ISOLATED CALLS when a hypothesis is supplied. An earlier
+            # version put the hypothesis in the same request behind a "generate
+            # your ideas first" instruction — but the model sees the whole
+            # prompt at once, so the preference was in context the entire time
+            # and the advertised independence was not real. Telling the caller
+            # their leaning was excluded when it was not is the exact
+            # accepted-but-ignored failure this feature exists to prevent.
+            # Call 1 generates and FREEZES the ideas with no knowledge of the
+            # leaning; call 2 critiques the leaning against that frozen set.
             result = await gemini.query(prompt=prompt, system_instruction=system)
+
+            if hypothesis:
+                critique_system = (
+                    "You are evaluating one proposed approach against a set of "
+                    "alternatives that were generated INDEPENDENTLY, before the "
+                    "proposal was known. Be blunt. Do not soften the verdict "
+                    "because the caller proposed it.\n\n"
+                    + _WEB_RESEARCH_DIRECTIVE
+                )
+                critique = await gemini.query(
+                    prompt=(
+                        "## Alternatives (generated with no knowledge of the "
+                        f"proposal below)\n{result}\n\n"
+                        "## The proposal to evaluate\n"
+                        f"<caller_hypothesis>\n{hypothesis}\n</caller_hypothesis>\n\n"
+                        "Answer, concisely:\n"
+                        "1. Does any alternative above beat this proposal? Name "
+                        "it and say why, or state plainly that none does.\n"
+                        "2. What does the proposal assume that the alternatives "
+                        "do not?\n"
+                        "3. **Hypothesis verdict**: CONFIRMED (it is the best "
+                        "of these) / REFUTED (a named alternative is better) / "
+                        "UNPROVEN (cannot tell without stated evidence) — with "
+                        "the reasoning that decided it."
+                    ),
+                    system_instruction=critique_system,
+                )
+                result = (
+                    f"{result}\n\n"
+                    f"{'─' * 72}\n"
+                    "## Critique of the caller's leaning\n"
+                    "_(second, isolated call — the ideas above were generated "
+                    "before this proposal was revealed to the model)_\n\n"
+                    f"{critique}"
+                )
 
         elif name == "antigravity_summarize":
             format_type = arguments.get("format", "bullets")
@@ -907,7 +1304,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             }
             system = (
                 f"Summarize the following content. Format: {format_type}. "
-                f"Length: {length_guide[length]}. Focus on the key points and main takeaways."
+                f"Length: {length_guide.get(length, length_guide['medium'])}. "
+                f"Focus on the key points and main takeaways."
             )
             result = await gemini.query(
                 prompt=arguments["content"],
@@ -929,22 +1327,46 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
         elif name == "antigravity_review_pr":
             context = arguments.get("context", "")
-            strictness = arguments.get("strictness", "balanced")
+            # Default flipped balanced -> strict: this tool exists to find
+            # defects, and the old default reported only some of them.
+            strictness = arguments.get("strictness", "strict")
+            # Severity THRESHOLD, not tone. The previous guide encoded
+            # agreeableness ("be encouraging", "acknowledge good practices"),
+            # which is the opposite of what an independent advisor is for.
             strictness_guide = {
-                "lenient": "Focus on major issues only, be encouraging",
-                "balanced": "Point out issues but acknowledge good practices",
-                "strict": "Be thorough, flag all potential issues including style",
+                "lenient": "Report CRITICAL and HIGH severity findings only; stay blunt about those",
+                "balanced": "Report CRITICAL, HIGH and MEDIUM findings; stay blunt about all of them",
+                "strict": "Report everything including LOW/nit and style; stay blunt about all of them",
             }
+            hits = _detect_anchoring({"context": context})
+            anchor_banner = _anchor_warning_banner(hits)
+            hypothesis_sent = arguments.get("caller_hypothesis", "")
             system = (
                 f"You are a senior code reviewer conducting a pull request review. "
-                f"Review style: {strictness_guide[strictness]}. "
-                f"Provide feedback in sections: 1. Summary (1-2 sentences) 2. What's Good "
-                f"3. Issues to Address (with severity: critical/major/minor/nit) "
-                f"4. Suggestions for Improvement 5. Questions for the Author"
+                f"Reporting threshold: {strictness_guide.get(strictness, strictness_guide['strict'])}.\n\n"
+                + _INDEPENDENCE_PREAMBLE
+                + "Review specifics: a diff that claims to fix something is a "
+                "CLAIM — verify the bug existed, verify the fix closes it, and "
+                "verify it did not open another. Read the code before any "
+                "description of it and trust the code where they conflict.\n\n"
+                + _WEB_RESEARCH_DIRECTIVE
+                + "For code specifically: verify library/API usage against "
+                "current upstream docs rather than memory, and check whether "
+                "any dependency touched here has a known CVE.\n\n"
+                "Output sections, in order: 1. Verdict (Ship it / Needs "
+                "changes / Do not ship) 2. Findings, highest severity first, "
+                "one line each as [CRITICAL/HIGH/MEDIUM/LOW] file:line — issue "
+                "→ fix 3. 'Where I disagree with the caller's framing' "
+                "(mandatory — state it or write 'none — framing held up') "
+                "4. Sources (URLs for every externally-sourced claim, or 'no "
+                "external claims made'). Do not open with praise and do not "
+                "include a 'What's Good' section."
             )
             prompt = f"Code changes:\n```\n{arguments['diff']}\n```"
             if context:
-                prompt += f"\n\nContext: {context}"
+                prompt += f"\n\nBackground (factual context, not findings): {context}"
+            prompt += _hypothesis_block(arguments.get("caller_hypothesis", ""))
+            prompt += _neutralizer(hits)
             result = await gemini.query(prompt=prompt, system_instruction=system)
 
         elif name == "antigravity_generate_tests":
@@ -957,7 +1379,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             }
             system = (
                 f"Generate test cases using {framework}. "
-                f"Coverage level: {coverage_guide[coverage]}. "
+                f"Coverage level: {coverage_guide.get(coverage, coverage_guide['comprehensive'])}. "
                 f"For each test: 1. Clear test name describing what's being tested "
                 f"2. Arrange-Act-Assert structure 3. Relevant assertions "
                 f"4. Brief comment explaining the test purpose"
@@ -1030,19 +1452,34 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
-        # Truncate to avoid exceeding Claude Code's MCP result limit.
-        if len(result) > MAX_OUTPUT_CHARS:
-            truncated = result[:MAX_OUTPUT_CHARS]
+        # Truncate to avoid exceeding Claude Code's MCP result limit. The
+        # anchoring banner is reserved OUT of the budget rather than added on
+        # top of it: the warning must survive truncation (it is the thing that
+        # tells the caller not to trust an agreeing answer), and the total must
+        # still respect the cap.
+        budget = (
+            MAX_OUTPUT_CHARS
+            - len(anchor_banner)
+            - (_VERDICT_NOTICE_LEN if hypothesis_sent else 0)
+            - _TRUNC_NOTICE_ALLOWANCE
+        )
+        if len(result) > budget:
+            truncated = result[:budget]
             last_nl = truncated.rfind("\n")
-            if last_nl > MAX_OUTPUT_CHARS * 0.8:
+            if last_nl > budget * 0.8:
                 truncated = truncated[:last_nl]
             result = (
                 f"{truncated}\n\n"
                 f"[TRUNCATED: output was {len(result):,} chars, "
-                f"capped at {MAX_OUTPUT_CHARS:,}]"
+                f"capped at {budget:,}]"
             )
 
-        return [TextContent(type="text", text=result)]
+        # Checked against the POST-truncation text — the verdict must be in what
+        # the caller actually receives, not in a tail that was cut off.
+        verdict_notice = _verdict_missing_notice(hypothesis_sent, result)
+        return [
+            TextContent(type="text", text=anchor_banner + verdict_notice + result)
+        ]
 
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]

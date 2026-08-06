@@ -8,24 +8,59 @@ A Claude Code plugin marketplace providing **`software-workflows`** — a skill 
 
 When you ask Claude Code to do anything involving 2+ agents, the `agent-teams` skill kicks in and drives the full lifecycle:
 
-1. Loads the deferred team tools (`TeamCreate`, `TaskCreate`, `TaskUpdate`, `SendMessage`, `TaskGet`, `TaskList`, `TeamDelete`)
-2. Creates a team + a shared task list
-3. Spawns focused teammates (each its own context window) with self-contained prompts
-4. Wires up task dependencies, assigns/claims work, coordinates via direct messages
-5. Shuts teammates down and cleans up when the work is done
+1. Loads the deferred team tools (`TaskCreate`, `TaskUpdate`, `SendMessage`, `TaskGet`, `TaskList`)
+2. Spawns focused teammates (each its own context window) with self-contained prompts — the team is **implicit**, formed by the first `Agent` call
+3. Wires up task dependencies, assigns/claims work, coordinates via direct messages
+4. Shuts teammates down when the work is done (the implicit team cleans up on session exit)
 
-It ships **role templates** (researcher, architect, implementer, reviewer, tester, …) and **team patterns** (research, implementation, debug, review), plus an optional **multi-model review** layer that uses Codex and Gemini as independent advisors when those MCP servers are present.
+It ships **role templates** (researcher, architect, implementer, reviewer, tester, …) and **team patterns** (research, implementation, debug, review), plus an optional **multi-model advisory** layer that uses Codex and Antigravity as independent advisors when those MCP servers are present.
 
 ## Why this exists (the v1.1.0 fix)
 
 Agent Teams tools are **deferred** and **schema-validated** (`additionalProperties: false`). The most common way orchestration runs fail is passing parameters the tools don't accept. This skill pins the exact signatures so the model can't improvise:
 
-- `team_name` belongs **only** on `TeamCreate` and `Agent` — never on the Task tools (they auto-associate with the session's team).
+- `TeamCreate` / `TeamDelete` **no longer exist** (removed in Claude Code v2.1.178) and `team_name` is deprecated and ignored — the team is implicit and the Task tools auto-associate with the session.
 - `TaskCreate` has **no** `blockedBy` — create first, then `TaskUpdate(taskId, addBlockedBy=[…])`.
 - `SendMessage` is `to` + `message` (+ optional `summary`) — **not** `recipient`/`type`/`content`, and there is **no broadcast**. Protocol `type` goes *inside* the `message` object.
 - Deferred tools load **per context** — every teammate prompt loads them first.
 
 The skill includes a Tool-Signatures reference table and troubleshooting entries mapping each error to its fix.
+
+## The Independence Protocol (v1.4.0)
+
+A second opinion is only worth something if it was formed **independently** — and the way that
+guarantee gets destroyed is subtle. You write up your own diagnosis, paste it into the prompt,
+and ask Codex/Antigravity to "review" it. What comes back is a reaction to *your framing*, not an
+independent read of the evidence. Hand the same framing to both advisors and their agreement
+looks like corroboration while being nothing but your own opinion echoed twice.
+
+Both MCPs now enforce independence server-side rather than trusting the caller to ask for it:
+
+- **`caller_hypothesis`** on every advisory tool — the one correct channel for your own view.
+  It is presented as an *unverified claim to refute* and answered with an explicit
+  **CONFIRMED / REFUTED / UNPROVEN** verdict naming the evidence that decided it.
+- **An independence contract** injected into every prompt: reason from primary evidence first,
+  treat caller claims as unverified, investigate what the caller *didn't* ask about, lead with
+  disagreement.
+- **An anchoring lint** on the neutral scoping fields (`context`, `concerns`, `focus`, `topic`).
+  Conclusion language ("the root cause is", "I fixed", "does this look right") triggers a
+  counter-anchoring injection *and* a loud `⚠️ ANCHORING WARNING` on the result telling you your
+  agreement is now weak evidence. It never silently strips your text and never blocks the call.
+- **A mandatory "where I disagree with the caller's framing"** section in every review's output.
+
+Round 1 is blind; round 2 can be adversarial. The rule to remember:
+
+> Two models agreeing is strong evidence **only if they were dispatched independently.**
+> Disagreement is strong evidence either way.
+
+## Live web research (v1.4.0)
+
+Both advisors now actually research instead of recalling. Codex runs with `web_search=live` —
+its default is `cached`, an OpenAI-maintained snapshot index, so the previous instruction to
+"search the web and cite URLs" had no mechanism behind it. Antigravity is directed to its live
+`search_web` tool. Both require primary sources with URLs, mark unverifiable load-bearing claims
+`UNVERIFIED`, and end with a Sources section; code reviews additionally check APIs against
+current upstream docs and touched dependencies for known CVEs.
 
 ## Install
 
@@ -43,7 +78,9 @@ Then just ask for multi-agent work (e.g. *"Create an agent team to review this P
   ```json
   { "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" } }
   ```
-- **Optional — multi-model review:** the Codex Oracle and Gemini MCP servers. If they aren't configured, the skill still runs normally; the cross-model review steps are simply skipped.
+- **Optional — multi-model advisory:** the `codex-oracle` and `antigravity` MCP servers (both ship in this marketplace). If they aren't configured, the skill still runs normally; the cross-model steps are simply skipped.
+  - `codex-oracle` needs the Codex CLI authenticated (`codex`); live web search is forced on per call, so no config change is required.
+  - `antigravity` needs `agy` installed and signed in (`agy` in a terminal, complete the Google sign-in — there is no headless re-auth).
 
 ## License
 
