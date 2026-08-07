@@ -559,6 +559,8 @@ def _process_exec_event(ev: dict[str, Any], state: dict[str, str]) -> str | None
 
     if et == "thread.started":
         state["activity"] = "session started"
+        # The rollout/session id — the handle `codex exec resume` continues.
+        state["thread_id"] = str(ev.get("thread_id") or "")
         return f"thread started (id: {ev.get('thread_id', '?')})"
     if et == "turn.started":
         state["activity"] = "thinking"
@@ -654,142 +656,156 @@ def _process_exec_event(ev: dict[str, Any], state: dict[str, str]) -> str | None
 
 
 # ---------------------------------------------------------------------------
-# Codex runner
+# Run journal + resume/retry
 # ---------------------------------------------------------------------------
+# Sessions are the recovery substrate. codex writes its rollout INCREMENTALLY
+# (measured 2026-08-08: a SIGKILL'd run resumed with full context — codeword
+# AND the interrupted computation recovered), so a failed or orphaned run can
+# be continued via `codex exec … resume <thread_id> <nudge>` — same thread id,
+# vendor-side context intact. --ephemeral is therefore NOT passed anymore.
+#
+# The journal (runs.jsonl, one JSON record per line: start/session/end) plus a
+# per-run .result.txt survive MCP-server restarts, so `codex_resume_run` can
+# recover a run after a plugin reload killed the call mid-flight — returning
+# the stored answer for free when the run actually finished.
+#
+# AMNESIA GUARD (measured): `codex exec resume` with an unknown/empty id
+# SILENTLY starts a fresh context-less thread and still exits 0 — every
+# resume must verify the resumed thread.started id equals the expected one.
 
-async def _run_codex(
-    prompt: str,
-    infra: bool = False,
-    ctx: Context | None = None,
-    reserve: int = 0,
-    web_search: bool = True,
-) -> str:
-    """Run codex exec headlessly with clean final-message extraction.
+RUNS_JOURNAL = LIVE_LOG_DIR / "runs.jsonl"
+RUNS_JOURNAL_MAX_BYTES = 5 * 1024 * 1024  # ~300 runs with full prompts; one
+# older generation kept as runs.jsonl.1 — recovery data, not an archive.
+MAX_TRANSIENT_RETRIES = 2
+RESUME_NUDGE = (
+    "The previous process was interrupted before your answer arrived. "
+    "Continue from where you left off and provide the complete final answer."
+)
 
-    Uses codex-cli 0.118.0+ features (live-view additions verified 0.144.1):
-    - ``--json`` — JSONL ThreadEvents on stdout, streamed to the per-run
-      live log (``~/.claude/logs/codex-oracle/latest.log``) together with
-      ``-c model_reasoning_summary=detailed`` so the operator can watch the
-      model's reasoning, web searches, commands and errors in real time.
-    - ``--output-last-message FILE`` — clean final-message extraction.
-    - ``-c approval_policy=never`` — prevents blocking on approval prompts.
-    - ``-c mcp_servers={}`` — disables codex's built-in MCP servers
-      (default mode only; ``infra=True`` keeps them and lifts the sandbox).
-    - ``-c web_search=live`` — LIVE web search (see below).
-    - ``--color never`` — strips ANSI sequences.
-    - ``stdin=DEVNULL`` — prevents reading the parent's MCP JSON-RPC stdin.
 
-    Web search (2026-08-07, verified against codex-cli 0.144.1 + the current
-    config reference at learn.chatgpt.com/docs/config-file/config-reference):
-    the top-level ``web_search`` key takes ``disabled`` | ``cached`` |
-    ``indexed`` | ``live``, and DEFAULTS TO ``cached`` — an OpenAI-maintained
-    snapshot index, not the live web. Every tool here asks for current
-    versions/APIs/CVEs, so ``live`` is forced on every invocation, including
-    under ``--sandbox read-only``: web search is a native Responses tool and
-    does not go through the shell sandbox (empirically confirmed — a read-only
-    run retrieved a same-day GitHub release tag). Do NOT switch to
-    ``tools.web_search`` (legacy boolean; superseded by the table form) or
-    ``features.web_search_request`` (rejected as deprecated by 0.144.1);
-    ``tools.web_search_request`` is not a valid key at all.
+def _journal(rec: dict[str, Any]) -> None:
+    """Append one record to runs.jsonl, flushed so a kill cannot lose it."""
+    with contextlib.suppress(Exception):
+        LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            if RUNS_JOURNAL.exists() and RUNS_JOURNAL.stat().st_size > RUNS_JOURNAL_MAX_BYTES:
+                RUNS_JOURNAL.replace(RUNS_JOURNAL.with_suffix(".jsonl.1"))
+        with RUNS_JOURNAL.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
-    Key fix (2026-04-09): subprocess stdout/stderr are consumed with
-    ``read(READ_CHUNK_SIZE)`` instead of ``readline()``. The old
-    ``readline()`` called ``StreamReader.readuntil(b'\\n')`` which raises
-    ``LimitOverrunError`` ("Separator is not found, and chunk exceed the
-    limit") when codex outputs any single line > 64 KiB (the default
-    asyncio StreamReader buffer). ``read()`` never searches for a separator
-    so it cannot overflow. Additionally, ``limit=SUBPROCESS_BUFFER_LIMIT``
-    (4 MiB) is passed to ``create_subprocess_exec()`` as a safety net.
+
+def _journal_runs() -> dict[str, dict[str, Any]]:
+    """Fold journal records into per-run views, oldest→newest insertion order."""
+    runs: dict[str, dict[str, Any]] = {}
+    for path in (RUNS_JOURNAL.with_suffix(".jsonl.1"), RUNS_JOURNAL):
+        if not path.exists():
+            continue
+        with contextlib.suppress(Exception):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                with contextlib.suppress(Exception):
+                    rec = json.loads(line)
+                    run = runs.setdefault(rec["run"], {})
+                    run.update({k: v for k, v in rec.items() if k != "phase"})
+                    run[f"has_{rec.get('phase', '?')}"] = True
+    return runs
+
+
+def _is_transient_error(text: str) -> bool:
+    """Failures worth an automatic resume/retry: infrastructure, not semantics.
+
+    Deliberately excludes auth (needs a human), usage/quota policy denials,
+    and argument errors (retrying can't fix them).
     """
-    model = _get_codex_model()
-    reasoning = _get_reasoning_effort()
-
-    # Temp file for the final assistant message — clean extraction, no parsing.
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".txt", delete=False, prefix="codex-oracle-"
+    t = text.lower()
+    signals = (
+        "stream disconnected",
+        "stream closed",
+        "connection reset",
+        "connection closed",
+        "connection refused",
+        "connection error",
+        "network error",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "overloaded",
+        "internal server error",
+        "bad gateway",
+        "gateway timeout",
+        "error 500",
+        "error 502",
+        "error 503",
+        "error 504",
+        " 429",
+        "rate limit",
+        "too many requests",
+        "retry later",
     )
-    tmp.close()
-    output_file = Path(tmp.name)
+    return any(s in t for s in signals)
 
+
+def _build_exec_argv(
+    model: str,
+    reasoning: str,
+    infra: bool,
+    web_search: bool,
+    output_file: Path,
+    prompt: str | None = None,
+    resume_tid: str | None = None,
+    resume_prompt: str | None = None,
+) -> list[str]:
+    """codex exec argv for a fresh run or a resume of an existing thread.
+
+    Grammar per codex-rs exec/src/cli.rs @8e4b104 (verified live 0.144.1):
+    ``--sandbox`` and ``-c`` overrides are PARENT options and must precede the
+    ``resume`` subcommand token; ``--json``/``--model``/``--output-last-message``/
+    ``--skip-git-repo-check`` are marked global. NO --ephemeral: persisting the
+    rollout is what makes interrupted runs resumable.
+    """
     if infra:
-        # Infra mode: full sandbox (network + shell) so Codex can SSH to the
-        # server, query the live DB, read container/Dokploy logs, etc., and
-        # the MCP servers from ~/.codex/config.toml (auth0, temporal, ...)
-        # stay enabled. Read-only DISCIPLINE is enforced via prompt only —
-        # callers opt in per call and must trust the investigation prompt.
-        prompt = (
-            "INFRA INVESTIGATION MODE — you have full shell and network access "
-            "plus your configured MCP tools. How to reach this project's "
-            "infrastructure (servers, databases, clusters, dashboards, logs) is "
-            "project-specific:\n"
-            "1. FIRST follow any access instructions given in the task below.\n"
-            "2. Otherwise DISCOVER them: read CLAUDE.md / AGENTS.md / README.md "
-            "in the working directory AND each parent directory up to $HOME "
-            "(workspace roots often document credentials that per-repo files "
-            "deliberately omit).\n"
-            "3. Also check standard local access: ~/.ssh/config, ~/.kube/config "
-            "+ kubectl contexts, docker contexts, cloud CLI profiles (aws/gcloud), "
-            "and .env files near the code.\n"
-            "Only conclude access is unavailable after steps 2-3.\n"
-            "STRICTLY READ-ONLY: observe and query only. Never write, restart, "
-            "delete, deploy, scale, or change any config, data, or service.\n\n"
-        ) + prompt
         access_args = ["--sandbox", "danger-full-access"]
     else:
         access_args = ["--sandbox", "read-only", "-c", "mcp_servers={}"]
-
-    cmd = [
+    argv = [
         "codex", "exec",
-        # Structured JSONL events on stdout (thread/turn/item lifecycle) —
-        # the live-view feed. --output-last-message still works alongside
-        # (verified on 0.144.1), so final-answer extraction is unchanged.
+        *access_args,
         "--json",
         "--model", model,
-        *access_args,
-        "--ephemeral",
         "--skip-git-repo-check",
         "--color", "never",
         "--output-last-message", str(output_file),
         "-c", "approval_policy=never",
         "-c", f"model_reasoning_effort={reasoning}",
-        # Without this the run has NO thinking output at all (banner says
-        # "reasoning summaries: none") — nothing to stream to the live log.
         "-c", "model_reasoning_summary=detailed",
-        # Live web, not the cached snapshot index. See the docstring.
-        # "disabled" removes the tool outright rather than falling back to the
-        # cached index — an offline call must be genuinely offline.
         "-c", f"web_search={'live' if web_search else 'disabled'}",
-        prompt,
     ]
+    if resume_tid is not None:
+        argv += ["resume", resume_tid, resume_prompt or RESUME_NUDGE]
+    else:
+        argv.append(prompt if prompt is not None else "")
+    return argv
 
-    t0 = time.monotonic()
-    live_path, live_fh, stream_fh, run_tag = _open_live_log("infra" if infra else "codex")
-    state: dict[str, str] = {"activity": "launching codex", "last_message": "",
-                             "last_error": "", "usage": ""}
 
-    def _emit(text: str) -> None:
-        """One event → the per-run log AND the tagged merged stream."""
-        _live_write(live_fh, t0, text)
-        _live_write(stream_fh, t0, text, run_tag)
 
-    if live_fh is not None:
-        with contextlib.suppress(Exception):
-            live_fh.write(
-                f"# codex-oracle live view — {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
-                f"# model={model} effort={reasoning} "
-                f"mode={'infra' if infra else 'read-only'} "
-                f"web_search={'live' if web_search else 'disabled'} cwd={_get_cwd()}\n"
-                f"# prompt ({len(prompt)} chars): {prompt[:400]!r}\n\n"
-            )
-            live_fh.flush()
-    _live_write(
-        stream_fh, t0,
-        f"▶ start model={model} effort={reasoning} "
-        f"mode={'infra' if infra else 'read-only'} "
-        f"prompt {len(prompt)} chars: {prompt[:120]!r}",
-        run_tag,
-    )
+async def _exec_codex_once(
+    cmd: list[str],
+    output_file: Path,
+    state: dict[str, str],
+    emit,
+    ctx: Context | None,
+    model: str,
+) -> tuple[str, bool, str, str, int, str | None, bool]:
+    """One codex exec attempt (spawn → stream → reap).
 
+    Returns ``(final_message, clean_extraction, stdout_text, stderr_text,
+    returncode, hung_reason, timed_out)``. The final message is read from
+    ``output_file`` (deleted here), falling back to the last parsed
+    agent_message. Live-log handles stay OPEN — the orchestrator owns them
+    across retry attempts.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -802,11 +818,11 @@ async def _run_codex(
         )
     except FileNotFoundError:
         output_file.unlink(missing_ok=True)
-        for _fh in (live_fh, stream_fh):
-            if _fh is not None:
-                with contextlib.suppress(Exception):
-                    _fh.close()
-        return "[Error: codex binary not found in PATH. Install with: npm i -g @openai/codex]"
+        return (
+            "", False, "",
+            "codex binary not found in PATH. Install with: npm i -g @openai/codex",
+            127, None, False,
+        )
 
     startup_seen = asyncio.Event()
     stdout_chunks: list[bytes] = []
@@ -822,7 +838,7 @@ async def _run_codex(
             nl = stdout_linebuf.find(b"\n")
             if nl < 0:
                 return
-            raw = bytes(stdout_linebuf[:nl]).strip()
+            raw = bytes(stdout_linebuf[: nl]).strip()
             del stdout_linebuf[: nl + 1]
             if not raw:
                 continue
@@ -833,13 +849,13 @@ async def _run_codex(
                 # Not JSON (stray CLI noise) — show it verbatim.
                 line = raw.decode("utf-8", errors="replace")
             if line:
-                _emit(line)
+                emit(line)
 
     def _feed_stderr(chunk: bytes) -> None:
         text = chunk.decode("utf-8", errors="replace")
         for ln in text.splitlines():
             if ln.strip():
-                _emit(f"! {ln}")
+                emit(f"! {ln}")
 
     async def _consume(
         stream: asyncio.StreamReader,
@@ -934,40 +950,6 @@ async def _run_codex(
                 _task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _task
-        with contextlib.suppress(Exception):
-            _emit(
-                f"■ run finished: exit={proc.returncode} "
-                f"timed_out={timed_out} "
-                f"{state.get('usage') or ''}".rstrip(),
-            )
-        for _fh in (live_fh, stream_fh):
-            if _fh is not None:
-                with contextlib.suppress(Exception):
-                    _fh.close()
-
-    # On timeout, salvage whatever the output file has (codex may have
-    # written a partial or complete answer before we killed it).
-    if timed_out:
-        partial = ""
-        try:
-            if output_file.exists() and output_file.stat().st_size > 0:
-                partial = output_file.read_text(encoding="utf-8", errors="replace").strip()
-        finally:
-            output_file.unlink(missing_ok=True)
-        log_note = f"\n[live log: {live_path}]" if live_path else ""
-        if partial:
-            return (
-                f"[Codex model: {model} | reasoning: {reasoning}]\n"
-                f"[TIMEOUT after {MAX_RUNTIME_SECONDS}s — partial output recovered]"
-                f"{log_note}\n\n"
-                f"{partial}"
-            )
-        return (
-            f"[Codex TIMEOUT: no response after {MAX_RUNTIME_SECONDS}s]\n"
-            f"The model may be overloaded or the query too complex. "
-            f"Try simplifying the prompt or reducing reasoning effort."
-            f"{log_note}"
-        )
 
     stdout_text = b"".join(stdout_chunks).decode("utf-8", errors="replace").strip()
     stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
@@ -981,12 +963,257 @@ async def _run_codex(
     finally:
         output_file.unlink(missing_ok=True)
 
-    if not final_message:
-        # stdout is a JSONL event stream now — the parsed last agent message
-        # is the meaningful fallback; raw stdout only as a last resort.
+    if not final_message and not timed_out:
+        # stdout is a JSONL event stream — the parsed last agent message is
+        # the meaningful fallback; raw stdout only as a last resort.
         final_message = state["last_message"] or stdout_text
 
+    return (
+        final_message, clean_extraction, stdout_text, stderr_text,
+        proc.returncode or 0, hung_reason, timed_out,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Codex runner
+# ---------------------------------------------------------------------------
+
+async def _run_codex(
+    prompt: str,
+    infra: bool = False,
+    ctx: Context | None = None,
+    reserve: int = 0,
+    web_search: bool = True,
+    resume_tid: str | None = None,
+    parent_run: str = "",
+) -> str:
+    """Run codex exec headlessly with clean final-message extraction.
+
+    Uses codex-cli 0.118.0+ features (live-view additions verified 0.144.1):
+    - ``--json`` — JSONL ThreadEvents on stdout, streamed to the per-run
+      live log (``~/.claude/logs/codex-oracle/latest.log``) together with
+      ``-c model_reasoning_summary=detailed`` so the operator can watch the
+      model's reasoning, web searches, commands and errors in real time.
+    - ``--output-last-message FILE`` — clean final-message extraction.
+    - ``-c approval_policy=never`` — prevents blocking on approval prompts.
+    - ``-c mcp_servers={}`` — disables codex's built-in MCP servers
+      (default mode only; ``infra=True`` keeps them and lifts the sandbox).
+    - ``-c web_search=live`` — LIVE web search (see below).
+    - ``--color never`` — strips ANSI sequences.
+    - ``stdin=DEVNULL`` — prevents reading the parent's MCP JSON-RPC stdin.
+
+    Web search (2026-08-07, verified against codex-cli 0.144.1 + the current
+    config reference at learn.chatgpt.com/docs/config-file/config-reference):
+    the top-level ``web_search`` key takes ``disabled`` | ``cached`` |
+    ``indexed`` | ``live``, and DEFAULTS TO ``cached`` — an OpenAI-maintained
+    snapshot index, not the live web. Every tool here asks for current
+    versions/APIs/CVEs, so ``live`` is forced on every invocation, including
+    under ``--sandbox read-only``: web search is a native Responses tool and
+    does not go through the shell sandbox (empirically confirmed — a read-only
+    run retrieved a same-day GitHub release tag). Do NOT switch to
+    ``tools.web_search`` (legacy boolean; superseded by the table form) or
+    ``features.web_search_request`` (rejected as deprecated by 0.144.1);
+    ``tools.web_search_request`` is not a valid key at all.
+
+    Key fix (2026-04-09): subprocess stdout/stderr are consumed with
+    ``read(READ_CHUNK_SIZE)`` instead of ``readline()``. The old
+    ``readline()`` called ``StreamReader.readuntil(b'\\n')`` which raises
+    ``LimitOverrunError`` ("Separator is not found, and chunk exceed the
+    limit") when codex outputs any single line > 64 KiB (the default
+    asyncio StreamReader buffer). ``read()`` never searches for a separator
+    so it cannot overflow. Additionally, ``limit=SUBPROCESS_BUFFER_LIMIT``
+    (4 MiB) is passed to ``create_subprocess_exec()`` as a safety net.
+    """
+    model = _get_codex_model()
+    reasoning = _get_reasoning_effort()
+
+    if infra:
+        # Infra mode: full sandbox (network + shell) so Codex can SSH to the
+        # server, query the live DB, read container/Dokploy logs, etc., and
+        # the MCP servers from ~/.codex/config.toml (auth0, temporal, ...)
+        # stay enabled. Read-only DISCIPLINE is enforced via prompt only —
+        # callers opt in per call and must trust the investigation prompt.
+        prompt = (
+            "INFRA INVESTIGATION MODE — you have full shell and network access "
+            "plus your configured MCP tools. How to reach this project's "
+            "infrastructure (servers, databases, clusters, dashboards, logs) is "
+            "project-specific:\n"
+            "1. FIRST follow any access instructions given in the task below.\n"
+            "2. Otherwise DISCOVER them: read CLAUDE.md / AGENTS.md / README.md "
+            "in the working directory AND each parent directory up to $HOME "
+            "(workspace roots often document credentials that per-repo files "
+            "deliberately omit).\n"
+            "3. Also check standard local access: ~/.ssh/config, ~/.kube/config "
+            "+ kubectl contexts, docker contexts, cloud CLI profiles (aws/gcloud), "
+            "and .env files near the code.\n"
+            "Only conclude access is unavailable after steps 2-3.\n"
+            "STRICTLY READ-ONLY: observe and query only. Never write, restart, "
+            "delete, deploy, scale, or change any config, data, or service.\n\n"
+        ) + prompt
+
+    t0 = time.monotonic()
+    live_path, live_fh, stream_fh, run_tag = _open_live_log("infra" if infra else "codex")
+    state: dict[str, str] = {"activity": "launching codex", "last_message": "",
+                             "last_error": "", "usage": "", "thread_id": ""}
+
+    journaled_tid = ""
+
+    def _emit(text: str) -> None:
+        """One event → per-run log, tagged merged stream, session journal.
+
+        The session id is journaled the INSTANT it streams in (not after the
+        attempt returns) — a run cancelled mid-flight must still leave a
+        resumable handle behind. Regression-tested by the kill-then-recover
+        case in the verification suite.
+        """
+        nonlocal journaled_tid
+        _live_write(live_fh, t0, text)
+        _live_write(stream_fh, t0, text, run_tag)
+        tid = state.get("thread_id") or ""
+        if tid and tid != journaled_tid:
+            journaled_tid = tid
+            _journal({"run": run_tag, "phase": "session", "ts": time.time(),
+                      "thread_id": tid})
+
+    if live_fh is not None:
+        with contextlib.suppress(Exception):
+            live_fh.write(
+                f"# codex-oracle live view — {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+                f"# model={model} effort={reasoning} "
+                f"mode={'infra' if infra else 'read-only'} "
+                f"web_search={'live' if web_search else 'disabled'} cwd={_get_cwd()}\n"
+                f"# prompt ({len(prompt)} chars): {prompt[:400]!r}\n\n"
+            )
+            live_fh.flush()
+    _live_write(
+        stream_fh, t0,
+        f"▶ start model={model} effort={reasoning} "
+        f"mode={'infra' if infra else 'read-only'} "
+        f"prompt {len(prompt)} chars: {prompt[:120]!r}",
+        run_tag,
+    )
+
+    _journal({
+        "run": run_tag, "phase": "start", "ts": time.time(), "engine": "codex",
+        "model": model, "reasoning": reasoning, "infra": infra,
+        "web_search": web_search, "parent_run": parent_run,
+        "prompt": prompt, "log": str(live_path or ""),
+    })
+
+    attempt = 0
+    final_message = ""
+    clean_extraction = False
+    stdout_text = stderr_text = ""
+    returncode = 0
+    hung_reason: str | None = None
+    timed_out = False
+
+    while True:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, prefix="codex-oracle-"
+        )
+        tmp.close()
+        output_file = Path(tmp.name)
+        cmd = _build_exec_argv(
+            model, reasoning, infra, web_search, output_file,
+            prompt=prompt, resume_tid=resume_tid,
+        )
+        expected_tid = resume_tid
+        state["last_error"] = ""
+        try:
+            (final_message, clean_extraction, stdout_text, stderr_text,
+             returncode, hung_reason, timed_out) = await _exec_codex_once(
+                cmd, output_file, state, _emit, ctx, model)
+        except asyncio.CancelledError:
+            _journal({"run": run_tag, "phase": "end", "ts": time.time(),
+                      "status": "cancelled"})
+            with contextlib.suppress(Exception):
+                _emit("■ run cancelled by caller (resume later: codex_resume_run)")
+            for _fh in (live_fh, stream_fh):
+                if _fh is not None:
+                    with contextlib.suppress(Exception):
+                        _fh.close()
+            raise
+
+        # AMNESIA GUARD (measured): resume with an unknown id silently starts
+        # a fresh context-less thread and exits 0 — that is NOT a resume.
+        if expected_tid and state.get("thread_id") and state["thread_id"] != expected_tid:
+            stderr_text = (
+                f"resume continuity lost: expected thread {expected_tid}, got "
+                f"{state['thread_id']} — codex started a fresh context-less "
+                f"thread instead of resuming. Not retrying; re-dispatch the "
+                f"original question instead."
+            )
+            returncode = returncode or 1
+            final_message = ""
+            _emit(f"✖ {stderr_text}")
+            break
+
+        failed = returncode != 0 and hung_reason is None and not timed_out
+        if (
+            failed
+            and attempt < MAX_TRANSIENT_RETRIES
+            and _is_transient_error(
+                f"{stderr_text}\n{state['last_error']}\n{stdout_text[-2000:]}"
+            )
+        ):
+            attempt += 1
+            resume_tid = state.get("thread_id") or None
+            if resume_tid:
+                _emit(
+                    f"⟲ transient failure — resuming thread {resume_tid} "
+                    f"(attempt {attempt + 1}/{MAX_TRANSIENT_RETRIES + 1})"
+                )
+            else:
+                _emit(
+                    f"⟲ transient failure before the session started — "
+                    f"retrying fresh (attempt {attempt + 1}/{MAX_TRANSIENT_RETRIES + 1})"
+                )
+            continue
+        break
+
+    with contextlib.suppress(Exception):
+        _emit(
+            f"■ run finished: exit={returncode} timed_out={timed_out} "
+            f"attempts={attempt + 1} {state.get('usage') or ''}".rstrip()
+        )
+    for _fh in (live_fh, stream_fh):
+        if _fh is not None:
+            with contextlib.suppress(Exception):
+                _fh.close()
+
     log_note = f"\n\n[live log: {live_path}]" if live_path else ""
+    status = (
+        "ok" if (returncode == 0 and not timed_out and hung_reason is None)
+        else ("timeout" if timed_out else ("hung" if hung_reason else "error"))
+    )
+    result_file = ""
+    if status == "ok" and final_message and live_path is not None:
+        with contextlib.suppress(Exception):
+            rf = live_path.with_suffix(".result.txt")
+            rf.write_text(final_message, encoding="utf-8")
+            result_file = str(rf)
+    _journal({
+        "run": run_tag, "phase": "end", "ts": time.time(), "status": status,
+        "returncode": returncode, "attempts": attempt + 1,
+        "error": (state["last_error"] or stderr_text)[:500] if status != "ok" else "",
+        "result_file": result_file,
+    })
+
+    if timed_out:
+        if final_message:
+            return (
+                f"[Codex model: {model} | reasoning: {reasoning}]\n"
+                f"[TIMEOUT after {MAX_RUNTIME_SECONDS}s — partial output recovered]"
+                f"{log_note}\n\n"
+                f"{final_message}"
+            )
+        return (
+            f"[Codex TIMEOUT: no response after {MAX_RUNTIME_SECONDS}s]\n"
+            f"The model may be overloaded or the query too complex. "
+            f"Try simplifying the prompt or reducing reasoning effort."
+            f"{log_note}"
+        )
 
     if hung_reason is not None:
         return (
@@ -999,13 +1226,25 @@ async def _run_codex(
             f"{log_note}"
         )
 
-    if proc.returncode != 0 and not final_message:
+    if returncode != 0 and not final_message:
         detail = state["last_error"] or stderr_text
-        return f"[Codex error (exit {proc.returncode})]\n{detail}{log_note}"
+        retry_note = (
+            f" after {attempt + 1} attempts" if attempt else ""
+        )
+        return (
+            f"[Codex error (exit {returncode}){retry_note}]\n{detail}{log_note}\n"
+            f"[recoverable: call codex_resume_run to continue this run "
+            f"(run id: {run_tag})]"
+        )
 
     header = f"[Codex model: {model} | reasoning: {reasoning}]"
     result = f"{header}\n\n{final_message}"
-    if state["last_error"] and proc.returncode != 0:
+    if attempt and returncode == 0:
+        result += (
+            f"\n\n[note: recovered automatically after a transient failure — "
+            f"{attempt + 1} attempts, context preserved via codex session resume]"
+        )
+    if state["last_error"] and returncode != 0:
         result += f"\n\n[run reported an error: {state['last_error']}]"
     result += log_note
 
@@ -1013,7 +1252,7 @@ async def _run_codex(
     # failed AND the process exited non-zero — i.e. we need the diagnostic
     # for debugging. A successful clean extraction returns only the header
     # and the final message; nothing else.
-    if not clean_extraction and proc.returncode != 0 and stderr_text:
+    if not clean_extraction and returncode != 0 and stderr_text:
         noise_patterns = (
             "Loaded cached credentials",
             "[INFO]",
@@ -1421,6 +1660,86 @@ async def codex_query(
         web_search=web_search, reserve=reserve,
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
+
+
+@mcp.tool()
+async def codex_resume_run(
+    run: str = "",
+    nudge: str = "",
+    ctx: Context = None,  # type: ignore[assignment]
+) -> str:
+    """
+    Continue a codex run that failed, timed out, or was interrupted —
+    WITH ITS ORIGINAL CONTEXT, not a re-ask.
+
+    Codex persists each run's session, so a run killed mid-flight (MCP
+    server restart, plugin reload, cancelled call, transient API error
+    that outlived the automatic retries) can be continued from where it
+    stopped. Never re-dispatch the whole question after a failure — resume
+    it: the model still has the reasoning and tool output it had built up.
+
+    A finished-but-undelivered run (e.g. the reload killed the call after
+    codex answered) returns its stored answer immediately, at no cost.
+
+    Args:
+        run: The run id from the failure message ("run id: codex7·21746").
+            Omit to resume the most recent recoverable run.
+        nudge: Optional instruction for the continuation. Default asks for
+            the complete final answer from where it left off.
+    """
+    runs = _journal_runs()
+    if not runs:
+        return (
+            "[No recorded codex runs to resume.]\n"
+            "Runs are journaled from codex-oracle 1.3.0 onward; older runs "
+            "cannot be recovered — re-dispatch the question instead."
+        )
+
+    if run:
+        rec = runs.get(run)
+        if rec is None:
+            known = ", ".join(list(runs)[-5:]) or "(none)"
+            return f"[Unknown run id '{run}'.] Recent runs: {known}"
+    else:
+        candidates = [
+            r for r in runs.values()
+            if r.get("status") != "ok" or not r.get("has_end")
+        ]
+        if not candidates:
+            return (
+                "[No failed or interrupted codex run to resume — the most "
+                "recent runs all completed successfully.]"
+            )
+        rec = candidates[-1]
+        run = str(rec.get("run", ""))
+
+    # Finished after all (the answer just never reached the caller).
+    result_file = str(rec.get("result_file") or "")
+    if result_file and Path(result_file).exists():
+        stored = Path(result_file).read_text(encoding="utf-8", errors="replace").strip()
+        if stored:
+            return (
+                f"[Recovered run {run} — it had COMPLETED; returning its "
+                f"stored answer (no new model call).]\n\n{stored}"
+            )
+
+    tid = str(rec.get("thread_id") or "")
+    if not tid:
+        return (
+            f"[Run {run} has no codex session id — it failed before the "
+            f"session started, so there is no context to continue.]\n"
+            f"Re-dispatch the original question instead. "
+            f"Error: {str(rec.get('error') or '(none)')[:300]}"
+        )
+
+    return await _run_codex(
+        nudge or RESUME_NUDGE,
+        infra=bool(rec.get("infra")),
+        ctx=ctx,
+        web_search=bool(rec.get("web_search", True)),
+        resume_tid=tid,
+        parent_run=run,
+    )
 
 
 # ---------------------------------------------------------------------------

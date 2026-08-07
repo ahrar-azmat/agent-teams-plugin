@@ -231,6 +231,104 @@ def _live_write(fh: TextIO | None, t0: float, text: str, tag: str = "") -> None:
         fh.flush()
 
 
+# ---------------------------------------------------------------------------
+# Run journal + resume/retry
+# ---------------------------------------------------------------------------
+# agy persists a conversation and `--conversation <id>` continues it — but
+# ONLY for turns that COMPLETED (measured 2026-08-08: a completed turn
+# recalled its codeword; a SIGKILL'd mid-turn run returned the SAME
+# conversation id with NO memory of the interrupted turn). Since the id
+# matches either way, there is no signal to detect the amnesia — so every
+# resume here RE-SENDS THE ORIGINAL REQUEST inside the continuation prompt.
+# If the context survived, the model continues with it; if it did not, the
+# model still has the full question and answers correctly. Fail-safe, never
+# a confidently context-less answer.
+#
+# The journal (runs.jsonl) + per-run .result.txt survive MCP-server restarts,
+# so `antigravity_resume_run` can recover a run whose call was killed by a
+# plugin reload — returning the stored answer for free when it had finished.
+
+RUNS_JOURNAL = LIVE_LOG_DIR / "runs.jsonl"
+RUNS_JOURNAL_MAX_BYTES = 5 * 1024 * 1024
+MAX_TRANSIENT_RETRIES = 2
+
+
+def _journal(rec: dict[str, Any]) -> None:
+    """Append one record to runs.jsonl, flushed so a kill cannot lose it."""
+    with contextlib.suppress(Exception):
+        LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            if RUNS_JOURNAL.exists() and RUNS_JOURNAL.stat().st_size > RUNS_JOURNAL_MAX_BYTES:
+                RUNS_JOURNAL.replace(RUNS_JOURNAL.with_suffix(".jsonl.1"))
+        with RUNS_JOURNAL.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+
+def _journal_runs() -> dict[str, dict[str, Any]]:
+    """Fold journal records into per-run views, oldest→newest insertion order."""
+    runs: dict[str, dict[str, Any]] = {}
+    for path in (RUNS_JOURNAL.with_suffix(".jsonl.1"), RUNS_JOURNAL):
+        if not path.exists():
+            continue
+        with contextlib.suppress(Exception):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                with contextlib.suppress(Exception):
+                    rec = json.loads(line)
+                    run = runs.setdefault(rec["run"], {})
+                    run.update({k: v for k, v in rec.items() if k != "phase"})
+                    run[f"has_{rec.get('phase', '?')}"] = True
+    return runs
+
+
+def _resume_prompt(original: str, nudge: str = "") -> str:
+    """Continuation prompt that is correct with OR without carried context."""
+    return (
+        "[CONTINUATION] A previous attempt at this request was interrupted "
+        "before its answer was delivered. If you still have that conversation "
+        "in context, continue from where you stopped rather than restarting. "
+        "The complete original request is repeated below so you can answer it "
+        "fully either way — do not ask for it again.\n\n"
+        + (f"{nudge}\n\n" if nudge else "")
+        + "=== ORIGINAL REQUEST ===\n"
+        + original
+    )
+
+
+def _is_transient_error(text: str) -> bool:
+    """Failures worth an automatic resume/retry: infrastructure, not semantics.
+
+    Excludes auth (needs a human) and argument/model errors (retry can't fix
+    them). Capacity/quota is handled by the existing Flash fallback, and is
+    intentionally NOT retried here as well.
+    """
+    t = text.lower()
+    signals = (
+        "stream disconnected",
+        "stream closed",
+        "connection reset",
+        "connection closed",
+        "connection refused",
+        "connection error",
+        "network error",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service unavailable",
+        "overloaded",
+        "internal server error",
+        "bad gateway",
+        "gateway timeout",
+        "error 500",
+        "error 502",
+        "error 503",
+        "error 504",
+        "ended without a result event",
+    )
+    return any(s in t for s in signals)
+
+
 def _step_text(step: dict[str, Any]) -> str:
     """Best-effort human text for an agy step_update payload."""
     for key in ("text", "content", "description", "tool_name", "title"):
@@ -253,6 +351,8 @@ def _process_agy_event(ev: dict[str, Any], state: dict[str, str]) -> str | None:
     if kind == "init":
         init = ev.get("init") or {}
         state["activity"] = "session started"
+        # The handle `--conversation <id>` continues (see the resume notes).
+        state["conversation_id"] = str(ev.get("conversation_id") or "")
         return f"session started (model: {init.get('model', '?')})"
     if kind == "step_update":
         step = ev.get("step_update") or {}
@@ -594,7 +694,9 @@ class AntigravityCLIClient:
             return f"[System: {system_instruction}]\n\n{prompt}"
         return prompt
 
-    def _build_query_cmd(self, full_prompt: str, model: str) -> list[str]:
+    def _build_query_cmd(
+        self, full_prompt: str, model: str, conversation: str | None = None
+    ) -> list[str]:
         """Assemble the agy argv for one non-interactive query.
 
         ``--output-format stream-json`` turns the buffered print mode into an
@@ -610,6 +712,8 @@ class AntigravityCLIClient:
             "--print-timeout", f"{AGY_PRINT_TIMEOUT_SECONDS}s",
             "--dangerously-skip-permissions",
         ]
+        if conversation:
+            cmd += ["--conversation", conversation]
         if self._stream_ok:
             cmd += ["--output-format", "stream-json"]
         return cmd
@@ -622,6 +726,7 @@ class AntigravityCLIClient:
         env: dict,
         live_label: str = "query",
         prompt_preview: str = "",
+        run_state: dict[str, str] | None = None,
     ) -> tuple[str, str, int, str | None, Path | None]:
         """Run an agy command, streaming its event feed to the live log.
 
@@ -645,7 +750,11 @@ class AntigravityCLIClient:
         streaming = "--output-format" in cmd
         live_path, live_fh, stream_fh, run_tag = _open_live_log(live_label)
         state: dict[str, str] = {"activity": "launching agy", "final": "",
-                                 "last_error": "", "status": ""}
+                                 "last_error": "", "status": "",
+                                 "conversation_id": ""}
+        if run_state is not None:
+            run_state["run_tag"] = run_tag
+            run_state["live_path"] = str(live_path or "")
 
         def _emit(text: str) -> None:
             """One event → the per-run log AND the tagged merged stream."""
@@ -795,6 +904,9 @@ class AntigravityCLIClient:
             if state["last_error"] and returncode == 0:
                 stderr_text = f"{state['last_error']}\n{stderr_text}".strip()
 
+        if run_state is not None:
+            run_state["conversation_id"] = state.get("conversation_id", "")
+
         if state["status"] not in ("", "SUCCESS") and returncode == 0:
             # agy reported a non-success terminal status but exited 0 —
             # propagate the failure instead of trusting the exit code.
@@ -841,6 +953,9 @@ class AntigravityCLIClient:
         prompt: str,
         model: str | None = None,
         system_instruction: str | None = None,
+        resume_cid: str | None = None,
+        resume_nudge: str = "",
+        parent_run: str = "",
     ) -> str:
         """Query Antigravity via agy, with automatic Flash fallback on quota errors.
 
@@ -868,14 +983,74 @@ class AntigravityCLIClient:
         full_prompt = self._build_prompt(prompt, system_instruction)
         env = self._build_environment()
 
-        async def _attempt(target: str) -> tuple[str, str, int, str | None, Path | None]:
-            return await self._execute_cli(
-                self._build_query_cmd(full_prompt, target), env,
-                prompt_preview=full_prompt,
-            )
+        run_state: dict[str, str] = {"run_tag": "", "live_path": "",
+                                     "conversation_id": ""}
+        journal_run = ""
 
-        stdout_text, stderr_text, returncode, hung, live_path = await _attempt(primary_model)
+        async def _attempt(
+            target: str, conversation: str | None = None, text: str | None = None
+        ) -> tuple[str, str, int, str | None, Path | None]:
+            nonlocal journal_run
+            res = await self._execute_cli(
+                self._build_query_cmd(text or full_prompt, target, conversation), env,
+                prompt_preview=text or full_prompt, run_state=run_state,
+            )
+            if not journal_run and run_state["run_tag"]:
+                journal_run = run_state["run_tag"]
+                _journal({
+                    "run": journal_run, "phase": "start", "ts": time.time(),
+                    "engine": "antigravity", "model": target,
+                    "parent_run": parent_run, "prompt": full_prompt,
+                    "log": run_state["live_path"],
+                })
+            if run_state["conversation_id"]:
+                _journal({
+                    "run": journal_run or run_state["run_tag"], "phase": "session",
+                    "ts": time.time(),
+                    "conversation_id": run_state["conversation_id"],
+                })
+            return res
+
+        # A resume RE-STATES the original request inside the continuation
+        # prompt (single wrap point — callers pass the original text).
+        try:
+            stdout_text, stderr_text, returncode, hung, live_path = await _attempt(
+                primary_model, resume_cid,
+                _resume_prompt(full_prompt, resume_nudge) if resume_cid else None,
+            )
+        except asyncio.CancelledError:
+            if journal_run:
+                _journal({"run": journal_run, "phase": "end", "ts": time.time(),
+                          "status": "cancelled"})
+            raise
         combined = f"{stdout_text}\n{stderr_text}"
+
+        # Transient-failure recovery: resume the SAME agy conversation so the
+        # model keeps whatever context it had (the continuation prompt also
+        # re-sends the original request — see the resume notes: agy loses
+        # mid-turn context silently, and its id matches either way).
+        transient_attempts = 0
+        while (
+            returncode != 0
+            and hung is None
+            and transient_attempts < MAX_TRANSIENT_RETRIES
+            and _is_transient_error(combined)
+            and not self._check_auth_error(combined)
+            and not self._is_capacity_error(combined)
+        ):
+            transient_attempts += 1
+            cid = run_state.get("conversation_id") or None
+            try:
+                stdout_text, stderr_text, returncode, hung, live_path = await _attempt(
+                    primary_model, cid,
+                    _resume_prompt(full_prompt, resume_nudge) if cid else None,
+                )
+            except asyncio.CancelledError:
+                if journal_run:
+                    _journal({"run": journal_run, "phase": "end",
+                              "ts": time.time(), "status": "cancelled"})
+                raise
+            combined = f"{stdout_text}\n{stderr_text}"
 
         # Older agy builds don't know --output-format: downgrade to plain-text
         # mode once (for the process lifetime) and retry.
@@ -908,29 +1083,63 @@ class AntigravityCLIClient:
 
         log_note = f"\n\n[live log: {live_path}]" if live_path else ""
 
+        def _ok(answer: str, prefix: str = "") -> str:
+            """Journal a successful end (persisting the answer) and return it."""
+            result_file = ""
+            if live_path is not None:
+                with contextlib.suppress(Exception):
+                    rf = Path(str(live_path)).with_suffix(".result.txt")
+                    rf.write_text(answer, encoding="utf-8")
+                    result_file = str(rf)
+            _journal({
+                "run": journal_run or run_state["run_tag"], "phase": "end",
+                "ts": time.time(), "status": "ok",
+                "attempts": transient_attempts + 1, "result_file": result_file,
+            })
+            retry_note = (
+                f"\n\n[note: recovered automatically after a transient failure — "
+                f"{transient_attempts + 1} attempts, agy conversation resumed]"
+                if transient_attempts else ""
+            )
+            return f"{prefix}{answer}{retry_note}{log_note}"
+
+        def _fail(msg: str, recoverable: bool = True) -> Exception:
+            """Journal a failed end and build the caller-facing exception."""
+            run_id = journal_run or run_state["run_tag"]
+            _journal({
+                "run": run_id, "phase": "end", "ts": time.time(),
+                "status": "error", "returncode": returncode,
+                "attempts": transient_attempts + 1, "error": msg[:500],
+            })
+            hint = (
+                f"\n[recoverable: call antigravity_resume_run to continue this "
+                f"run (run id: {run_id})]"
+                if recoverable and run_id else ""
+            )
+            return Exception(f"{msg}{log_note}{hint}")
+
         if hung is not None:
-            raise Exception(
+            raise _fail(
                 f"agy timed out for model '{primary_model}': {hung}. "
                 f"Partial stderr: {stderr_text[:500] or '(none)'}"
-                f"{log_note}"
             )
 
         if returncode != 0 and self._check_auth_error(combined):
-            raise Exception(
+            raise _fail(
                 "agy authentication required/expired. Run `agy` in a terminal, "
                 "complete the Google sign-in, then retry. "
-                f"Detail: {(stderr_text or stdout_text)[:300] or '(none)'}"
+                f"Detail: {(stderr_text or stdout_text)[:300] or '(none)'}",
+                recoverable=False,
             )
 
         if returncode == 0:
             cleaned = self._clean_output(stdout_text)
             if cleaned:
-                return f"{cleaned}{log_note}"
+                return _ok(cleaned)
             # exit 0 but only noise/empty — surface clearly, never return "".
-            raise Exception(
+            raise _fail(
                 f"agy returned exit 0 but no usable output for '{primary_model}'. "
                 "It may have printed only status noise — please retry."
-                f"{log_note}"
             )
 
         # Capacity/quota fallback: Pro -> Flash (only if caller didn't pin one).
@@ -946,24 +1155,28 @@ class AntigravityCLIClient:
             if hung is None and returncode == 0:
                 cleaned = self._clean_output(stdout_text)
                 if cleaned:
-                    return (
-                        f"[Fallback: '{primary_model}' hit a capacity/quota limit, "
-                        f"answered by '{fallback_model}']\n\n{cleaned}{log_note}"
+                    return _ok(
+                        cleaned,
+                        prefix=(
+                            f"[Fallback: '{primary_model}' hit a capacity/quota "
+                            f"limit, answered by '{fallback_model}']\n\n"
+                        ),
                     )
             combined = f"{stdout_text}\n{stderr_text}"
 
         # Error path — auth first (clear remediation), then capacity, then generic.
         if self._check_auth_error(combined):
-            raise Exception(
+            raise _fail(
                 "agy authentication required/expired. Run `agy` in a terminal, "
                 "complete the Google sign-in, then retry. "
-                f"Detail: {(stderr_text or stdout_text)[:300] or '(none)'}"
+                f"Detail: {(stderr_text or stdout_text)[:300] or '(none)'}",
+                recoverable=False,
             )
         detail = stderr_text or stdout_text or "(no output)"
         hint = ""
         if self._is_capacity_error(combined):
             hint = " (capacity/quota limit — consumer Antigravity quota may be exhausted)"
-        raise Exception(f"agy error (exit {returncode}){hint}: {detail[:800]}{log_note}")
+        raise _fail(f"agy error (exit {returncode}){hint}: {detail[:800]}")
 
     async def query_with_tools(
         self,
@@ -1613,6 +1826,41 @@ async def list_tools() -> list[Tool]:
                 "required": []
             }
         ),
+        Tool(
+            name="antigravity_resume_run",
+            description=(
+                "Continue an antigravity run that failed, timed out, or was "
+                "interrupted (MCP server restart, plugin reload, cancelled "
+                "call) — WITHOUT re-asking from scratch. Resumes the agy "
+                "conversation and re-states the original request, so it is "
+                "correct whether or not agy kept the context. A run that had "
+                "already finished returns its stored answer instantly, with "
+                "no new model call. Never re-dispatch a whole question after "
+                "a failure; resume it."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "run": {
+                        "type": "string",
+                        "default": "",
+                        "description": (
+                            "Run id from the failure message (e.g. "
+                            "'query7·21746'). Omit for the most recent "
+                            "recoverable run."
+                        ),
+                    },
+                    "nudge": {
+                        "type": "string",
+                        "default": "",
+                        "description": (
+                            "Optional extra instruction for the continuation."
+                        ),
+                    },
+                },
+                "required": []
+            }
+        ),
     ]
 
 
@@ -1957,6 +2205,72 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             lines.append("")
             lines.append("Aliases: 'pro'/'latest' → deepest pro, 'flash'/'fast' → flash")
             result = "\n".join(lines)
+
+        elif name == "antigravity_resume_run":
+            run_id = str(arguments.get("run", "") or "")
+            nudge = str(arguments.get("nudge", "") or "")
+            runs = _journal_runs()
+            if not runs:
+                result = (
+                    "[No recorded antigravity runs to resume.]\n"
+                    "Runs are journaled from antigravity 1.3.0 onward; older "
+                    "runs cannot be recovered — re-dispatch the question."
+                )
+            else:
+                if run_id:
+                    rec = runs.get(run_id)
+                else:
+                    candidates = [
+                        r for r in runs.values()
+                        if r.get("status") != "ok" or not r.get("has_end")
+                    ]
+                    rec = candidates[-1] if candidates else None
+                    run_id = str(rec.get("run", "")) if rec else ""
+                if rec is None:
+                    known = ", ".join(list(runs)[-5:]) or "(none)"
+                    result = (
+                        f"[No matching recoverable antigravity run"
+                        f"{f' for id {run_id!r}' if run_id else ''}.] "
+                        f"Recent runs: {known}"
+                    )
+                else:
+                    stored_path = str(rec.get("result_file") or "")
+                    stored = ""
+                    if stored_path and Path(stored_path).exists():
+                        with contextlib.suppress(OSError):
+                            stored = Path(stored_path).read_text(
+                                encoding="utf-8", errors="replace"
+                            ).strip()
+                    if stored:
+                        result = (
+                            f"[Recovered run {run_id} — it had COMPLETED; "
+                            f"returning its stored answer (no new model call).]"
+                            f"\n\n{stored}"
+                        )
+                    else:
+                        original = str(rec.get("prompt") or "")
+                        if not original:
+                            result = (
+                                f"[Run {run_id} has no recorded prompt — nothing "
+                                f"to continue. Re-dispatch the question. "
+                                f"Error: {str(rec.get('error') or '(none)')[:300]}]"
+                            )
+                        else:
+                            cid = str(rec.get("conversation_id") or "") or None
+                            # No conversation id → nothing to resume; re-ask
+                            # the original request in full (still correct).
+                            result = await gemini.query(
+                                original if cid else _resume_prompt(original, nudge),
+                                resume_cid=cid,
+                                resume_nudge=nudge,
+                                parent_run=run_id,
+                            )
+                            result = (
+                                f"[Resumed run {run_id}"
+                                + (f" (agy conversation {cid})" if cid else
+                                   " (no conversation id — re-asked in full)")
+                                + "]\n\n" + result
+                            )
 
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
