@@ -13,11 +13,17 @@ integrations use the new names.
 
 How it works:
 - Headless one-shot queries via ``agy -p`` (clean text on stdout, no JSON).
-- Model auto-discovery via ``agy models`` (display names like
-  "Gemini 3.1 Pro (High)"; the thinking depth is encoded in the name).
+- Model auto-discovery via ``agy models``. Since agy 1.1.x the output is
+  tab-separated ``slug\tDisplay Name`` lines (e.g.
+  ``gemini-3.1-pro-high\tGemini 3.1 Pro (High)``); older builds printed the
+  display name only. Both line shapes are parsed; ``--model`` is passed the
+  SLUG (measured on agy 1.1.11: slug and display name are both accepted —
+  slug is canonical because it is space/paren-free).
 - Default reasoning model is the deepest-thinking Pro tier available
-  ("Gemini 3.1 Pro (High)" today; the picker auto-upgrades if Google ships a
-  deeper tier), with automatic fallback to Flash on capacity/quota errors.
+  (``gemini-3.1-pro-high`` today; the picker auto-upgrades if Google ships a
+  deeper tier), with automatic fallback to Flash on capacity/quota errors,
+  and a one-shot registry force-refresh + retry if agy rejects a cached
+  model id (lineup changes under the 1h cache).
 - Anti-zombie subprocess handling: ``stdin=DEVNULL`` (so the spawned agy never
   consumes the MCP JSON-RPC stream), kill-on-cancel, and a total wall-clock
   timeout (agy buffers output until the final answer, so a "first byte" probe
@@ -65,10 +71,11 @@ AGY_PRINT_TIMEOUT_SECONDS = 1200  # 20 minutes
 AGY_OVERALL_TIMEOUT_SECONDS = AGY_PRINT_TIMEOUT_SECONDS + 120
 
 # ---------------------------------------------------------------------------
-# Model auto-discovery (agy display names)
+# Model auto-discovery (agy model list)
 # ---------------------------------------------------------------------------
-# agy reports models as e.g. "Gemini 3.1 Pro (High)", "Gemini 3.5 Flash (Low)".
-# The parenthesised token is the THINKING DEPTH — deeper = better reasoning.
+# agy >= 1.1.x lists models as "slug\tDisplay Name" (older builds: display name
+# only). Ranking parses the DISPLAY name — "Gemini 3.1 Pro (High)" — where the
+# parenthesised token is the THINKING DEPTH; the SLUG is what --model gets.
 _MODEL_RE = re.compile(
     r"Gemini\s+(\d+(?:\.\d+)?)\s+(Pro|Flash)(\s+Lite)?\s*\(([^)]+)\)",
     re.IGNORECASE,
@@ -120,18 +127,28 @@ class ModelRegistry:
     CACHE_TTL = 3600  # Re-check every hour
 
     def __init__(self) -> None:
-        self._models: list[str] = []
+        # (slug, display) pairs; for old-format agy output slug == display.
+        self._models: list[tuple[str, str]] = []
         self._last_fetch: float = 0.0
-        # Deepest-thinking Pro tier = strongest reasoning. "High" is the deepest
-        # agy exposes for 3.1 Pro today; the picker upgrades automatically.
-        self._default_pro: str = "Gemini 3.1 Pro (High)"
+        # Defaults are SLUGS (the value passed to --model). Measured against
+        # agy 1.1.11 (`agy -p … --model <slug>` headless): both the slug and
+        # the display name are accepted; slug is canonical. These are only
+        # used until the first successful `agy models` refresh.
+        # Deepest-thinking Pro tier = strongest reasoning. "high" is the
+        # deepest agy exposes for 3.1 Pro today; the picker upgrades
+        # automatically when a deeper tier appears in the live list.
+        self._default_pro: str = "gemini-3.1-pro-high"
         # Capacity/quota fallback — Flash has higher availability than Pro.
-        self._fallback_pro: str = "Gemini 3.5 Flash (High)"
+        self._fallback_pro: str = "gemini-3.6-flash-high"
         # Lightweight default ('flash'/'fast' alias + utility calls).
-        self._default_flash: str = "Gemini 3.5 Flash (High)"
+        self._default_flash: str = "gemini-3.6-flash-high"
 
-    async def _fetch_models(self) -> list[str]:
-        """Run ``agy models`` and return the raw display-name lines.
+    async def _fetch_models(self) -> list[tuple[str, str]]:
+        """Run ``agy models`` and return parsed ``(slug, display)`` pairs.
+
+        agy >= 1.1.x emits ``slug\\tDisplay Name`` per line; older builds
+        emitted the display name only (then slug == display — the CLI accepts
+        either form as ``--model``).
 
         ``stdin=DEVNULL`` is CRITICAL — without it the spawned process inherits
         the MCP server's JSON-RPC stdin and corrupts the protocol stream.
@@ -153,12 +170,18 @@ class ModelRegistry:
             if proc is not None:
                 await _kill_and_reap(proc)
             return []
-        models: list[str] = []
+        models: list[tuple[str, str]] = []
         for raw in stdout.decode("utf-8", "replace").splitlines():
             line = raw.strip().strip("-•* ").strip("`")
-            # Real model lines look like "Name (Level)"; skip blanks/errors/help.
-            if line and "(" in line and ")" in line and "sign in" not in line.lower():
-                models.append(line)
+            if not line or "sign in" in line.lower():
+                continue
+            slug, _, display = line.partition("\t")
+            slug = slug.strip()
+            display = display.strip() or slug
+            # Real model lines carry "(Level)"/"(Thinking)" in the display
+            # part; this also drops noise like "Fetching available models...".
+            if "(" in display and ")" in display:
+                models.append((slug, display))
         return models
 
     async def refresh(self, force: bool = False) -> None:
@@ -182,15 +205,19 @@ class ModelRegistry:
             self._fallback_pro = best_flash
 
     def _pick_best(self, tier: str) -> str | None:
-        """Highest version, then deepest thinking level, for a given tier."""
+        """Highest version, then deepest thinking level, for a given tier.
+
+        Ranks on the DISPLAY name (where the thinking depth lives) and
+        returns the SLUG — the value ``--model`` actually takes.
+        """
         candidates: list[tuple[tuple[int, ...], int, str]] = []
-        for name in self._models:
-            parsed = _parse_model(name)
+        for slug, display in self._models:
+            parsed = _parse_model(display)
             if not parsed:
                 continue
             version, model_tier, level = parsed
             if model_tier == tier:
-                candidates.append((version, level, name))
+                candidates.append((version, level, slug))
         if not candidates:
             return None
         candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
@@ -210,11 +237,21 @@ class ModelRegistry:
         return self._default_flash
 
     @property
-    def available_models(self) -> list[str]:
-        return self._models if self._models else [self._default_pro, self._default_flash]
+    def available_models(self) -> list[tuple[str, str]]:
+        """``(slug, display)`` pairs from the last successful discovery."""
+        if self._models:
+            return self._models
+        return [
+            (self._default_pro, self._default_pro),
+            (self._default_flash, self._default_flash),
+        ]
 
     def resolve_alias(self, model: str) -> str:
-        """Resolve friendly aliases ('pro'/'latest'/'flash'/'fast') to agy names."""
+        """Resolve friendly aliases ('pro'/'latest'/'flash'/'fast') to slugs.
+
+        Anything else passes through untouched — agy accepts both slugs and
+        display names (measured on 1.1.11), so a caller may pin either.
+        """
         aliases = {
             "pro": self._default_pro,
             "latest": self._default_pro,
@@ -303,6 +340,22 @@ class AntigravityCLIClient:
             "exceeded your current quota",
             "no capacity",
             "out of capacity",
+        )
+        return any(s in t for s in signals)
+
+    @staticmethod
+    def _is_invalid_model_error(text: str) -> bool:
+        """agy rejected the --model value (fast exit 1, before any spend).
+
+        Fires when the lineup/naming changed underneath a cached model id —
+        e.g. agy 1.1.x switching `agy models` to slug\\tdisplay lines, or a
+        model being retired inside the registry's 1h cache window.
+        """
+        t = text.lower()
+        signals = (
+            "invalid model selection",
+            "not recognized as a known model",
+            "unknown model",
         )
         return any(s in t for s in signals)
 
@@ -425,10 +478,12 @@ class AntigravityCLIClient:
         """Query Antigravity via agy, with automatic Flash fallback on quota errors.
 
         1. First attempt uses the deepest-thinking Pro model
-           ("Gemini 3.1 Pro (High)" by default).
-        2. On a capacity / quota signal (and only when the caller did not pin a
+           (``gemini-3.1-pro-high`` by default).
+        2. If agy rejects the model id (lineup changed under the cache) and the
+           caller did not pin a model, force-refresh the registry and retry once.
+        3. On a capacity / quota signal (and only when the caller did not pin a
            model), fall back to Flash and prefix the answer with a notice.
-        3. Auth failures raise with instructions (agy needs an interactive
+        4. Auth failures raise with instructions (agy needs an interactive
            browser login; there is no headless re-auth).
         """
         # Refresh the model list (TTL-cached: a real `agy models` fetch happens at
@@ -451,6 +506,23 @@ class AntigravityCLIClient:
 
         stdout_text, stderr_text, returncode, hung = await _attempt(primary_model)
         combined = f"{stdout_text}\n{stderr_text}"
+
+        # Self-heal a stale model id: agy rejects unknown models with a fast
+        # exit 1 (no spend), so force-refresh the registry once and retry with
+        # the re-discovered default. Only for non-pinned calls — a caller who
+        # pinned a model should see the rejection verbatim.
+        if (
+            returncode != 0
+            and hung is None
+            and not user_specified
+            and self._is_invalid_model_error(combined)
+        ):
+            await self.models.refresh(force=True)
+            refreshed = self.models.default_pro
+            if refreshed != primary_model:
+                primary_model = refreshed
+                stdout_text, stderr_text, returncode, hung = await _attempt(primary_model)
+                combined = f"{stdout_text}\n{stderr_text}"
 
         if hung is not None:
             raise Exception(
@@ -1485,15 +1557,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 f"  Default Pro (deepest thinking): {gemini.models.default_pro}",
                 f"  Default Flash / fallback:       {gemini.models.default_flash}",
                 "",
-                "All models:",
+                "All models (slug — display name; pass either as `model`):",
             ]
-            for m in models:
+            for slug, display in models:
                 marker = ""
-                if m == gemini.models.default_pro:
+                if slug == gemini.models.default_pro:
                     marker = " ← default pro"
-                elif m == gemini.models.default_flash:
+                elif slug == gemini.models.default_flash:
                     marker = " ← default flash"
-                lines.append(f"  • {m}{marker}")
+                label = slug if slug == display else f"{slug} — {display}"
+                lines.append(f"  • {label}{marker}")
             lines.append("")
             lines.append("Aliases: 'pro'/'latest' → deepest pro, 'flash'/'fast' → flash")
             result = "\n".join(lines)
