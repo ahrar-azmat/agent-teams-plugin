@@ -12,7 +12,12 @@ tool surface has been renamed to the ``antigravity_*`` tools (formerly
 integrations use the new names.
 
 How it works:
-- Headless one-shot queries via ``agy -p`` (clean text on stdout, no JSON).
+- Headless one-shot queries via ``agy -p --output-format stream-json``:
+  incremental init/step_update/result events (measured on agy 1.1.11) feed a
+  per-run live log — ``tail -f ~/.claude/logs/antigravity/latest.log`` — and
+  10s MCP progress heartbeats carrying the current activity; the final answer
+  is extracted from the terminal ``result`` event. Older agy builds that
+  reject the flag are downgraded to plain-text mode automatically.
 - Model auto-discovery via ``agy models``. Since agy 1.1.x the output is
   tab-separated ``slug\tDisplay Name`` lines (e.g.
   ``gemini-3.1-pro-high\tGemini 3.1 Pro (High)``); older builds printed the
@@ -32,13 +37,14 @@ How it works:
 
 import asyncio
 import contextlib
+import itertools
 import json
 import os
 import re
 import shutil
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -119,6 +125,156 @@ async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
         proc.kill()
     with contextlib.suppress(Exception):
         await asyncio.wait_for(proc.wait(), timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Live view
+# ---------------------------------------------------------------------------
+# Every query streams agy's event feed (``--output-format stream-json``:
+# init / step_update / result events, verified incremental on agy 1.1.11)
+# to a per-run log so the operator can watch what Gemini is doing:
+#
+#     tail -f ~/.claude/logs/antigravity/latest.log
+#
+# The final answer is extracted from the terminal ``result`` event; if the
+# stream yields none, the raw text is used as before. Observability must
+# never break the run — every live-view failure degrades silently.
+
+LIVE_LOG_DIR = Path.home() / ".claude" / "logs" / "antigravity"
+LIVE_LOG_RETENTION_DAYS = 7
+PROGRESS_INTERVAL_SECONDS = float(
+    os.environ.get("ANTIGRAVITY_PROGRESS_INTERVAL", "10")
+)
+_live_log_seq = itertools.count(1)
+
+
+def _prune_live_logs() -> None:
+    """Drop run logs older than the retention window. Never raises."""
+    cutoff = time.time() - LIVE_LOG_RETENTION_DAYS * 86_400
+    with contextlib.suppress(OSError):
+        for p in LIVE_LOG_DIR.glob("*.log"):
+            if p.is_symlink():
+                continue
+            with contextlib.suppress(OSError):
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+
+
+def _open_live_log(label: str) -> tuple[Path | None, TextIO | None]:
+    """Open a per-run live log and repoint ``latest.log`` at it."""
+    try:
+        LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _prune_live_logs()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = LIVE_LOG_DIR / f"{stamp}-p{os.getpid()}-{next(_live_log_seq)}-{label}.log"
+        fh = path.open("w", encoding="utf-8")
+        latest = LIVE_LOG_DIR / "latest.log"
+        with contextlib.suppress(OSError):
+            latest.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            latest.symlink_to(path.name)
+        return path, fh
+    except OSError:
+        return None, None
+
+
+def _live_write(fh: TextIO | None, t0: float, text: str) -> None:
+    """Append one stamped block to the live log, flushed for tail -f."""
+    if fh is None:
+        return
+    with contextlib.suppress(Exception):
+        stamp = f"[{time.monotonic() - t0:7.1f}s] "
+        pad = " " * len(stamp)
+        lines = text.splitlines() or [""]
+        fh.write(stamp + lines[0] + "\n")
+        for line in lines[1:]:
+            fh.write(pad + line + "\n")
+        fh.flush()
+
+
+def _step_text(step: dict[str, Any]) -> str:
+    """Best-effort human text for an agy step_update payload."""
+    for key in ("text", "content", "description", "tool_name", "title"):
+        val = step.get(key)
+        if isinstance(val, str) and val.strip():
+            return val
+    return ""
+
+
+def _process_agy_event(ev: dict[str, Any], state: dict[str, str]) -> str | None:
+    """Digest one agy stream-json event (measured on agy 1.1.11).
+
+    Shapes: ``{"event":"init","init":{"model":...}}``,
+    ``{"event":"step_update","step_update":{step_index,state,step_type,...}}``
+    (agent_response steps carry incremental text), and the terminal
+    ``{"event":"result","result":{"status":"SUCCESS","response":...}}``.
+    Unknown shapes degrade to a raw JSON snippet, never a crash.
+    """
+    kind = str(ev.get("event", ""))
+    if kind == "init":
+        init = ev.get("init") or {}
+        state["activity"] = "session started"
+        return f"session started (model: {init.get('model', '?')})"
+    if kind == "step_update":
+        step = ev.get("step_update") or {}
+        stype = str(step.get("step_type", "?"))
+        sstate = str(step.get("state", "?"))
+        text = _step_text(step)
+        if stype == "agent_response":
+            if sstate == "ACTIVE":
+                # Incremental text — track for the heartbeat, log on DONE only.
+                if text:
+                    state["activity"] = f"responding: …{text[-90:]}"
+                return None
+            if text:
+                state["activity"] = "response complete"
+                return "response:\n" + "\n".join(f"  {ln}" for ln in text.splitlines())
+            return "response step done"
+        if stype in ("user_input", "checkpoint", "unknown"):
+            return None  # lifecycle plumbing, not worth a log line
+        label = f"step {step.get('step_index', '?')} {stype} {sstate}"
+        state["activity"] = f"{stype} {sstate.lower()}"
+        return f"{label}: {text}" if text else label
+    if kind == "result":
+        res = ev.get("result") or {}
+        status = str(res.get("status", "?"))
+        response = res.get("response")
+        if isinstance(response, str) and response.strip():
+            state["final"] = response
+        state["status"] = status
+        if status != "SUCCESS":
+            state["last_error"] = (
+                str(res.get("error") or res.get("message") or response or "")[:500]
+                or f"agy result status={status}"
+            )
+        state["activity"] = f"result: {status}"
+        return f"result: status={status} ({len(response) if isinstance(response, str) else 0} chars)"
+    if kind == "error":
+        msg = str(ev.get("message") or json.dumps(ev)[:300])
+        state["last_error"] = msg
+        state["activity"] = "stream error"
+        return f"STREAM ERROR: {msg}"
+    return f"event: {json.dumps(ev)[:300]}"
+
+
+async def _report_progress(progress: float, total: float, message: str) -> None:
+    """Send an MCP progress notification for the current request, if any.
+
+    Uses the low-level Server's request context; silently a no-op when the
+    client sent no progressToken. Resets Claude Code's 30-min idle-abort
+    timer exactly like codex-oracle's FastMCP heartbeat does.
+    """
+    with contextlib.suppress(Exception):
+        rc = server.request_context
+        token = getattr(rc.meta, "progressToken", None) if rc.meta else None
+        if token is None:
+            return
+        await rc.session.send_progress_notification(
+            progress_token=token,
+            progress=progress,
+            total=total,
+            message=message,
+        )
 
 
 class ModelRegistry:
@@ -271,6 +427,9 @@ class AntigravityCLIClient:
     def __init__(self) -> None:
         self.secrets_path = Path.home() / ".claude" / "secrets.json"
         self.models = ModelRegistry()
+        # stream-json live view: flips False (for the process lifetime) the
+        # first time agy rejects --output-format, e.g. an older CLI build.
+        self._stream_ok = True
 
     # -- environment ------------------------------------------------------
 
@@ -360,6 +519,22 @@ class AntigravityCLIClient:
         return any(s in t for s in signals)
 
     @staticmethod
+    def _is_flag_error(text: str) -> bool:
+        """agy rejected ``--output-format`` (older CLI build without it)."""
+        t = text.lower()
+        if "output-format" not in t:
+            return False
+        return any(
+            s in t
+            for s in (
+                "unknown flag",
+                "unexpected argument",
+                "invalid argument",
+                "flag provided but not defined",
+            )
+        )
+
+    @staticmethod
     def _clean_output(text: str) -> str:
         """agy -p emits clean text; strip any stray update/log noise."""
         kept: list[str] = []
@@ -381,14 +556,24 @@ class AntigravityCLIClient:
         return prompt
 
     def _build_query_cmd(self, full_prompt: str, model: str) -> list[str]:
-        """Assemble the agy argv for one non-interactive query."""
-        return [
+        """Assemble the agy argv for one non-interactive query.
+
+        ``--output-format stream-json`` turns the buffered print mode into an
+        incremental event feed (init/step_update/result — measured on agy
+        1.1.11) that powers the live log; the final answer comes from the
+        terminal ``result`` event instead of raw stdout. Omitted after the
+        first "unknown flag" rejection from an older agy build.
+        """
+        cmd = [
             AGY_BIN,
             "-p", full_prompt,
             "--model", model,
             "--print-timeout", f"{AGY_PRINT_TIMEOUT_SECONDS}s",
             "--dangerously-skip-permissions",
         ]
+        if self._stream_ok:
+            cmd += ["--output-format", "stream-json"]
+        return cmd
 
     # -- subprocess execution --------------------------------------------
 
@@ -396,19 +581,42 @@ class AntigravityCLIClient:
         self,
         cmd: list[str],
         env: dict,
-    ) -> tuple[str, str, int, str | None]:
-        """Run an agy command to completion under a total wall-clock timeout.
+        live_label: str = "query",
+        prompt_preview: str = "",
+    ) -> tuple[str, str, int, str | None, Path | None]:
+        """Run an agy command, streaming its event feed to the live log.
 
-        Returns ``(stdout, stderr, returncode, hung_reason)`` where
-        ``hung_reason`` is non-None if the overall timeout tripped.
+        Returns ``(text, stderr, returncode, hung_reason, live_path)``:
+        ``text`` is the final response from the stream-json ``result`` event
+        when the stream produced one, else the raw stdout text (plain-text
+        mode); ``hung_reason`` is non-None if the overall timeout tripped.
 
         - ``stdin=DEVNULL`` prevents the subprocess from consuming the MCP
           JSON-RPC stdin stream.
-        - agy buffers output until the final answer, so we wait for completion
-          (no "first byte" probe) and bound the call with an overall timeout.
-        - On caller ``CancelledError`` the process is SIGKILLed so it does not
-          become a zombie.
+        - Events are consumed incrementally: each one lands in the live log
+          (``~/.claude/logs/antigravity/latest.log``) and updates the
+          heartbeat activity, so the operator can watch the run.
+        - A stream-json run that exits 0 WITHOUT a ``result`` event is
+          reported as a failure — the event soup is never returned as if it
+          were the model's answer.
+        - On caller ``CancelledError`` the process is SIGKILLed so it does
+          not become a zombie.
         """
+        t0 = time.monotonic()
+        streaming = "--output-format" in cmd
+        live_path, live_fh = _open_live_log(live_label)
+        state: dict[str, str] = {"activity": "launching agy", "final": "",
+                                 "last_error": "", "status": ""}
+        if live_fh is not None:
+            with contextlib.suppress(Exception):
+                shown = [a for a in cmd if a != prompt_preview]
+                live_fh.write(
+                    f"# antigravity live view — {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+                    f"# argv: {' '.join(shown)}\n"
+                    f"# prompt ({len(prompt_preview)} chars): {prompt_preview[:400]!r}\n\n"
+                )
+                live_fh.flush()
+
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -418,23 +626,124 @@ class AntigravityCLIClient:
                 env=env,
             )
         except FileNotFoundError as e:
-            return ("", f"agy CLI not found at {AGY_BIN}: {e}", 127, None)
+            if live_fh is not None:
+                with contextlib.suppress(Exception):
+                    live_fh.close()
+            return ("", f"agy CLI not found at {AGY_BIN}: {e}", 127, None, live_path)
+
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        linebuf = bytearray()
+
+        def _feed_stdout(chunk: bytes) -> None:
+            linebuf.extend(chunk)
+            while True:
+                nl = linebuf.find(b"\n")
+                if nl < 0:
+                    return
+                raw = bytes(linebuf[:nl]).strip()
+                del linebuf[: nl + 1]
+                if not raw:
+                    continue
+                try:
+                    ev = json.loads(raw)
+                    line = _process_agy_event(ev, state)
+                except ValueError:
+                    line = raw.decode("utf-8", errors="replace")
+                if line:
+                    _live_write(live_fh, t0, line)
+
+        def _feed_stderr(chunk: bytes) -> None:
+            for ln in chunk.decode("utf-8", errors="replace").splitlines():
+                if ln.strip():
+                    _live_write(live_fh, t0, f"! {ln}")
+
+        async def _consume(stream: asyncio.StreamReader, buffer: list[bytes], feed) -> None:
+            while True:
+                chunk = await stream.read(65_536)
+                if not chunk:
+                    return
+                buffer.append(chunk)
+                with contextlib.suppress(Exception):
+                    feed(chunk)
+
+        async def _heartbeat() -> None:
+            while True:
+                await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
+                elapsed = time.monotonic() - t0
+                await _report_progress(
+                    min(elapsed, AGY_OVERALL_TIMEOUT_SECONDS),
+                    AGY_OVERALL_TIMEOUT_SECONDS,
+                    f"antigravity · {int(elapsed)}s · {state['activity'][:140]}",
+                )
+
+        stdout_task = asyncio.create_task(_consume(process.stdout, stdout_chunks, _feed_stdout))
+        stderr_task = asyncio.create_task(_consume(process.stderr, stderr_chunks, _feed_stderr))
+        heartbeat_task = asyncio.create_task(_heartbeat())
+        hung_reason: str | None = None
 
         try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                process.communicate(), timeout=AGY_OVERALL_TIMEOUT_SECONDS
+            await asyncio.wait_for(
+                asyncio.gather(stdout_task, stderr_task),
+                timeout=AGY_OVERALL_TIMEOUT_SECONDS,
             )
+            await process.wait()
         except asyncio.TimeoutError:
             await _kill_and_reap(process)
-            reason = f"no completion within {AGY_OVERALL_TIMEOUT_SECONDS}s"
-            return ("", reason, process.returncode or -1, reason)
+            hung_reason = f"no completion within {AGY_OVERALL_TIMEOUT_SECONDS}s"
         except asyncio.CancelledError:
             await _kill_and_reap(process)
+            if live_fh is not None:
+                with contextlib.suppress(Exception):
+                    live_fh.close()
             raise
+        finally:
+            heartbeat_task.cancel()
+            for task in (stdout_task, stderr_task, heartbeat_task):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            if live_fh is not None:
+                with contextlib.suppress(Exception):
+                    _live_write(
+                        live_fh, t0,
+                        f"run finished: exit={process.returncode} "
+                        f"status={state['status'] or 'n/a'} hung={hung_reason or 'no'}",
+                    )
+                    live_fh.close()
 
-        stdout_text = stdout_b.decode("utf-8", errors="replace").strip()
-        stderr_text = stderr_b.decode("utf-8", errors="replace").strip()
-        return (stdout_text, stderr_text, process.returncode or 0, None)
+        if hung_reason is not None:
+            return ("", hung_reason, process.returncode or -1, hung_reason, live_path)
+
+        stdout_text = b"".join(stdout_chunks).decode("utf-8", errors="replace").strip()
+        stderr_text = b"".join(stderr_chunks).decode("utf-8", errors="replace").strip()
+        returncode = process.returncode or 0
+
+        if streaming:
+            if state["final"]:
+                text = state["final"]
+            else:
+                # No result event: never hand the event soup back as an
+                # answer. Distinguish agy-reported failure from a truncated
+                # stream, and surface which one happened.
+                text = ""
+                detail = state["last_error"] or (
+                    "stream-json run ended without a result event"
+                )
+                stderr_text = f"{detail}\n{stderr_text}".strip()
+                if returncode == 0:
+                    returncode = 1
+        else:
+            text = stdout_text
+            if state["last_error"] and returncode == 0:
+                stderr_text = f"{state['last_error']}\n{stderr_text}".strip()
+
+        if state["status"] not in ("", "SUCCESS") and returncode == 0:
+            # agy reported a non-success terminal status but exited 0 —
+            # propagate the failure instead of trusting the exit code.
+            returncode = 1
+            stderr_text = f"{state['last_error'] or state['status']}\n{stderr_text}".strip()
+
+        return (text, stderr_text, returncode, None, live_path)
 
     # -- auth -------------------------------------------------------------
 
@@ -501,11 +810,26 @@ class AntigravityCLIClient:
         full_prompt = self._build_prompt(prompt, system_instruction)
         env = self._build_environment()
 
-        async def _attempt(target: str) -> tuple[str, str, int, str | None]:
-            return await self._execute_cli(self._build_query_cmd(full_prompt, target), env)
+        async def _attempt(target: str) -> tuple[str, str, int, str | None, Path | None]:
+            return await self._execute_cli(
+                self._build_query_cmd(full_prompt, target), env,
+                prompt_preview=full_prompt,
+            )
 
-        stdout_text, stderr_text, returncode, hung = await _attempt(primary_model)
+        stdout_text, stderr_text, returncode, hung, live_path = await _attempt(primary_model)
         combined = f"{stdout_text}\n{stderr_text}"
+
+        # Older agy builds don't know --output-format: downgrade to plain-text
+        # mode once (for the process lifetime) and retry.
+        if (
+            returncode != 0
+            and hung is None
+            and self._stream_ok
+            and self._is_flag_error(combined)
+        ):
+            self._stream_ok = False
+            stdout_text, stderr_text, returncode, hung, live_path = await _attempt(primary_model)
+            combined = f"{stdout_text}\n{stderr_text}"
 
         # Self-heal a stale model id: agy rejects unknown models with a fast
         # exit 1 (no spend), so force-refresh the registry once and retry with
@@ -521,13 +845,16 @@ class AntigravityCLIClient:
             refreshed = self.models.default_pro
             if refreshed != primary_model:
                 primary_model = refreshed
-                stdout_text, stderr_text, returncode, hung = await _attempt(primary_model)
+                stdout_text, stderr_text, returncode, hung, live_path = await _attempt(primary_model)
                 combined = f"{stdout_text}\n{stderr_text}"
+
+        log_note = f"\n\n[live log: {live_path}]" if live_path else ""
 
         if hung is not None:
             raise Exception(
                 f"agy timed out for model '{primary_model}': {hung}. "
                 f"Partial stderr: {stderr_text[:500] or '(none)'}"
+                f"{log_note}"
             )
 
         if returncode != 0 and self._check_auth_error(combined):
@@ -540,11 +867,12 @@ class AntigravityCLIClient:
         if returncode == 0:
             cleaned = self._clean_output(stdout_text)
             if cleaned:
-                return cleaned
+                return f"{cleaned}{log_note}"
             # exit 0 but only noise/empty — surface clearly, never return "".
             raise Exception(
                 f"agy returned exit 0 but no usable output for '{primary_model}'. "
                 "It may have printed only status noise — please retry."
+                f"{log_note}"
             )
 
         # Capacity/quota fallback: Pro -> Flash (only if caller didn't pin one).
@@ -555,13 +883,14 @@ class AntigravityCLIClient:
             and self._is_capacity_error(combined)
         )
         if should_fallback:
-            stdout_text, stderr_text, returncode, hung = await _attempt(fallback_model)
+            stdout_text, stderr_text, returncode, hung, live_path = await _attempt(fallback_model)
+            log_note = f"\n\n[live log: {live_path}]" if live_path else ""
             if hung is None and returncode == 0:
                 cleaned = self._clean_output(stdout_text)
                 if cleaned:
                     return (
                         f"[Fallback: '{primary_model}' hit a capacity/quota limit, "
-                        f"answered by '{fallback_model}']\n\n{cleaned}"
+                        f"answered by '{fallback_model}']\n\n{cleaned}{log_note}"
                     )
             combined = f"{stdout_text}\n{stderr_text}"
 
@@ -576,7 +905,7 @@ class AntigravityCLIClient:
         hint = ""
         if self._is_capacity_error(combined):
             hint = " (capacity/quota limit — consumer Antigravity quota may be exhausted)"
-        raise Exception(f"agy error (exit {returncode}){hint}: {detail[:800]}")
+        raise Exception(f"agy error (exit {returncode}){hint}: {detail[:800]}{log_note}")
 
     async def query_with_tools(
         self,

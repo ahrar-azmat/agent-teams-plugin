@@ -38,12 +38,15 @@ Two properties are enforced by this server rather than left to the caller
 
 import asyncio
 import contextlib
+import itertools
+import json
 import os
 import re
 import tempfile
 import time
 import tomllib
 from pathlib import Path
+from typing import Any, TextIO
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -434,6 +437,186 @@ def _get_cwd() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Live view
+# ---------------------------------------------------------------------------
+# Every run streams its full event feed — reasoning summaries, web-search
+# queries, commands, MCP tool calls, errors, token usage — to a per-run log:
+#
+#     tail -f ~/.claude/logs/codex-oracle/latest.log
+#
+# Mechanism: ``codex exec --json`` (JSONL ThreadEvents on stdout) plus
+# ``-c model_reasoning_summary=detailed`` so the thinking is actually
+# emitted (the default banner showed "reasoning summaries: none" — nothing
+# to watch). Both verified live on codex-cli 0.144.1 headless exec mode:
+# events arrive incrementally and --output-last-message still works.
+
+LIVE_LOG_DIR = Path.home() / ".claude" / "logs" / "codex-oracle"
+LIVE_LOG_RETENTION_DAYS = 7
+_live_log_seq = itertools.count(1)
+
+
+def _prune_live_logs() -> None:
+    """Drop run logs older than the retention window. Never raises."""
+    cutoff = time.time() - LIVE_LOG_RETENTION_DAYS * 86_400
+    with contextlib.suppress(OSError):
+        for p in LIVE_LOG_DIR.glob("*.log"):
+            if p.is_symlink():
+                continue
+            with contextlib.suppress(OSError):
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+
+
+def _open_live_log(label: str) -> tuple[Path | None, TextIO | None]:
+    """Open a per-run live log and repoint ``latest.log`` at it.
+
+    Observability must never break the run itself: any OS failure returns
+    ``(None, None)`` and the caller degrades to no live view.
+    """
+    try:
+        LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _prune_live_logs()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = LIVE_LOG_DIR / f"{stamp}-p{os.getpid()}-{next(_live_log_seq)}-{label}.log"
+        fh = path.open("w", encoding="utf-8")
+        latest = LIVE_LOG_DIR / "latest.log"
+        with contextlib.suppress(OSError):
+            latest.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            latest.symlink_to(path.name)
+        return path, fh
+    except OSError:
+        return None, None
+
+
+def _live_write(fh: TextIO | None, t0: float, text: str) -> None:
+    """Append one stamped block to the live log, flushed for tail -f."""
+    if fh is None:
+        return
+    with contextlib.suppress(Exception):
+        stamp = f"[{time.monotonic() - t0:7.1f}s] "
+        pad = " " * len(stamp)
+        lines = text.splitlines() or [""]
+        fh.write(stamp + lines[0] + "\n")
+        for line in lines[1:]:
+            fh.write(pad + line + "\n")
+        fh.flush()
+
+
+def _process_exec_event(ev: dict[str, Any], state: dict[str, str]) -> str | None:
+    """Digest one ``codex exec --json`` ThreadEvent.
+
+    Returns the human line(s) for the live log (None = nothing to show) and
+    updates ``state`` in place: ``activity`` (for the progress heartbeat),
+    ``last_message`` (final-answer fallback), ``last_error``, ``usage``.
+
+    Field names follow codex-rs ``exec/src/exec_events.rs`` (verified against
+    the installed 0.144.1 binary): items are tagged unions with flat fields —
+    reasoning/agent_message carry ``text``, command_execution ``command``/
+    ``exit_code``, web_search ``query``, mcp_tool_call ``server``/``tool``.
+    Unknown shapes degrade to a raw JSON snippet, never a crash.
+    """
+    et = str(ev.get("type", ""))
+    item = ev.get("item") or {}
+    it = str(item.get("type") or item.get("item_type") or "")
+
+    if et == "thread.started":
+        state["activity"] = "session started"
+        return f"thread started (id: {ev.get('thread_id', '?')})"
+    if et == "turn.started":
+        state["activity"] = "thinking"
+        return "turn started"
+    if et == "turn.completed":
+        usage = ev.get("usage") or {}
+        if usage:
+            state["usage"] = (
+                f"tokens in={usage.get('input_tokens', '?')} "
+                f"(cached {usage.get('cached_input_tokens', 0)}) "
+                f"out={usage.get('output_tokens', '?')}"
+            )
+        return f"turn completed — {state.get('usage', 'no usage reported')}"
+    if et == "turn.failed":
+        err = (ev.get("error") or {}).get("message") or json.dumps(ev)[:400]
+        state["last_error"] = err
+        state["activity"] = "turn FAILED"
+        return f"TURN FAILED: {err}"
+    if et == "error":
+        msg = str(ev.get("message") or json.dumps(ev)[:400])
+        state["last_error"] = msg
+        state["activity"] = "stream error"
+        return f"STREAM ERROR: {msg}"
+
+    if et in ("item.started", "item.updated", "item.completed"):
+        done = et == "item.completed"
+        if it == "reasoning":
+            text = str(item.get("text") or "")
+            if not (done and text):
+                return None
+            first = text.splitlines()[0].strip("* ") if text.splitlines() else ""
+            state["activity"] = f"thinking: {first[:100]}"
+            return "reasoning:\n" + "\n".join(f"  {ln}" for ln in text.splitlines())
+        if it == "agent_message":
+            text = str(item.get("text") or "")
+            if not (done and text):
+                return None
+            state["last_message"] = text
+            state["activity"] = f"answer: {text[:100]}"
+            return f"assistant: {text}"
+        if it == "web_search":
+            query = str(item.get("query") or "")
+            if done and query:
+                state["activity"] = f"web search: {query[:100]}"
+                return f"web_search: {query}"
+            if et == "item.started":
+                state["activity"] = "web search…"
+                return "web search started"
+            return None
+        if it == "command_execution":
+            command = str(item.get("command") or "")
+            if et == "item.started":
+                state["activity"] = f"exec: {command[:100]}"
+                return f"$ {command}"
+            if done:
+                status = item.get("status", "?")
+                code = item.get("exit_code")
+                out = str(item.get("aggregated_output") or "").strip()
+                line = f"$ {command} → {status}" + (f" (exit {code})" if code is not None else "")
+                if out:
+                    tail = out[-500:]
+                    line += "\n" + "\n".join(f"  | {ln}" for ln in tail.splitlines())
+                if str(status) == "failed":
+                    state["last_error"] = f"command failed: {command} → exit {code}"
+                return line
+            return None
+        if it == "mcp_tool_call":
+            name = f"{item.get('server', '?')}.{item.get('tool', '?')}"
+            if et == "item.started":
+                state["activity"] = f"mcp: {name}"
+                return f"mcp call: {name}"
+            if done:
+                return f"mcp call: {name} → {item.get('status', '?')}"
+            return None
+        if it == "file_change":
+            if done:
+                return f"file change: {item.get('status', '?')}"
+            return None
+        if it == "error":
+            msg = str(item.get("message") or "")
+            if msg:
+                state["last_error"] = msg
+                state["activity"] = "error"
+                return f"ERROR: {msg}"
+            return None
+        if it == "todo_list":
+            return None  # progress plumbing, too chatty for the log
+        if done:
+            return f"{it or 'item'}: {json.dumps(item)[:300]}"
+        return None
+
+    return f"event: {json.dumps(ev)[:300]}"
+
+
+# ---------------------------------------------------------------------------
 # Codex runner
 # ---------------------------------------------------------------------------
 
@@ -446,7 +629,11 @@ async def _run_codex(
 ) -> str:
     """Run codex exec headlessly with clean final-message extraction.
 
-    Uses codex-cli 0.118.0 features:
+    Uses codex-cli 0.118.0+ features (live-view additions verified 0.144.1):
+    - ``--json`` — JSONL ThreadEvents on stdout, streamed to the per-run
+      live log (``~/.claude/logs/codex-oracle/latest.log``) together with
+      ``-c model_reasoning_summary=detailed`` so the operator can watch the
+      model's reasoning, web searches, commands and errors in real time.
     - ``--output-last-message FILE`` — clean final-message extraction.
     - ``-c approval_policy=never`` — prevents blocking on approval prompts.
     - ``-c mcp_servers={}`` — disables codex's built-in MCP servers
@@ -516,6 +703,10 @@ async def _run_codex(
 
     cmd = [
         "codex", "exec",
+        # Structured JSONL events on stdout (thread/turn/item lifecycle) —
+        # the live-view feed. --output-last-message still works alongside
+        # (verified on 0.144.1), so final-answer extraction is unchanged.
+        "--json",
         "--model", model,
         *access_args,
         "--ephemeral",
@@ -524,12 +715,30 @@ async def _run_codex(
         "--output-last-message", str(output_file),
         "-c", "approval_policy=never",
         "-c", f"model_reasoning_effort={reasoning}",
+        # Without this the run has NO thinking output at all (banner says
+        # "reasoning summaries: none") — nothing to stream to the live log.
+        "-c", "model_reasoning_summary=detailed",
         # Live web, not the cached snapshot index. See the docstring.
         # "disabled" removes the tool outright rather than falling back to the
         # cached index — an offline call must be genuinely offline.
         "-c", f"web_search={'live' if web_search else 'disabled'}",
         prompt,
     ]
+
+    t0 = time.monotonic()
+    live_path, live_fh = _open_live_log("infra" if infra else "codex")
+    state: dict[str, str] = {"activity": "launching codex", "last_message": "",
+                             "last_error": "", "usage": ""}
+    if live_fh is not None:
+        with contextlib.suppress(Exception):
+            live_fh.write(
+                f"# codex-oracle live view — {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+                f"# model={model} effort={reasoning} "
+                f"mode={'infra' if infra else 'read-only'} "
+                f"web_search={'live' if web_search else 'disabled'} cwd={_get_cwd()}\n"
+                f"# prompt ({len(prompt)} chars): {prompt[:400]!r}\n\n"
+            )
+            live_fh.flush()
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -550,13 +759,45 @@ async def _run_codex(
     stderr_chunks: list[bytes] = []
     hung_reason: str | None = None
     timed_out = False
+    stdout_linebuf = bytearray()
 
-    async def _consume(stream: asyncio.StreamReader, buffer: list[bytes]) -> None:
+    def _feed_stdout(chunk: bytes) -> None:
+        """Split the JSONL event stream into lines and feed the live view."""
+        stdout_linebuf.extend(chunk)
+        while True:
+            nl = stdout_linebuf.find(b"\n")
+            if nl < 0:
+                return
+            raw = bytes(stdout_linebuf[:nl]).strip()
+            del stdout_linebuf[: nl + 1]
+            if not raw:
+                continue
+            try:
+                ev = json.loads(raw)
+                line = _process_exec_event(ev, state)
+            except ValueError:
+                # Not JSON (stray CLI noise) — show it verbatim.
+                line = raw.decode("utf-8", errors="replace")
+            if line:
+                _live_write(live_fh, t0, line)
+
+    def _feed_stderr(chunk: bytes) -> None:
+        text = chunk.decode("utf-8", errors="replace")
+        for ln in text.splitlines():
+            if ln.strip():
+                _live_write(live_fh, t0, f"! {ln}")
+
+    async def _consume(
+        stream: asyncio.StreamReader,
+        buffer: list[bytes],
+        on_chunk,
+    ) -> None:
         """Consume a subprocess stream using fixed-size reads.
 
         Uses read(READ_CHUNK_SIZE) instead of readline() to avoid
         LimitOverrunError — read() never searches for a separator so it
         cannot overflow regardless of line length or buffer limit.
+        The live view must never break the run: feeder errors are swallowed.
         """
         while True:
             chunk = await stream.read(READ_CHUNK_SIZE)
@@ -565,6 +806,8 @@ async def _run_codex(
             if not startup_seen.is_set():
                 startup_seen.set()
             buffer.append(chunk)
+            with contextlib.suppress(Exception):
+                on_chunk(chunk)
 
     async def _startup_probe() -> None:
         """Wait up to STARTUP_PROBE_SECONDS for first output. Kill on silence."""
@@ -592,19 +835,16 @@ async def _run_codex(
         while True:
             await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
             elapsed = time.monotonic() - started
-            out_kib = (
-                sum(map(len, stdout_chunks)) + sum(map(len, stderr_chunks))
-            ) // 1024
             with contextlib.suppress(Exception):
                 await ctx.report_progress(
                     min(elapsed, MAX_RUNTIME_SECONDS),
                     MAX_RUNTIME_SECONDS,
-                    f"codex {model} running: {int(elapsed)}s elapsed, "
-                    f"{out_kib} KiB output",
+                    f"codex {model} · {int(elapsed)}s · "
+                    f"{state['activity'][:140]}",
                 )
 
-    stdout_task = asyncio.create_task(_consume(proc.stdout, stdout_chunks))
-    stderr_task = asyncio.create_task(_consume(proc.stderr, stderr_chunks))
+    stdout_task = asyncio.create_task(_consume(proc.stdout, stdout_chunks, _feed_stdout))
+    stderr_task = asyncio.create_task(_consume(proc.stderr, stderr_chunks, _feed_stderr))
     probe_task = asyncio.create_task(_startup_probe())
     heartbeat_task = (
         asyncio.create_task(_heartbeat()) if ctx is not None else None
@@ -640,6 +880,15 @@ async def _run_codex(
                 _task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _task
+        if live_fh is not None:
+            with contextlib.suppress(Exception):
+                _live_write(
+                    live_fh, t0,
+                    f"run finished: exit={proc.returncode} "
+                    f"timed_out={timed_out} "
+                    f"{state.get('usage') or ''}".rstrip(),
+                )
+                live_fh.close()
 
     # On timeout, salvage whatever the output file has (codex may have
     # written a partial or complete answer before we killed it).
@@ -650,16 +899,19 @@ async def _run_codex(
                 partial = output_file.read_text(encoding="utf-8", errors="replace").strip()
         finally:
             output_file.unlink(missing_ok=True)
+        log_note = f"\n[live log: {live_path}]" if live_path else ""
         if partial:
             return (
                 f"[Codex model: {model} | reasoning: {reasoning}]\n"
-                f"[TIMEOUT after {MAX_RUNTIME_SECONDS}s — partial output recovered]\n\n"
+                f"[TIMEOUT after {MAX_RUNTIME_SECONDS}s — partial output recovered]"
+                f"{log_note}\n\n"
                 f"{partial}"
             )
         return (
             f"[Codex TIMEOUT: no response after {MAX_RUNTIME_SECONDS}s]\n"
             f"The model may be overloaded or the query too complex. "
             f"Try simplifying the prompt or reducing reasoning effort."
+            f"{log_note}"
         )
 
     stdout_text = b"".join(stdout_chunks).decode("utf-8", errors="replace").strip()
@@ -675,7 +927,11 @@ async def _run_codex(
         output_file.unlink(missing_ok=True)
 
     if not final_message:
-        final_message = stdout_text
+        # stdout is a JSONL event stream now — the parsed last agent message
+        # is the meaningful fallback; raw stdout only as a last resort.
+        final_message = state["last_message"] or stdout_text
+
+    log_note = f"\n\n[live log: {live_path}]" if live_path else ""
 
     if hung_reason is not None:
         return (
@@ -685,13 +941,18 @@ async def _run_codex(
             f"(3) an approval prompt blocked by a missing TTY.\n\n"
             f"Partial stdout ({len(stdout_text)} chars):\n{stdout_text[:2000] or '(none)'}\n\n"
             f"Partial stderr ({len(stderr_text)} chars):\n{stderr_text[:2000] or '(none)'}"
+            f"{log_note}"
         )
 
     if proc.returncode != 0 and not final_message:
-        return f"[Codex error (exit {proc.returncode})]\n{stderr_text}"
+        detail = state["last_error"] or stderr_text
+        return f"[Codex error (exit {proc.returncode})]\n{detail}{log_note}"
 
     header = f"[Codex model: {model} | reasoning: {reasoning}]"
     result = f"{header}\n\n{final_message}"
+    if state["last_error"] and proc.returncode != 0:
+        result += f"\n\n[run reported an error: {state['last_error']}]"
+    result += log_note
 
     # Only surface the noisy session stream when the clean extraction path
     # failed AND the process exited non-zero — i.e. we need the diagnostic
