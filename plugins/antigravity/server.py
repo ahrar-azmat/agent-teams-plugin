@@ -142,6 +142,12 @@ async def _kill_and_reap(proc: asyncio.subprocess.Process) -> None:
 
 LIVE_LOG_DIR = Path.home() / ".claude" / "logs" / "antigravity"
 LIVE_LOG_RETENTION_DAYS = 7
+# Merged viewer feed: every run ALSO appends tagged lines to stream.log so
+# `tail -F stream.log` shows ALL concurrent runs (across sessions/processes —
+# O_APPEND interleaves at line granularity). Truncated at run-start past this
+# cap; it duplicates the per-run files (the archive), so truncation loses
+# nothing durable. 128 MiB ≈ months of heavy use at observed run sizes.
+STREAM_LOG_MAX_BYTES = 128 * 1024 * 1024
 PROGRESS_INTERVAL_SECONDS = float(
     os.environ.get("ANTIGRAVITY_PROGRESS_INTERVAL", "10")
 )
@@ -160,35 +166,68 @@ def _prune_live_logs() -> None:
                     p.unlink()
 
 
-def _open_live_log(label: str) -> tuple[Path | None, TextIO | None]:
-    """Open a per-run live log and repoint ``latest.log`` at it."""
+def _open_live_log(label: str) -> tuple[Path | None, TextIO | None, TextIO | None, str]:
+    """Open the per-run live log + the merged stream, repoint ``latest.log``.
+
+    Returns ``(path, run_fh, stream_fh, tag)``. The tag (``query3·8123``)
+    prefixes this run's lines in ``stream.log`` so concurrent runs stay
+    tellable-apart in the merged view.
+    """
+    seq = next(_live_log_seq)
+    tag = f"{label}{seq}·{os.getpid()}"
+    path: Path | None = None
+    fh: TextIO | None = None
+    stream_fh: TextIO | None = None
     try:
         LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
         _prune_live_logs()
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        path = LIVE_LOG_DIR / f"{stamp}-p{os.getpid()}-{next(_live_log_seq)}-{label}.log"
+        path = LIVE_LOG_DIR / f"{stamp}-p{os.getpid()}-{seq}-{label}.log"
         fh = path.open("w", encoding="utf-8")
         latest = LIVE_LOG_DIR / "latest.log"
         with contextlib.suppress(OSError):
             latest.unlink(missing_ok=True)
         with contextlib.suppress(OSError):
             latest.symlink_to(path.name)
-        return path, fh
     except OSError:
-        return None, None
+        path, fh = None, None
+    with contextlib.suppress(OSError):
+        stream_path = LIVE_LOG_DIR / "stream.log"
+        truncated = False
+        with contextlib.suppress(OSError):
+            if stream_path.exists() and stream_path.stat().st_size > STREAM_LOG_MAX_BYTES:
+                # O_APPEND writers elsewhere keep working: their next write
+                # lands at the new (small) EOF. Per-run files keep everything.
+                stream_path.write_text("")
+                truncated = True
+        stream_fh = stream_path.open("a", encoding="utf-8")
+        if truncated:
+            stream_fh.write(
+                f"# stream.log truncated past {STREAM_LOG_MAX_BYTES:,} bytes "
+                f"— full history stays in the per-run files\n"
+            )
+            stream_fh.flush()
+    return path, fh, stream_fh, tag
 
 
-def _live_write(fh: TextIO | None, t0: float, text: str) -> None:
-    """Append one stamped block to the live log, flushed for tail -f."""
+def _live_write(fh: TextIO | None, t0: float, text: str, tag: str = "") -> None:
+    """Append one stamped block to a live log, flushed for tail -f.
+
+    With ``tag`` the stamp carries the run id — the merged-stream format.
+    The whole block is one buffered write so concurrent runs interleave at
+    block granularity in stream.log.
+    """
     if fh is None:
         return
     with contextlib.suppress(Exception):
-        stamp = f"[{time.monotonic() - t0:7.1f}s] "
+        stamp = (
+            f"[{time.monotonic() - t0:7.1f}s {tag}] " if tag
+            else f"[{time.monotonic() - t0:7.1f}s] "
+        )
         pad = " " * len(stamp)
         lines = text.splitlines() or [""]
-        fh.write(stamp + lines[0] + "\n")
-        for line in lines[1:]:
-            fh.write(pad + line + "\n")
+        block = stamp + lines[0] + "\n" + "".join(pad + ln + "\n" for ln in lines[1:])
+        fh.write(block)
         fh.flush()
 
 
@@ -604,9 +643,21 @@ class AntigravityCLIClient:
         """
         t0 = time.monotonic()
         streaming = "--output-format" in cmd
-        live_path, live_fh = _open_live_log(live_label)
+        live_path, live_fh, stream_fh, run_tag = _open_live_log(live_label)
         state: dict[str, str] = {"activity": "launching agy", "final": "",
                                  "last_error": "", "status": ""}
+
+        def _emit(text: str) -> None:
+            """One event → the per-run log AND the tagged merged stream."""
+            _live_write(live_fh, t0, text)
+            _live_write(stream_fh, t0, text, run_tag)
+
+        def _close_logs() -> None:
+            for _fh in (live_fh, stream_fh):
+                if _fh is not None:
+                    with contextlib.suppress(Exception):
+                        _fh.close()
+
         if live_fh is not None:
             with contextlib.suppress(Exception):
                 shown = [a for a in cmd if a != prompt_preview]
@@ -616,6 +667,12 @@ class AntigravityCLIClient:
                     f"# prompt ({len(prompt_preview)} chars): {prompt_preview[:400]!r}\n\n"
                 )
                 live_fh.flush()
+        _live_write(
+            stream_fh, t0,
+            f"▶ start {' '.join(a for a in cmd[3:5])} "
+            f"prompt {len(prompt_preview)} chars: {prompt_preview[:120]!r}",
+            run_tag,
+        )
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -626,9 +683,7 @@ class AntigravityCLIClient:
                 env=env,
             )
         except FileNotFoundError as e:
-            if live_fh is not None:
-                with contextlib.suppress(Exception):
-                    live_fh.close()
+            _close_logs()
             return ("", f"agy CLI not found at {AGY_BIN}: {e}", 127, None, live_path)
 
         stdout_chunks: list[bytes] = []
@@ -651,12 +706,12 @@ class AntigravityCLIClient:
                 except ValueError:
                     line = raw.decode("utf-8", errors="replace")
                 if line:
-                    _live_write(live_fh, t0, line)
+                    _emit(line)
 
         def _feed_stderr(chunk: bytes) -> None:
             for ln in chunk.decode("utf-8", errors="replace").splitlines():
                 if ln.strip():
-                    _live_write(live_fh, t0, f"! {ln}")
+                    _emit(f"! {ln}")
 
         async def _consume(stream: asyncio.StreamReader, buffer: list[bytes], feed) -> None:
             while True:
@@ -693,23 +748,26 @@ class AntigravityCLIClient:
             hung_reason = f"no completion within {AGY_OVERALL_TIMEOUT_SECONDS}s"
         except asyncio.CancelledError:
             await _kill_and_reap(process)
-            if live_fh is not None:
-                with contextlib.suppress(Exception):
-                    live_fh.close()
             raise
         finally:
             heartbeat_task.cancel()
             for task in (stdout_task, stderr_task, heartbeat_task):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
-            if live_fh is not None:
-                with contextlib.suppress(Exception):
-                    _live_write(
-                        live_fh, t0,
-                        f"run finished: exit={process.returncode} "
-                        f"status={state['status'] or 'n/a'} hung={hung_reason or 'no'}",
-                    )
-                    live_fh.close()
+            with contextlib.suppress(Exception):
+                # returncode None here = the MCP call was cancelled mid-run
+                # (caller abort/Esc) and we killed agy — say so explicitly;
+                # "exit=None" read like a defect in the 08-08 log sweep.
+                rc_label = (
+                    process.returncode
+                    if process.returncode is not None
+                    else "none (cancelled by caller)"
+                )
+                _emit(
+                    f"■ run finished: exit={rc_label} "
+                    f"status={state['status'] or 'n/a'} hung={hung_reason or 'no'}",
+                )
+            _close_logs()
 
         if hung_reason is not None:
             return ("", hung_reason, process.returncode or -1, hung_reason, live_path)

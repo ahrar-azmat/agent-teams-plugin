@@ -9,10 +9,12 @@
 # or in any plain terminal:
 #     mcp-live
 #
-# tail -F (follow the NAME, retry) tracks each latest.log symlink as new
-# runs repoint it — verified across repoints on macOS BSD tail. Per-run
-# history lives next to the symlinks:
+# stream.log is the MERGED feed: every run (including concurrent ones,
+# across sessions/processes) appends its lines tagged with a run id like
+# [codex5·21746], so parallel advisors interleave chronologically in one
+# view. Focus on a single run instead with its per-run file:
 #     ls -t ~/.claude/logs/codex-oracle/ ~/.claude/logs/antigravity/
+#     tail -F ~/.claude/logs/codex-oracle/latest.log   # newest run only
 exec tail -F \
-  "$HOME/.claude/logs/codex-oracle/latest.log" \
-  "$HOME/.claude/logs/antigravity/latest.log"
+  "$HOME/.claude/logs/codex-oracle/stream.log" \
+  "$HOME/.claude/logs/antigravity/stream.log"

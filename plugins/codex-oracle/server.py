@@ -452,6 +452,13 @@ def _get_cwd() -> str:
 
 LIVE_LOG_DIR = Path.home() / ".claude" / "logs" / "codex-oracle"
 LIVE_LOG_RETENTION_DAYS = 7
+# Merged viewer feed: every run ALSO appends tagged lines to stream.log so
+# `tail -F stream.log` shows ALL concurrent runs (across sessions/processes —
+# O_APPEND interleaves at line granularity). Truncated at run-start past this
+# cap; it is a convenience view DUPLICATING the per-run files (the archive),
+# so truncation loses nothing durable. 128 MiB ≈ months of heavy use at the
+# observed ~60 KB per max-effort review run.
+STREAM_LOG_MAX_BYTES = 128 * 1024 * 1024
 _live_log_seq = itertools.count(1)
 
 
@@ -467,39 +474,69 @@ def _prune_live_logs() -> None:
                     p.unlink()
 
 
-def _open_live_log(label: str) -> tuple[Path | None, TextIO | None]:
-    """Open a per-run live log and repoint ``latest.log`` at it.
+def _open_live_log(label: str) -> tuple[Path | None, TextIO | None, TextIO | None, str]:
+    """Open the per-run live log + the merged stream, repoint ``latest.log``.
 
-    Observability must never break the run itself: any OS failure returns
-    ``(None, None)`` and the caller degrades to no live view.
+    Returns ``(path, run_fh, stream_fh, tag)``. The tag (``codex5·21746``)
+    prefixes this run's lines in ``stream.log`` so concurrent runs stay
+    tellable-apart in the merged view. Observability must never break the
+    run itself: any OS failure degrades to ``None`` handles.
     """
+    seq = next(_live_log_seq)
+    tag = f"{label}{seq}·{os.getpid()}"
+    path: Path | None = None
+    fh: TextIO | None = None
+    stream_fh: TextIO | None = None
     try:
         LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
         _prune_live_logs()
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        path = LIVE_LOG_DIR / f"{stamp}-p{os.getpid()}-{next(_live_log_seq)}-{label}.log"
+        path = LIVE_LOG_DIR / f"{stamp}-p{os.getpid()}-{seq}-{label}.log"
         fh = path.open("w", encoding="utf-8")
         latest = LIVE_LOG_DIR / "latest.log"
         with contextlib.suppress(OSError):
             latest.unlink(missing_ok=True)
         with contextlib.suppress(OSError):
             latest.symlink_to(path.name)
-        return path, fh
     except OSError:
-        return None, None
+        path, fh = None, None
+    with contextlib.suppress(OSError):
+        stream_path = LIVE_LOG_DIR / "stream.log"
+        truncated = False
+        with contextlib.suppress(OSError):
+            if stream_path.exists() and stream_path.stat().st_size > STREAM_LOG_MAX_BYTES:
+                # O_APPEND writers elsewhere keep working: their next write
+                # lands at the new (small) EOF. Per-run files keep everything.
+                stream_path.write_text("")
+                truncated = True
+        stream_fh = stream_path.open("a", encoding="utf-8")
+        if truncated:
+            stream_fh.write(
+                f"# stream.log truncated past {STREAM_LOG_MAX_BYTES:,} bytes "
+                f"— full history stays in the per-run files\n"
+            )
+            stream_fh.flush()
+    return path, fh, stream_fh, tag
 
 
-def _live_write(fh: TextIO | None, t0: float, text: str) -> None:
-    """Append one stamped block to the live log, flushed for tail -f."""
+def _live_write(fh: TextIO | None, t0: float, text: str, tag: str = "") -> None:
+    """Append one stamped block to a live log, flushed for tail -f.
+
+    With ``tag`` the stamp carries the run id — the merged-stream format.
+    The whole block is one buffered write so concurrent runs interleave at
+    block granularity in stream.log.
+    """
     if fh is None:
         return
     with contextlib.suppress(Exception):
-        stamp = f"[{time.monotonic() - t0:7.1f}s] "
+        stamp = (
+            f"[{time.monotonic() - t0:7.1f}s {tag}] " if tag
+            else f"[{time.monotonic() - t0:7.1f}s] "
+        )
         pad = " " * len(stamp)
         lines = text.splitlines() or [""]
-        fh.write(stamp + lines[0] + "\n")
-        for line in lines[1:]:
-            fh.write(pad + line + "\n")
+        block = stamp + lines[0] + "\n" + "".join(pad + ln + "\n" for ln in lines[1:])
+        fh.write(block)
         fh.flush()
 
 
@@ -726,9 +763,15 @@ async def _run_codex(
     ]
 
     t0 = time.monotonic()
-    live_path, live_fh = _open_live_log("infra" if infra else "codex")
+    live_path, live_fh, stream_fh, run_tag = _open_live_log("infra" if infra else "codex")
     state: dict[str, str] = {"activity": "launching codex", "last_message": "",
                              "last_error": "", "usage": ""}
+
+    def _emit(text: str) -> None:
+        """One event → the per-run log AND the tagged merged stream."""
+        _live_write(live_fh, t0, text)
+        _live_write(stream_fh, t0, text, run_tag)
+
     if live_fh is not None:
         with contextlib.suppress(Exception):
             live_fh.write(
@@ -739,6 +782,13 @@ async def _run_codex(
                 f"# prompt ({len(prompt)} chars): {prompt[:400]!r}\n\n"
             )
             live_fh.flush()
+    _live_write(
+        stream_fh, t0,
+        f"▶ start model={model} effort={reasoning} "
+        f"mode={'infra' if infra else 'read-only'} "
+        f"prompt {len(prompt)} chars: {prompt[:120]!r}",
+        run_tag,
+    )
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -752,6 +802,10 @@ async def _run_codex(
         )
     except FileNotFoundError:
         output_file.unlink(missing_ok=True)
+        for _fh in (live_fh, stream_fh):
+            if _fh is not None:
+                with contextlib.suppress(Exception):
+                    _fh.close()
         return "[Error: codex binary not found in PATH. Install with: npm i -g @openai/codex]"
 
     startup_seen = asyncio.Event()
@@ -779,13 +833,13 @@ async def _run_codex(
                 # Not JSON (stray CLI noise) — show it verbatim.
                 line = raw.decode("utf-8", errors="replace")
             if line:
-                _live_write(live_fh, t0, line)
+                _emit(line)
 
     def _feed_stderr(chunk: bytes) -> None:
         text = chunk.decode("utf-8", errors="replace")
         for ln in text.splitlines():
             if ln.strip():
-                _live_write(live_fh, t0, f"! {ln}")
+                _emit(f"! {ln}")
 
     async def _consume(
         stream: asyncio.StreamReader,
@@ -880,15 +934,16 @@ async def _run_codex(
                 _task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await _task
-        if live_fh is not None:
-            with contextlib.suppress(Exception):
-                _live_write(
-                    live_fh, t0,
-                    f"run finished: exit={proc.returncode} "
-                    f"timed_out={timed_out} "
-                    f"{state.get('usage') or ''}".rstrip(),
-                )
-                live_fh.close()
+        with contextlib.suppress(Exception):
+            _emit(
+                f"■ run finished: exit={proc.returncode} "
+                f"timed_out={timed_out} "
+                f"{state.get('usage') or ''}".rstrip(),
+            )
+        for _fh in (live_fh, stream_fh):
+            if _fh is not None:
+                with contextlib.suppress(Exception):
+                    _fh.close()
 
     # On timeout, salvage whatever the output file has (codex may have
     # written a partial or complete answer before we killed it).

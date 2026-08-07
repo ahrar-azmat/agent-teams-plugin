@@ -2,10 +2,8 @@
   "mcpServers": {
     "antigravity": {
       "type": "stdio",
-      "command": "${CLAUDE_PLUGIN_ROOT}/.venv/bin/python",
-      "args": [
-        "${CLAUDE_PLUGIN_ROOT}/server.py"
-      ],
+      "command": "${CLAUDE_PLUGIN_ROOT}/run-server.sh",
+      "args": [],
       "timeout": 7200000
     }
   }
