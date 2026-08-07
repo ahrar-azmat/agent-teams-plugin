@@ -1,0 +1,18 @@
+#!/bin/sh
+# mcp-live — watch codex-oracle + antigravity advisory runs in real time.
+#
+# Run it as a Claude Code BACKGROUND shell to get the same "Enter to view"
+# experience the Shells panel gives (MCP tasks have no output buffer to
+# open — the harness only streams stdout for shells, so this bridges the
+# servers' live logs into one):
+#     ask Claude: "run mcp-live in the background"
+# or in any plain terminal:
+#     mcp-live
+#
+# tail -F (follow the NAME, retry) tracks each latest.log symlink as new
+# runs repoint it — verified across repoints on macOS BSD tail. Per-run
+# history lives next to the symlinks:
+#     ls -t ~/.claude/logs/codex-oracle/ ~/.claude/logs/antigravity/
+exec tail -F \
+  "$HOME/.claude/logs/codex-oracle/latest.log" \
+  "$HOME/.claude/logs/antigravity/latest.log"
