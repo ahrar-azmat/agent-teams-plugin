@@ -2,6 +2,16 @@
   "hooks": {
     "PreToolUse": [
       {
+        "matcher": "mcp__.*(codex-oracle|antigravity).*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/live_view_nudge.py"]
+          }
+        ]
+      },
+      {
         "matcher": "EnterPlanMode",
         "hooks": [
           {

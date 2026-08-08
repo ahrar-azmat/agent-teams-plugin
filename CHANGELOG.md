@@ -3,6 +3,11 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.10.0] — 2026-08-09
+
+### Added
+- **Live view autostarts (codex-oracle 1.6.0).** Pressing Enter on a backgrounded advisory MCP task shows nothing — MCP tasks carry status pings, not a stdout stream, and only agent-launched SHELLS get an Enter-to-view buffer (host limitation; the reason mcp-live exists). Previously the user had to know to ask for mcp-live per session. Now a PreToolUse hook on `mcp__.*(codex-oracle|antigravity).*` injects an instruction to start the mcp-live tail as a background shell the moment any advisory call begins — scoped to sessions that actually use the advisors (no standing SessionStart noise), idempotent (one shell per session), and in place while a >120s call is still running, since backgrounding returns control mid-turn. A hook process cannot own a Shells-panel row itself, so hook→additionalContext→agent-starts-shell is the only mechanism that yields the panel-native live view.
+
 ## [1.9.0] — 2026-08-08
 
 ### Added
