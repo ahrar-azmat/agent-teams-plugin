@@ -3,6 +3,23 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] — 2026-08-08
+
+### Added
+- **Image references to both advisors.** Pass local image paths (UI screenshots, diagrams, error dialogs) and the model views them — visual context beats prose. codex via native `-i FILE`; agy via its own file tools. Verified live: both read agent names straight off a real screenshot. Missing paths are rejected before any spend. On `architect_review`, `code_review`, `research`, `codex_query`, and `antigravity_query`.
+- **CLAUDE.md as project context for codex** — pinned via `project_doc_fallback_filenames` (survives `--ignore-user-config`; codex also reads it natively — measured both ways).
+
+### Fixed
+- **Default-mode MCP isolation — codex was silently starting all ~12 user MCP servers on every "MCP-free" call.** MEASURED on 0.144.1: `-c mcp_servers={}` (used for this since forever) is a NO-OP — `codex mcp list -c mcp_servers={}` still shows every server, and default runs emitted rmcp worker/auth-failure lines (the noise seen in the live logs). Switched default mode to `--ignore-user-config`, which starts ZERO MCP servers, still honors the explicit `-c`/`--model` overrides, and still reads CLAUDE.md (all verified live: MCP-worker noise 1 → 0). Infra mode deliberately keeps the user config so codex has its own tools. Faster default calls, no more auth-hang noise. Surfaced by codex-oracle's own review of this change.
+- **Output cap lowered to 60K chars (env-adjustable), full answer preserved.** MCP results stay in the caller's context all session (measured: antigravity 18% / codex 8%+ of a session's usage). The complete answer is still saved to the per-run `.result.txt`, and the truncation notice keeps the live-log pointer. A malformed cap env value now falls back instead of crashing the server at import.
+
+### Reviewed
+- Both changes went through parallel codex-oracle + Antigravity review; every CONFIRMED CRITICAL/HIGH was addressed before ship:
+  - **MCP-forwarding into codex was PULLED** — both reviewers independently showed the design was unsound: `-c mcp_servers={...}` deep-merges rather than replaces (so the exclusion set could exclude nothing) and forwarding server `env` through argv exposes credentials. It returns later built correctly (config-file transport + `--ignore-user-config` isolation + 0600), tracked as an open item.
+  - **agy image handling hardened** — `--add-dir` on a real image would have granted its entire parent directory (a screenshot in `$HOME` → `$HOME`). Images are now copied into a private per-run `0700` staging dir that is granted alone and removed after the call.
+  - **Cross-workspace disclosure in resume closed** — the run journal is global; `resume`/`list` now scope to the current workspace and refuse an explicit run id from another workspace, so an untrusted repo can't retrieve another project's answers.
+  - codex image paths resolved to absolute (a `-`-leading relative name can't be parsed as a flag); lone-string `images` coerced to a list.
+
 ## [1.7.0] — 2026-08-08
 
 ### Added

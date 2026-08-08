@@ -50,11 +50,27 @@ from typing import Any, TextIO
 
 from mcp.server.fastmcp import Context, FastMCP
 
-# Safety-net truncation. Claude Code's MAX_MCP_OUTPUT_TOKENS is set to
-# 150K tokens (~600K chars). When multiple MCP tools run in the same
-# agent turn (e.g. Codex + Antigravity in agent-teams), their combined output
-# can overflow context. Cap each tool's output to leave room for others.
-MAX_OUTPUT_CHARS = 200_000
+# Conversation-facing output cap. MCP results STAY IN CONTEXT for the rest
+# of the caller's session (measured 2026-08-08: advisory MCP results = 26%
+# of a session's usage in the Claude Code usage panel). The FULL answer is
+# always persisted to the per-run .result.txt + live log, so the cap only
+# bounds what enters the caller's context; the truncation notice keeps the
+# live-log pointer so the rest is one Read away. ~60K chars ≈ 15K tokens ≈
+# 2× a typical long advisory answer. Env-adjustable, never a code edit.
+def _env_int(name: str, default: int, minimum: int) -> int:
+    """Parse an int env override, clamped to a sane minimum. A malformed or
+    too-small value must NOT crash the server at import (a non-int used to
+    raise ValueError before the module finished loading) — fall back instead."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_OUTPUT_CHARS = _env_int("CODEX_ORACLE_MAX_OUTPUT_CHARS", 60000, 2000)
 
 # ---------------------------------------------------------------------------
 # Subprocess I/O limits
@@ -756,6 +772,7 @@ def _build_exec_argv(
     prompt: str | None = None,
     resume_tid: str | None = None,
     resume_prompt: str | None = None,
+    images: list[str] | None = None,
 ) -> list[str]:
     """codex exec argv for a fresh run or a resume of an existing thread.
 
@@ -764,14 +781,39 @@ def _build_exec_argv(
     ``resume`` subcommand token; ``--json``/``--model``/``--output-last-message``/
     ``--skip-git-repo-check`` are marked global. NO --ephemeral: persisting the
     rollout is what makes interrupted runs resumable.
+
+    MCP isolation (default mode): ``--ignore-user-config``, NOT
+    ``-c mcp_servers={}``. MEASURED 2026-08-08 on 0.144.1: ``-c mcp_servers={}``
+    is a NO-OP — ``codex mcp list -c mcp_servers={}`` still shows every
+    configured server, and default-mode runs emitted rmcp worker/auth-failure
+    lines, i.e. codex was starting all ~12 user MCP servers on every
+    supposedly-MCP-free call. ``--ignore-user-config`` drops
+    ``$CODEX_HOME/config.toml`` entirely (auth still uses CODEX_HOME), so no
+    user MCP servers start; the ``-c`` overrides and ``--model`` below are
+    passed explicitly so they survive it, and CLAUDE.md project-doc discovery
+    still works (all verified live). Infra mode deliberately KEEPS the user
+    config so codex has its own MCP tools (auth0, temporal, ...) for live
+    investigation.
+
+    Images attach via ``-i`` on fresh runs only (vision verified live on
+    0.144.1); on resume the originals are already part of the persisted
+    thread, so re-attaching is unnecessary. ``--image`` is VARIADIC
+    (``<FILE>...``) — measured live: if the ``-i`` list sits immediately
+    before the positional prompt, clap swallows the prompt as another image
+    path and codex reports "No prompt provided via stdin". So images go RIGHT
+    AFTER ``exec``, where the following flag terminates the value list and the
+    prompt stays a clean trailing positional.
     """
+    argv = ["codex", "exec"]
+    if resume_tid is None:
+        for img in images or []:
+            argv += ["-i", img]
     if infra:
-        access_args = ["--sandbox", "danger-full-access"]
+        argv += ["--sandbox", "danger-full-access"]
     else:
-        access_args = ["--sandbox", "read-only", "-c", "mcp_servers={}"]
-    argv = [
-        "codex", "exec",
-        *access_args,
+        # Isolate: no user MCP servers, no user config bleed-through.
+        argv += ["--sandbox", "read-only", "--ignore-user-config"]
+    argv += [
         "--json",
         "--model", model,
         "--skip-git-repo-check",
@@ -780,11 +822,16 @@ def _build_exec_argv(
         "-c", "approval_policy=never",
         "-c", f"model_reasoning_effort={reasoning}",
         "-c", "model_reasoning_summary=detailed",
+        # CLAUDE.md as a project-doc fallback. Explicit -c so it survives
+        # --ignore-user-config (verified: CLAUDE.md still read under it).
+        "-c", 'project_doc_fallback_filenames=["CLAUDE.md"]',
         "-c", f"web_search={'live' if web_search else 'disabled'}",
     ]
     if resume_tid is not None:
         argv += ["resume", resume_tid, resume_prompt or RESUME_NUDGE]
     else:
+        # Images already attached right after `exec` (see docstring — the
+        # variadic -i must not sit next to the positional prompt).
         argv.append(prompt if prompt is not None else "")
     return argv
 
@@ -986,6 +1033,7 @@ async def _run_codex(
     web_search: bool = True,
     resume_tid: str | None = None,
     parent_run: str = "",
+    images: list[str] | None = None,
 ) -> str:
     """Run codex exec headlessly with clean final-message extraction.
 
@@ -1026,6 +1074,23 @@ async def _run_codex(
     """
     model = _get_codex_model()
     reasoning = _get_reasoning_effort()
+
+    # Coerce a lone string to a list — iterating a str yields characters,
+    # which would produce a baffling per-character "not found".
+    if isinstance(images, str):
+        images = [images]
+    if images:
+        missing = [p for p in images if not Path(p).is_file()]
+        if missing:
+            # Refuse loudly BEFORE any spend — a silently dropped image
+            # produces a confident review of the wrong thing.
+            return (
+                "[Error: image file(s) not found — nothing was sent to "
+                f"codex: {', '.join(missing)}]"
+            )
+        # Resolve to absolute paths: a relative path that begins with '-'
+        # (e.g. "-x.png") would be parsed by clap as a flag, not a value.
+        images = [str(Path(p).resolve()) for p in images]
 
     if infra:
         # Infra mode: full sandbox (network + shell) so Codex can SSH to the
@@ -1097,6 +1162,7 @@ async def _run_codex(
         "run": run_tag, "phase": "start", "ts": time.time(), "engine": "codex",
         "model": model, "reasoning": reasoning, "infra": infra,
         "web_search": web_search, "parent_run": parent_run,
+        "images": list(images or []), "cwd": _get_cwd(),
         "prompt": prompt, "log": str(live_path or ""),
     })
 
@@ -1116,7 +1182,7 @@ async def _run_codex(
         output_file = Path(tmp.name)
         cmd = _build_exec_argv(
             model, reasoning, infra, web_search, output_file,
-            prompt=prompt, resume_tid=resume_tid,
+            prompt=prompt, resume_tid=resume_tid, images=images,
         )
         expected_tid = resume_tid
         state["last_error"] = ""
@@ -1285,10 +1351,13 @@ async def _run_codex(
         last_nl = truncated.rfind("\n")
         if last_nl > budget * 0.8:
             truncated = truncated[:last_nl]
+        # The live-log/result-file pointer lives at the END of the result —
+        # re-attach it so the caller can always reach the full answer.
         result = (
             f"{truncated}\n\n"
-            f"[TRUNCATED: output was {len(result):,} chars, "
-            f"capped at {budget:,}]"
+            f"[TRUNCATED: output was {len(result):,} chars, capped at "
+            f"{budget:,} — the FULL answer is in the run's .result.txt next "
+            f"to the live log]{log_note}"
         )
 
     return result
@@ -1306,6 +1375,7 @@ async def architect_review(
     caller_hypothesis: str = "",
     web_search: bool = True,
     infra: bool = False,
+    images: list[str] = [],
     ctx: Context = None,
 ) -> str:
     """
@@ -1398,6 +1468,7 @@ async def architect_review(
     result = await _run_codex(
         "\n".join(prompt_parts), infra=infra, ctx=ctx,
         web_search=web_search, reserve=reserve,
+        images=list(images or []),
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
@@ -1410,6 +1481,7 @@ async def code_review(
     caller_hypothesis: str = "",
     web_search: bool = True,
     infra: bool = False,
+    images: list[str] = [],
     ctx: Context = None,
 ) -> str:
     """
@@ -1504,6 +1576,7 @@ async def code_review(
     result = await _run_codex(
         "\n".join(prompt_parts), infra=infra, ctx=ctx,
         web_search=web_search, reserve=reserve,
+        images=list(images or []),
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
@@ -1515,6 +1588,7 @@ async def research(
     caller_hypothesis: str = "",
     web_search: bool = True,
     infra: bool = False,
+    images: list[str] = [],
     ctx: Context = None,
 ) -> str:
     """
@@ -1543,6 +1617,10 @@ async def research(
             from stale training data; treat them as unverified.
         infra: Enable live-infrastructure access (SSH, live DB, Dokploy,
             logs, MCP tools) for read-only investigation.
+        images: Local image file paths (UI screenshots, diagrams, error
+            dialogs) to attach — codex views them natively, so visual
+            references beat prose descriptions. Missing paths are rejected
+            loudly before any spend.
     """
     hits = _detect_anchoring({"topic": topic, "constraints": constraints})
 
@@ -1594,6 +1672,7 @@ async def research(
     result = await _run_codex(
         "\n".join(prompt_parts), infra=infra, ctx=ctx,
         web_search=web_search, reserve=reserve,
+        images=list(images or []),
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
@@ -1604,6 +1683,7 @@ async def codex_query(
     caller_hypothesis: str = "",
     web_search: bool = True,
     infra: bool = False,
+    images: list[str] = [],
     ctx: Context = None,
 ) -> str:
     """
@@ -1631,6 +1711,10 @@ async def codex_query(
             from stale training data; treat them as unverified.
         infra: Enable live-infrastructure access (SSH, live DB, Dokploy,
             logs, MCP tools) for read-only investigation.
+        images: Local image file paths (UI screenshots, diagrams, error
+            dialogs) to attach — codex views them natively, so visual
+            references beat prose descriptions. Missing paths are rejected
+            loudly before any spend.
     """
     hits = _detect_anchoring({"prompt": prompt})
 
@@ -1658,6 +1742,7 @@ async def codex_query(
     result = await _run_codex(
         preamble + body, infra=infra, ctx=ctx,
         web_search=web_search, reserve=reserve,
+        images=list(images or []),
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
@@ -1683,23 +1768,44 @@ async def codex_resume_run(
 
     Args:
         run: The run id from the failure message ("run id: codex7·21746").
-            Omit to resume the most recent recoverable run.
+            Omit to resume the most recent recoverable run. Pass "list" to
+            see the recent runs and their statuses instead.
         nudge: Optional instruction for the continuation. Default asks for
             the complete final answer from where it left off.
     """
-    runs = _journal_runs()
-    if not runs:
-        return (
-            "[No recorded codex runs to resume.]\n"
-            "Runs are journaled from codex-oracle 1.3.0 onward; older runs "
-            "cannot be recovered — re-dispatch the question instead."
-        )
+    # WORKSPACE SCOPING (security): the journal is global across every project
+    # on this machine. Listing or auto-resuming must not surface another
+    # workspace's prompts/answers — an untrusted repo could otherwise drive a
+    # cross-project read. Scope discovery to the current cwd; an EXPLICIT id
+    # from another workspace is refused rather than silently retrieved.
+    cwd = _get_cwd()
+    all_runs = _journal_runs()
+    runs = {k: v for k, v in all_runs.items() if v.get("cwd") == cwd}
+
+    if run == "list":
+        if not runs:
+            return "[No recorded codex runs for this workspace.]"
+        lines = ["Recent codex runs in this workspace (oldest → newest):"]
+        for rec in list(runs.values())[-10:]:
+            lines.append(
+                f"  • {rec.get('run', '?')}: {rec.get('status') or 'RUNNING/INTERRUPTED'}"
+                f" — {str(rec.get('prompt') or '')[:80]!r}"
+                + (f" [thread {rec.get('thread_id')}]" if rec.get("thread_id") else "")
+            )
+        return "\n".join(lines)
 
     if run:
         rec = runs.get(run)
         if rec is None:
+            # Distinguish "unknown" from "belongs to another workspace" —
+            # never return that run, but say why so it isn't a silent miss.
+            if run in all_runs:
+                return (
+                    f"[Run '{run}' belongs to a different workspace and cannot "
+                    f"be resumed from here.] Re-dispatch it in its own project."
+                )
             known = ", ".join(list(runs)[-5:]) or "(none)"
-            return f"[Unknown run id '{run}'.] Recent runs: {known}"
+            return f"[Unknown run id '{run}'.] Recent runs here: {known}"
     else:
         candidates = [
             r for r in runs.values()
@@ -1707,8 +1813,8 @@ async def codex_resume_run(
         ]
         if not candidates:
             return (
-                "[No failed or interrupted codex run to resume — the most "
-                "recent runs all completed successfully.]"
+                "[No failed or interrupted codex run to resume in this "
+                "workspace — the most recent runs all completed successfully.]"
             )
         rec = candidates[-1]
         run = str(rec.get("run", ""))

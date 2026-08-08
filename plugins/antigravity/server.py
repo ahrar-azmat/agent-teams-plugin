@@ -42,6 +42,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, TextIO
@@ -50,10 +51,26 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-# Safety-net truncation. When multiple MCP tools run in the same agent turn
-# (e.g. Codex + Antigravity in agent-teams), their combined output can overflow
-# context. Cap each tool's output to leave room for others.
-MAX_OUTPUT_CHARS = 300_000
+# Conversation-facing output cap. MCP results STAY IN CONTEXT for the rest
+# of the caller's session (measured 2026-08-08: antigravity results alone =
+# 18% of a session's usage in the Claude Code usage panel). The FULL answer
+# is always persisted to the per-run .result.txt + live log, so the cap only
+# bounds what enters the caller's context; the truncation notice keeps the
+# live-log pointer so the rest is one Read away. ~60K chars ≈ 15K tokens ≈
+# 2× a typical long advisory answer. Env-adjustable, never a code edit.
+def _env_int(name: str, default: int, minimum: int) -> int:
+    """Parse an int env override, clamped to a sane minimum. A malformed or
+    too-small value must NOT crash the server at import — fall back instead."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+MAX_OUTPUT_CHARS = _env_int("ANTIGRAVITY_MAX_OUTPUT_CHARS", 60000, 2000)
 
 
 def _resolve_agy() -> str:
@@ -689,13 +706,30 @@ class AntigravityCLIClient:
         return "\n".join(kept).strip()
 
     @staticmethod
-    def _build_prompt(prompt: str, system_instruction: str | None) -> str:
-        if system_instruction:
-            return f"[System: {system_instruction}]\n\n{prompt}"
-        return prompt
+    def _build_prompt(
+        prompt: str,
+        system_instruction: str | None,
+        images: list[str] | None = None,
+    ) -> str:
+        head = f"[System: {system_instruction}]\n\n" if system_instruction else ""
+        if images:
+            # agy has no --image flag; it reads files with its own tools. Name
+            # the absolute paths and instruct it to view them first. Parent
+            # dirs are added to the workspace via --add-dir (see _build_query_cmd).
+            listing = "\n".join(f"  - {p}" for p in images)
+            head += (
+                "[Attached images — VIEW THESE FILES FIRST using your file/"
+                "image tools before answering; they are references for the "
+                f"task below:\n{listing}\n]\n\n"
+            )
+        return head + prompt
 
     def _build_query_cmd(
-        self, full_prompt: str, model: str, conversation: str | None = None
+        self,
+        full_prompt: str,
+        model: str,
+        conversation: str | None = None,
+        add_dirs: list[str] | None = None,
     ) -> list[str]:
         """Assemble the agy argv for one non-interactive query.
 
@@ -712,6 +746,8 @@ class AntigravityCLIClient:
             "--print-timeout", f"{AGY_PRINT_TIMEOUT_SECONDS}s",
             "--dangerously-skip-permissions",
         ]
+        for d in add_dirs or []:
+            cmd += ["--add-dir", d]
         if conversation:
             cmd += ["--conversation", conversation]
         if self._stream_ok:
@@ -956,6 +992,7 @@ class AntigravityCLIClient:
         resume_cid: str | None = None,
         resume_nudge: str = "",
         parent_run: str = "",
+        images: list[str] | None = None,
     ) -> str:
         """Query Antigravity via agy, with automatic Flash fallback on quota errors.
 
@@ -968,6 +1005,41 @@ class AntigravityCLIClient:
         4. Auth failures raise with instructions (agy needs an interactive
            browser login; there is no headless re-auth).
         """
+        # Validate image paths BEFORE any spend — a silently dropped image
+        # produces a confident answer about the wrong thing.
+        add_dirs: list[str] = []
+        staging_dir: str | None = None
+        if isinstance(images, str):
+            images = [images]  # a lone str would iterate as characters
+        if images:
+            missing = [p for p in images if not Path(p).is_file()]
+            if missing:
+                return (
+                    "[Error: image file(s) not found — nothing was sent to "
+                    f"antigravity: {', '.join(missing)}]"
+                )
+            # SECURITY: agy has no --image flag, so we grant a directory via
+            # --add-dir and name the files in the prompt. Granting the image's
+            # OWN parent would expose every sibling file (a screenshot in $HOME
+            # would grant $HOME). Instead copy the images into a private
+            # per-run 0700 staging dir and grant ONLY that. Cleaned up in a
+            # finally at the end of the call.
+            try:
+                staging_dir = tempfile.mkdtemp(prefix="agy-img-")
+                os.chmod(staging_dir, 0o700)
+                staged: list[str] = []
+                for i, src in enumerate(images):
+                    ext = Path(src).suffix
+                    dst = Path(staging_dir) / f"image_{i}{ext}"
+                    shutil.copyfile(src, dst)
+                    staged.append(str(dst))
+                images = staged
+                add_dirs = [staging_dir]
+            except OSError as e:
+                if staging_dir:
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+                return f"[Error: could not stage image(s) for antigravity: {e}]"
+
         # Refresh the model list (TTL-cached: a real `agy models` fetch happens at
         # most once/hour) so the deepest-thinking Pro tier auto-upgrades if Google
         # ships a newer/deeper one. Failures keep the existing defaults.
@@ -980,7 +1052,7 @@ class AntigravityCLIClient:
             primary_model = self.models.resolve_alias(model)
             user_specified = True
 
-        full_prompt = self._build_prompt(prompt, system_instruction)
+        full_prompt = self._build_prompt(prompt, system_instruction, images)
         env = self._build_environment()
 
         run_state: dict[str, str] = {"run_tag": "", "live_path": "",
@@ -992,7 +1064,9 @@ class AntigravityCLIClient:
         ) -> tuple[str, str, int, str | None, Path | None]:
             nonlocal journal_run
             res = await self._execute_cli(
-                self._build_query_cmd(text or full_prompt, target, conversation), env,
+                self._build_query_cmd(
+                    text or full_prompt, target, conversation, add_dirs
+                ), env,
                 prompt_preview=text or full_prompt, run_state=run_state,
             )
             if not journal_run and run_state["run_tag"]:
@@ -1001,6 +1075,7 @@ class AntigravityCLIClient:
                     "run": journal_run, "phase": "start", "ts": time.time(),
                     "engine": "antigravity", "model": target,
                     "parent_run": parent_run, "prompt": full_prompt,
+                    "cwd": os.environ.get("CLAUDE_CWD", os.getcwd()),
                     "log": run_state["live_path"],
                 })
             if run_state["conversation_id"]:
@@ -1083,8 +1158,13 @@ class AntigravityCLIClient:
 
         log_note = f"\n\n[live log: {live_path}]" if live_path else ""
 
+        def _cleanup_staging() -> None:
+            if staging_dir:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
         def _ok(answer: str, prefix: str = "") -> str:
             """Journal a successful end (persisting the answer) and return it."""
+            _cleanup_staging()
             result_file = ""
             if live_path is not None:
                 with contextlib.suppress(Exception):
@@ -1105,6 +1185,7 @@ class AntigravityCLIClient:
 
         def _fail(msg: str, recoverable: bool = True) -> Exception:
             """Journal a failed end and build the caller-facing exception."""
+            _cleanup_staging()
             run_id = journal_run or run_state["run_tag"]
             _journal({
                 "run": run_id, "phase": "end", "ts": time.time(),
@@ -1525,6 +1606,16 @@ async def list_tools() -> list[Tool]:
                     "system_instruction": {
                         "type": "string",
                         "description": "Optional system instruction to guide Antigravity's behavior"
+                    },
+                    "images": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Local image file paths (UI screenshots, diagrams, "
+                            "error dialogs) for Gemini to view as references — "
+                            "visual context beats a prose description. Missing "
+                            "paths are rejected loudly before any spend."
+                        )
                     }
                 },
                 "required": ["prompt"],
@@ -1917,6 +2008,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 ),
                 model=None,  # always wrapper-decided
                 system_instruction=system,
+                images=[str(p) for p in (arguments.get("images") or [])],
             )
 
         elif name == "antigravity_with_tools":
@@ -2209,10 +2301,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         elif name == "antigravity_resume_run":
             run_id = str(arguments.get("run", "") or "")
             nudge = str(arguments.get("nudge", "") or "")
-            runs = _journal_runs()
+            # WORKSPACE SCOPING (security): the journal is global; discovery
+            # and cross-workspace ids must not leak another project's answers.
+            cwd = os.environ.get("CLAUDE_CWD", os.getcwd())
+            all_runs = _journal_runs()
+            runs = {k: v for k, v in all_runs.items() if v.get("cwd") == cwd}
             if not runs:
                 result = (
-                    "[No recorded antigravity runs to resume.]\n"
+                    "[No recorded antigravity runs to resume in this workspace.]\n"
                     "Runs are journaled from antigravity 1.3.0 onward; older "
                     "runs cannot be recovered — re-dispatch the question."
                 )
@@ -2227,12 +2323,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     rec = candidates[-1] if candidates else None
                     run_id = str(rec.get("run", "")) if rec else ""
                 if rec is None:
-                    known = ", ".join(list(runs)[-5:]) or "(none)"
-                    result = (
-                        f"[No matching recoverable antigravity run"
-                        f"{f' for id {run_id!r}' if run_id else ''}.] "
-                        f"Recent runs: {known}"
-                    )
+                    if run_id and run_id in all_runs:
+                        result = (
+                            f"[Run '{run_id}' belongs to a different workspace "
+                            f"and cannot be resumed from here.]"
+                        )
+                    else:
+                        known = ", ".join(list(runs)[-5:]) or "(none)"
+                        result = (
+                            f"[No matching recoverable antigravity run"
+                            f"{f' for id {run_id!r}' if run_id else ''}.] "
+                            f"Recent runs here: {known}"
+                        )
                 else:
                     stored_path = str(rec.get("result_file") or "")
                     stored = ""
@@ -2287,6 +2389,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             - _TRUNC_NOTICE_ALLOWANCE
         )
         if len(result) > budget:
+            # Preserve the live-log pointer — it is how the caller reaches
+            # the untruncated answer, and it lives at the END of the result
+            # where naive slicing would cut it off.
+            pointer = ""
+            for ln in reversed(result.splitlines()):
+                if ln.startswith("[live log: "):
+                    pointer = "\n" + ln
+                    break
             truncated = result[:budget]
             last_nl = truncated.rfind("\n")
             if last_nl > budget * 0.8:
@@ -2294,7 +2404,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             result = (
                 f"{truncated}\n\n"
                 f"[TRUNCATED: output was {len(result):,} chars, "
-                f"capped at {budget:,}]"
+                f"capped at {budget:,} — the FULL answer is in the run's "
+                f".result.txt next to the live log]{pointer}"
             )
 
         # Checked against the POST-truncation text — the verdict must be in what
