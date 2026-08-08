@@ -480,6 +480,14 @@ STREAM_LOG_MAX_BYTES = 128 * 1024 * 1024
 _live_log_seq = itertools.count(1)
 
 
+def _private(path: Path, mode: int) -> None:
+    """Tighten permissions on a log/journal file or dir. These carry full
+    prompts, model output and command output — other local users must not be
+    able to read them (they were 0644 before). Never raises."""
+    with contextlib.suppress(OSError):
+        os.chmod(path, mode)
+
+
 def _prune_live_logs() -> None:
     """Drop run logs older than the retention window. Never raises."""
     cutoff = time.time() - LIVE_LOG_RETENTION_DAYS * 86_400
@@ -507,10 +515,12 @@ def _open_live_log(label: str) -> tuple[Path | None, TextIO | None, TextIO | Non
     stream_fh: TextIO | None = None
     try:
         LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _private(LIVE_LOG_DIR, 0o700)
         _prune_live_logs()
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = LIVE_LOG_DIR / f"{stamp}-p{os.getpid()}-{seq}-{label}.log"
         fh = path.open("w", encoding="utf-8")
+        _private(path, 0o600)
         latest = LIVE_LOG_DIR / "latest.log"
         with contextlib.suppress(OSError):
             latest.unlink(missing_ok=True)
@@ -528,6 +538,7 @@ def _open_live_log(label: str) -> tuple[Path | None, TextIO | None, TextIO | Non
                 stream_path.write_text("")
                 truncated = True
         stream_fh = stream_path.open("a", encoding="utf-8")
+        _private(stream_path, 0o600)
         if truncated:
             stream_fh.write(
                 f"# stream.log truncated past {STREAM_LOG_MAX_BYTES:,} bytes "
@@ -674,6 +685,83 @@ def _process_exec_event(ev: dict[str, Any], state: dict[str, str]) -> str | None
 
 
 # ---------------------------------------------------------------------------
+# Advisor context (curated, secret-free — NOT CLAUDE.md, NOT memory)
+# ---------------------------------------------------------------------------
+# SECURITY: a project's CLAUDE.md and its memory files contain LIVE SECRETS
+# (verified: this workspace's CLAUDE.md carries SSH/DB passwords in its first
+# 3 KB and says "never copy into any repo"; project-typed memories carry
+# credentials too). The advisors are EXTERNAL providers (OpenAI/Google), so we
+# NEVER inject those. We inject ONLY a file the maintainer curates to be
+# external-safe: ADVISOR_CONTEXT.md. Absent file = nothing sent (default
+# CLOSED). Chosen by the user 2026-08-09.
+#
+# NOTE (measured 0.144.1, twice): codex reads CLAUDE.md as a project doc
+# NATIVELY and neither `project_doc_max_bytes=0` nor
+# `project_doc_fallback_filenames=[...]` suppresses it — so codex→OpenAI
+# CLAUDE.md exposure is PRE-EXISTING and outside this wrapper's control. We
+# neither add to it nor pin it. (A source read of a NEWER upstream commit
+# suggests it is only a configurable fallback there; that is not what the
+# deployed binary does — verify the backend you run, not the source you read.)
+ADVISOR_CONTEXT_FILE = "ADVISOR_CONTEXT.md"
+ADVISOR_CONTEXT_MAX_CHARS = _env_int("CODEX_ORACLE_ADVISOR_CONTEXT_MAX_CHARS", 32000, 0)
+
+
+def _advisor_context_bases(cwd: Path, home: Path) -> list[Path]:
+    """Directories to search for ADVISOR_CONTEXT.md, nearest first.
+
+    Bounded to $HOME: inside it we walk cwd -> $HOME; OUTSIDE it (e.g. cwd is
+    /tmp/project) we search ONLY cwd — never a shared parent like /tmp or /
+    where another user could plant a file."""
+    if cwd == home or home in cwd.parents:
+        bases, b = [], cwd
+        while True:
+            bases.append(b)
+            if b == home:
+                break
+            b = b.parent
+        return bases
+    return [cwd]
+
+
+def _advisor_context(max_chars: int = ADVISOR_CONTEXT_MAX_CHARS) -> str:
+    """The curated ADVISOR_CONTEXT.md (cwd, then up to $HOME), bounded, or "".
+
+    Explicitly NOT CLAUDE.md/AGENTS.md/memory — only the maintainer's vetted,
+    secret-free advisor file. Nearest wins. Best-effort; never raises.
+
+    SECURITY: the file must be a REGULAR file, NOT a symlink (a repo could
+    plant ADVISOR_CONTEXT.md -> ~/.ssh/id_rsa or -> CLAUDE.md and exfiltrate
+    it to the provider), must resolve inside the directory it was found in,
+    and is read with a BOUNDED read so a huge file can't exhaust memory."""
+    if max_chars <= 0:
+        return ""
+    with contextlib.suppress(OSError):
+        cwd = Path(os.environ.get("CLAUDE_CWD", os.getcwd())).resolve()
+        home = Path.home().resolve()
+        for base in _advisor_context_bases(cwd, home):
+            fp = base / ADVISOR_CONTEXT_FILE
+            try:
+                if fp.is_symlink() or not fp.is_file():
+                    continue
+                if not fp.resolve().is_relative_to(base.resolve()):
+                    continue  # a parent-dir symlink escaped the tree
+                with fp.open("r", encoding="utf-8", errors="replace") as fh:
+                    raw = fh.read(max_chars + 1)  # bounded read
+            except OSError:
+                continue
+            text = raw.strip()
+            if text:
+                body = text[:max_chars]
+                if len(raw) > max_chars:
+                    body += "\n[...advisor context truncated...]"
+                return (
+                    "[PROJECT CONTEXT — the maintainer's curated, external-safe "
+                    f"notes on how this codebase works ({fp}):\n\n{body}]"
+                )
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Run journal + resume/retry
 # ---------------------------------------------------------------------------
 # Sessions are the recovery substrate. codex writes its rollout INCREMENTALLY
@@ -705,10 +793,12 @@ def _journal(rec: dict[str, Any]) -> None:
     """Append one record to runs.jsonl, flushed so a kill cannot lose it."""
     with contextlib.suppress(Exception):
         LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _private(LIVE_LOG_DIR, 0o700)
         with contextlib.suppress(OSError):
             if RUNS_JOURNAL.exists() and RUNS_JOURNAL.stat().st_size > RUNS_JOURNAL_MAX_BYTES:
                 RUNS_JOURNAL.replace(RUNS_JOURNAL.with_suffix(".jsonl.1"))
         with RUNS_JOURNAL.open("a", encoding="utf-8") as fh:
+            _private(RUNS_JOURNAL, 0o600)
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
@@ -824,9 +914,12 @@ def _build_exec_argv(
         "-c", "approval_policy=never",
         "-c", f"model_reasoning_effort={reasoning}",
         "-c", "model_reasoning_summary=detailed",
-        # CLAUDE.md as a project-doc fallback. Explicit -c so it survives
-        # --ignore-user-config (verified: CLAUDE.md still read under it).
-        "-c", 'project_doc_fallback_filenames=["CLAUDE.md"]',
+        # NO CLAUDE.md project-doc pin: that file carries LIVE SECRETS and the
+        # advisor is an external provider. (Measured twice on 0.144.1: codex
+        # reads CLAUDE.md natively regardless — neither project_doc_max_bytes=0
+        # nor a fallback-list override suppresses it. That exposure is
+        # pre-existing and outside this wrapper; we simply never add to it.
+        # We inject only the curated ADVISOR_CONTEXT.md ourselves.)
         "-c", f"web_search={'live' if web_search else 'disabled'}",
     ]
     if resume_tid is not None:
@@ -1298,6 +1391,7 @@ async def _run_codex(
         with contextlib.suppress(Exception):
             rf = live_path.with_suffix(".result.txt")
             rf.write_text(final_message, encoding="utf-8")
+            _private(rf, 0o600)
             result_file = str(rf)
     _journal({
         "run": run_tag, "phase": "end", "ts": time.time(), "status": status,

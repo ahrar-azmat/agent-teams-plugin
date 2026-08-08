@@ -3,6 +3,19 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.11.0] — 2026-08-09
+
+### Added
+- **Curated project context for both advisors — `ADVISOR_CONTEXT.md`.** Drop an `ADVISOR_CONTEXT.md` at your repo root (or anywhere up to `$HOME`) with the architecture/conventions notes you're happy to send to an external model, and every codex-oracle and antigravity call is prefixed with it. This is the ONLY file the wrappers inject. Absent file = nothing sent (default CLOSED). Live-verified on both engines.
+
+### Security
+- **The obvious version of this feature would have exfiltrated your secrets — it was built, caught in review, and rebuilt.** The first implementation injected `CLAUDE.md`/`AGENTS.md` plus "facts-only" project memory. Verified against a real workspace: that `CLAUDE.md` carries **live SSH/DB passwords in its first 3 KB** (and says *"never copy into any repo"*), and `type: project` memories carry credentials too — so it would have shipped live secrets to OpenAI **and Google** on every call, and written them to world-readable logs. `metadata.type` is a *factuality* boundary, never a *confidentiality* one. Both injectors were removed entirely; only the curated file remains.
+- **`ADVISOR_CONTEXT.md` is symlink-hardened.** A hostile repo could otherwise ship `ADVISOR_CONTEXT.md → ~/.ssh/id_rsa` (or `→ CLAUDE.md`) and exfiltrate the target, since `Path.is_file()` follows symlinks. Symlinks are refused, the resolved path must stay inside the directory it was found in, the read is bounded, and the upward walk stops at `$HOME` (outside `$HOME` only `cwd` is searched, so a planted `/tmp/ADVISOR_CONTEXT.md` is ignored).
+- **Logs, journals, stream files and stored results are now `0600`, their directories `0700`** (were `0644`/`0755`). They contain full prompts, model output and command output — other local users could read them.
+- **No `CLAUDE.md` project-doc pin.** MEASURED twice on codex 0.144.1: codex reads `CLAUDE.md` natively and NEITHER `project_doc_max_bytes=0` NOR a `project_doc_fallback_filenames` override suppresses it. That codex→OpenAI exposure is pre-existing and outside this wrapper's control; we no longer pin it, so we never add to it. (A newer upstream source commit suggests it is only a configurable fallback *there* — the deployed binary behaves otherwise. Verify the backend you run, not the source you read.)
+
+### Deferred
+- **MCP-forwarding (Claude's tools → codex) is NOT in this release**, after being built twice. Both reviewers independently established the blocker is inherent rather than a wrapper bug: to give codex your MCP tools, those servers' credentials must be readable by a codex process that can be prompt-injected, and codex's own recommendation is a sanitized container plus a capability broker — a different product. The secure-transport work (0600 config in a private `CODEX_HOME`, additive config merge preserving proxies/TLS/providers, fail-closed prep, resume-home retention) is kept for a focused round.
 ## [1.10.0] — 2026-08-09
 
 ### Added

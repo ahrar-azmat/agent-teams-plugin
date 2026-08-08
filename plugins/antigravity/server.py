@@ -72,6 +72,65 @@ def _env_int(name: str, default: int, minimum: int) -> int:
 
 MAX_OUTPUT_CHARS = _env_int("ANTIGRAVITY_MAX_OUTPUT_CHARS", 60000, 2000)
 
+# Advisor context (curated, secret-free). agy reads NO project docs natively
+# (measured: CLAUDE.md/AGENTS.md/GEMINI.md all NONE), and injecting CLAUDE.md
+# or memory would exfiltrate LIVE SECRETS to Google (this repo's CLAUDE.md
+# carries SSH/DB passwords). So we inject ONLY the maintainer's curated,
+# external-safe ADVISOR_CONTEXT.md. Absent = nothing sent (default CLOSED).
+ADVISOR_CONTEXT_FILE = "ADVISOR_CONTEXT.md"
+ADVISOR_CONTEXT_MAX_CHARS = _env_int("ANTIGRAVITY_ADVISOR_CONTEXT_MAX_CHARS", 32000, 0)
+
+
+def _advisor_context_bases(cwd: Path, home: Path) -> list[Path]:
+    """Dirs to search for ADVISOR_CONTEXT.md, nearest first. Bounded to $HOME:
+    inside it walk cwd -> $HOME; OUTSIDE it search ONLY cwd (never a shared
+    parent like /tmp where another user could plant a file)."""
+    if cwd == home or home in cwd.parents:
+        bases, b = [], cwd
+        while True:
+            bases.append(b)
+            if b == home:
+                break
+            b = b.parent
+        return bases
+    return [cwd]
+
+
+def _advisor_context(max_chars: int = ADVISOR_CONTEXT_MAX_CHARS) -> str:
+    """The curated ADVISOR_CONTEXT.md (cwd, then up to $HOME), bounded, or "".
+
+    Explicitly NOT CLAUDE.md/AGENTS.md/memory. Nearest wins. Never raises.
+    SECURITY: reject a SYMLINK named ADVISOR_CONTEXT.md (a repo could point it
+    at ~/.ssh/id_rsa or CLAUDE.md to exfiltrate it to Google), require the
+    resolved path to stay inside its directory, and read BOUNDED."""
+    if max_chars <= 0:
+        return ""
+    with contextlib.suppress(OSError):
+        cwd = Path(os.environ.get("CLAUDE_CWD", os.getcwd())).resolve()
+        home = Path.home().resolve()
+        for base in _advisor_context_bases(cwd, home):
+            fp = base / ADVISOR_CONTEXT_FILE
+            try:
+                if fp.is_symlink() or not fp.is_file():
+                    continue
+                if not fp.resolve().is_relative_to(base.resolve()):
+                    continue
+                with fp.open("r", encoding="utf-8", errors="replace") as fh:
+                    raw = fh.read(max_chars + 1)
+            except OSError:
+                continue
+            text = raw.strip()
+            if text:
+                body = text[:max_chars]
+                if len(raw) > max_chars:
+                    body += "\n[...advisor context truncated...]"
+                return (
+                    "[PROJECT CONTEXT — the maintainer's curated, external-safe "
+                    f"notes on how this codebase works ({fp}):\n\n{body}]"
+                )
+    return ""
+
+
 
 def _agy_install_dir() -> Path:
     """Where the official installer puts agy: ~/.local/bin on POSIX,
@@ -188,6 +247,14 @@ PROGRESS_INTERVAL_SECONDS = float(
 _live_log_seq = itertools.count(1)
 
 
+def _private(path: Path, mode: int) -> None:
+    """Tighten permissions on a log/journal file or dir — they carry full
+    prompts and model output, so other local users must not read them
+    (they were 0644 before). Never raises."""
+    with contextlib.suppress(OSError):
+        os.chmod(path, mode)
+
+
 def _prune_live_logs() -> None:
     """Drop run logs older than the retention window. Never raises."""
     cutoff = time.time() - LIVE_LOG_RETENTION_DAYS * 86_400
@@ -214,10 +281,12 @@ def _open_live_log(label: str) -> tuple[Path | None, TextIO | None, TextIO | Non
     stream_fh: TextIO | None = None
     try:
         LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _private(LIVE_LOG_DIR, 0o700)
         _prune_live_logs()
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = LIVE_LOG_DIR / f"{stamp}-p{os.getpid()}-{seq}-{label}.log"
         fh = path.open("w", encoding="utf-8")
+        _private(path, 0o600)
         latest = LIVE_LOG_DIR / "latest.log"
         with contextlib.suppress(OSError):
             latest.unlink(missing_ok=True)
@@ -235,6 +304,7 @@ def _open_live_log(label: str) -> tuple[Path | None, TextIO | None, TextIO | Non
                 stream_path.write_text("")
                 truncated = True
         stream_fh = stream_path.open("a", encoding="utf-8")
+        _private(stream_path, 0o600)
         if truncated:
             stream_fh.write(
                 f"# stream.log truncated past {STREAM_LOG_MAX_BYTES:,} bytes "
@@ -291,10 +361,12 @@ def _journal(rec: dict[str, Any]) -> None:
     """Append one record to runs.jsonl, flushed so a kill cannot lose it."""
     with contextlib.suppress(Exception):
         LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        _private(LIVE_LOG_DIR, 0o700)
         with contextlib.suppress(OSError):
             if RUNS_JOURNAL.exists() and RUNS_JOURNAL.stat().st_size > RUNS_JOURNAL_MAX_BYTES:
                 RUNS_JOURNAL.replace(RUNS_JOURNAL.with_suffix(".jsonl.1"))
         with RUNS_JOURNAL.open("a", encoding="utf-8") as fh:
+            _private(RUNS_JOURNAL, 0o600)
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
@@ -1071,6 +1143,11 @@ class AntigravityCLIClient:
             user_specified = True
 
         full_prompt = self._build_prompt(prompt, system_instruction, images)
+        # agy reads no project docs natively — inject ONLY the curated,
+        # external-safe ADVISOR_CONTEXT.md (never CLAUDE.md/memory: secrets).
+        _ctx = _advisor_context()
+        if _ctx:
+            full_prompt = f"{_ctx}\n\n{full_prompt}"
         env = self._build_environment()
 
         run_state: dict[str, str] = {"run_tag": "", "live_path": "",
@@ -1188,6 +1265,7 @@ class AntigravityCLIClient:
                 with contextlib.suppress(Exception):
                     rf = Path(str(live_path)).with_suffix(".result.txt")
                     rf.write_text(answer, encoding="utf-8")
+                    _private(rf, 0o600)
                     result_file = str(rf)
             _journal({
                 "run": journal_run or run_state["run_tag"], "phase": "end",
