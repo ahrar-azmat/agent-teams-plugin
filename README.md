@@ -79,8 +79,11 @@ Then just ask for multi-agent work (e.g. *"Create an agent team to review this P
   { "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" } }
   ```
 - **Optional — multi-model advisory:** the `codex-oracle` and `antigravity` MCP servers (both ship in this marketplace). If they aren't configured, the skill still runs normally; the cross-model steps are simply skipped.
-  - `codex-oracle` needs the Codex CLI authenticated (`codex`); live web search is forced on per call, so no config change is required.
+  - Both servers are Python and launch via `python` (≥3.11) on PATH — on python3-only systems (stock macOS), point `python` at python3.
+  - `codex-oracle` needs the Codex CLI (`npm i -g @openai/codex`) authenticated (`codex`); live web search is forced on per call, so no config change is required.
   - `antigravity` needs `agy` installed and signed in (`agy` in a terminal, complete the Google sign-in — there is no headless re-auth).
+    - POSIX: `curl -fsSL https://antigravity.google/cli/install.sh | bash` · Windows: `irm https://antigravity.google/cli/install.ps1 | iex` (installs to `%LOCALAPPDATA%\agy\bin`; open a fresh terminal afterward).
+  - **Windows (v1.9.0+):** fully supported — no WSL needed. Optional: enable Developer Mode if you want the `latest.log` convenience symlink; without it the merged `stream.log` is the live view.
 
 ## License
 

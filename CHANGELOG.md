@@ -3,6 +3,22 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] — 2026-08-08
+
+### Added
+- **Native Windows support for both advisory MCPs** (codex-oracle 1.5.0, antigravity 1.5.0). The stack was POSIX-only in five verified places; a fresh Windows 11 machine now works end-to-end:
+  - **Launcher.** `.mcp.json` pointed at `run-server.sh` — Windows cannot exec a `.sh` file at all, and a Windows venv keeps its interpreter at `.venv/Scripts/python.exe`, not `.venv/bin/python`. Both plugins now launch `run_server.py` via `python` (exec-form args; `${CLAUDE_PLUGIN_ROOT}` expansion unchanged). Same behavior as the shell version — marketplace-checkout venv fast path, cold venv bootstrap with all output on stderr — on both platforms. `run-server.sh` is deleted: one launcher, no drift.
+  - **codex argv[0].** npm installs only `.cmd`/`.ps1` shims on Windows, and `CreateProcess` cannot resolve a bare `codex` (WinError 2 — MEASURED on codex-cli 0.147.0: the spawn died before the server's own install-hint path could even fire). `_codex_argv0()` resolves the shim PATHEXT-aware via `shutil.which` and prefers the vendored native `codex.exe` (keeps untrusted prompt text away from cmd.exe argument parsing), falling back to node + `codex.js`, then the full-path shim (measured spawnable when given a full path).
+  - **PATH corruption.** The codex spawn env unconditionally prepended `/opt/homebrew/bin:` — on Windows, where the separator is `;`, that silently corrupted the first real PATH entry. Homebrew prepend is now macOS-only and uses `os.pathsep`.
+  - **agy resolution.** The Windows installer places `agy.exe` at `%LOCALAPPDATA%\agy\bin` and only updates the User PATH *registry* — a process started before the install (or before a terminal restart) never sees it, so a bare PATH lookup misses agy for the whole session (observed live). `_resolve_agy()` now checks the per-platform install dir absolutely (`~/.local/bin` POSIX, `%LOCALAPPDATA%\agy\bin` Windows) before any PATH lookup, and `_build_environment` prepends the same dir.
+  - **Hooks.** The sh+jq one-liners (POSIX-shell-only) became `hooks/plan_gate.py` + `hooks/push_gate.py`, wired in exec form (`command` + `args`) so NO shell parses them on either platform. Gate message text unchanged; the jq dependency is gone on POSIX too. `push_gate.py` stays fail-open: malformed payloads or unreadable transcripts never block the tool call.
+
+### Changed
+- **POSIX launcher requirement.** The MCP command is now `python` (≥3.11) — plugin `.mcp.json` has no per-platform command mechanism, so one name must resolve everywhere. On python3-only systems (stock macOS), point `python` at python3 (pyenv, or an alias/symlink) — the changelogged alternative was keeping `.sh` and having no Windows story at all.
+
+### Unchanged by design
+- `latest.log` symlinks were already `contextlib.suppress(OSError)`-guarded ("observability must never break the run") — on Windows without Developer Mode the symlink is silently skipped; `stream.log` and the per-run files remain the live view.
+
 ## [1.8.0] — 2026-08-08
 
 ### Added

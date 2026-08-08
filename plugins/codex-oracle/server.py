@@ -42,6 +42,8 @@ import itertools
 import json
 import os
 import re
+import shutil
+import sys
 import tempfile
 import time
 import tomllib
@@ -804,7 +806,7 @@ def _build_exec_argv(
     AFTER ``exec``, where the following flag terminates the value list and the
     prompt stays a clean trailing positional.
     """
-    argv = ["codex", "exec"]
+    argv = [*_codex_argv0(), "exec"]
     if resume_tid is None:
         for img in images or []:
             argv += ["-i", img]
@@ -837,6 +839,44 @@ def _build_exec_argv(
 
 
 
+def _codex_argv0() -> list[str]:
+    """Executable prefix for codex — usually one element, ["node", codex.js] as
+    a fallback.
+
+    POSIX: the bare name resolves via PATH. Windows: npm installs only
+    .cmd/.ps1 shims, and CreateProcess cannot resolve a bare "codex" to a
+    .cmd (WinError 2, measured on codex-cli 0.147.0) — so resolve the shim
+    via shutil.which (PATHEXT-aware) and prefer the vendored native
+    codex.exe next to it, which avoids routing untrusted prompt text through
+    cmd.exe. Fallbacks: node + codex.js, then the full-path .cmd shim
+    (spawnable when given a full path — measured).
+    """
+    if os.name != "nt":
+        return ["codex"]
+    shim = shutil.which("codex")
+    if not shim:
+        return ["codex"]  # spawn fails; the caller reports the install hint
+    pkg = Path(shim).parent / "node_modules" / "@openai" / "codex"
+    for exe in sorted(pkg.glob("node_modules/@openai/codex-win32-*/vendor/*/bin/codex.exe")):
+        return [str(exe)]
+    js = pkg / "bin" / "codex.js"
+    node = shutil.which("node")
+    if js.is_file() and node:
+        return [node, str(js)]
+    return [shim]
+
+
+def _codex_env() -> dict[str, str]:
+    """Subprocess env. On macOS ensure Homebrew's bin dir is on PATH; on
+    other platforms the parent PATH passes through untouched (the previous
+    unconditional '/opt/homebrew/bin:' prefix corrupted the first PATH entry
+    on Windows, where the separator is ';')."""
+    env = dict(os.environ)
+    if sys.platform == "darwin":
+        env["PATH"] = "/opt/homebrew/bin" + os.pathsep + env.get("PATH", "")
+    return env
+
+
 async def _exec_codex_once(
     cmd: list[str],
     output_file: Path,
@@ -861,7 +901,7 @@ async def _exec_codex_once(
             stderr=asyncio.subprocess.PIPE,
             cwd=_get_cwd(),
             limit=SUBPROCESS_BUFFER_LIMIT,
-            env={**os.environ, "PATH": f"/opt/homebrew/bin:{os.environ.get('PATH', '')}"},
+            env=_codex_env(),
         )
     except FileNotFoundError:
         output_file.unlink(missing_ok=True)

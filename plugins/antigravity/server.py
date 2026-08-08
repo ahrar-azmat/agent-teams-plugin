@@ -73,9 +73,26 @@ def _env_int(name: str, default: int, minimum: int) -> int:
 MAX_OUTPUT_CHARS = _env_int("ANTIGRAVITY_MAX_OUTPUT_CHARS", 60000, 2000)
 
 
+def _agy_install_dir() -> Path:
+    """Where the official installer puts agy: ~/.local/bin on POSIX,
+    %LOCALAPPDATA%\\agy\\bin on Windows (verified against install.ps1,
+    agy placed at ...\\agy\\bin\\agy.exe)."""
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA")
+        base = Path(local) if local else Path.home() / "AppData" / "Local"
+        return base / "agy" / "bin"
+    return Path.home() / ".local" / "bin"
+
+
 def _resolve_agy() -> str:
-    """Absolute path to the agy binary so the MCP server's PATH is irrelevant."""
-    candidate = Path.home() / ".local" / "bin" / "agy"
+    """Absolute path to the agy binary so the MCP server's PATH is irrelevant.
+
+    The absolute-path candidate matters most on Windows: the installer adds
+    its bin dir to the User PATH *registry*, which a Claude Code process
+    started earlier never sees — a bare PATH lookup would miss agy for the
+    rest of that session.
+    """
+    candidate = _agy_install_dir() / ("agy.exe" if os.name == "nt" else "agy")
     if candidate.exists():
         return str(candidate)
     # Fall back to a PATH lookup (create_subprocess_exec uses the parent PATH,
@@ -603,8 +620,9 @@ class AntigravityCLIClient:
     def _build_environment(self) -> dict:
         """Build the subprocess environment (PATH + shared secrets)."""
         env = os.environ.copy()
-        # Ensure ~/.local/bin is on PATH so agy (and its self-update) resolve.
-        local_bin = str(Path.home() / ".local" / "bin")
+        # Ensure the agy install dir is on PATH so agy (and its self-update)
+        # resolve — ~/.local/bin on POSIX, %LOCALAPPDATA%\agy\bin on Windows.
+        local_bin = str(_agy_install_dir())
         if local_bin not in env.get("PATH", "").split(os.pathsep):
             env["PATH"] = local_bin + os.pathsep + env.get("PATH", "")
         for key, value in self._load_secrets().items():
