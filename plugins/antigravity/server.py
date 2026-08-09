@@ -244,6 +244,17 @@ STREAM_LOG_MAX_BYTES = 128 * 1024 * 1024
 PROGRESS_INTERVAL_SECONDS = float(
     os.environ.get("ANTIGRAVITY_PROGRESS_INTERVAL", "10")
 )
+# STOP heartbeating once the client has BACKGROUNDED the call (measured on the
+# sibling codex-oracle server, 2026-08-09, same design): Claude Code moves an
+# MCP call to a background task at ~120s and DEREGISTERS its progress token.
+# Continuing to send on it produces "progress notification for an unknown
+# token" connection errors and the client eventually SIGTERMs the server —
+# killing every sibling in-flight run. Heartbeats only matter while the client
+# is WAITING (30-min idle abort); after backgrounding it gets a completion
+# notification instead. The live log keeps streaming either way.
+PROGRESS_MAX_SECONDS = float(
+    os.environ.get("ANTIGRAVITY_PROGRESS_MAX_SECONDS", "150")
+)
 _live_log_seq = itertools.count(1)
 
 
@@ -961,6 +972,16 @@ class AntigravityCLIClient:
             while True:
                 await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
                 elapsed = time.monotonic() - t0
+                if elapsed > PROGRESS_MAX_SECONDS:
+                    # Past the client's backgrounding threshold: its progress
+                    # token is gone and sending on it can get the whole server
+                    # SIGTERM'd (see PROGRESS_MAX_SECONDS). The live log
+                    # continues to carry every event.
+                    _emit(
+                        f"⏱ progress notifications stopped at {int(elapsed)}s "
+                        f"(call backgrounded by the client; live log continues)"
+                    )
+                    return
                 await _report_progress(
                     min(elapsed, AGY_OVERALL_TIMEOUT_SECONDS),
                     AGY_OVERALL_TIMEOUT_SECONDS,

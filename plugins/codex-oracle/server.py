@@ -100,6 +100,25 @@ PROGRESS_INTERVAL_SECONDS = float(
     os.environ.get("CODEX_ORACLE_PROGRESS_INTERVAL", "10")
 )
 
+# STOP heartbeating once the client has BACKGROUNDED the call — measured
+# incident 2026-08-09. Claude Code moves an MCP call to a background task at
+# ~120s and DEREGISTERS that request's progress token. Our heartbeat kept
+# sending on it every 10s; each one came back as
+#   "Connection error: Received a progress notification for an unknown token"
+# and after enough of them the client KILLED THE SERVER
+#   ("SIGINT failed, sending SIGTERM to MCP server process")
+# taking every SIBLING in-flight run down with it
+#   ("Tool 'architect_review' failed after 269s: MCP error -32000: Connection
+#    closed").
+# Heartbeats only ever existed to stop the client's 30-min idle-abort while it
+# WAITS on the call; once the call is backgrounded the client no longer waits
+# (it gets a completion notification instead), so further progress is useless
+# AND actively harmful. Stop just past the backgrounding threshold. The live
+# log keeps streaming regardless, so nothing observable is lost.
+PROGRESS_MAX_SECONDS = float(
+    os.environ.get("CODEX_ORACLE_PROGRESS_MAX_SECONDS", "150")
+)
+
 # ---------------------------------------------------------------------------
 # Timeouts
 # ---------------------------------------------------------------------------
@@ -1100,6 +1119,16 @@ async def _exec_codex_once(
         while True:
             await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
             elapsed = time.monotonic() - started
+            if elapsed > PROGRESS_MAX_SECONDS:
+                # Past the client's backgrounding threshold: the request's
+                # progress token is gone, and sending on it kills the whole
+                # server (see PROGRESS_MAX_SECONDS). Stop — the live log
+                # continues to carry every event.
+                emit(
+                    f"⏱ progress notifications stopped at {int(elapsed)}s "
+                    f"(call backgrounded by the client; live log continues)"
+                )
+                return
             with contextlib.suppress(Exception):
                 await ctx.report_progress(
                     min(elapsed, MAX_RUNTIME_SECONDS),

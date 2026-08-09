@@ -3,6 +3,14 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.12.1] — 2026-08-09
+
+### Fixed
+- **The progress heartbeat was getting the whole MCP server killed — taking every sibling in-flight run with it.** MEASURED from the client log 2026-08-09: Claude Code moves an MCP call to a background task at ~120s and **deregisters that request's progress token**. The 10s heartbeat kept sending on it, so every tick came back as `Connection error: Received a progress notification for an unknown token`, and after enough of them the client killed the server — `SIGINT failed, sending SIGTERM to MCP server process` — ending unrelated concurrent calls with `Tool 'architect_review' failed after 269s: MCP error -32000: Connection closed`. One long backgrounded call could therefore kill a whole batch of parallel advisory runs.
+  - Heartbeats only ever existed to hold off the client's 30-minute idle-abort **while it is waiting** on the call. Once the call is backgrounded the client stops waiting (it gets a completion notification instead), so further progress is useless *and* actively harmful.
+  - Both servers now stop heartbeating at `PROGRESS_MAX_SECONDS` (default **150s**, comfortably past the ~120s backgrounding threshold, env-tunable) and RECORD the stop in the live log rather than going silently quiet. The live log keeps streaming every event, so nothing observable is lost — `mcp-live` / `tail -f` is unaffected.
+  - 11 heartbeat tests: the loop ends by itself, sends stop at the bound, the guard and its log line are present in both shipped servers, and both defaults clear the threshold.
+
 ## [1.12.0] — 2026-08-09
 
 ### Changed
