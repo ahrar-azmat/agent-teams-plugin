@@ -21,10 +21,16 @@ how a real defect ships.
 1. Run `git diff` via Bash to gather all changes in the working directory (staged + unstaged)
 2. If the diff is large, also read the changed files with Read to understand full context
 3. Call BOTH reviewers in PARALLEL (same tool call batch) and **BLIND**:
-   - **Codex**: `mcp__codex-oracle__code_review` with the diff
-   - **Antigravity**: `mcp__antigravity__antigravity_review_pr` with the same diff (strictness: `strict`)
-4. Wait for BOTH to respond — do NOT skip either
-5. Synthesize into a unified report
+   - **Codex** — **PRIMARY, authoritative**: `mcp__codex-oracle__code_review` with the diff
+   - **Antigravity** — **SECONDARY, corroborating**: `mcp__antigravity__antigravity_review_pr`
+     with the same diff (strictness: `strict`)
+4. **Wait for BOTH — and above all for CODEX.** Codex runs at max reasoning and often takes many
+   minutes; a long call is backgrounded and returns later as a task notification. That is normal.
+   Antigravity nearly always answers first — **first is not authoritative.** Reporting a verdict
+   with only Antigravity's answer is a HALF REVIEW and is not permitted; wait for Codex.
+5. Synthesize into a unified report — **Codex's verdict governs** where the two disagree, unless
+   you can disprove it by measuring the deployed system. An Antigravity-only finding is still
+   real: verify it, never discard it because Codex didn't mention it.
 
 ## Dispatch rules (the part that is easy to get wrong)
 
@@ -64,12 +70,16 @@ Synthesize findings from both models into ONE compact report. Do NOT dump raw ou
 model separately.
 
 ### Review Summary
-- **Verdict**: Ship it / Needs changes / Do not ship
+- **Verdict**: Ship it / Needs changes / Do not ship — **Codex's verdict governs**; say so if
+  Antigravity's differed
 - **CRITICAL** (must fix): issue — file:line — source (Codex/Antigravity/both)
 - **HIGH** (should fix): issue — file:line — source
 - **MEDIUM/LOW** (consider): issue — file:line — source
-- **Disagreements**: where models differ — both perspectives in 1-2 lines each
-- **Dispatch note**: state that both were dispatched blind and in parallel, or flag which were not
+- **Disagreements**: where models differ — both perspectives in 1-2 lines each, and which one you
+  followed (default: Codex, unless measurement settled it)
+- **Dispatch note**: state that both were dispatched blind and in parallel, **and that Codex
+  actually returned**. If Codex did not answer, the verdict line must read
+  "INCOMPLETE — Codex did not return" rather than a ship/no-ship call.
 
 One line per finding. Code snippets only for CRITICAL/HIGH fixes. Skip empty severity levels.
 

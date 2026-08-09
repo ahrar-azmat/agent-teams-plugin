@@ -256,14 +256,26 @@ Agents accumulate stale context. When a teammate finishes its tasks:
 
 Fresh agents get only the new task's instructions — no leftover context pollution.
 
-## Multi-Model Integration (Antigravity + Codex in Every Phase)
+## Multi-Model Integration (Codex primary + Antigravity secondary, in Every Phase)
 
-Teammates inherit all MCP servers from the project. **Antigravity and Codex must be used in ALL phases of work, not just final review.** Use the highest-capability models available:
+Teammates inherit all MCP servers from the project. **Both advisors must be used in ALL phases of work, not just final review** — but they are NOT peers:
 
-- **Codex Oracle**: Always uses the strongest OpenAI model (auto-detected from the Codex CLI config) at **max** reasoning — the effort is pinned in the MCP server itself, so the Codex desktop-app slider can never downgrade it — `architect_review`, `code_review`, `research`, `codex_query`. Runs with **live web search** (`web_search=live`, forced by the server — the CLI default is a cached snapshot index). Pass `infra: true` on any tool when the review needs LIVE state (SSH to servers, live DB queries, logs, dashboards) — read-only investigation; Codex discovers project access itself, but state the access pattern in the prompt when you know it.
-- **Antigravity**: drives the deepest-thinking Gemini Pro model automatically via the `agy` CLI — `antigravity_query`, `antigravity_brainstorm`, `antigravity_analyze_code`, `antigravity_review_pr`. Has a live `search_web` tool, and the server instructs it to use it. **Model selection is NOT a parameter** (the wrapper always picks the strongest Pro model, with Flash fallback only on capacity errors) — do not pass a `model` argument; it will be rejected.
+> ### Codex is PRIMARY. Antigravity is SECONDARY.
+>
+> **Codex Oracle is the authority** on review, architecture, research, web research and synthesis: the strongest OpenAI model at **max** reasoning, with repository access and live web search. **Its verdict governs.**
+>
+> **NEVER conclude, ship, commit, or declare a decision on Antigravity alone.** Antigravity is corroboration, not authority.
+>
+> **WAIT FOR CODEX.** Codex runs at max effort and routinely takes many minutes; a long call is moved to the background and returns later as a task notification. **That is normal, not a failure.** Antigravity almost always answers first — *returning first is not being right.* Until Codex has answered, the review is INCOMPLETE: block on its result (Monitor, or wait for the notification) and do other work meanwhile. Acting on the fast answer because the slow one is still running is the failure this rule exists to prevent.
+>
+> **On disagreement, Codex carries** — unless you can DISPROVE it by measuring the deployed system. Measurement outranks both models (Codex has been wrong when it read newer upstream source instead of the installed binary).
+>
+> **But never discard an Antigravity-only finding.** Its value is independence: it sometimes catches what Codex missed (both directions of miss have happened in practice — Codex caught a secret-exfiltration CRITICAL Antigravity missed; Antigravity caught a symlink-traversal CRITICAL Codex missed). Verify such a finding on its merits; do not treat "Codex didn't say it" as refutation.
+
+- **Codex Oracle** (PRIMARY): Always uses the strongest OpenAI model (auto-detected from the Codex CLI config) at **max** reasoning — the effort is pinned in the MCP server itself, so the Codex desktop-app slider can never downgrade it — `architect_review`, `code_review`, `research`, `codex_query`. Runs with **live web search** (`web_search=live`, forced by the server — the CLI default is a cached snapshot index). Pass `infra: true` on any tool when the review needs LIVE state (SSH to servers, live DB queries, logs, dashboards) — read-only investigation; Codex discovers project access itself, but state the access pattern in the prompt when you know it.
+- **Antigravity** (SECONDARY — corroboration only): drives the deepest-thinking Gemini Pro model automatically via the `agy` CLI — `antigravity_query`, `antigravity_brainstorm`, `antigravity_analyze_code`, `antigravity_review_pr`. Has a live `search_web` tool, and the server instructs it to use it. **Model selection is NOT a parameter** (the wrapper always picks the strongest Pro model, with Flash fallback only on capacity errors) — do not pass a `model` argument; it will be rejected.
 - **Every advisory tool on both servers takes `caller_hypothesis`** — the single correct channel for your own view. It is presented as an unverified claim to REFUTE and answered with an explicit CONFIRMED/REFUTED/UNPROVEN verdict. The neutral scoping fields (`context`, `concerns`, `focus`, `topic`, `prompt`) are heuristically lint-checked for conclusion language; a hit prepends a **⚠️ ANCHORING WARNING** to the result. If you send a hypothesis and no CONFIRMED/REFUTED/UNPROVEN verdict comes back, the servers say so rather than letting you read silence as agreement.
-- **ALWAYS dispatch Codex + Antigravity IN PARALLEL** — batch both MCP tool calls in the same message. Never call one, wait for its answer, then call the other: sequential dispatch doubles wall-clock time, and independent opinions must be formed without seeing each other's answer.
+- **ALWAYS dispatch Codex + Antigravity IN PARALLEL** — batch both MCP tool calls in the same message. Never call one, wait for its answer, then call the other: sequential dispatch doubles wall-clock time, and independent opinions must be formed without seeing each other's answer. **Parallel dispatch is about starting together, NOT about finishing together** — you still wait for Codex (the primary) before concluding.
 - **ALWAYS dispatch BLIND** — the same evidence to both, your diagnosis to neither. Parallel dispatch protects them from each other; blind dispatch protects them from *you*. You need both, or their agreement means nothing. See **The Independence Protocol**.
 
 ### Phase 1: Research

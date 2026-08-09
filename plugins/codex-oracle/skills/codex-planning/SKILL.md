@@ -10,10 +10,16 @@ independent perspectives before finalizing.
 
 ## Step 1: Launch all advisors in parallel (SAME tool call batch) — and BLIND
 
-- **Codex Oracle**: `architect_review` with the **requirement, the constraints, and the relevant
-  file paths**
-- **Antigravity**: `antigravity_brainstorm` or `antigravity_analyze_code` for alternatives
+- **Codex Oracle** — **PRIMARY, authoritative**: `architect_review` with the **requirement, the
+  constraints, and the relevant file paths**
+- **Antigravity** — **SECONDARY, corroborating**: `antigravity_brainstorm` or
+  `antigravity_analyze_code` for alternatives
 - **Your own agents**: Explore/Plan subagents for codebase investigation
+
+> **No plan is finalized until CODEX has answered.** It runs at max effort and often takes many
+> minutes (backgrounded, returning as a task notification — normal). Antigravity nearly always
+> answers first; **first is not authoritative.** Never commit to a design on Antigravity alone —
+> wait for Codex and do other work meanwhile.
 
 **Ask them to solve the problem. Do not ask them to bless your solution.**
 
@@ -45,12 +51,15 @@ Both servers require a **Sources** section. Unsourced external claims were answe
 re-ask.
 
 ## Step 3: Synthesize findings
-Once all return:
+Once all return — **and "all" means Codex too; if only Antigravity is back, you are not here yet**:
 1. Summarize each model's key findings
 2. Identify agreements and disagreements
 3. If Codex or Antigravity raised CONCERNS/REJECT — critically analyze why. Do you agree?
 4. **Weigh agreement by independence**: two blind advisors converging is strong evidence; two
    advisors you handed the same design are one opinion echoed twice
+4b. **Where they contradict each other, Codex's design judgment carries** — unless measurement of
+   the deployed system disproves it. An Antigravity-only idea or objection is still worth
+   evaluating on its merits; the secondary is there to surface what the primary didn't see.
 5. Present ALL perspectives to the user with your own assessment
 
 ## Step 4: Optional round 2 — adversarial

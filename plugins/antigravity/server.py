@@ -1383,7 +1383,29 @@ class AntigravityCLIClient:
 # MCP Server
 # ---------------------------------------------------------------------------
 
-server = Server("antigravity-oauth")
+server = Server(
+    "antigravity-oauth",
+    instructions=(
+        "Antigravity (Google Gemini) is the SECONDARY cross-model advisor. The "
+        "PRIMARY is codex-oracle (OpenAI Codex at max reasoning, with repo "
+        "access): it is deeper on review, architecture, research, web research "
+        "and synthesis, and ITS VERDICT GOVERNS.\n\n"
+        "NEVER ACT ON ANTIGRAVITY ALONE. An answer from this server is "
+        "corroboration, not authority, and never a basis to ship, commit, or "
+        "declare a decision by itself. Antigravity usually answers FIRST "
+        "because Codex runs longer at max effort — returning first is not "
+        "being right. If Codex is still running (often backgrounded, returning "
+        "later as a task notification), the review is NOT complete: WAIT for "
+        "Codex before concluding.\n\n"
+        "Its value is INDEPENDENCE, not precedence — a second pair of eyes that "
+        "sometimes catches what the primary missed. Such a finding is real and "
+        "must be verified, not discarded. But where the two disagree, Codex "
+        "carries unless measurement of the deployed system settles it.\n\n"
+        "DISPATCH BLIND: send the evidence, not your conclusion. Put any theory "
+        "of your own in `caller_hypothesis` so it is attacked rather than "
+        "confirmed; the neutral scoping fields are lint-checked."
+    ),
+)
 client: AntigravityCLIClient | None = None
 
 

@@ -19,8 +19,15 @@ changed files so you can answer follow-ups without re-dispatching.
 Batch both MCP calls in the **same message**. Neither advisor may see the other's answer before
 forming its own.
 
-- **Codex Oracle**: `code_review` with the diff
-- **Antigravity**: `antigravity_review_pr` (strictness: `strict`) with the same diff
+- **Codex Oracle** — **PRIMARY, authoritative**: `code_review` with the diff
+- **Antigravity** — **SECONDARY, corroborating**: `antigravity_review_pr` (strictness: `strict`)
+  with the same diff
+
+> **The review is NOT complete until CODEX has answered.** Codex runs at max effort and often
+> takes many minutes; long calls are backgrounded and return later as a task notification —
+> that is normal. Antigravity nearly always answers first; **answering first is not being
+> right.** Never ship, commit, or declare the review done on Antigravity's answer alone. If
+> Codex is still running, WAIT for it (Monitor / the notification) and do other work meanwhile.
 
 **Send the diff. Do not send your conclusion.**
 
@@ -76,6 +83,8 @@ Both servers inject this hunt into `code_review` and `review_pr` automatically �
 yourself too, since it is the finding a fast reviewer most reliably misses.
 
 ## Step 5: Process findings
+0. **Confirm Codex actually answered.** If only Antigravity has returned, STOP — you have half a
+   review. Go back and wait.
 1. Collect all findings from both models
 2. Categorize by severity: CRITICAL > HIGH > MEDIUM > LOW
 3. Any CRITICAL or HIGH finding MUST be addressed or explicitly acknowledged to the user
@@ -84,6 +93,13 @@ yourself too, since it is the finding a fast reviewer most reliably misses.
    re-dispatch blind before relying on it.
 5. **Disagreement is always strong signal** — an advisor that contradicts you even after being
    nudged toward you has found something. Investigate it before dismissing it.
+   **Where the two models contradict EACH OTHER, Codex carries** — unless you can disprove it by
+   MEASURING the deployed system (measurement outranks both; Codex has been wrong when it read
+   newer upstream source instead of the installed binary).
+   **An Antigravity-only finding is still real** — verify it on its merits. "Codex didn't mention
+   it" is not a refutation; the secondary exists precisely to catch what the primary missed, and
+   it has (a symlink-traversal CRITICAL Codex missed, in the same session Codex caught a
+   secret-exfiltration CRITICAL Antigravity missed).
 6. Verify file:line citations in the tree that is canon for this task — Codex reads the whole
    workspace and can cite a sibling checkout.
 

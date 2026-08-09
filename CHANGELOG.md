@@ -3,6 +3,20 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.12.0] — 2026-08-09
+
+### Changed
+- **Codex is now the declared PRIMARY advisor; Antigravity is SECONDARY — and the workflow WAITS for Codex.** The two were documented as peers, which produced a real failure mode: Codex runs at max reasoning and its long calls get backgrounded, Antigravity answers in a fraction of the time, and work proceeds on the fast answer as though the review were finished. **Returning first is not being right.**
+  - **Codex Oracle = PRIMARY/authoritative** on review, architecture, research, web research and synthesis (strongest OpenAI model at max effort, repo access, live web search). **Its verdict governs.**
+  - **Antigravity = SECONDARY/corroborating.** Never ship, commit, or declare a decision on its answer alone.
+  - **Never conclude while Codex is still running.** A backgrounded Codex call returning later as a task notification is NORMAL — block on it (Monitor / notification) and do other work meanwhile.
+  - **On disagreement Codex carries** — unless MEASURING the deployed system disproves it. Measurement outranks both models (Codex has been wrong reading newer upstream source instead of the installed binary).
+  - **An Antigravity-only finding is still real** and must be verified, never discarded because Codex didn't mention it. Both directions of miss are documented: Codex caught a secret-exfiltration CRITICAL Antigravity missed; Antigravity caught a symlink-traversal CRITICAL Codex missed — in the same review round. The secondary earns its slot by independence, not precedence.
+  - Applied at every surface the model actually reads: both MCP servers' `instructions` (loaded at tool-listing time — Antigravity had none at all before), the `agent-teams` skill, `codex-planning`, `codex-review`, and the `code-reviewer` agent (whose verdict line must now read "INCOMPLETE — Codex did not return" rather than a ship/no-ship call).
+
+### Fixed
+- **The push gate was passing on a half review.** It checked whether `code_review` and `antigravity_review_pr` appeared in the transcript — but a tool NAME is present the moment the call is MADE, so a backgrounded Codex that never returned still satisfied it. The gate now requires an actual Codex RESULT (its `[Codex model: …]` header, or a terminal TIMEOUT/health-check outcome) and, when the call was dispatched but never came back, says exactly that: Codex has not returned, do not push on Antigravity alone, wait. Stays advisory and fail-open. 11 gate tests cover silent/generic/pending/complete/terminal/malformed.
+
 ## [1.11.0] — 2026-08-09
 
 ### Added
