@@ -3,6 +3,56 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.13.0] — 2026-08-14
+
+### Added
+- **`/abraham` — write mode for codex-oracle (plugin 1.10.0), as two air-gapped phases.**
+  One `abraham` MCP tool + `commands/abraham.md` slash command; the Claude session stays the
+  orchestrator (dispatch → monitor → review the diff). Phase 1 ANALYSIS is read-only — this
+  is where `infra` (live SSH/DB/logs + user MCP servers) and `web_search` apply — and
+  produces an implementation brief. Phase 2 IMPLEMENTATION is **sealed**: workspace-write
+  file access and nothing else — no network, no web search, no user MCP servers — so
+  untrusted web content and live credentials never share a process with write capability.
+  (The air-gap was demanded independently by BOTH cross-model reviewers; the original
+  single-process write+infra design was rejected in review and rebuilt.)
+  - **Mode algebra:** read and write are separate tools — structural mutual exclusion.
+    `infra`/`web_search` compose with abraham by governing its analysis phase; the write
+    phase is always sealed, and a write process NEVER uses `danger-full-access`.
+  - **Sandbox facts probed live on codex-cli 0.147.0, calibrated both ways:** read-only
+    refused the very write workspace-write then performed; sealed egress measured (`curl`
+    cannot resolve DNS); `--strict-config` rejects a bogus key (exit 1) and accepts
+    `model_auto_compact_token_limit` — recognition, not a permissive parser. `/tmp` and
+    `$TMPDIR` are excluded from the writable roots (an artifact there would outlive the run
+    OUTSIDE the reviewed diff); build tools get a TMPDIR redirected to a workspace-local
+    `.abraham/tmp` instead.
+  - **Git safety:** refuses outside a git work tree (autonomous writes with no undo);
+    refuses a DIRTY tree unless `allow_dirty=true` (the implementer may legitimately rewrite
+    files, and uncommitted edits it touches are unrecoverable — committed work never is);
+    one-writer-per-tree via an authoritative O_EXCL lockfile held across both phases
+    (pid-liveness stale-break so a crashed server never blocks its own recovery), plus the
+    journal-liveness check as an advisory belt; codex is contract-bound never to
+    commit/push/reset; every outcome — success, timeout, hang, error — ends with a
+    **[CHANGED FILES]** report separating this run's changes from pre-existing dirt and
+    verifying HEAD did not move (a violation is called out loudly instead of trusted).
+  - **Write runs are never auto-retried** (review CRITICAL): replaying "implement X" after
+    half of X was written double-applies. Recovery is the explicit `codex_resume_run` path,
+    which resumes write runs SEALED regardless of caller overrides; read runs cannot
+    escalate to write by resuming. Read runs keep their transient auto-retry.
+  - **Auto-compaction at ~65% (owner-specified 60–70%) for the implementation phase**, via
+    `-c model_auto_compact_token_limit`. The window comes from the deployed binary's own
+    registry (`models_cache.json` — `gpt-5.6-sol: 272,000` measured 2026-08-14; 65% =
+    176,800), with `CODEX_ORACLE_CONTEXT_WINDOW` / `CODEX_ORACLE_AUTOCOMPACT_PCT` env
+    overrides; unknown model → flag omitted so the vendor's 90% default governs, and the
+    chosen branch is recorded in the live-log header. Two measured traps drove this: a
+    user-set limit beats the vendor default OUTRIGHT (no min with the window — a too-high
+    limit would silently never fire), and the first draft's recalled 400k window would have
+    put "65%" at 95.6% of the real 272k window (caught by the owner mid-build).
+  - 84-check dependency-free suite (`tests/test_write_mode.py`): sealed-argv matrix,
+    auto-compact derivation incl. corrupt-cache and env precedence, changed-files set math,
+    lockfile semantics incl. dead-pid break, no-retry-for-writes (and read-retry
+    regression), two-phase orchestration incl. analysis-failure stop, resume inheritance.
+  - Full design + probe record + review reconciliation: `PLAN_ABRAHAM_WRITE_MODE.md`.
+
 ## [1.12.1] — 2026-08-09
 
 ### Fixed

@@ -39,10 +39,13 @@ Two properties are enforced by this server rather than left to the caller
 import asyncio
 import contextlib
 import itertools
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -132,6 +135,76 @@ STARTUP_PROBE_SECONDS = 90
 # (SSH/DB/log exploration) while still preventing the multi-hour hangs we
 # observed with stuck processes.
 MAX_RUNTIME_SECONDS = 3600  # 60 minutes
+
+# ---------------------------------------------------------------------------
+# Write mode (abraham): auto-compaction
+# ---------------------------------------------------------------------------
+# Implementation runs are LONG. codex only auto-compacts its own history at
+# 90% of the context window by default (0.147.0-generation source:
+# resolved_context_window * 9 / 10 in openai_models.rs; the registry carries
+# no per-model override for the gpt-5.6 family), which leaves the tail of a
+# long write run degraded. Write runs therefore pass an explicit
+# -c model_auto_compact_token_limit at AUTOCOMPACT_PCT of the window.
+#
+# Two measured traps shape this code:
+# 1. A user-config value WINS OUTRIGHT over the model-derived default
+#    (config.model_auto_compact_token_limit.or_else(model default) — no min()
+#    with the window on that path), so a limit above the real window would
+#    simply NEVER fire, silently disabling compaction. The flag is only
+#    passed when the window is KNOWN.
+# 2. The window must come from the deployed binary's OWN registry
+#    (models_cache.json under CODEX_HOME — the same base its 90% default
+#    derives from), never from recalled docs: gpt-5.6-sol is 272_000 there
+#    (measured 2026-08-14) while API-era docs suggest 400_000. A guessed 400k
+#    base would have put "65%" at 95.6% of the real window — LATER than the
+#    default it replaced.
+# Precedence: CODEX_ORACLE_CONTEXT_WINDOW env (explicit operator override)
+# > models_cache.json exact-slug lookup > omit the flag (vendor default
+# governs). The chosen branch is recorded in the live-log header.
+AUTOCOMPACT_PCT = min(85, _env_int("CODEX_ORACLE_AUTOCOMPACT_PCT", 65, 30))
+
+
+def _model_context_window(model: str) -> tuple[int, str]:
+    """(window_tokens, source) per the DEPLOYED binary's own registry cache;
+    (0, reason) when unknown. Never guesses a number."""
+    override = _env_int("CODEX_ORACLE_CONTEXT_WINDOW", 0, 0)
+    if override:
+        return override, "env CODEX_ORACLE_CONTEXT_WINDOW"
+    cache = (
+        Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+        / "models_cache.json"
+    )
+    try:
+        if cache.stat().st_size > 20 * 1024 * 1024:
+            return 0, "models_cache.json implausibly large — refused"
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        for entry in data.get("models") or []:
+            if isinstance(entry, dict) and entry.get("slug") == model:
+                # Mirrors ModelInfo::resolved_context_window(): prefer
+                # context_window, fall back to max_context_window.
+                window = int(
+                    entry.get("context_window")
+                    or entry.get("max_context_window")
+                    or 0
+                )
+                if window > 0:
+                    return window, "models_cache.json"
+                break
+        return 0, f"model {model!r} not in models_cache.json"
+    except (OSError, ValueError, TypeError):
+        return 0, "models_cache.json unreadable"
+
+
+def _auto_compact_limit(model: str) -> tuple[int | None, str]:
+    """Explicit auto-compaction threshold for write runs, or (None, why) when
+    the flag must be omitted so the vendor's own 90% default governs."""
+    window, source = _model_context_window(model)
+    if not window:
+        return None, f"window unknown ({source}); vendor default (90%) governs"
+    return (window * AUTOCOMPACT_PCT) // 100, (
+        f"{AUTOCOMPACT_PCT}% of {window:,} ({source})"
+    )
+
 
 mcp = FastMCP(
     "codex-oracle",
@@ -489,6 +562,235 @@ def _get_cwd() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Infra-shaped question detection (auto `infra` for research)
+# ---------------------------------------------------------------------------
+# `infra=True` is NOT a free upgrade: it runs codex with --sandbox
+# danger-full-access AND the caller's own MCP servers (which hold live
+# credentials), with read-only enforced by PROMPT ONLY. Research is also the
+# one mode that ingests UNTRUSTED external content (live web), so defaulting it
+# on would put web-borne prompt injection in front of a credentialed shell.
+#
+# Live WEB research does NOT need it — `web_search=live` is forced on every
+# call regardless of mode (measured: ordinary sandboxed runs perform real web
+# searches). What infra actually buys is reaching THIS PROJECT'S live systems:
+# SSH, the live DB, container/deploy logs.
+#
+# So auto-enable only for questions that are actually about live systems,
+# using TWO signals — a liveness word AND an infra noun. One signal alone is
+# too loose: "compare Postgres vs MySQL indexing" is a general question and
+# must stay sandboxed; "why is our production database slow" is not.
+# An explicit infra= from the caller ALWAYS wins, in both directions, and the
+# decision is reported in the result so the mode is never switched silently.
+_INFRA_LIVENESS = (
+    "live", "production", "prod", "our ", "currently", "right now",
+    "deployed", "running", "actual", "in-flight", "real-time", "realtime",
+)
+_INFRA_NOUNS = (
+    "server", "database", " db", "postgres", "redis", "log", "container",
+    "docker", "kubernetes", "k8s", "cluster", "deploy", "dokploy", "ssh",
+    "endpoint", "instance", "traefik", "nginx", "celery", "temporal",
+    "migration", "outage", "downtime",
+)
+
+
+def _looks_infra_shaped(text: str) -> tuple[bool, str]:
+    """True when a topic is about THIS project's LIVE systems.
+
+    Returns ``(enable, reason)``; the reason is surfaced to the caller so an
+    auto-enabled full-access run is always visible, never silent.
+    """
+    t = f" {text.lower()} "
+    live = next((w for w in _INFRA_LIVENESS if w in t), "")
+    noun = next((w for w in _INFRA_NOUNS if w in t), "")
+    if live and noun:
+        return True, f"matched liveness {live.strip()!r} + infra noun {noun.strip()!r}"
+    return False, ""
+
+
+# ---------------------------------------------------------------------------
+# Write mode (abraham): git safety
+# ---------------------------------------------------------------------------
+# An autonomous write run gets exactly one undo mechanism: git. So a write
+# run (1) refuses to start outside a work tree, (2) snapshots the dirty state
+# BEFORE dispatch so its report separates "changed by this run" from "already
+# dirty", and (3) verifies afterwards that HEAD did not move (the prompt
+# forbids commits; the report calls out a violation instead of trusting it).
+
+
+def _git(args: list[str], cwd: str) -> tuple[int, str]:
+    """Run a short git metadata query. Sync on purpose: these are <50ms
+    reads at dispatch/return time, not part of the streamed run."""
+    try:
+        p = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=15,
+        )
+        return p.returncode, (p.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+
+
+def _git_state(cwd: str) -> tuple[bool, set[str], str]:
+    """(is_work_tree, dirty porcelain lines, HEAD sha — '' on a repo with no
+    commits yet, which is still a valid write target)."""
+    rc, out = _git(["rev-parse", "--is-inside-work-tree"], cwd)
+    if rc != 0 or out != "true":
+        return False, set(), ""
+    _, porcelain = _git(["status", "--porcelain"], cwd)
+    lines = {ln for ln in porcelain.splitlines() if ln.strip()}
+    # --verify --quiet: a repo with no commits yields rc!=0 and NO output.
+    # Plain `rev-parse HEAD` echoes the literal string "HEAD" there, which
+    # would masquerade as a sha (caught by the test suite).
+    rc, head = _git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd)
+    return True, lines, head if rc == 0 else ""
+
+
+_WRITE_REPORT_MAX_CHARS = 3500  # the report is a summary; the DIFF is the review surface
+
+
+def _write_changes_report(before: set[str], head_before: str, cwd: str) -> str:
+    """Attribution block appended to every write-run result.
+
+    Porcelain-line set math cannot see codex piling FURTHER changes onto a
+    file that was already dirty (same 'M path' line before and after) — the
+    report says so instead of pretending; the caller's diff review covers
+    those paths.
+    """
+    ok, after, head_after = _git_state(cwd)
+    if not ok:
+        return (
+            "\n\n[CHANGED FILES: git state unreadable after the run — "
+            "inspect the tree manually]"
+        )
+    new_lines = sorted(after - before)
+    gone_lines = sorted(before - after)
+    pre_dirty = sorted(before & after)
+    parts = ["\n\n[CHANGED FILES — this write run]"]
+    if new_lines:
+        parts += [f"  {ln}" for ln in new_lines]
+    else:
+        parts.append("  (no new working-tree changes attributable to this run)")
+    if gone_lines:
+        parts.append(
+            "  pre-existing dirty entries that DISAPPEARED "
+            "(deleted, reverted, or renamed by the run):"
+        )
+        parts += [f"    {ln}" for ln in gone_lines]
+    if pre_dirty:
+        parts.append(
+            f"  dirty before dispatch ({len(pre_dirty)} path(s)) — further "
+            "changes to these are NOT separable here; review them in the diff:"
+        )
+        parts += [f"    {ln}" for ln in pre_dirty[:20]]
+        if len(pre_dirty) > 20:
+            parts.append(f"    … +{len(pre_dirty) - 20} more")
+    if head_after != head_before:
+        parts.append(
+            f"  ⚠ HEAD MOVED {head_before[:9] or '(none)'} → "
+            f"{head_after[:9] or '(none)'} — the run violated the no-commit "
+            "contract; audit `git log` before trusting the tree"
+        )
+    else:
+        parts.append(
+            f"  HEAD unchanged ({head_before[:9] or 'no commits yet'}) — "
+            "nothing was committed"
+        )
+    report = "\n".join(parts)
+    if len(report) > _WRITE_REPORT_MAX_CHARS:
+        report = (
+            report[:_WRITE_REPORT_MAX_CHARS]
+            + "\n  … report truncated — run `git status` for the full picture"
+        )
+    return report
+
+
+def _active_write_run(cwd: str, exclude_run: str = "") -> str:
+    """Run tag of a still-alive WRITE run in this workspace, or ''.
+
+    One writer per tree: two autonomous write runs interleaving edits in the
+    same checkout produce an unreviewable diff. Liveness = journaled start
+    without an end record + live log written <60s ago (the same test the
+    resume guard applies before touching a thread).
+    """
+    for rec in _journal_runs().values():
+        if not rec.get("write") or rec.get("cwd") != cwd or rec.get("has_end"):
+            continue
+        if exclude_run and rec.get("run") == exclude_run:
+            continue
+        log_path = str(rec.get("log") or "")
+        with contextlib.suppress(OSError):
+            if log_path and Path(log_path).is_file():
+                if time.time() - Path(log_path).stat().st_mtime < 60:
+                    return str(rec.get("run", "?"))
+    return ""
+
+
+def _write_lock_path(cwd: str) -> Path:
+    return (
+        LIVE_LOG_DIR / "write-locks"
+        / f"{hashlib.sha1(cwd.encode('utf-8', 'replace')).hexdigest()[:16]}.lock"
+    )
+
+
+def _acquire_write_lock(cwd: str, run_hint: str) -> tuple[bool, str]:
+    """One-writer-per-tree MUTUAL EXCLUSION, across server processes.
+
+    The journal liveness check in _active_write_run is advisory only — two
+    dispatches in the same second both pass it. This O_EXCL lockfile is the
+    authoritative gate (cross-model review finding: an mtime check is not a
+    lock). Staleness: no run outlives MAX_RUNTIME_SECONDS, so an older lock
+    belongs to a dead process and is broken. Unusable lock dir FAILS CLOSED —
+    write dispatch without mutual exclusion is not an acceptable fallback.
+
+    Returns (acquired, holder_description_when_refused).
+    """
+    path = _write_lock_path(cwd)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _private(path.parent, 0o700)
+    except OSError as e:
+        return False, f"write-lock dir unusable ({e}) — refusing to write unlocked"
+    payload = f"{run_hint} pid={os.getpid()} cwd={cwd} t={int(time.time())}\n"
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(payload)
+            return True, ""
+        except FileExistsError:
+            try:
+                age = time.time() - path.stat().st_mtime
+                holder = path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue  # holder released between EXISTS and stat — retry
+            # A lock whose recorded holder PROCESS is dead is stale now, not
+            # in MAX_RUNTIME seconds — a crashed server must not block the
+            # recovery resume of its own run for an hour. (Age remains the
+            # fallback for unparseable payloads and pid reuse.)
+            holder_dead = False
+            m = re.search(r"\bpid=(\d+)\b", holder)
+            if m and os.name != "nt":
+                try:
+                    os.kill(int(m.group(1)), 0)
+                except ProcessLookupError:
+                    holder_dead = True
+                except (PermissionError, OSError):
+                    pass  # exists (or unknowable) — treat as alive
+            if holder_dead or age > MAX_RUNTIME_SECONDS:
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                continue
+            return False, holder or "unknown holder"
+        except OSError as e:
+            return False, f"write-lock unusable ({e}) — refusing to write unlocked"
+    return False, "lock contention"
+
+
+def _release_write_lock(cwd: str) -> None:
+    with contextlib.suppress(OSError):
+        _write_lock_path(cwd).unlink()
+
+
+# ---------------------------------------------------------------------------
 # Live view
 # ---------------------------------------------------------------------------
 # Every run streams its full event feed — reasoning summaries, web-search
@@ -798,11 +1100,18 @@ def _advisor_context(max_chars: int = ADVISOR_CONTEXT_MAX_CHARS) -> str:
 # ---------------------------------------------------------------------------
 # Run journal + resume/retry
 # ---------------------------------------------------------------------------
-# Sessions are the recovery substrate. codex writes its rollout INCREMENTALLY
-# (measured 2026-08-08: a SIGKILL'd run resumed with full context — codeword
-# AND the interrupted computation recovered), so a failed or orphaned run can
-# be continued via `codex exec … resume <thread_id> <nudge>` — same thread id,
-# vendor-side context intact. --ephemeral is therefore NOT passed anymore.
+# Sessions are the recovery substrate: a failed or orphaned run can be
+# continued via `codex exec … resume <thread_id> <nudge>` — same thread id.
+# --ephemeral is therefore NOT passed anymore.
+#
+# ⚠ Do NOT rely on the rollout having the original input. An earlier note
+# here said "measured 2026-08-08: a SIGKILL'd run resumed with full context"
+# — that measurement was taken under the LEAKY kill (proc.kill() reaped only
+# the node shim; the surviving grandchild FINISHED the turn and flushed it).
+# Re-measured 2026-08-09 under the true process-group kill: a turn killed
+# early persists NOTHING of its input — the resumed thread starts with only
+# session plumbing, and the model fabricates. codex_resume_run therefore
+# restates the journaled original prompt in every continuation.
 #
 # The journal (runs.jsonl, one JSON record per line: start/session/end) plus a
 # per-run .result.txt survive MCP-server restarts, so `codex_resume_run` can
@@ -897,8 +1206,9 @@ def _build_exec_argv(
     output_file: Path,
     prompt: str | None = None,
     resume_tid: str | None = None,
-    resume_prompt: str | None = None,
     images: list[str] | None = None,
+    write: bool = False,
+    auto_compact_limit: int | None = None,
 ) -> list[str]:
     """codex exec argv for a fresh run or a resume of an existing thread.
 
@@ -929,12 +1239,41 @@ def _build_exec_argv(
     path and codex reports "No prompt provided via stdin". So images go RIGHT
     AFTER ``exec``, where the following flag terminates the value list and the
     prompt stays a clean trailing positional.
+
+    Write modes (2026-08-14, probed live on 0.147.0 — see PLAN_ABRAHAM_WRITE_
+    MODE.md §10): ``write=True`` is the SEALED implementation phase — always
+    workspace-write + --ignore-user-config, never danger-full-access, and
+    ``infra`` deliberately does NOT open the network here (the read-only
+    analysis phase is where infra/web live). Probe: workspace-write created
+    files while ``curl`` could not resolve DNS (egress sealed); read-only
+    refused the same write (probe calibration). ``auto_compact_limit`` emits
+    ``model_auto_compact_token_limit`` — the caller passes it ONLY when the
+    model's window is known, because a user-config value beats the vendor's
+    90% default OUTRIGHT and a limit above the real window would never fire
+    at all.
     """
     argv = [*_codex_argv0(), "exec"]
     if resume_tid is None:
         for img in images or []:
             argv += ["-i", img]
-    if infra:
+    if write:
+        # SEALED implementation process (cross-model review verdict,
+        # 2026-08-14: both advisors independently required the air-gap).
+        # Write capability NEVER shares a process with untrusted external
+        # content or live credentials: no network egress, no web search
+        # (forced off below), no user config → no user MCP servers. The
+        # analysis phase (a separate read-only run) had the web/infra access;
+        # its brief travels here via the prompt. /tmp and $TMPDIR are
+        # excluded from the writable roots — a /tmp artifact would outlive
+        # the run OUTSIDE the reviewed diff; build tools get a TMPDIR
+        # redirected inside the workspace instead (see _run_codex).
+        argv += [
+            "--sandbox", "workspace-write",
+            "--ignore-user-config",
+            "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+            "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        ]
+    elif infra:
         argv += ["--sandbox", "danger-full-access"]
     else:
         # Isolate: no user MCP servers, no user config bleed-through.
@@ -956,8 +1295,14 @@ def _build_exec_argv(
         # We inject only the curated ADVISOR_CONTEXT.md ourselves.)
         "-c", f"web_search={'live' if web_search else 'disabled'}",
     ]
+    if auto_compact_limit is not None:
+        argv += ["-c", f"model_auto_compact_token_limit={auto_compact_limit}"]
     if resume_tid is not None:
-        argv += ["resume", resume_tid, resume_prompt or RESUME_NUDGE]
+        # The caller's nudge rides in ``prompt`` — same slot as a fresh run.
+        # (A separate resume_prompt param existed here that no caller ever
+        # passed, so every resume silently sent the generic nudge and DROPPED
+        # the caller's added instructions. One prompt slot, no shadow.)
+        argv += ["resume", resume_tid, prompt or RESUME_NUDGE]
     else:
         # Images already attached right after `exec` (see docstring — the
         # variadic -i must not sit next to the positional prompt).
@@ -1004,6 +1349,47 @@ def _codex_env() -> dict[str, str]:
     return env
 
 
+def _new_group_kwargs() -> dict[str, Any]:
+    """Spawn kwargs that put the child in its own process group, so the whole
+    tree can be reaped later (see _kill_tree)."""
+    if os.name != "nt":
+        return {"start_new_session": True}
+    return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+
+
+def _kill_tree(proc) -> None:
+    """Kill the subprocess AND everything it spawned.
+
+    `codex` on POSIX is a node SHIM that execs the vendored native binary as a
+    GRANDCHILD. proc.kill() reaps only the shim: the real codex survives with
+    ppid=1, keeps burning tokens, and — measured 2026-08-09 — keeps holding
+    the thread-store writer lock, so a later resume dies with
+    "thread <id> already has an active writer". Orphans up to EIGHT DAYS old
+    were found this way. Because we spawn with start_new_session=True, the
+    child leads its own process GROUP, so one killpg takes the whole tree.
+    """
+    if os.name != "nt":
+        try:
+            pgid = os.getpgid(proc.pid)
+            # Refuse to killpg our OWN group: if a refactor ever drops the
+            # start_new_session spawn kwarg, the child shares this server's
+            # group and killpg would take down the MCP server and every
+            # sibling run with it. Fall through to the single-process kill.
+            if pgid != os.getpgid(0):
+                os.killpg(pgid, signal.SIGKILL)
+                return
+        except (ProcessLookupError, PermissionError, OSError):
+            pass  # group already gone, or we can't signal it — fall through
+    else:
+        # Windows: no process groups to signal; taskkill /T walks the tree.
+        with contextlib.suppress(Exception):
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10)
+            return
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+
+
 async def _exec_codex_once(
     cmd: list[str],
     output_file: Path,
@@ -1011,6 +1397,7 @@ async def _exec_codex_once(
     emit,
     ctx: Context | None,
     model: str,
+    extra_env: dict[str, str] | None = None,
 ) -> tuple[str, bool, str, str, int, str | None, bool]:
     """One codex exec attempt (spawn → stream → reap).
 
@@ -1028,7 +1415,11 @@ async def _exec_codex_once(
             stderr=asyncio.subprocess.PIPE,
             cwd=_get_cwd(),
             limit=SUBPROCESS_BUFFER_LIMIT,
-            env=_codex_env(),
+            env={**_codex_env(), **(extra_env or {})},
+            # Own process group so _kill_tree reaps the node shim AND the
+            # vendored codex grandchild together (POSIX: setsid + killpg;
+            # Windows: its own group, reaped via taskkill /T).
+            **_new_group_kwargs(),
         )
     except FileNotFoundError:
         output_file.unlink(missing_ok=True)
@@ -1104,8 +1495,7 @@ async def _exec_codex_once(
                     f"no output within {STARTUP_PROBE_SECONDS}s of launch — "
                     "process never started producing events"
                 )
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
+                _kill_tree(proc)
 
     async def _heartbeat() -> None:
         """Emit MCP progress every PROGRESS_INTERVAL_SECONDS while codex runs.
@@ -1153,11 +1543,9 @@ async def _exec_codex_once(
         )
     except asyncio.TimeoutError:
         timed_out = True
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
+        _kill_tree(proc)
     except asyncio.CancelledError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
+        _kill_tree(proc)
         with contextlib.suppress(Exception):
             await proc.wait()
         output_file.unlink(missing_ok=True)
@@ -1165,8 +1553,7 @@ async def _exec_codex_once(
     finally:
         # Always ensure process is reaped and watchdog tasks are cancelled.
         if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+            _kill_tree(proc)
         with contextlib.suppress(Exception):
             await proc.wait()
         for _task in (probe_task, heartbeat_task):
@@ -1205,6 +1592,7 @@ async def _exec_codex_once(
 async def _run_codex(
     prompt: str,
     infra: bool = False,
+    write: bool = False,
     ctx: Context | None = None,
     reserve: int = 0,
     web_search: bool = True,
@@ -1269,7 +1657,60 @@ async def _run_codex(
         # (e.g. "-x.png") would be parsed by clap as a flag, not a value.
         images = [str(Path(p).resolve()) for p in images]
 
-    if infra:
+    # WRITE PRECONDITION: git is the only undo an autonomous write run has.
+    # Refuse outside a work tree, and snapshot the dirty state so the final
+    # report can attribute changes honestly (see _write_changes_report).
+    write_before: set[str] = set()
+    write_head = ""
+    extra_env: dict[str, str] = {}
+    if write:
+        ok, write_before, write_head = _git_state(_get_cwd())
+        if not ok:
+            return (
+                f"[write run refused: {_get_cwd()} is not inside a git work "
+                "tree. Autonomous writes without version control have no "
+                "undo. Run from a git checkout (or `git init` first), or use "
+                "the read-only tools instead.]"
+            )
+        # /tmp and $TMPDIR are excluded from the sandbox's writable roots
+        # (_build_exec_argv): a /tmp artifact would outlive the run OUTSIDE
+        # the reviewed diff. Build tools still need scratch space, so TMPDIR
+        # points at a workspace-local dir — same sandbox, and anything left
+        # behind is visible to the review.
+        tmp_dir = Path(_get_cwd()) / ".abraham" / "tmp"
+        with contextlib.suppress(OSError):
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            extra_env["TMPDIR"] = str(tmp_dir)
+
+    # Inject the curated external-safe ADVISOR_CONTEXT.md (never CLAUDE.md or
+    # memory — those carry live secrets). Fresh threads only: a resumed thread
+    # received it on turn one and re-sending would bloat the rollout.
+    if resume_tid is None:
+        advisor_ctx = _advisor_context()
+        if advisor_ctx:
+            prompt = f"{advisor_ctx}\n\n{prompt}"
+
+    if write:
+        # Sealed implementation phase. Ordered ahead of the infra branch: a
+        # write run must get THIS scaffold and never danger-full-access —
+        # infra/web belong to the separate read-only analysis phase.
+        prompt = (
+            "IMPLEMENTATION MODE — you may create, edit and delete files "
+            "INSIDE this workspace only (OS-enforced sandbox; writes outside "
+            "it will fail).\n"
+            "This process is deliberately SEALED: no shell network egress, "
+            "no web search, no external tools — untrusted external content "
+            "and live credentials never share a process with write access. "
+            "Every external fact you need is in your instructions; "
+            "everything local you may read from the workspace itself.\n"
+            "GIT CONTRACT (non-negotiable): leave ALL changes as uncommitted "
+            "working-tree edits for the caller to review. NEVER run git "
+            "commit, push, checkout, switch, restore, reset, stash, clean, "
+            "rebase, merge, or any branch/tag operation; never touch .git "
+            "internals; no bulk deletes. Violations are detected after the "
+            "run and reported to the caller.\n\n"
+        ) + prompt
+    elif infra:
         # Infra mode: full sandbox (network + shell) so Codex can SSH to the
         # server, query the live DB, read container/Dokploy logs, etc., and
         # the MCP servers from ~/.codex/config.toml (auth0, temporal, ...)
@@ -1294,7 +1735,22 @@ async def _run_codex(
         ) + prompt
 
     t0 = time.monotonic()
-    live_path, live_fh, stream_fh, run_tag = _open_live_log("infra" if infra else "codex")
+    mode_str = ("write+infra" if write and infra else
+                "write" if write else
+                "infra" if infra else "read-only")
+    ac_limit: int | None = None
+    ac_why = ""
+    if write:
+        ac_limit, ac_why = _auto_compact_limit(model)
+    # Which auto-compact branch ran is RECORDED, never silent: an omitted
+    # flag is a deliberate fallback to the vendor's 90% default, and the
+    # header must let a later reader tell the two apart.
+    ac_note = (
+        f" autocompact={ac_limit if ac_limit is not None else 'vendor-default(90%)'}"
+        f" [{ac_why}]"
+    ) if write else ""
+    live_path, live_fh, stream_fh, run_tag = _open_live_log(
+        "abraham" if write else ("infra" if infra else "codex"))
     state: dict[str, str] = {"activity": "launching codex", "last_message": "",
                              "last_error": "", "usage": "", "thread_id": ""}
 
@@ -1322,7 +1778,7 @@ async def _run_codex(
             live_fh.write(
                 f"# codex-oracle live view — {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
                 f"# model={model} effort={reasoning} "
-                f"mode={'infra' if infra else 'read-only'} "
+                f"mode={mode_str}{ac_note} "
                 f"web_search={'live' if web_search else 'disabled'} cwd={_get_cwd()}\n"
                 f"# prompt ({len(prompt)} chars): {prompt[:400]!r}\n\n"
             )
@@ -1330,14 +1786,14 @@ async def _run_codex(
     _live_write(
         stream_fh, t0,
         f"▶ start model={model} effort={reasoning} "
-        f"mode={'infra' if infra else 'read-only'} "
+        f"mode={mode_str} "
         f"prompt {len(prompt)} chars: {prompt[:120]!r}",
         run_tag,
     )
 
     _journal({
         "run": run_tag, "phase": "start", "ts": time.time(), "engine": "codex",
-        "model": model, "reasoning": reasoning, "infra": infra,
+        "model": model, "reasoning": reasoning, "infra": infra, "write": write,
         "web_search": web_search, "parent_run": parent_run,
         "images": list(images or []), "cwd": _get_cwd(),
         "prompt": prompt, "log": str(live_path or ""),
@@ -1360,13 +1816,15 @@ async def _run_codex(
         cmd = _build_exec_argv(
             model, reasoning, infra, web_search, output_file,
             prompt=prompt, resume_tid=resume_tid, images=images,
+            write=write, auto_compact_limit=ac_limit,
         )
         expected_tid = resume_tid
         state["last_error"] = ""
         try:
             (final_message, clean_extraction, stdout_text, stderr_text,
              returncode, hung_reason, timed_out) = await _exec_codex_once(
-                cmd, output_file, state, _emit, ctx, model)
+                cmd, output_file, state, _emit, ctx, model,
+                extra_env=extra_env)
         except asyncio.CancelledError:
             _journal({"run": run_tag, "phase": "end", "ts": time.time(),
                       "status": "cancelled"})
@@ -1393,8 +1851,15 @@ async def _run_codex(
             break
 
         failed = returncode != 0 and hung_reason is None and not timed_out
+        # NO AUTOMATIC RETRY FOR WRITE RUNS (cross-model review, CRITICAL):
+        # replaying "implement X" after half of X was written is not
+        # idempotent — a fresh retry can double-apply edits the failed
+        # attempt already made. Recovery for write runs is the EXPLICIT
+        # codex_resume_run path, where the caller first reconciles the
+        # changed-files report against the tree.
         if (
             failed
+            and not write
             and attempt < MAX_TRANSIENT_RETRIES
             and _is_transient_error(
                 f"{stderr_text}\n{state['last_error']}\n{stdout_text[-2000:]}"
@@ -1444,19 +1909,27 @@ async def _run_codex(
         "result_file": result_file,
     })
 
+    # Every write-run outcome — success, timeout, hang, error — reports what
+    # changed on disk: a timed-out run may still have written files, and the
+    # caller's next step is reviewing exactly that.
+    write_report = (
+        _write_changes_report(write_before, write_head, _get_cwd())
+        if write else ""
+    )
+
     if timed_out:
         if final_message:
             return (
                 f"[Codex model: {model} | reasoning: {reasoning}]\n"
                 f"[TIMEOUT after {MAX_RUNTIME_SECONDS}s — partial output recovered]"
                 f"{log_note}\n\n"
-                f"{final_message}"
+                f"{final_message}{write_report}"
             )
         return (
             f"[Codex TIMEOUT: no response after {MAX_RUNTIME_SECONDS}s]\n"
             f"The model may be overloaded or the query too complex. "
             f"Try simplifying the prompt or reducing reasoning effort."
-            f"{log_note}"
+            f"{log_note}{write_report}"
         )
 
     if hung_reason is not None:
@@ -1467,7 +1940,7 @@ async def _run_codex(
             f"(3) an approval prompt blocked by a missing TTY.\n\n"
             f"Partial stdout ({len(stdout_text)} chars):\n{stdout_text[:2000] or '(none)'}\n\n"
             f"Partial stderr ({len(stderr_text)} chars):\n{stderr_text[:2000] or '(none)'}"
-            f"{log_note}"
+            f"{log_note}{write_report}"
         )
 
     if returncode != 0 and not final_message:
@@ -1478,7 +1951,7 @@ async def _run_codex(
         return (
             f"[Codex error (exit {returncode}){retry_note}]\n{detail}{log_note}\n"
             f"[recoverable: call codex_resume_run to continue this run "
-            f"(run id: {run_tag})]"
+            f"(run id: {run_tag})]{write_report}"
         )
 
     header = f"[Codex model: {model} | reasoning: {reasoning}]"
@@ -1490,6 +1963,7 @@ async def _run_codex(
         )
     if state["last_error"] and returncode != 0:
         result += f"\n\n[run reported an error: {state['last_error']}]"
+    result += write_report
     result += log_note
 
     # Only surface the noisy session stream when the clean extraction path
@@ -1765,7 +2239,7 @@ async def research(
     constraints: str = "",
     caller_hypothesis: str = "",
     web_search: bool = True,
-    infra: bool = False,
+    infra: bool | None = None,
     images: list[str] = [],
     ctx: Context = None,
 ) -> str:
@@ -1793,13 +2267,32 @@ async def research(
             sensitive enough that outbound search queries are themselves a
             disclosure risk. Turning it off means version and API claims come
             from stale training data; treat them as unverified.
-        infra: Enable live-infrastructure access (SSH, live DB, Dokploy,
-            logs, MCP tools) for read-only investigation.
+        infra: Live-infrastructure access (SSH, live DB, Dokploy, logs, your
+            MCP servers) for read-only investigation. Default None = AUTO:
+            enabled only for questions about THIS project's live systems
+            (a liveness word AND an infra noun — "why is our production
+            database slow" yes; "compare Postgres vs MySQL indexing" no).
+            True/False force it. Live WEB research never needs this — web
+            search is live in every mode. When you already know the access
+            path (host, DB, container), STATE IT IN THE TOPIC so codex uses
+            it directly; its own discovery is the fallback, not the plan.
         images: Local image file paths (UI screenshots, diagrams, error
             dialogs) to attach — codex views them natively, so visual
             references beat prose descriptions. Missing paths are rejected
             loudly before any spend.
     """
+    # infra: None = AUTO (on only for live-systems questions), True/False =
+    # explicit and always honoured. Never switch mode silently — an
+    # auto-enabled full-access run says so in the result.
+    infra_notice = ""
+    if infra is None:
+        infra, why = _looks_infra_shaped(f"{topic} {constraints}")
+        if infra:
+            infra_notice = (
+                f"[infra mode AUTO-ENABLED — {why}. Codex ran with live "
+                f"infrastructure access (shell/network + your MCP servers), "
+                f"read-only by instruction. Pass infra=false to force it off.]\n\n"
+            )
     hits = _detect_anchoring({"topic": topic, "constraints": constraints})
 
     prompt_parts = [
@@ -1846,13 +2339,15 @@ async def research(
     )
 
     banner = _anchor_warning_banner(hits)
-    reserve = len(banner) + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0)
+    reserve = (len(banner) + len(infra_notice)
+               + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0))
     result = await _run_codex(
-        "\n".join(prompt_parts), infra=infra, ctx=ctx,
+        "\n".join(prompt_parts), infra=bool(infra), ctx=ctx,
         web_search=web_search, reserve=reserve,
         images=list(images or []),
     )
-    return banner + _verdict_missing_notice(caller_hypothesis, result) + result
+    return (banner + infra_notice
+            + _verdict_missing_notice(caller_hypothesis, result) + result)
 
 
 @mcp.tool()
@@ -1926,9 +2421,210 @@ async def codex_query(
 
 
 @mcp.tool()
+async def abraham(
+    task: str,
+    context: str = "",
+    constraints: str = "",
+    web_search: bool = True,
+    infra: bool = False,
+    allow_dirty: bool = False,
+    images: list[str] = [],
+    ctx: Context = None,  # type: ignore[assignment]
+) -> str:
+    """
+    WRITE MODE — the one tool that EDITS FILES, as TWO air-gapped phases:
+
+    1. ANALYSIS (read-only): codex investigates the codebase, the live web
+       (`web_search`), and live infrastructure (`infra` — SSH, DB, logs,
+       your MCP servers) and produces an implementation brief.
+    2. IMPLEMENTATION (sealed): a separate codex process with
+       workspace-write file access and NOTHING else — no network, no web,
+       no user MCP servers — implements the brief and reports. Untrusted
+       external content and live credentials never share a process with
+       write capability.
+
+    Mode algebra: read and write are separate TOOLS (structural
+    exclusivity); `infra`/`web_search` compose with abraham by governing
+    its ANALYSIS phase. The implementation phase is always sealed.
+
+    Safety envelope (enforced, not trusted): git work tree required; a
+    DIRTY tree is refused unless `allow_dirty=true` (the implementer may
+    legitimately rewrite files, and uncommitted edits it touches have no
+    undo — committed work is always recoverable); one writer per tree via
+    an authoritative lockfile held across both phases; no automatic retry
+    once a write process starts (a replay after partial writes
+    double-applies); codex must not commit/push — every outcome ends with a
+    CHANGED FILES report (this run's changes vs pre-existing dirt, HEAD
+    verified unmoved) for you to review with `git diff`. Long
+    implementation runs auto-compact codex's context at ~65% of the model
+    window (read from the deployed binary's own registry, never guessed).
+
+    This is a DIRECTIVE dispatch, not an advisory one: state the desired
+    outcome plainly — no anchoring lint, no caller_hypothesis; the contract
+    is "implement", not "judge". While it runs, do NOT edit the tree
+    yourself; afterwards, review the diff before anything is committed.
+
+    Args:
+        task: What to build/fix/change, with the desired outcome and
+            acceptance criteria; repro steps for bugfixes.
+        context: What you already know — relevant paths, prior findings,
+            decisions already made and why. Feed `research` output here to
+            shorten the analysis phase (or to skip web entirely).
+        constraints: Hard boundaries — files/areas NOT to touch, APIs to
+            keep stable, scope rules beyond the repo's own docs.
+        web_search: Analysis-phase live-web verification of external
+            claims. The implementation phase never has web access either
+            way.
+        infra: Analysis-phase read-only live-infrastructure investigation.
+            The implementation phase never has infra access either way.
+        allow_dirty: Accept a dirty working tree (default False — see
+            safety envelope).
+        images: Local image paths (mockups, error screenshots) — attached
+            to both phases.
+    """
+    if not task.strip():
+        return "[abraham refused: empty task — state what to implement.]"
+
+    cwd = _get_cwd()
+    ok, dirty, _head = _git_state(cwd)
+    if not ok:
+        return (
+            f"[abraham refused: {cwd} is not inside a git work tree. "
+            "Autonomous writes without version control have no undo.]"
+        )
+    if dirty and not allow_dirty:
+        sample = "\n".join(f"  {ln}" for ln in sorted(dirty)[:10])
+        more = f"\n  … +{len(dirty) - 10} more" if len(dirty) > 10 else ""
+        return (
+            "[abraham refused: the working tree is DIRTY and the sealed "
+            "implementer may overwrite uncommitted work irrecoverably "
+            "(committed work is always recoverable).\n"
+            f"{sample}{more}\n"
+            "Commit or stash first — or pass allow_dirty=true to accept "
+            "the risk; the final report will separate this run's changes "
+            "from the pre-existing dirt.]"
+        )
+
+    # One writer per tree — the authoritative lock is held across BOTH
+    # phases (the brief describes the tree as analyzed; another writer
+    # landing between the phases would invalidate it). The journal check
+    # stays as an advisory belt for server processes running older code.
+    live_run = _active_write_run(cwd)
+    if live_run:
+        return (
+            f"[abraham refused: write run {live_run} is still LIVE in this "
+            "workspace (one writer per tree). Wait for it or cancel it; an "
+            "interrupted write run is resumable via codex_resume_run.]"
+        )
+    got_lock, holder = _acquire_write_lock(cwd, "abraham")
+    if not got_lock:
+        return (
+            f"[abraham refused: another write run holds this tree's lock "
+            f"({holder}). One writer per tree.]"
+        )
+    try:
+        # ---- Phase 1: read-only analysis → implementation brief ----
+        analysis_parts = [
+            "PHASE 1 of 2 — ANALYSIS ONLY. You are a senior engineer "
+            "preparing an implementation. A SEPARATE, SEALED process will "
+            "do the writing: it has full read/write access to this "
+            "workspace but NO web search, NO network and NO external "
+            "tools, and it will see ONLY your final message. So your final "
+            "message must be a complete IMPLEMENTATION BRIEF:",
+            "",
+            "## Findings — how the relevant system actually works, with "
+            "file:line references (trace real call paths, don't guess).",
+        ]
+        if infra:
+            analysis_parts.append(
+                "## Live state — what the live infrastructure shows "
+                "(read-only investigation) where it bears on the task."
+            )
+        if web_search:
+            analysis_parts.append(
+                "## External facts — every API/version/vendor behavior the "
+                "implementer must rely on, verified against current "
+                "primary sources, with URLs and EXACT values (the "
+                "implementer cannot look anything up)."
+            )
+        analysis_parts += [
+            "## Plan — the minimal COMPLETE change: ordered edits per "
+            "file, including error paths and edge cases; no artificial "
+            "caps, no silently deferred scope.",
+            "## Risks — what could break, and what to check.",
+            "## Verification — the exact fast checks to run "
+            "(tests/linters/build) and expected outcomes.",
+            "",
+            "Do NOT modify any file in this phase.",
+            "",
+            "## Task",
+            task,
+        ]
+        if context:
+            analysis_parts += ["", "## Context (from the caller)", context]
+        if constraints:
+            analysis_parts += [
+                "", "## Constraints (hard boundaries)", constraints]
+
+        brief = await _run_codex(
+            "\n".join(analysis_parts),
+            infra=infra, ctx=ctx, web_search=web_search,
+            images=list(images or []),
+        )
+        for marker in ("[Codex TIMEOUT", "[Codex error",
+                       "[Codex health check FAILED"):
+            if marker in brief[:200]:
+                return (
+                    "[abraham: ANALYSIS phase failed — nothing was "
+                    f"written. Phase-1 result follows.]\n\n{brief}"
+                )
+
+        # ---- Phase 2: sealed implementation ----
+        impl_parts = [
+            "PHASE 2 of 2 — IMPLEMENT. A read-only analysis run has "
+            "already investigated this task; its brief is below. You have "
+            "full local code access — re-read anything you need — but no "
+            "web/network/external tools: every external fact you need is "
+            "in the brief.",
+            "",
+            "WORKFLOW: follow the brief's Plan (deviate only where the "
+            "code proves it wrong, and say so); match the surrounding "
+            "code's style; reuse existing helpers; then run the brief's "
+            "Verification checks that exist and fix what they catch; "
+            "finally REPORT: what changed and why, file by file; what you "
+            "verified and how; any deviation from the brief and its "
+            "reason.",
+            "",
+            "## Task",
+            task,
+        ]
+        if constraints:
+            impl_parts += ["", "## Constraints (hard boundaries)", constraints]
+        impl_parts += ["", "## Implementation brief (from the analysis phase)",
+                       brief]
+
+        result = await _run_codex(
+            "\n".join(impl_parts),
+            write=True, infra=False, ctx=ctx, web_search=False,
+            images=list(images or []),
+        )
+        return (
+            "[abraham — phase 1 analyzed (read-only"
+            + (", infra" if infra else "")
+            + (", live web" if web_search else "")
+            + "); phase 2 implemented (sealed: no web/network/MCP)]\n\n"
+            + result
+        )
+    finally:
+        _release_write_lock(cwd)
+
+
+@mcp.tool()
 async def codex_resume_run(
     run: str = "",
     nudge: str = "",
+    infra: bool | None = None,
+    web_search: bool | None = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -1942,14 +2638,42 @@ async def codex_resume_run(
     it: the model still has the reasoning and tool output it had built up.
 
     A finished-but-undelivered run (e.g. the reload killed the call after
-    codex answered) returns its stored answer immediately, at no cost.
+    codex answered) returns its stored answer immediately, at no cost —
+    unless you pass a nudge, which continues the thread with your new
+    instructions instead of replaying the old answer.
+
+    Every continuation RESTATES the original task from the run journal:
+    a hard-killed turn may have persisted none of its input vendor-side
+    (measured 2026-08-09), so the thread cannot be trusted to remember the
+    question. Threads that did retain context see a labelled duplicate.
+
+    SWITCH CAPABILITIES MID-COURSE. A resume may change the run's settings,
+    so a run that turns out to need something it didn't have can be rescued
+    instead of restarted: cancel the call, then resume the SAME thread — all
+    its accumulated reasoning and tool output intact — with new settings and
+    new instructions. The classic case: research that needs the live system.
+
+        codex_resume_run(run="codex3·8123", infra=True,
+                         nudge="SSH to the app host and check the celery "
+                               "queue depth, then finish the analysis")
+
+    Write runs (abraham) resume as write runs — sandbox, git contract and
+    changed-files report intact. The write axis itself has no override:
+    read runs cannot be escalated to write by resuming, and write runs
+    cannot be downgraded mid-implementation.
 
     Args:
         run: The run id from the failure message ("run id: codex7·21746").
             Omit to resume the most recent recoverable run. Pass "list" to
             see the recent runs and their statuses instead.
-        nudge: Optional instruction for the continuation. Default asks for
-            the complete final answer from where it left off.
+        nudge: Instructions for the continuation — additional direction, not
+            just "carry on". Default asks for the complete final answer from
+            where it left off.
+        infra: Change live-infrastructure access for the continuation.
+            None (default) inherits the original run's setting; True grants
+            shell/network + your MCP servers; False takes it away.
+        web_search: Change live web search for the continuation. None
+            inherits the original run's setting.
     """
     # WORKSPACE SCOPING (security): the journal is global across every project
     # on this machine. Listing or auto-resuming must not surface another
@@ -1997,14 +2721,18 @@ async def codex_resume_run(
         rec = candidates[-1]
         run = str(rec.get("run", ""))
 
-    # Finished after all (the answer just never reached the caller).
+    # Finished after all (the answer just never reached the caller) — but
+    # only short-circuit when the caller wants THAT answer. An explicit nudge
+    # means "continue this thread with new instructions"; returning the old
+    # answer instead would silently discard the nudge.
     result_file = str(rec.get("result_file") or "")
-    if result_file and Path(result_file).exists():
+    if result_file and not nudge and Path(result_file).exists():
         stored = Path(result_file).read_text(encoding="utf-8", errors="replace").strip()
         if stored:
             return (
                 f"[Recovered run {run} — it had COMPLETED; returning its "
-                f"stored answer (no new model call).]\n\n{stored}"
+                f"stored answer (no new model call). Pass a nudge to "
+                f"continue the thread instead.]\n\n{stored}"
             )
 
     tid = str(rec.get("thread_id") or "")
@@ -2016,14 +2744,99 @@ async def codex_resume_run(
             f"Error: {str(rec.get('error') or '(none)')[:300]}"
         )
 
-    return await _run_codex(
-        nudge or RESUME_NUDGE,
-        infra=bool(rec.get("infra")),
-        ctx=ctx,
-        web_search=bool(rec.get("web_search", True)),
-        resume_tid=tid,
-        parent_run=run,
-    )
+    # MID-COURSE SWITCH: the continuation may change the run's capabilities.
+    # None = inherit the original run's setting; True/False = override. This is
+    # how you rescue a run that turned out to need live infrastructure: cancel
+    # it, then resume the SAME thread (all its accumulated reasoning intact)
+    # with infra=true and instructions for what to go look at.
+    was_infra = bool(rec.get("infra"))
+    use_infra = was_infra if infra is None else bool(infra)
+    use_web = bool(rec.get("web_search", True)) if web_search is None else bool(web_search)
+
+    # WRITE INHERITS, ALWAYS — deliberately no override parameter. Escalating
+    # a read run to write on resume would bypass abraham's dispatch guards
+    # (git precondition, one-writer-per-tree, the implementation contract);
+    # downgrading a write run mid-implementation would strand half-applied
+    # changes behind a read-only sandbox. Re-dispatch through the right tool
+    # instead of flipping this axis mid-thread.
+    use_write = bool(rec.get("write"))
+    if use_write:
+        # A write continuation is SEALED like every write process — even if
+        # the caller asked for infra/web, and regardless of what an older
+        # journal record claims. The analysis phase is where those lived.
+        use_infra = False
+        use_web = False
+        other = _active_write_run(cwd, exclude_run=run)
+        if other:
+            return (
+                f"[resume refused: write run {other} is still LIVE in this "
+                "workspace (one writer per tree). Wait for it or cancel it "
+                "first.]"
+            )
+
+    # GUARD: never resume a thread that is still being written. Two codex
+    # processes on one rollout can corrupt it. A run with no end record whose
+    # log grew in the last minute is alive, not orphaned.
+    if not rec.get("has_end"):
+        log_path = str(rec.get("log") or "")
+        with contextlib.suppress(OSError):
+            if log_path and Path(log_path).is_file():
+                idle = time.time() - Path(log_path).stat().st_mtime
+                if idle < 60:
+                    return (
+                        f"[Run {run} is still ACTIVELY RUNNING (its live log was "
+                        f"written {int(idle)}s ago). Resuming a live thread can "
+                        f"corrupt its session. Cancel that call first (or wait "
+                        f"for it to finish), then resume.]"
+                    )
+
+    switches = []
+    if use_infra != was_infra:
+        switches.append(f"infra {was_infra} → {use_infra}")
+    if use_web != bool(rec.get("web_search", True)):
+        switches.append(f"web_search {bool(rec.get('web_search', True))} → {use_web}")
+    note = (f"[Resuming {run} with changed settings: {', '.join(switches)}]\n\n"
+            if switches else "")
+
+    # RESTATE THE ORIGINAL TASK. MEASURED 2026-08-09: a turn that is truly
+    # killed early (process-group kill, mid-turn) may persist NOTHING of its
+    # input in the rollout — the resumed model then has no idea what the
+    # question was and confidently fabricates (it mined a marker out of the
+    # cwd PATH in the regression test). The journal holds the full prompt we
+    # sent (advisor context included), so the continuation carries it; a
+    # thread that did retain context treats it as a stated duplicate.
+    continuation = nudge or RESUME_NUDGE
+    original_prompt = str(rec.get("prompt") or "")
+    if original_prompt:
+        continuation = (
+            "[RECOVERY CONTEXT — this thread's interrupted turn may not have "
+            "persisted its input. The original task is restated below; if "
+            "you already have it in-thread, treat this as a duplicate and "
+            "continue.]\n\n<original_task>\n"
+            f"{original_prompt}\n</original_task>\n\n"
+            f"[CONTINUATION INSTRUCTIONS]\n{continuation}"
+        )
+
+    if use_write:
+        got_lock, holder = _acquire_write_lock(cwd, f"resume:{run}")
+        if not got_lock:
+            return (
+                f"[resume refused: another write run holds this tree's "
+                f"lock ({holder}). One writer per tree.]"
+            )
+    try:
+        return note + await _run_codex(
+            continuation,
+            infra=use_infra,
+            write=use_write,
+            ctx=ctx,
+            web_search=use_web,
+            resume_tid=tid,
+            parent_run=run,
+        )
+    finally:
+        if use_write:
+            _release_write_lock(cwd)
 
 
 # ---------------------------------------------------------------------------

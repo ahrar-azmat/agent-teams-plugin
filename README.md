@@ -15,6 +15,8 @@ When you ask Claude Code to do anything involving 2+ agents, the `agent-teams` s
 
 It ships **role templates** (researcher, architect, implementer, reviewer, tester, …) and **team patterns** (research, implementation, debug, review), plus an optional **multi-model advisory** layer that uses Codex and Antigravity as independent advisors when those MCP servers are present.
 
+The codex-oracle plugin also ships **`/abraham`** (v1.13.0): a write-capable mode that runs as two air-gapped codex phases — read-only deep analysis (codebase + live infra + live web) producing an implementation brief, then a sealed implementer (workspace-write file access, no network/web/MCP) that edits the working tree under git preconditions, a one-writer lock, and changed-files attribution for the orchestrator to review.
+
 ## Why this exists (the v1.1.0 fix)
 
 Agent Teams tools are **deferred** and **schema-validated** (`additionalProperties: false`). The most common way orchestration runs fail is passing parameters the tools don't accept. This skill pins the exact signatures so the model can't improvise:
