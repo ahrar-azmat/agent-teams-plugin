@@ -3,6 +3,20 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.13.1] — 2026-08-15
+
+### Added
+- **`scripts/codex_src.py` — tag-matched upstream source reference (map vs territory).**
+  Keeps a stable worktree (`~/Documents/codex-installed`) checked out at
+  `rust-v<installed codex version>`, re-aligning itself after every CLI update; the base
+  clone is never touched, dirty reference trees are refused loudly, deleted worktrees
+  self-heal via prune. Motivation (measured): the clone's main-branch HEAD is DIVERGENT
+  from the `rust-v0.147.0` release tag — releases are cut on branches — and reading the
+  wrong ref has produced wrong conclusions twice in this repo's history ("verify the
+  backend you run, not the source you read"). codex-oracle 1.10.1: the codex-review and
+  codex-planning skills now require stating WHICH ref was read whenever upstream source is
+  part of the evidence, and confirming load-bearing claims against the running binary.
+
 ## [1.13.0] — 2026-08-14
 
 ### Added

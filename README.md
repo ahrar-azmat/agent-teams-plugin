@@ -64,6 +64,23 @@ its default is `cached`, an OpenAI-maintained snapshot index, so the previous in
 `UNVERIFIED`, and end with a Sources section; code reviews additionally check APIs against
 current upstream docs and touched dependencies for known CVEs.
 
+## Upstream codex source as reference (map vs territory)
+
+The `openai/codex` CLI is Apache-2.0 open source, and its internals are the reference for
+everything these plugins wrap. Two rules keep that reference honest:
+
+1. **Read the ref that matches the installed binary, never main-HEAD.** Releases are cut on
+   branches, so main and the release tags are divergent — either direction of drift has
+   produced wrong conclusions here. `python3 scripts/codex_src.py` keeps a stable worktree
+   (`~/Documents/codex-installed`, override via `CODEX_SRC_WORKTREE`) checked out at
+   `rust-v<installed version>`, re-aligning itself after every codex update. It never touches
+   the base clone (`~/Documents/codex`, override via `CODEX_SRC_CLONE`) and refuses to run
+   over local modifications.
+2. **Source is the map; the installed binary is the territory.** Source names the config
+   keys, events, and mechanisms worth probing — but anything load-bearing is confirmed
+   against the running binary (`--strict-config` with a known-bad key first, live probes,
+   the binary's own `models_cache.json`), never asserted from source alone.
+
 ## Install
 
 ```text

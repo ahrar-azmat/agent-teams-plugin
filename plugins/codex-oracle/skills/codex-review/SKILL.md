@@ -116,5 +116,15 @@ Summarize:
 - Where they disagree — with both perspectives
 - Which findings you've already fixed vs which need user input
 
+## When upstream vendor source is part of the evidence
+Source is the MAP; the installed binary is the TERRITORY. If a finding rests on reading
+vendor source (codex internals, a library's repo), read the checkout that matches the
+INSTALLED version — for codex, `python3 scripts/codex_src.py` keeps
+`~/Documents/codex-installed` aligned to the installed CLI's release tag — and **state the
+ref you read** in the finding. Main-branch HEAD and release tags are divergent; conclusions
+drawn from the wrong ref have been wrong twice in this repo's history. Anything load-bearing
+still gets confirmed against the running binary (probe / `--strict-config` / registry), not
+the source alone.
+
 ## Skip conditions
 Only skip if the user explicitly says "skip review" or "just push it".
