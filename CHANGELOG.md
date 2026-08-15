@@ -3,6 +3,29 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.14.0] — 2026-08-15
+
+### Added
+- **Caller-side internet channel layer (agent-reach integration).** The agent-teams and
+  codex-planning skills now teach a fetch discipline for sources beyond advisor web search
+  (YouTube subtitles, RSS, Exa semantic search, Jina-rendered pages): the ORCHESTRATOR or a
+  teammate runs the `agent-reach` CLI, curates the output, and passes it to Codex/Antigravity
+  as cited context data. Optional — an absent CLI changes nothing. software-workflows 1.7.0.
+
+### Architecture decision (measured)
+- The alternative — a networked "research sandbox" so Codex could fetch for itself — was
+  REJECTED by measurement on the installed binary: codex 0.147.0 has **no mechanism for
+  network egress without full disk read**. `--strict-config` rejects `sandbox_permissions`
+  as *"unknown configuration field … in -c/--config override"* (identically for a
+  real-looking and a bogus token — the KEY is unknown, not the value); those tokens exist
+  only in main-HEAD test harnesses, not in the `rust-v0.147.0` config surface. Any
+  networked posture on 0.147.0 reads everything, and untrusted web content + full-disk
+  read + egress in one process is an exfiltration triangle. Caller-side fetch preserves
+  the advisor context boundary and abraham's air-gap unchanged.
+- `agent-reach doctor` verified in source to report **local readiness, not reachability**
+  (its web channel's `check()` returns "ok" unconditionally) — the skills now say so, and
+  channels count as unverified until a fetch succeeds in-session.
+
 ## [1.13.1] — 2026-08-15
 
 ### Added

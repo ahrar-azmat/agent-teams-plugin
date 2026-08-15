@@ -50,6 +50,12 @@ design opinion with no reference to how this has been solved before is speculati
 Both servers require a **Sources** section. Unsourced external claims were answered from memory —
 re-ask.
 
+When a needed source is beyond the advisors' own web reach (YouTube subtitles, RSS feeds,
+semantic search, JS-heavy pages), fetch it yourself with a channel CLI such as `agent-reach`
+(if installed) and pass the curated content — with its origin URL — as context. **The caller
+fetches; the advisor receives.** Never hand an advisor a network-enabled sandbox to fetch for
+itself: untrusted web content, full-disk read, and network egress must never share a process.
+
 ## Step 3: Synthesize findings
 Once all return — **and "all" means Codex too; if only Antigravity is back, you are not here yet**:
 1. Summarize each model's key findings

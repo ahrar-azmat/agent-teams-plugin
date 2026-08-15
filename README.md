@@ -64,6 +64,17 @@ its default is `cached`, an OpenAI-maintained snapshot index, so the previous in
 `UNVERIFIED`, and end with a Sources section; code reviews additionally check APIs against
 current upstream docs and touched dependencies for known CVEs.
 
+## The channel layer (v1.14.0)
+
+Advisor web search reaches ordinary pages; it can't read YouTube subtitles, RSS feeds, or
+semantic-search indexes. When the [agent-reach](https://github.com/Panniantong/agent-reach)
+CLI is installed, the orchestration skill uses it as a **caller-side fetch layer**: the
+orchestrator or a teammate fetches, curates, and passes content to the advisors as cited
+context data. Advisors are never given networked sandboxes to fetch for themselves —
+untrusted web content, full-disk read, and network egress must never share a process
+(measured on codex 0.147.0: no mechanism exists for network without full disk read).
+Entirely optional — without the CLI, nothing changes.
+
 ## Upstream codex source as reference (map vs territory)
 
 The `openai/codex` CLI is Apache-2.0 open source, and its internals are the reference for
