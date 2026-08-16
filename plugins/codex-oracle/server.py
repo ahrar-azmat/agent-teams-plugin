@@ -209,7 +209,7 @@ def _auto_compact_limit(model: str) -> tuple[int | None, str]:
 mcp = FastMCP(
     "codex-oracle",
     instructions=(
-        "Codex Oracle is the PRIMARY cross-model advisor: OpenAI's latest Codex "
+        "Codex Oracle is the SOLE cross-model advisor: OpenAI's latest Codex "
         "model at MAXIMUM reasoning effort, with repository access and LIVE web "
         "search. It is the deepest and most rigorous advisor available — use it "
         "for review, architecture, research, web research, and synthesis. Its "
@@ -217,17 +217,14 @@ mcp = FastMCP(
         "NEVER CONCLUDE OR ACT WITHOUT CODEX. Codex runs at max effort and can "
         "take many minutes; long calls are moved to the background and return "
         "later as a task notification. That is NORMAL — WAIT for it. Do not "
-        "ship, commit, or declare a decision on the strength of the secondary "
-        "advisor (Antigravity) alone: the secondary is corroboration, not "
-        "authority. If Codex has not answered yet, the review is NOT complete — "
+        "ship, commit, or declare a decision while Codex's answer is pending. "
+        "If Codex has not answered yet, the review is NOT complete — "
         "block on its result (Monitor / wait for the notification) and keep "
         "working on something else meanwhile.\n\n"
-        "WHEN THEY DISAGREE, Codex carries — unless you can DISPROVE it by "
-        "measuring the deployed system. (Measurement beats both models: Codex "
-        "has been wrong when it read newer upstream source instead of the "
-        "installed binary.) A finding the secondary raised that Codex missed is "
-        "still real and must be verified, never discarded — both directions of "
-        "miss have happened.\n\n"
+        "WHEN YOU AND CODEX DISAGREE, Codex carries — unless you can DISPROVE "
+        "it by measuring the deployed system. (Measurement beats the model: "
+        "Codex has been wrong when it read newer upstream source instead of "
+        "the installed binary.)\n\n"
         "Codex responses are authoritative expert opinions — take them "
         "seriously, cross-reference with your own analysis, and flag any "
         "disagreements to the user.\n\n"
@@ -247,18 +244,11 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 # INDEPENDENCE / WEB RESEARCH — shared prompt construction
 # ---------------------------------------------------------------------------
-# NOTE ON DUPLICATION: this block is duplicated verbatim in the sibling
-# plugin's server.py, deliberately. `software-workflows`, `codex-oracle` and
-# `antigravity` are three INDEPENDENTLY INSTALLABLE plugins (see
-# .claude-plugin/marketplace.json) that each run from their own in-tree venv.
-# A shared module would make each plugin unusable unless the other is also
-# installed, and unimportable across venvs without sys.path surgery. Keep the
-# two copies in sync by hand; they are ~120 lines of prose constants.
 # Anchoring is the dominant failure mode of cross-model advice. The caller
 # (usually another LLM) writes a prompt containing its own diagnosis and asks
 # for a "review"; the advisor then evaluates the caller's story instead of the
-# evidence, and returns agreement. Two independent models anchored on the same
-# framing produce correlated agreement that reads like corroboration and is
+# evidence, and returns agreement. An advisor anchored on the caller's framing
+# returns the caller's own opinion wearing the advisor's voice — agreement
 # worth nothing. These blocks are injected server-side so independence does not
 # depend on the caller remembering to ask for it.
 
@@ -559,6 +549,46 @@ def _get_reasoning_effort() -> str:
 def _get_cwd() -> str:
     """Get the working directory — prefer CLAUDE_CWD if set."""
     return os.environ.get("CLAUDE_CWD", os.getcwd())
+
+
+def _workspace_digest(cwd: str) -> str:
+    """12-hex digest of the workspace state (HEAD + tracked diff + status).
+
+    Stamped into answer headers by ``_answer_sig`` and recomputed by the
+    push-gate hook at push time: a mismatch means the tree changed after the
+    answer, so a completed review no longer vouches for the push. Duplicated
+    in hooks/push_gate.py (hooks cannot import this module — it needs the
+    mcp package); tests/test_push_gate.py pins behavioral parity.
+    """
+    try:
+        parts = []
+        for args in (("rev-parse", "HEAD"), ("diff", "HEAD"), ("status", "--porcelain")):
+            proc = subprocess.run(
+                ["git", "-C", cwd, *args],
+                capture_output=True, text=True, timeout=15,
+            )
+            if proc.returncode != 0:
+                # A digest over PARTIAL state is worse than no digest: a
+                # failed diff/status hashed as empty could still open the
+                # gate. Every command must succeed or the digest is void.
+                return "nogit" if args[0] == "rev-parse" else "unknown"
+            parts.append(proc.stdout)
+        return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:12]
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
+def _answer_sig(tool_name: str, status: str) -> str:
+    """Machine-verifiable answer signature, appended inside the result header.
+
+    hooks/push_gate.py opens the push gate only for a header carrying
+    ``tool:code_review | status:ok`` and a ``tree:`` digest matching the
+    workspace at push time — so a TIMEOUT partial, another tool's answer, or
+    a review of an older tree can never satisfy the gate.
+    """
+    if not tool_name:
+        return ""
+    return f" | tool:{tool_name} | status:{status} | tree:{_workspace_digest(_get_cwd())}"
 
 
 # ---------------------------------------------------------------------------
@@ -1026,7 +1056,7 @@ def _process_exec_event(ev: dict[str, Any], state: dict[str, str]) -> str | None
 # SECURITY: a project's CLAUDE.md and its memory files contain LIVE SECRETS
 # (verified: this workspace's CLAUDE.md carries SSH/DB passwords in its first
 # 3 KB and says "never copy into any repo"; project-typed memories carry
-# credentials too). The advisors are EXTERNAL providers (OpenAI/Google), so we
+# credentials too). The advisor is an EXTERNAL provider (OpenAI), so we
 # NEVER inject those. We inject ONLY a file the maintainer curates to be
 # external-safe: ADVISOR_CONTEXT.md. Absent file = nothing sent (default
 # CLOSED). Chosen by the user 2026-08-09.
@@ -1258,7 +1288,8 @@ def _build_exec_argv(
             argv += ["-i", img]
     if write:
         # SEALED implementation process (cross-model review verdict,
-        # 2026-08-14: both advisors independently required the air-gap).
+        # 2026-08-14: two independent advisors both required the air-gap
+        # at the time).
         # Write capability NEVER shares a process with untrusted external
         # content or live credentials: no network egress, no web search
         # (forced off below), no user config → no user MCP servers. The
@@ -1599,6 +1630,7 @@ async def _run_codex(
     resume_tid: str | None = None,
     parent_run: str = "",
     images: list[str] | None = None,
+    tool_name: str = "",
 ) -> str:
     """Run codex exec headlessly with clean final-message extraction.
 
@@ -1793,6 +1825,7 @@ async def _run_codex(
 
     _journal({
         "run": run_tag, "phase": "start", "ts": time.time(), "engine": "codex",
+        "tool": tool_name,
         "model": model, "reasoning": reasoning, "infra": infra, "write": write,
         "web_search": web_search, "parent_run": parent_run,
         "images": list(images or []), "cwd": _get_cwd(),
@@ -1920,7 +1953,8 @@ async def _run_codex(
     if timed_out:
         if final_message:
             return (
-                f"[Codex model: {model} | reasoning: {reasoning}]\n"
+                f"[Codex model: {model} | reasoning: {reasoning}"
+                f"{_answer_sig(tool_name, 'timeout')}]\n"
                 f"[TIMEOUT after {MAX_RUNTIME_SECONDS}s — partial output recovered]"
                 f"{log_note}\n\n"
                 f"{final_message}{write_report}"
@@ -1954,7 +1988,13 @@ async def _run_codex(
             f"(run id: {run_tag})]{write_report}"
         )
 
-    header = f"[Codex model: {model} | reasoning: {reasoning}]"
+    # status:ok is EARNED by exit 0 — a non-zero run that still produced a
+    # final_message reaches this branch, and stamping it ok would let the
+    # push gate accept a failed review (probed in review round 3).
+    header = (
+        f"[Codex model: {model} | reasoning: {reasoning}"
+        f"{_answer_sig(tool_name, 'ok' if returncode == 0 else 'error')}]"
+    )
     result = f"{header}\n\n{final_message}"
     if attempt and returncode == 0:
         result += (
@@ -2121,6 +2161,7 @@ async def architect_review(
         "\n".join(prompt_parts), infra=infra, ctx=ctx,
         web_search=web_search, reserve=reserve,
         images=list(images or []),
+        tool_name="architect_review",
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
@@ -2229,6 +2270,7 @@ async def code_review(
         "\n".join(prompt_parts), infra=infra, ctx=ctx,
         web_search=web_search, reserve=reserve,
         images=list(images or []),
+        tool_name="code_review",
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
@@ -2345,6 +2387,7 @@ async def research(
         "\n".join(prompt_parts), infra=bool(infra), ctx=ctx,
         web_search=web_search, reserve=reserve,
         images=list(images or []),
+        tool_name="research",
     )
     return (banner + infra_notice
             + _verdict_missing_notice(caller_hypothesis, result) + result)
@@ -2416,6 +2459,7 @@ async def codex_query(
         preamble + body, infra=infra, ctx=ctx,
         web_search=web_search, reserve=reserve,
         images=list(images or []),
+        tool_name="codex_query",
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
@@ -2570,6 +2614,7 @@ async def abraham(
             "\n".join(analysis_parts),
             infra=infra, ctx=ctx, web_search=web_search,
             images=list(images or []),
+            tool_name="abraham",
         )
         for marker in ("[Codex TIMEOUT", "[Codex error",
                        "[Codex health check FAILED"):
@@ -2607,6 +2652,7 @@ async def abraham(
             "\n".join(impl_parts),
             write=True, infra=False, ctx=ctx, web_search=False,
             images=list(images or []),
+            tool_name="abraham",
         )
         return (
             "[abraham — phase 1 analyzed (read-only"
@@ -2833,6 +2879,7 @@ async def codex_resume_run(
             web_search=use_web,
             resume_tid=tid,
             parent_run=run,
+            tool_name=str(rec.get("tool") or ""),
         )
     finally:
         if use_write:

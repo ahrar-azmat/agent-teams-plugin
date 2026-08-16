@@ -4,18 +4,16 @@ that only a POSIX shell could run; hooks now use exec form + python)."""
 import json
 
 CONTEXT = (
-    "PLANNING GATE: Before entering plan mode, ensure you have multi-model "
+    "PLANNING GATE: Before entering plan mode, ensure you have cross-model "
     "advisory context. If you have NOT yet consulted Codex architect_review "
-    "or Antigravity antigravity_brainstorm in this session for the current "
-    "task, call them NOW (in PARALLEL, same message) (they work in plan mode "
-    "since plan mode supports all tools except Write/Edit). DISPATCH BLIND: "
-    "give them the REQUIREMENT and CONSTRAINTS and ask them to solve it "
-    "— do NOT paste the design you already picked and ask them to bless "
+    "in this session for the current task, call it NOW (it works in plan "
+    "mode since plan mode supports all tools except Write/Edit). DISPATCH "
+    "BLIND: give it the REQUIREMENT and CONSTRAINTS and ask it to solve it "
+    "— do NOT paste the design you already picked and ask it to bless "
     "it, which returns agreement rather than architecture. Put any preferred "
     "design in the caller_hypothesis parameter so it is refuted instead of "
     "confirmed. Expect live web research with source URLs for prior art and "
-    "version claims. If multi-model advisory has already run, proceed into "
-    "plan mode."
+    "version claims. If the advisory has already run, proceed into plan mode."
 )
 
 print(json.dumps({

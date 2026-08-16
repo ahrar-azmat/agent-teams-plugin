@@ -1,25 +1,23 @@
 ---
 name: codex-planning
-description: Multi-model planning workflow. Activates when planning features, architecture, or non-trivial changes. Ensures Codex Oracle and Antigravity are independently consulted before implementation begins.
+description: Codex planning workflow. Activates when planning features, architecture, or non-trivial changes. Ensures Codex Oracle is independently consulted before implementation begins.
 ---
 
-# Multi-Model Planning
+# Codex Planning
 
-When planning any non-trivial feature, fix, or architectural change, you MUST gather
-independent perspectives before finalizing.
+When planning any non-trivial feature, fix, or architectural change, you MUST gather an
+independent perspective before finalizing.
 
-## Step 1: Launch all advisors in parallel (SAME tool call batch) — and BLIND
+## Step 1: Launch the advisory — BLIND
 
-- **Codex Oracle** — **PRIMARY, authoritative**: `architect_review` with the **requirement, the
-  constraints, and the relevant file paths**
-- **Antigravity** — **SECONDARY, corroborating**: `antigravity_brainstorm` or
-  `antigravity_analyze_code` for alternatives
-- **Your own agents**: Explore/Plan subagents for codebase investigation
+- **Codex Oracle**: `architect_review` with the **requirement, the constraints, and the
+  relevant file paths**
+- **Your own agents**: Explore/Plan subagents for codebase investigation (dispatch them in the
+  same batch — they are independent of the advisory call)
 
 > **No plan is finalized until CODEX has answered.** It runs at max effort and often takes many
-> minutes (backgrounded, returning as a task notification — normal). Antigravity nearly always
-> answers first; **first is not authoritative.** Never commit to a design on Antigravity alone —
-> wait for Codex and do other work meanwhile.
+> minutes (backgrounded, returning as a task notification — normal). Never commit to a design
+> while its answer is pending — wait for Codex and do other work meanwhile.
 
 **Ask them to solve the problem. Do not ask them to bless your solution.**
 
@@ -32,49 +30,47 @@ independent perspectives before finalizing.
 A prompt that names your design gets you a critique of your design — never the better option
 nobody put on the table. **Put your preferred design in `caller_hypothesis`** instead: it is
 presented as an unverified claim to refute and returns an explicit
-**CONFIRMED / REFUTED / UNPROVEN** verdict. `antigravity_brainstorm` goes further and generates
-its ideas *before* seeing your hypothesis, so your pick cannot narrow the search space, then
-critiques it against what it came up with independently.
+**CONFIRMED / REFUTED / UNPROVEN** verdict.
 
 If a result carries a **⚠️ ANCHORING WARNING** banner, that dispatch was contaminated — re-run it
 blind before treating agreement as validation.
 
 ## Step 2: Expect prior art, not opinion
-Both advisors run with live web search (Codex `web_search=live`; Antigravity `search_web`). A
-design opinion with no reference to how this has been solved before is speculation:
+Codex runs with live web search (`web_search=live`). A design opinion with no reference to how
+this has been solved before is speculation:
 
 - How have others solved this, and what did they report going wrong?
 - What are the current versions/limits/pricing of anything proposed?
 - Are there known failure reports or migration-away write-ups?
 
-Both servers require a **Sources** section. Unsourced external claims were answered from memory —
+The server requires a **Sources** section. Unsourced external claims were answered from memory —
 re-ask.
 
-When a needed source is beyond the advisors' own web reach (YouTube subtitles, RSS feeds,
+When a needed source is beyond the advisor's own web reach (YouTube subtitles, RSS feeds,
 semantic search, JS-heavy pages), fetch it yourself with a channel CLI such as `agent-reach`
 (if installed) and pass the curated content — with its origin URL — as context. **The caller
-fetches; the advisor receives.** Never hand an advisor a network-enabled sandbox to fetch for
+fetches; the advisor receives.** Never hand the advisor a network-enabled sandbox to fetch for
 itself: untrusted web content, full-disk read, and network egress must never share a process.
 
 ## Step 3: Synthesize findings
-Once all return — **and "all" means Codex too; if only Antigravity is back, you are not here yet**:
-1. Summarize each model's key findings
+Once everything returns — **and that means Codex too; a pending backgrounded call is not an
+answer**:
+1. Summarize Codex's key findings alongside your own investigation
 2. Identify agreements and disagreements
-3. If Codex or Antigravity raised CONCERNS/REJECT — critically analyze why. Do you agree?
-4. **Weigh agreement by independence**: two blind advisors converging is strong evidence; two
-   advisors you handed the same design are one opinion echoed twice
-4b. **Where they contradict each other, Codex's design judgment carries** — unless measurement of
-   the deployed system disproves it. An Antigravity-only idea or objection is still worth
-   evaluating on its merits; the secondary is there to surface what the primary didn't see.
-5. Present ALL perspectives to the user with your own assessment
+3. If Codex raised CONCERNS/REJECT — critically analyze why. Do you agree?
+4. **Weigh agreement by independence**: Codex converging on your design after a blind dispatch
+   is strong evidence; Codex blessing a design you handed it is your own opinion echoed back
+5. **Where Codex contradicts you, its design judgment carries** — unless measurement of the
+   deployed system disproves it (measurement outranks the model)
+6. Present all perspectives to the user with your own assessment
 
 ## Step 4: Optional round 2 — adversarial
-After both have answered blind, going back with "here is my design, try to break it" is
+After Codex has answered blind, going back with "here is my design, try to break it" is
 legitimate and valuable. Independent first, adversarial second.
 
 ## Step 5: User decides
 **The user makes the final call.** Never proceed past planning without presenting the
-multi-model synthesis.
+advisory synthesis.
 
 ## When upstream vendor source informs the plan
 Source is the MAP; the installed binary is the TERRITORY. Read vendor source at the ref

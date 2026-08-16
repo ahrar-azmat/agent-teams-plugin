@@ -23,10 +23,10 @@ If arguments were provided: "$ARGUMENTS" — use this as the task description an
 8. **Use `general-purpose` subagent_type** for teammates that need to edit files; `Explore` or `Plan` for read-only work
 9. **Use `mode: "plan"` only when needed** — plan-mode teammates are expensive; prefer one architect/reviewer instead of multiple planners
 10. **Shut teammates down as soon as their tasks are complete** — idle teammates still consume tokens
-11. **Antigravity + Codex in EVERY phase** — research, planning, AND review. Not just final review. See Multi-Model Integration below.
+11. **Codex in EVERY phase** — research, planning, AND review. Not just final review. See Cross-Model Advisory below.
 12. **Never be conservative** — all prompts must push for the best possible solution. Never include language like "the current approach is fine", "keep the existing pattern", or "maintain backward compatibility unless necessary". Always critically evaluate what exists and propose improvements.
 13. **Dispatch cross-model calls BLIND** — send the evidence and the question, never your own diagnosis. Anchoring an advisor with your conclusion turns an independent review into an echo. If you have a hypothesis, pass it in the `caller_hypothesis` parameter so it gets refuted, not confirmed. See **The Independence Protocol** below.
-14. **Demand live web research** — both advisors have live web search. Version/API/CVE/best-practice claims must be checked against primary sources with URLs, not recalled from training data. See **Mandatory web research** below.
+14. **Demand live web research** — the advisor has live web search. Version/API/CVE/best-practice claims must be checked against primary sources with URLs, not recalled from training data. See **Mandatory web research** below.
 15. **"Present" is not "supported"** — a missing method fails at lint time in seconds; a present-but-unsupported one fails in production on a real customer's data. At every call into a swappable backend, verify the *deployed* engine implements it, not that the type stub declares it. See **The Runtime Capability Law** below.
 
 ## Tool Signatures — Exact Parameters (do NOT improvise)
@@ -162,7 +162,7 @@ Agent(
     run_in_background=true,
     prompt="""You are the architect teammate. Your name is 'architect'. Design the authentication architecture. You are in plan mode — propose your design, then wait for approval before implementing.
 
-IMPORTANT: Use Codex Oracle (architect_review MCP tool) and Antigravity (antigravity_brainstorm MCP tool) during your design phase. Get their input on your proposed architecture BEFORE submitting your plan for approval.
+IMPORTANT: Use Codex Oracle (architect_review MCP tool) during your design phase. Get its input BEFORE submitting your plan for approval — dispatched blind (requirement + constraints, not your chosen design).
 
 Do NOT default to the existing architecture or patterns. Evaluate from first principles — what is the best possible design for performance, quality, and adaptability? If the current approach is suboptimal, say so and propose something better."""
 )
@@ -237,9 +237,9 @@ Pick roles based on what the work needs. Not every team needs all roles. **All r
 | Role | Purpose | subagent_type | mode | model |
 |------|---------|---------------|------|-------|
 | `researcher` | Deep research, codebase exploration, web research | `general-purpose` | — | `opus` |
-| `architect` | Design, patterns, architecture — uses Codex + Antigravity during design | `general-purpose` | `plan` | `opus` |
+| `architect` | Design, patterns, architecture — uses Codex during design | `general-purpose` | `plan` | `opus` |
 | `implementer` | Write code, make changes | `general-purpose` | — | `opus` |
-| `reviewer` | Code review with Codex + Antigravity cross-model analysis | `general-purpose` | — | `opus` |
+| `reviewer` | Code review with Codex cross-model analysis | `general-purpose` | — | `opus` |
 | `tester` | Write and run tests | `general-purpose` | — | `opus` |
 | `db-specialist` | Migrations, schema, queries | `general-purpose` | — | `opus` |
 | `security` | Vulnerability analysis | `general-purpose` | — | `opus` |
@@ -256,36 +256,30 @@ Agents accumulate stale context. When a teammate finishes its tasks:
 
 Fresh agents get only the new task's instructions — no leftover context pollution.
 
-## Multi-Model Integration (Codex primary + Antigravity secondary, in Every Phase)
+## Cross-Model Advisory (Codex, in Every Phase)
 
-Teammates inherit all MCP servers from the project. **Both advisors must be used in ALL phases of work, not just final review** — but they are NOT peers:
+Teammates inherit all MCP servers from the project. **Codex must be used in ALL phases of work, not just final review.** Codex Oracle is the sole cross-model advisor — a second model reviewing what a Claude built:
 
-> ### Codex is PRIMARY. Antigravity is SECONDARY.
+> ### Codex is the advisor. Its verdict governs.
 >
-> **Codex Oracle is the authority** on review, architecture, research, web research and synthesis: the strongest OpenAI model at **max** reasoning, with repository access and live web search. **Its verdict governs.**
+> **Codex Oracle is the authority** on review, architecture, research, web research and synthesis: the strongest OpenAI model at **max** reasoning, with repository access and live web search.
 >
-> **NEVER conclude, ship, commit, or declare a decision on Antigravity alone.** Antigravity is corroboration, not authority.
+> **WAIT FOR CODEX.** Codex runs at max effort and routinely takes many minutes; a long call is moved to the background and returns later as a task notification. **That is normal, not a failure.** Until Codex has answered, the review is INCOMPLETE: block on its result (Monitor, or wait for the notification) and do other work meanwhile. Acting without the answer because the call is slow is the failure this rule exists to prevent.
 >
-> **WAIT FOR CODEX.** Codex runs at max effort and routinely takes many minutes; a long call is moved to the background and returns later as a task notification. **That is normal, not a failure.** Antigravity almost always answers first — *returning first is not being right.* Until Codex has answered, the review is INCOMPLETE: block on its result (Monitor, or wait for the notification) and do other work meanwhile. Acting on the fast answer because the slow one is still running is the failure this rule exists to prevent.
->
-> **On disagreement, Codex carries** — unless you can DISPROVE it by measuring the deployed system. Measurement outranks both models (Codex has been wrong when it read newer upstream source instead of the installed binary).
->
-> **But never discard an Antigravity-only finding.** Its value is independence: it sometimes catches what Codex missed (both directions of miss have happened in practice — Codex caught a secret-exfiltration CRITICAL Antigravity missed; Antigravity caught a symlink-traversal CRITICAL Codex missed). Verify such a finding on its merits; do not treat "Codex didn't say it" as refutation.
+> **On disagreement between you and Codex, Codex carries** — unless you can DISPROVE it by measuring the deployed system. Measurement outranks the model (Codex has been wrong when it read newer upstream source instead of the installed binary).
 
-- **Codex Oracle** (PRIMARY): Always uses the strongest OpenAI model (auto-detected from the Codex CLI config) at **max** reasoning — the effort is pinned in the MCP server itself, so the Codex desktop-app slider can never downgrade it — `architect_review`, `code_review`, `research`, `codex_query`. Runs with **live web search** (`web_search=live`, forced by the server — the CLI default is a cached snapshot index). Pass `infra: true` on any tool when the review needs LIVE state (SSH to servers, live DB queries, logs, dashboards) — read-only investigation; Codex discovers project access itself, but state the access pattern in the prompt when you know it.
-- **Antigravity** (SECONDARY — corroboration only): drives the deepest-thinking Gemini Pro model automatically via the `agy` CLI — `antigravity_query`, `antigravity_brainstorm`, `antigravity_analyze_code`, `antigravity_review_pr`. Has a live `search_web` tool, and the server instructs it to use it. **Model selection is NOT a parameter** (the wrapper always picks the strongest Pro model, with Flash fallback only on capacity errors) — do not pass a `model` argument; it will be rejected.
-- **Every advisory tool on both servers takes `caller_hypothesis`** — the single correct channel for your own view. It is presented as an unverified claim to REFUTE and answered with an explicit CONFIRMED/REFUTED/UNPROVEN verdict. The neutral scoping fields (`context`, `concerns`, `focus`, `topic`, `prompt`) are heuristically lint-checked for conclusion language; a hit prepends a **⚠️ ANCHORING WARNING** to the result. If you send a hypothesis and no CONFIRMED/REFUTED/UNPROVEN verdict comes back, the servers say so rather than letting you read silence as agreement.
-- **ALWAYS dispatch Codex + Antigravity IN PARALLEL** — batch both MCP tool calls in the same message. Never call one, wait for its answer, then call the other: sequential dispatch doubles wall-clock time, and independent opinions must be formed without seeing each other's answer. **Parallel dispatch is about starting together, NOT about finishing together** — you still wait for Codex (the primary) before concluding.
-- **ALWAYS dispatch BLIND** — the same evidence to both, your diagnosis to neither. Parallel dispatch protects them from each other; blind dispatch protects them from *you*. You need both, or their agreement means nothing. See **The Independence Protocol**.
+- **Tool naming**: a user-scope codex-oracle server exposes `mcp__codex-oracle__<tool>`; a plugin-bundled server exposes `mcp__plugin_codex-oracle_codex-oracle__<tool>`. The bare `mcp__codex-oracle__…` names in this skill mean whichever variant the session exposes — ToolSearch finds the one that exists.
+- **Codex Oracle**: Always uses the strongest OpenAI model (auto-detected from the Codex CLI config) at **max** reasoning — the effort is pinned in the MCP server itself, so the Codex desktop-app slider can never downgrade it — `architect_review`, `code_review`, `research`, `codex_query`. Runs with **live web search** (`web_search=live`, forced by the server — the CLI default is a cached snapshot index). Pass `infra: true` on any tool when the review needs LIVE state (SSH to servers, live DB queries, logs, dashboards) — read-only investigation; Codex discovers project access itself, but state the access pattern in the prompt when you know it.
+- **Every advisory tool takes `caller_hypothesis`** — the single correct channel for your own view. It is presented as an unverified claim to REFUTE and answered with an explicit CONFIRMED/REFUTED/UNPROVEN verdict. The neutral scoping fields (`context`, `concerns`, `focus`, `topic`, `prompt`) are heuristically lint-checked for conclusion language; a hit prepends a **⚠️ ANCHORING WARNING** to the result. If you send a hypothesis and no CONFIRMED/REFUTED/UNPROVEN verdict comes back, the server says so rather than letting you read silence as agreement.
+- **ALWAYS dispatch BLIND** — the evidence and the question, never your diagnosis. Blind dispatch protects the advisor from *you*: an anchored dispatch returns your own opinion wearing the advisor's voice. See **The Independence Protocol**.
 
 ### Phase 1: Research
 
 When a researcher teammate explores the codebase or investigates a problem, they MUST also:
 - Run `mcp__codex-oracle__research` on the topic for an independent technical perspective
-- Run `mcp__antigravity__antigravity_query` for a cross-reference opinion
-- **Dispatch both BLIND and in the same message** — pose the open question, not the answer you expect. "Which X fits these constraints?" not "we're using X, confirm that's right." Any current leaning goes in `caller_hypothesis`.
-- **Require live sources** — both advisors have live web search. Reject version/API/CVE/best-practice claims that arrive without a URL; re-ask instead of passing them on as fact.
-- **Challenge assumptions** — if Codex or Antigravity disagree with the current codebase approach, that disagreement is valuable signal, not noise
+- **Dispatch it BLIND** — pose the open question, not the answer you expect. "Which X fits these constraints?" not "we're using X, confirm that's right." Any current leaning goes in `caller_hypothesis`.
+- **Require live sources** — the advisor has live web search. Reject version/API/CVE/best-practice claims that arrive without a URL; re-ask instead of passing them on as fact.
+- **Challenge assumptions** — if Codex disagrees with the current codebase approach, that disagreement is valuable signal, not noise
 
 **Researcher prompt template:**
 ```
@@ -297,29 +291,27 @@ Your workflow:
 2. Use TaskGet to read full task details
 3. Mark tasks in_progress with TaskUpdate
 4. Research the topic thoroughly — read code, search the web, explore the codebase
-5. THEN get cross-model perspectives — BOTH IN ONE MESSAGE, BOTH BLIND:
+5. THEN get the cross-model perspective — BLIND:
    - Use Codex Oracle research tool for deep technical analysis
-   - Use Antigravity antigravity_query for an independent perspective
-   - Pose the OPEN question. Do NOT tell them what you already concluded — that
+   - Pose the OPEN question. Do NOT tell it what you already concluded — that
      produces agreement with you, not research. If you have a leaning, pass it in
-     the `caller_hypothesis` parameter so they try to refute it instead.
-   - Demand live sources: both have web search. Any version/API/CVE/pricing/
+     the `caller_hypothesis` parameter so it tries to refute it instead.
+   - Demand live sources: it has web search. Any version/API/CVE/pricing/
      best-practice claim without a URL is a guess — re-ask rather than repeat it.
-6. Synthesize ALL findings — your own + Codex + Antigravity. Where they disagree, explain why and which approach is better for performance/quality/adaptability
-7. Mark tasks completed and send findings to the team lead via SendMessage — include the SOURCES, and say explicitly whether the advisors were dispatched blind
+6. Synthesize ALL findings — your own + Codex's. Where they disagree, explain why and which approach is better for performance/quality/adaptability
+7. Mark tasks completed and send findings to the team lead via SendMessage — include the SOURCES, and say explicitly whether the advisor was dispatched blind
 
 CRITICAL: Do not validate existing patterns just because they exist. Evaluate everything against performance, quality, and adaptability. If the current approach is suboptimal, say so clearly and propose better alternatives.
 
-CRITICAL: Two advisors agreeing is strong evidence ONLY if you dispatched them blind and in parallel. If you fed them your conclusion, their agreement is an echo of you — worth one data point, not two."
+CRITICAL: Codex agreeing with you is strong evidence ONLY if you dispatched it blind. If you fed it your conclusion, its agreement is an echo of you — one data point wearing two hats."
 ```
 
 ### Phase 2: Planning / Architecture
 
 When an architect designs a solution, they MUST:
-- Run `mcp__codex-oracle__architect_review` on the proposed design
-- Run `mcp__antigravity__antigravity_brainstorm` for alternative approaches
+- Run `mcp__codex-oracle__architect_review` on the problem
 - **Never anchor on the existing architecture** — evaluate from first principles
-- **Never anchor the advisors on your chosen design either.** Send the requirement and the constraints; let them design. A prompt that says "review my approach of doing A then B" gets you a critique of A-then-B, never the C nobody proposed. Put your preferred design in `caller_hypothesis` — it is then attacked, and `antigravity_brainstorm` deliberately generates its ideas *before* seeing it so your pick cannot narrow the search
+- **Never anchor the advisor on your chosen design either.** Send the requirement and the constraints; let it design. A prompt that says "review my approach of doing A then B" gets you a critique of A-then-B, never the C nobody proposed. Put your preferred design in `caller_hypothesis` — it is then attacked rather than blessed
 - **Require prior art with URLs** — how have others solved this, and what did they report going wrong?
 
 **Architect prompt template:**
@@ -333,29 +325,26 @@ Your workflow:
 3. Mark tasks in_progress
 4. Explore the current codebase to understand what exists
 5. Design your solution from first principles — do NOT default to existing patterns
-6. Get cross-model review BEFORE submitting your plan — BOTH IN ONE MESSAGE, BOTH BLIND:
+6. Get the cross-model review BEFORE submitting your plan — BLIND:
    - Use Codex Oracle architect_review — give it the REQUIREMENT and the CONSTRAINTS
-   - Use Antigravity antigravity_brainstorm for approaches you might have missed
    - Do NOT paste your chosen design as the thing to react to. State the problem and
-     let them design; then pass your own design in `caller_hypothesis` so it is
-     stress-tested against what they came up with independently.
+     let it design; then pass your own design in `caller_hypothesis` so it is
+     stress-tested against what Codex came up with independently.
    - Demand prior art with URLs — how has this been solved before, and what went wrong?
 7. Incorporate feedback, then submit your plan for approval
 8. After approval, mark completed and message the lead
 
-CRITICAL: The existing architecture is NOT sacred. If Codex or Antigravity suggest a fundamentally better approach, seriously consider it. Your job is to find the BEST design for performance, quality, and adaptability — not to preserve what exists.
+CRITICAL: The existing architecture is NOT sacred. If Codex suggests a fundamentally better approach, seriously consider it. Your job is to find the BEST design for performance, quality, and adaptability — not to preserve what exists.
 
-CRITICAL: If you describe your design and ask 'is this good?', you will be told it is good. Ask them to solve the problem, then compare. Two advisors blessing a design they were handed is not validation."
+CRITICAL: If you describe your design and ask 'is this good?', you will be told it is good. Ask Codex to solve the problem, then compare. An advisor blessing a design it was handed is not validation."
 ```
 
 ### Phase 3: Post-Implementation Review
 
 After implementation tasks are marked complete, reviewers MUST:
 - Run `mcp__codex-oracle__code_review` on the changed files/diff
-- Run `mcp__antigravity__antigravity_review_pr` on the diff
-- Run `mcp__antigravity__antigravity_analyze_code` on critical sections with `focus: "performance"` and `focus: "security"`
-- **Send the diff, not the story.** `context` carries factual background only — what the feature does, which invariants hold. It must NOT say "this fixes the race" or "I believe this is correct": that is the claim under review, and stating it as fact is how a real defect gets waved through by two models at once. Put it in `caller_hypothesis` and get a CONFIRMED/REFUTED/UNPROVEN verdict instead
-- **Require the API/CVE check** — both advisors have live web search; a review that never verified whether a used API is deprecated or a touched dependency has a CVE is incomplete
+- **Send the diff, not the story.** `context` carries factual background only — what the feature does, which invariants hold. It must NOT say "this fixes the race" or "I believe this is correct": that is the claim under review, and stating it as fact is how a real defect gets waved through. Put it in `caller_hypothesis` and get a CONFIRMED/REFUTED/UNPROVEN verdict instead
+- **Require the API/CVE check** — the advisor has live web search; a review that never verified whether a used API is deprecated or a touched dependency has a CVE is incomplete
 - **Run the Runtime Capability check** — for every call into a swappable backend, is the method supported by the engine we actually deploy, or merely present in the type stub? Present-but-unsupported is the expensive failure; see **The Runtime Capability Law** above
 - **Any CRITICAL/HIGH findings must be addressed before the team wraps up**
 
@@ -368,12 +357,10 @@ Your workflow:
 1. Check TaskList for review tasks assigned to you
 2. Wait for implementation tasks to be marked completed
 3. Read all changed files thoroughly
-4. Run cross-model reviews — ALL IN ONE MESSAGE, ALL BLIND:
+4. Run the cross-model review — BLIND:
    - Codex Oracle code_review on the full diff — focus on correctness, security, performance
-   - Antigravity antigravity_review_pr on the diff — strictness: 'strict'
-   - Antigravity antigravity_analyze_code on critical code sections — focus: 'performance', then 'security'
-   - Send the DIFF and let them find the problems. Never write "the implementer fixed
-     X by doing Y — check that's right": that hands them the verdict. Anything you
+   - Send the DIFF and let it find the problems. Never write "the implementer fixed
+     X by doing Y — check that's right": that hands it the verdict. Anything you
      believe about the code goes in `caller_hypothesis`, which returns an explicit
      CONFIRMED/REFUTED/UNPROVEN verdict with file:line evidence.
    - If a result comes back with a ⚠️ ANCHORING WARNING banner, you contaminated that
@@ -393,7 +380,7 @@ CRITICAL: Be ruthlessly honest. Do not rubber-stamp changes. If the implementati
 
 A second opinion is only worth something if it was formed **independently**. The failure mode is
 subtle and extremely common: you write up your own diagnosis, paste it into the prompt, and ask
-Codex/Antigravity to "review" it. What comes back is a reaction to *your framing*, not an
+Codex to "review" it. What comes back is a reaction to *your framing*, not an
 independent read of the evidence. That is **anchoring**, and it silently converts a review into
 a rubber stamp.
 
@@ -416,8 +403,8 @@ a rubber stamp.
 | "This is safe because the caller holds the lock." | "Is this safe under concurrent callers? Here is the call site." |
 | "Review my approach of doing A then B." | "Here is the requirement and the constraints. Design an approach." |
 
-**If you genuinely have a hypothesis, pass it in the `caller_hypothesis` parameter.** Both MCPs
-take it. It is presented to the advisor as an *unverified claim to refute*, not as background,
+**If you genuinely have a hypothesis, pass it in the `caller_hypothesis` parameter.** Every
+advisory tool takes it. It is presented to the advisor as an *unverified claim to refute*, not as background,
 and you get back an explicit **CONFIRMED / REFUTED / UNPROVEN** verdict with the evidence that
 decided it. This is the *only* correct channel for your own view. Never smuggle it into
 `context`, `concerns`, `focus`, or `topic` — those fields are lint-checked, and a hit prepends a
@@ -425,28 +412,24 @@ loud **⚠️ ANCHORING WARNING** to the result telling you the answer is contam
 The lint is a **heuristic** — it catches the common phrasings, not all of them. A clean
 dispatch is your job; the absence of a banner is not a certificate of independence.
 
-**Round 2 is adversarial, and only comes after round 1.** Once both advisors have answered
+**Round 2 is adversarial, and only comes after round 1.** Once the advisor has answered
 blind, it is legitimate — and valuable — to go back with "here is my hypothesis, try to refute
-it" or to put each model's finding to the other. The ordering is what matters: independent
-first, adversarial second.
+it". The ordering is what matters: independent first, adversarial second.
 
 **The inference rule that everyone gets wrong:**
 
-> Two models agreeing is strong evidence **only if they were dispatched independently.**
-> If you handed both the same framing, their agreement is an echo of *you* — one data point
+> The advisor agreeing with you is strong evidence **only if it was dispatched blind.**
+> If you handed it your framing, its agreement is an echo of *you* — one data point
 > wearing two hats. Correlated inputs produce correlated outputs.
 
-So: **agreement between blind dispatches → strong signal, act on it.** Agreement after you
-anchored them → weak, re-dispatch blind before you trust it. **Disagreement is always strong
+So: **agreement with a blind dispatch → strong signal, act on it.** Agreement after you
+anchored it → weak, re-dispatch blind before you trust it. **Disagreement is always strong
 signal**, anchored or not — an advisor that contradicts you despite being pushed toward you has
 found something real.
 
-This is also *why* Codex and Antigravity must be dispatched **in the same message**: neither may
-see the other's answer before forming its own.
-
 ### Mandatory web research
-Both advisors have **live web search** (Codex runs with `web_search=live`; Antigravity has a
-`search_web` tool). Their training data is stale and your codebase is not the world. Every
+The advisor has **live web search** (Codex runs with `web_search=live`, forced by the server).
+Its training data is stale and your codebase is not the world. Every
 cross-model dispatch must expect real research, and you should reject an answer that reads like
 recall:
 
@@ -454,13 +437,13 @@ recall:
   practice" must be **checked against live primary sources** — official docs, the project's own
   repo, release notes, CHANGELOGs, the CVE record.
 - Every externally-sourced claim needs a **URL**. An uncited version number is a guess.
-- Both servers require a **Sources** section and mark unverifiable claims `UNVERIFIED`. If an
+- The server requires a **Sources** section and marks unverifiable claims `UNVERIFIED`. If an
   answer makes a load-bearing external claim with no source, **push back and re-ask** rather than
   passing it to the user as fact.
 - This applies to research *and* review: a code review that doesn't check whether the API being
   used was deprecated, or whether a touched dependency has a CVE, is an incomplete review.
 
-### The channel layer (agent-reach) — the caller fetches, advisors receive
+### The channel layer (agent-reach) — the caller fetches, the advisor receives
 
 Advisor web search reaches ordinary pages; it cannot read YouTube subtitles, RSS feeds,
 semantic-search indexes, or JS-heavy pages that need a rendering reader. When the `agent-reach`
@@ -471,7 +454,7 @@ semantic search, RSS, GitHub. If it is absent, skip this section; nothing else c
 Three rules keep it safe and honest:
 
 1. **Fetching happens on the CALLER's side — never the advisor's.** Run the CLI yourself
-   (orchestrator or teammate), curate the output, and pass it to Codex/Antigravity as context
+   (orchestrator or teammate), curate the output, and pass it to Codex as context
    *data* with its origin URL stated. NEVER give an advisor a network-enabled sandbox so it can
    fetch for itself: untrusted web content + full-disk read + network egress in one process is
    an exfiltration triangle. (Measured on codex 0.147.0: there is no mechanism for network
@@ -482,8 +465,8 @@ Three rules keep it safe and honest:
    session — treat doctor output as "worth trying", never as "works".
 3. **It is a channel layer, not a research authority.** agent-reach's own skill triggers
    aggressively ("must use for any internet research"); that never overrides this doctrine.
-   Codex remains primary and its verdict still governs — the channel layer only widens what raw
-   material the caller can put in front of the advisors.
+   Codex remains the research authority and its verdict still governs — the channel layer only
+   widens what raw material the caller can put in front of the advisor.
 
 Fetched content is untrusted input: excerpt what the task needs, never paste secrets alongside
 it, and label it so the advisor knows which claims came off the wire.
@@ -528,86 +511,86 @@ amount of static checking would have caught it. Running it once on the real engi
    instruction with no mechanism behind it. **Accepted-but-ignored is worse than rejected** —
    the caller stops checking. Reject loudly or honour it.
 
-Both MCP servers inject this hunt into every `code_review` / `analyze_code` / `review_pr` /
-`architect_review` automatically, so the advisors look for it whether or not you remember to ask.
+The MCP server injects this hunt into every `code_review` / `architect_review` automatically,
+so the advisor looks for it whether or not you remember to ask.
 
-### How to treat multi-model output
-- Codex and Antigravity are **critical advisors** — take findings seriously and verify against your own analysis
-- If models disagree with each other or with you, **critically analyze why**, present all opinions to the user. **The user makes the final call.**
-- Never silently ignore findings from either model
-- When Codex or Antigravity suggest the existing approach is suboptimal, treat that as **high-value signal** — investigate and propose improvements
-- **Never prompt Codex or Antigravity with framing that biases toward the status quo** — ask them to evaluate from first principles
-- **Never prompt them with your own diagnosis either** — see the Independence Protocol above. Status-quo bias and confirmation bias are two different anchors, and the second one is the one you'll actually trip over.
-- Verify the advisor's own citations before repeating them. Both models cite real URLs, but a plausible-looking file:line from a cross-checkout read can be wrong — treat citations as leads.
+### How to treat advisory output
+- Codex is a **critical advisor** — take findings seriously and verify against your own analysis
+- If it disagrees with you, **critically analyze why**, present both views to the user. **The user makes the final call.**
+- Never silently ignore its findings
+- When Codex suggests the existing approach is suboptimal, treat that as **high-value signal** — investigate and propose improvements
+- **Never prompt Codex with framing that biases toward the status quo** — ask it to evaluate from first principles
+- **Never prompt it with your own diagnosis either** — see the Independence Protocol above. Status-quo bias and confirmation bias are two different anchors, and the second one is the one you'll actually trip over.
+- Verify the advisor's own citations before repeating them. It cites real URLs, but a plausible-looking file:line from a cross-checkout read can be wrong — treat citations as leads.
 
 ## Common Patterns
 
 ### Research Team (3 teammates, all Opus)
 
 Tasks:
-- "Deep research on existing patterns in codebase + Codex/Antigravity analysis" → `researcher-1`
-- "Web research: best practices and modern approaches + Codex/Antigravity cross-reference" → `researcher-2`
+- "Deep research on existing patterns in codebase + Codex analysis" → `researcher-1`
+- "Web research: best practices and modern approaches + Codex cross-reference" → `researcher-2`
 - "Synthesize all findings, challenge assumptions, propose optimal approach" → `analyst` (blocked by first two)
 
 | Role | Purpose | model |
 |------|---------|-------|
-| `researcher-1` | Codebase exploration + Codex research + Antigravity query | `opus` |
-| `researcher-2` | Web research + Codex research + Antigravity query | `opus` |
-| `analyst` | Synthesize, challenge, recommend — uses Codex + Antigravity to validate conclusions | `opus` |
+| `researcher-1` | Codebase exploration + Codex research | `opus` |
+| `researcher-2` | Web research + Codex research | `opus` |
+| `analyst` | Synthesize, challenge, recommend — uses Codex to validate conclusions | `opus` |
 
 ### Implementation Team (4 teammates, all Opus)
 
 Prefer a 3-teammate variant first:
-- `architect` or `lead-reviewer` (uses Codex + Antigravity during design)
+- `architect` or `lead-reviewer` (uses Codex during design)
 - `implementer`
-- `reviewer` (uses Codex + Antigravity during review)
+- `reviewer` (uses Codex during review)
 
 Use the 4+ teammate pattern only when backend, frontend, and validation are genuinely independent.
 
 Tasks:
-- "Design architecture with Codex/Antigravity input, create task breakdown" → `architect` (plan mode)
+- "Design architecture with Codex input, create task breakdown" → `architect` (plan mode)
 - "Implement backend API endpoints" → `implementer-1` (blocked by architect)
 - "Implement frontend components" → `implementer-2` (blocked by architect)
 - "Write integration tests for API + frontend" → `tester` (blocked by both implementers)
-- "Review all changes with Codex + Antigravity, strict analysis" → `reviewer` (blocked by tester)
+- "Review all changes with Codex, strict analysis" → `reviewer` (blocked by tester)
 
 | Role | Mode | Purpose | model |
 |------|------|---------|-------|
-| `architect` | `plan` | Design with Codex + Antigravity input | `opus` |
+| `architect` | `plan` | Design with Codex input | `opus` |
 | `implementer-1` | — | Backend changes | `opus` |
 | `implementer-2` | — | Frontend changes | `opus` |
 | `tester` | — | Write tests, validate integration | `opus` |
-| `reviewer` | — | Strict Codex + Antigravity cross-model review | `opus` |
+| `reviewer` | — | Strict Codex cross-model review | `opus` |
 
 ### Debug Team (3 teammates, all Opus)
 
 Tasks:
 - "Investigate hypothesis A with Codex deep analysis" → `investigator-1`
-- "Investigate hypothesis B with Antigravity analysis" → `investigator-2`
-- "Investigate hypothesis C, challenge others' findings with both Codex + Antigravity" → `investigator-3`
+- "Investigate hypothesis B, evidence-first from the code and logs" → `investigator-2`
+- "Investigate hypothesis C, challenge others' findings with Codex" → `investigator-3`
 
 All tasks run in parallel. Teammates should message each other to challenge findings.
 
 | Role | Purpose | model |
 |------|---------|-------|
 | `investigator-1` | Hypothesis A + Codex research | `opus` |
-| `investigator-2` | Hypothesis B + Antigravity analysis | `opus` |
-| `investigator-3` | Hypothesis C + cross-challenge with both models | `opus` |
+| `investigator-2` | Hypothesis B, evidence-first | `opus` |
+| `investigator-3` | Hypothesis C + cross-challenge via Codex | `opus` |
 
 ### Review Team (3 teammates, all Opus)
 
 Tasks:
 - "Security review: OWASP top 10, CWE analysis + Codex code_review (focus: security)" → `security-reviewer`
-- "Performance review: N+1 queries, missing indexes, async bottlenecks + Antigravity analyze_code (focus: performance)" → `perf-reviewer`
-- "Quality review: test coverage, code patterns, DRY violations + Codex + Antigravity full review" → `quality-reviewer`
+- "Performance review: N+1 queries, missing indexes, async bottlenecks + Codex code_review (focus: performance)" → `perf-reviewer`
+- "Quality review: test coverage, code patterns, DRY violations + Codex full review" → `quality-reviewer`
 
 All tasks run in parallel.
 
 | Role | Purpose | model |
 |------|---------|-------|
 | `security-reviewer` | OWASP/CWE + Codex security analysis | `opus` |
-| `perf-reviewer` | Performance + Antigravity perf analysis | `opus` |
-| `quality-reviewer` | Quality + Codex + Antigravity full review | `opus` |
+| `perf-reviewer` | Performance + Codex perf analysis | `opus` |
+| `quality-reviewer` | Quality + Codex full review | `opus` |
 
 ## Troubleshooting
 
@@ -629,13 +612,13 @@ All tasks run in parallel.
 
 **Teammate ignoring tasks:** Their prompt might be missing the workflow instructions. Make sure the prompt tells them to check TaskList, use TaskGet, and mark tasks in_progress/completed.
 
-**Codex/Antigravity not being used:** Check that the teammate prompt explicitly instructs them to call the MCP tools. Teammates have access but won't use them unless prompted.
+**Codex not being used:** Check that the teammate prompt explicitly instructs them to call the MCP tools. Teammates have access but won't use them unless prompted.
 
-**Both models agreed with you and the code still broke:** classic anchoring. Check whether the dispatch put your diagnosis in `context`/`concerns`/`focus` — if so, you asked two models to grade your own answer and they obliged. Re-dispatch blind (evidence + question only, hypothesis in `caller_hypothesis`). A **⚠️ ANCHORING WARNING** banner on a result is the server telling you this already happened.
+**Codex agreed with you and the code still broke:** classic anchoring. Check whether the dispatch put your diagnosis in `context`/`concerns`/`focus` — if so, you asked the model to grade your own answer and it obliged. Re-dispatch blind (evidence + question only, hypothesis in `caller_hypothesis`). A **⚠️ ANCHORING WARNING** banner on a result is the server telling you this already happened.
 
 **`⚠️ ANCHORING WARNING` banner on a result:** the lint found conclusion language in a neutral scoping field. The answer is not worthless — but its *agreement* with you is. Re-run that dispatch blind; disagreement in the flagged answer is still trustworthy.
 
-**Advisor cited a version/API that turned out to be wrong:** check whether it gave a URL. Both servers require a Sources section and force live web search; an answer with no sources answered from memory. Re-ask demanding primary sources. Also re-verify file:line citations in the tree that is canon for the task — Codex reads the whole workspace and can cite a sibling checkout.
+**Advisor cited a version/API that turned out to be wrong:** check whether it gave a URL. The server requires a Sources section and forces live web search; an answer with no sources answered from memory. Re-ask demanding primary sources. Also re-verify file:line citations in the tree that is canon for the task — Codex reads the whole workspace and can cite a sibling checkout.
 
 **Advisor answer reads like generic best-practice with no specifics:** it did not actually research. Re-ask with the concrete question and require URLs + retrieval dates.
 
@@ -651,12 +634,11 @@ Before starting a team:
 - [ ] Teammate prompts START with a `ToolSearch(query="select:TaskList,TaskGet,TaskUpdate,TaskCreate,SendMessage")` step
 - [ ] Teammate prompts include: name, full workflow (TaskList → TaskGet → in_progress → work → completed → SendMessage)
 - [ ] Architects use `mode: "plan"` to require plan approval
-- [ ] Researchers and architects are prompted to use Codex + Antigravity DURING their work (not just after)
-- [ ] Reviewers are prompted to use Codex + Antigravity with strict/critical analysis
+- [ ] Researchers and architects are prompted to use Codex DURING their work (not just after)
+- [ ] Reviewers are prompted to use Codex with strict/critical analysis
 - [ ] NO prompts contain conservative language ("keep existing", "maintain current", "the approach is fine")
 - [ ] ALL prompts emphasize: performance, quality, adaptability — challenge what exists
 - [ ] Cross-model prompts are **blind**: evidence + question, NO caller diagnosis. Any hypothesis rides in `caller_hypothesis`, never in `context`/`concerns`/`focus`/`topic`
-- [ ] Codex + Antigravity are dispatched **in the same message** (parallel, neither sees the other's answer)
 - [ ] Advisor answers carrying external claims came back **with URLs**; unsourced version/API/CVE claims were re-asked, not repeated
 - [ ] Calls into swappable backends (browser engine, DB driver, storage/LLM provider, cloud SDK, container binary) were checked for **present-but-unsupported** — verified against the vendor compatibility matrix and probed on the engine actually deployed, not the library default
 - [ ] Any engine/driver/provider/version **swap** in the diff triggered a sweep of every call into that surface

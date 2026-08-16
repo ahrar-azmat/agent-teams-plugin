@@ -1,14 +1,17 @@
 {
   "name": "agent-teams",
-  "description": "Multi-agent orchestration for Claude Code — agent-teams workflow skill plus the Codex Oracle and Antigravity cross-model advisory MCPs it integrates with",
+  "description": "Multi-agent orchestration for Claude Code — agent-teams workflow skill plus the Codex Oracle cross-model advisory MCP it integrates with",
   "owner": {
     "name": "Ahrar Ahmad"
+  },
+  "renames": {
+    "antigravity": null
   },
   "plugins": [
     {
       "name": "software-workflows",
       "source": "./plugins/software-workflows",
-      "description": "Agent-teams orchestration skill — spawn, coordinate, and shut down Claude Code implicit agent teams with correct, schema-validated tool signatures (Agent, TaskCreate, TaskUpdate, SendMessage). Antigravity + Codex multi-model integration with the Independence Protocol: cross-model advisors are dispatched blind and in parallel, so their agreement is evidence rather than an echo of your own framing.",
+      "description": "Agent-teams orchestration skill — spawn, coordinate, and shut down Claude Code implicit agent teams with correct, schema-validated tool signatures (Agent, TaskCreate, TaskUpdate, SendMessage). Codex cross-model integration with the Independence Protocol: the advisor is dispatched blind, so its agreement is evidence rather than an echo of your own framing.",
       "category": "workflow",
       "keywords": [
         "agent-teams",
@@ -23,7 +26,7 @@
     {
       "name": "codex-oracle",
       "source": "./plugins/codex-oracle",
-      "description": "Cross-model advisory MCP — Codex (strongest configured OpenAI model, auto-detected from the Codex CLI config; reasoning effort pinned to max, immune to the desktop-app slider) as senior architect/reviewer: architect_review, code_review, research, codex_query. Live web search forced on (web_search=live, not the cached default) with mandatory primary sources; anti-anchoring built in — a caller_hypothesis parameter that is refuted rather than confirmed, plus a lint that flags callers who smuggle a conclusion into the scoping fields. Opt-in infra mode for read-only live-infrastructure investigation. NEW: /abraham write mode — two air-gapped phases: read-only deep analysis (codebase + live infra + live web) produces a brief, then a SEALED implementer (workspace-write file access, no network/web/MCP) carries it out; git preconditions incl. dirty-tree refusal, an authoritative one-writer-per-tree lock, changed-files attribution with HEAD verification, no auto-retry for writes, and ~65% auto-compaction for long implementation runs. Ships hooks that gate plan mode and git push on multi-model review.",
+      "description": "Cross-model advisory MCP — Codex (strongest configured OpenAI model, auto-detected from the Codex CLI config; reasoning effort pinned to max, immune to the desktop-app slider) as senior architect/reviewer: architect_review, code_review, research, codex_query. Live web search forced on (web_search=live, not the cached default) with mandatory primary sources; anti-anchoring built in — a caller_hypothesis parameter that is refuted rather than confirmed, plus a lint that flags callers who smuggle a conclusion into the scoping fields. Opt-in infra mode for read-only live-infrastructure investigation. NEW: /abraham write mode — two air-gapped phases: read-only deep analysis (codebase + live infra + live web) produces a brief, then a SEALED implementer (workspace-write file access, no network/web/MCP) carries it out; git preconditions incl. dirty-tree refusal, an authoritative one-writer-per-tree lock, changed-files attribution with HEAD verification, no auto-retry for writes, and ~65% auto-compaction for long implementation runs. Ships hooks that gate plan mode and git push on the Codex review.",
       "category": "workflow",
       "keywords": [
         "codex",
@@ -31,22 +34,6 @@
         "review",
         "mcp",
         "advisory",
-        "web-search",
-        "anti-anchoring"
-      ],
-      "license": "PolyForm-Noncommercial-1.0.0"
-    },
-    {
-      "name": "antigravity",
-      "source": "./plugins/antigravity",
-      "description": "Antigravity MCP — Gemini as an independent critical advisor via the Antigravity CLI (agy). Auto-selects the deepest-thinking Gemini Pro model (Flash fallback only on capacity errors); query, brainstorm, code analysis, PR review, agentic tools. Live web research via agy's search_web with mandatory primary sources; anti-anchoring built in — a caller_hypothesis parameter that is refuted rather than confirmed, plus a lint that flags callers who smuggle a conclusion into the scoping fields. Requires an authenticated agy install.",
-      "category": "workflow",
-      "keywords": [
-        "antigravity",
-        "gemini",
-        "cross-model",
-        "review",
-        "mcp",
         "web-search",
         "anti-anchoring"
       ],

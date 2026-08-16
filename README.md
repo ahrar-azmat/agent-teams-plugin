@@ -13,7 +13,7 @@ When you ask Claude Code to do anything involving 2+ agents, the `agent-teams` s
 3. Wires up task dependencies, assigns/claims work, coordinates via direct messages
 4. Shuts teammates down when the work is done (the implicit team cleans up on session exit)
 
-It ships **role templates** (researcher, architect, implementer, reviewer, tester, …) and **team patterns** (research, implementation, debug, review), plus an optional **multi-model advisory** layer that uses Codex and Antigravity as independent advisors when those MCP servers are present.
+It ships **role templates** (researcher, architect, implementer, reviewer, tester, …) and **team patterns** (research, implementation, debug, review), plus an optional **cross-model advisory** layer that uses Codex Oracle as an independent senior advisor when its MCP server is present.
 
 The codex-oracle plugin also ships **`/abraham`** (v1.13.0): a write-capable mode that runs as two air-gapped codex phases — read-only deep analysis (codebase + live infra + live web) producing an implementation brief, then a sealed implementer (workspace-write file access, no network/web/MCP) that edits the working tree under git preconditions, a one-writer lock, and changed-files attribution for the orchestrator to review.
 
@@ -32,11 +32,10 @@ The skill includes a Tool-Signatures reference table and troubleshooting entries
 
 A second opinion is only worth something if it was formed **independently** — and the way that
 guarantee gets destroyed is subtle. You write up your own diagnosis, paste it into the prompt,
-and ask Codex/Antigravity to "review" it. What comes back is a reaction to *your framing*, not an
-independent read of the evidence. Hand the same framing to both advisors and their agreement
-looks like corroboration while being nothing but your own opinion echoed twice.
+and ask Codex to "review" it. What comes back is a reaction to *your framing*, not an
+independent read of the evidence — your own opinion wearing the advisor's voice.
 
-Both MCPs now enforce independence server-side rather than trusting the caller to ask for it:
+The MCP enforces independence server-side rather than trusting the caller to ask for it:
 
 - **`caller_hypothesis`** on every advisory tool — the one correct channel for your own view.
   It is presented as an *unverified claim to refute* and answered with an explicit
@@ -52,25 +51,25 @@ Both MCPs now enforce independence server-side rather than trusting the caller t
 
 Round 1 is blind; round 2 can be adversarial. The rule to remember:
 
-> Two models agreeing is strong evidence **only if they were dispatched independently.**
+> The advisor agreeing with you is strong evidence **only if it was dispatched blind.**
 > Disagreement is strong evidence either way.
 
 ## Live web research (v1.4.0)
 
-Both advisors now actually research instead of recalling. Codex runs with `web_search=live` —
+The advisor actually researches instead of recalling. Codex runs with `web_search=live` —
 its default is `cached`, an OpenAI-maintained snapshot index, so the previous instruction to
-"search the web and cite URLs" had no mechanism behind it. Antigravity is directed to its live
-`search_web` tool. Both require primary sources with URLs, mark unverifiable load-bearing claims
-`UNVERIFIED`, and end with a Sources section; code reviews additionally check APIs against
-current upstream docs and touched dependencies for known CVEs.
+"search the web and cite URLs" had no mechanism behind it. It requires primary sources with
+URLs, marks unverifiable load-bearing claims `UNVERIFIED`, and ends with a Sources section;
+code reviews additionally check APIs against current upstream docs and touched dependencies
+for known CVEs.
 
 ## The channel layer (v1.14.0)
 
 Advisor web search reaches ordinary pages; it can't read YouTube subtitles, RSS feeds, or
 semantic-search indexes. When the [agent-reach](https://github.com/Panniantong/agent-reach)
 CLI is installed, the orchestration skill uses it as a **caller-side fetch layer**: the
-orchestrator or a teammate fetches, curates, and passes content to the advisors as cited
-context data. Advisors are never given networked sandboxes to fetch for themselves —
+orchestrator or a teammate fetches, curates, and passes content to the advisor as cited
+context data. The advisor is never given a networked sandbox to fetch for itself —
 untrusted web content, full-disk read, and network egress must never share a process
 (measured on codex 0.147.0: no mechanism exists for network without full disk read).
 Entirely optional — without the CLI, nothing changes.
@@ -103,16 +102,14 @@ Then just ask for multi-agent work (e.g. *"Create an agent team to review this P
 
 ## Requirements
 
-- **Claude Code v2.1.32+** (Agent Teams support).
+- **Claude Code v2.1.178+** — the skill drives the implicit-team API introduced when `TeamCreate`/`TeamDelete` were removed in v2.1.178. (v2.1.193+ additionally auto-migrates installs that still have the removed `antigravity` plugin enabled, via the marketplace `renames` mapping.)
 - **Agent Teams enabled** — they're experimental and off by default. Enable in `settings.json`:
   ```json
   { "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" } }
   ```
-- **Optional — multi-model advisory:** the `codex-oracle` and `antigravity` MCP servers (both ship in this marketplace). If they aren't configured, the skill still runs normally; the cross-model steps are simply skipped.
-  - Both servers are Python and launch via `python` (≥3.11) on PATH — on python3-only systems (stock macOS), point `python` at python3.
+- **Optional — cross-model advisory:** the `codex-oracle` MCP server (ships in this marketplace). If it isn't configured, the skill still runs normally; the cross-model steps are simply skipped.
+  - The server is Python and launches via `python` (≥3.11) on PATH — on python3-only systems (stock macOS), point `python` at python3.
   - `codex-oracle` needs the Codex CLI (`npm i -g @openai/codex`) authenticated (`codex`); live web search is forced on per call, so no config change is required.
-  - `antigravity` needs `agy` installed and signed in (`agy` in a terminal, complete the Google sign-in — there is no headless re-auth).
-    - POSIX: `curl -fsSL https://antigravity.google/cli/install.sh | bash` · Windows: `irm https://antigravity.google/cli/install.ps1 | iex` (installs to `%LOCALAPPDATA%\agy\bin`; open a fresh terminal afterward).
   - **Windows (v1.9.0+):** fully supported — no WSL needed. Optional: enable Developer Mode if you want the `latest.log` convenience symlink; without it the merged `stream.log` is the live view.
 
 ## License

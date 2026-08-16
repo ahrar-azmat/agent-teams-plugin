@@ -1,4 +1,4 @@
 # mcp capped <2: 2.0.0 broke the 1.x server APIs this code targets
-# (measured 2026-08-08 on the sibling antigravity server; FastMCP layout
-# also changed in 2.x). Floor = measured-working 1.26.
+# (measured 2026-08-08; FastMCP layout also changed in 2.x).
+# Floor = measured-working 1.26.
 mcp>=1.26.0,<2.0.0

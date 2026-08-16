@@ -3,6 +3,73 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.15.0] — 2026-08-16
+
+### Removed — Antigravity, per user ruling ("it's not a better model")
+- **The `antigravity` plugin is deleted from the marketplace and the tree.** Codex Oracle is
+  now the SOLE cross-model advisor; its verdict still governs, measurement still outranks it,
+  and the Independence Protocol (blind dispatch + `caller_hypothesis`) is unchanged — it now
+  guards the Claude↔Codex pair instead of a two-advisor panel.
+- Every dispatch surface rewritten to single-advisor: the agent-teams skill (advisory section,
+  all phase templates, team patterns, checklist), the codex-planning and codex-review skills,
+  the code-reviewer agent, the plan/push hooks (the push gate now requires a completed Codex
+  review; the two-advisor parallel-dispatch requirement is gone), the live-view nudge and
+  mcp-live (codex log only), the hooks matcher, and the MCP instruction block.
+- `tests/test_anchor_lint.py` now tests the codex-oracle server only; the cross-plugin parity
+  checks (pattern-table and capability-hunt drift) died with the second copy.
+- codex-oracle 1.11.0, software-workflows 1.8.0.
+
+### Hardened — the push gate became a real gate (two Codex review rounds, findings probed live)
+- **Signed answers.** server.py now stamps every answer header with
+  `tool:<name> | status:<ok|timeout> | tree:<12-hex workspace digest>` (`_answer_sig` /
+  `_workspace_digest`: HEAD + tracked diff + porcelain status). The push gate verifies the
+  signature instead of sniffing shapes, which closes four probed forgeries at once: a TIMEOUT
+  partial that carries the answer header (status:timeout), another tool's answer whose text
+  mentions code_review (tool:codex_query), a review of an older tree (digest mismatch →
+  STALE), and transcript pollution from reading the gate's own source. Pre-signature answers
+  (an old server still running before `/mcp` Reconnect) fail verification, so the gate asks —
+  the safe direction; reconnect self-heals it.
+- **The gate now actually gates**: `permissionDecision: "ask"` (+ the same text as
+  `additionalContext` so the model sees it too) instead of an additionalContext-only nudge
+  that could not stop a call already executing. Known limitation, disclosed: the digest is
+  computed at answer time, so edits made *while* the review runs are not distinguished from
+  the reviewed state — binding covers everything after the answer.
+- **Command detection is over-broad by design** (`git … push|commit` within one shell
+  segment): catches `npm test && git push`, `git -C /repo push`, `FOO=1 git commit`; a false
+  positive costs one permission prompt, a false negative skipped the gate entirely.
+- **Foreground MCP wrappers decoded** (`{"result": "..."}` / list shapes) — real transcripts
+  wrap results, and the previous startswith check missed them.
+- **`tests/test_push_gate.py`** pins all of the above (19 cases), including behavioral parity
+  between the gate's and the server's digest twins, on real measured JSONL entry shapes.
+- **Round-3 fixes (probed):** `status:ok` is now EARNED by exit 0 — a failed run with partial
+  output stamps `status:error` and never opens the gate; the digest voids itself (`unknown`)
+  if ANY git command fails instead of hashing partial state; opening requires the structural
+  dispatch leg AND the digest leg (a forged tool_result alone is insufficient); pushes that
+  redirect to another repository (`-C`/`--git-dir`/`GIT_DIR=`) always ask, since the cwd
+  digest cannot vouch for them; the venv marker includes the interpreter identity and is
+  written atomically.
+- **Declared trust model** (in the gate's docstring): this is a guardrail against FORGETTING,
+  not a security boundary — any Bash-command-text hook is bypassable by a deliberately
+  evasive agent by construction, so keyed signatures would add ceremony, not security.
+  Disclosed residuals: edits made while a review runs are stamped into the answer-time
+  digest; whether the installed host enforces `permissionDecision: "ask"` is unverified
+  upstream (anthropic/claude-code#81041) — additionalContext duplication keeps the previous
+  nudge as the floor. A recovered completed run (resume fast path) returns its stored result
+  without a fresh signature and therefore asks — the safe direction.
+- **Plugin-scoped tool naming**: the code-reviewer agent allowlists both
+  `mcp__codex-oracle__code_review` and `mcp__plugin_codex-oracle_codex-oracle__code_review`
+  (plugin-bundled servers expose the scoped name; a user-scope server the bare one) and drops
+  the unsupported `mcpServers` frontmatter; the agent-teams skill documents the same naming
+  rule; `git diff HEAD` replaces plain `git diff` (which silently omits staged changes) in
+  the agent and the codex-review skill.
+- **`renames: {"antigravity": null}`** in marketplace.json migrates existing installs off the
+  removed plugin (Claude Code ≥ 2.1.193); README now states the real version floor (2.1.178+
+  for implicit agent teams).
+- **run_server.py rebuilds the venv on requirements changes** (sha256 marker; installs with
+  `--upgrade` so a re-install moves within the declared constraint range) — previously a
+  deployed venv kept its original dependency set forever, and the maintained-checkout fast
+  path could mask a shipped dependency change.
+
 ## [1.14.0] — 2026-08-15
 
 ### Added

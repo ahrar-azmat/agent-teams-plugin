@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for the anchoring lint shipped in both advisory MCP servers.
+"""Tests for the anchoring lint shipped in the codex-oracle MCP server.
 
 Run:  python3 tests/test_anchor_lint.py        (no dependencies — mcp is stubbed)
 
@@ -15,10 +15,6 @@ is contaminated. Two properties must hold, and both can silently rot:
    dispatched blind" when you did not.
 2. SPECIFICITY — it must NOT fire on ordinary factual background. False
    positives train callers to ignore the banner, which destroys the signal.
-
-3. PARITY — `_ANCHOR_PATTERNS` is duplicated verbatim in the two plugins (they
-   are independently installable and run from separate venvs, so a shared
-   module is not available). The copies must not drift.
 """
 
 import importlib.util
@@ -30,7 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def _stub_mcp() -> None:
-    """Provide just enough of the `mcp` package to import both servers."""
+    """Provide just enough of the `mcp` package to import the server."""
     for name in (
         "mcp",
         "mcp.server",
@@ -54,18 +50,8 @@ def _stub_mcp() -> None:
 
         tool = staticmethod(_passthrough_decorator)
 
-    class _Server:
-        """Stub for the antigravity server's lower-level Server usage."""
-
-        def __init__(self, *a, **k):
-            pass
-
-        list_tools = staticmethod(_passthrough_decorator)
-        call_tool = staticmethod(_passthrough_decorator)
-
     sys.modules["mcp.server.fastmcp"].FastMCP = _FastMCP
     sys.modules["mcp.server.fastmcp"].Context = object
-    sys.modules["mcp.server"].Server = _Server
     sys.modules["mcp.server.stdio"].stdio_server = None
     sys.modules["mcp.types"].Tool = object
     sys.modules["mcp.types"].TextContent = object
@@ -122,16 +108,10 @@ MUST_PASS = [
 ]
 
 
-def _pattern_table(source: str) -> str:
-    start = source.index("_ANCHOR_PATTERNS: tuple")
-    return source[start : source.index("\n)\n", start)]
-
-
 def main() -> int:
     _stub_mcp()
     servers = {
         "codex-oracle": _load("plugins/codex-oracle/server.py", "cx_srv"),
-        "antigravity": _load("plugins/antigravity/server.py", "ag_srv"),
     }
 
     failures = 0
@@ -195,32 +175,23 @@ def main() -> int:
             print(f"✗ [{plugin}] _VERDICT_NOTICE_LEN under-reserves")
             failures += 1
 
-    tables = {p: _pattern_table((ROOT / f"plugins/{p}/server.py").read_text())
-              for p in servers}
-    if len(set(tables.values())) != 1:
-        print("✗ _ANCHOR_PATTERNS has DRIFTED between the two plugin copies")
-        failures += 1
-
-    # The Runtime Capability hunt is duplicated for the same reason and must
-    # not drift either — a review dimension that exists in one advisor and not
-    # the other produces exactly the false "both models agreed" this release
-    # is about.
-    hunts = {name: mod._CAPABILITY_HUNT for name, mod in servers.items()}
-    if len(set(hunts.values())) != 1:
-        print("✗ _CAPABILITY_HUNT has DRIFTED between the two plugin copies")
-        failures += 1
-    for name, hunt in hunts.items():
+    for name, mod in servers.items():
+        hunt = mod._CAPABILITY_HUNT
         if "present is not supported" not in hunt or "swappable" not in hunt.lower():
             print(f"✗ [{name}] _CAPABILITY_HUNT lost its core directive")
             failures += 1
 
-    checked = len(servers) * (len(MUST_FLAG) + len(MUST_PASS) + 13) + 3
+    # 12 = the per-server validations outside the two case lists: empty-field,
+    # neutralizer+banner pair, clean-no-banner, empty-hypothesis,
+    # real-hypothesis, 2 curly-apostrophe variants, verdict-missing,
+    # verdict-present, notice-without-hypothesis, notice-length, and the
+    # capability-hunt core directive. Update when adding one.
+    checked = len(servers) * (len(MUST_FLAG) + len(MUST_PASS) + 12)
     if failures:
         print(f"\n{failures} FAILURE(S) across {checked} checks")
         return 1
     print(f"✓ all {checked} checks passed "
-          f"({len(MUST_FLAG)} flag / {len(MUST_PASS)} pass cases × "
-          f"{len(servers)} plugins, + parity)")
+          f"({len(MUST_FLAG)} flag / {len(MUST_PASS)} pass cases, codex-oracle)")
     return 0
 
 

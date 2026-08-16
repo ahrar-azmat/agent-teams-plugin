@@ -28,6 +28,30 @@ def _venv_python(venv: Path) -> Path:
     return venv / "bin" / "python"
 
 
+def _requirements_hash() -> str:
+    import hashlib
+
+    try:
+        req = hashlib.sha256((ROOT / "requirements.txt").read_bytes()).hexdigest()
+    except OSError:
+        return ""
+    # The interpreter is part of the venv's identity: a venv built by an
+    # older/other python is stale even when requirements did not change.
+    return f"{req}:py{sys.version_info.major}.{sys.version_info.minor}:{sys.platform}"
+
+
+def _venv_current(venv: Path, expected: str) -> bool:
+    """A venv is usable only if it exists AND was installed from the same
+    requirements.txt — otherwise a dependency change in the plugin would
+    silently keep running against the old environment forever."""
+    if not _venv_python(venv).exists():
+        return False
+    try:
+        return (venv / ".requirements.sha256").read_text().strip() == expected
+    except OSError:
+        return False
+
+
 def _err(msg: str) -> None:
     print(f"[{NAME}] {msg}", file=sys.stderr, flush=True)
 
@@ -52,27 +76,40 @@ def main() -> int:
         )
         return 1
 
+    expected = _requirements_hash()
+
     # Fast path: this machine's maintained marketplace checkout already carries
     # a working venv — reuse its interpreter (deps only; the code that runs is
-    # still THIS copy's server.py).
+    # still THIS copy's server.py). Only when its installed dependencies match
+    # THIS copy's requirements.txt: a stale sibling venv must not mask a
+    # dependency change shipped with the plugin.
     mk = Path.home() / ".claude" / "plugins" / "marketplaces" / "agent-teams" / "plugins" / NAME
-    if ROOT != mk:
-        mk_python = _venv_python(mk / ".venv")
-        if mk_python.exists():
-            return _run(mk_python)
+    if ROOT != mk and _venv_current(mk / ".venv", expected):
+        return _run(_venv_python(mk / ".venv"))
 
     venv = ROOT / ".venv"
     py = _venv_python(venv)
-    if not py.exists():
-        _err(f"bootstrapping venv at {venv} with {sys.executable}")
-        for cmd in (
-            [sys.executable, "-m", "venv", str(venv)],
-            [str(py), "-m", "pip", "install", "--quiet", "-r", str(ROOT / "requirements.txt")],
-        ):
+    if not _venv_current(venv, expected):
+        _err(f"(re)installing venv deps at {venv} with {sys.executable}")
+        cmds = []
+        if not py.exists():
+            cmds.append([sys.executable, "-m", "venv", str(venv)])
+        # --upgrade so a re-install actually moves within the declared
+        # constraint range instead of keeping whatever satisfied it years ago.
+        cmds.append([str(py), "-m", "pip", "install", "--quiet", "--upgrade",
+                     "-r", str(ROOT / "requirements.txt")])
+        for cmd in cmds:
             proc = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
             if proc.returncode != 0:
                 _err(f"bootstrap failed: {' '.join(cmd)} -> exit {proc.returncode}")
                 return 1
+        try:
+            marker = venv / ".requirements.sha256"
+            tmp = marker.with_suffix(".tmp")
+            tmp.write_text(expected)
+            tmp.replace(marker)  # atomic: never a torn marker
+        except OSError as exc:
+            _err(f"could not record requirements hash: {exc}")
     return _run(py)
 
 

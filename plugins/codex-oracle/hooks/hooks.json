@@ -2,7 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "mcp__.*(codex-oracle|antigravity).*",
+        "matcher": "mcp__.*codex-oracle.*",
         "hooks": [
           {
             "type": "command",

@@ -1,45 +1,185 @@
 #!/usr/bin/env python3
-"""PreToolUse gate on Bash git push/commit — cross-platform port of the
-former sh+jq+grep one-liner (exec form + python; also drops the jq
-dependency on POSIX). Reads the hook payload from stdin; if the command is
-a git push/commit and the session transcript does not show BOTH advisory
-reviews, injects the push-gate context. Fail-open: a malformed payload or
-unreadable transcript must never block the tool call outright."""
+"""PreToolUse gate on Bash git push/commit. Reads the hook payload from
+stdin; if the command is a git push/commit and the session transcript does
+not show a Codex review COMPLETED FOR THE CURRENT TREE, returns
+permissionDecision "ask" so the user explicitly approves the un-reviewed
+operation — an additionalContext nudge cannot stop a tool call that is
+already about to execute. Fail-open: a malformed payload or unreadable
+transcript must never block the call.
+
+Answer verification is a SIGNATURE, not shape-sniffing: server.py stamps
+every answer header with `tool:<name> | status:<ok|timeout> | tree:<digest>`
+(see `_answer_sig`). The gate opens only for a header carrying
+`tool:code_review | status:ok` whose tree digest matches the workspace at
+push time. Consequences, each pinned by tests/test_push_gate.py:
+  - another tool's answer (codex_query etc.) carries its own tool name and
+    never opens the gate, even if its text mentions code_review;
+  - a TIMEOUT partial carries status:timeout and never opens the gate;
+  - a review of an OLDER tree fails the digest compare — edits after the
+    answer mean the review no longer vouches for this push (stale → ask);
+  - reading this source file (or any file) into the transcript cannot forge
+    a passing header for the current tree;
+  - pre-signature answers (older server still running before /mcp
+    Reconnect) fail verification, so the gate asks — the safe direction.
+
+Command detection is deliberately over-broad (`git … push|commit` anywhere
+in one shell segment): a false positive costs one extra permission prompt,
+a false negative silently skips the gate.
+
+TRUST MODEL — a guardrail against FORGETTING, not a security boundary.
+This hook protects a cooperative agent from the accident of pushing
+without a review, on a stale review, or on a failed/timed-out one. It
+does NOT defend against a deliberately evasive agent: any Bash-text hook
+is bypassable by construction (write a script and execute it, shell
+functions, aliases), so a keyed signature would add ceremony, not
+security — the header check is honesty-against-accident. Two disclosed
+residuals: edits made WHILE the review runs are stamped into the
+answer-time digest and are indistinguishable from reviewed state; and
+whether the installed Claude Code enforces permissionDecision "ask" is
+UNVERIFIED (anthropic/claude-code#81041 reports "ask" executing silently
+on some versions) — the reason is therefore duplicated into
+additionalContext, so the worst case degrades to the previous
+context-nudge behavior, never below it.
+"""
+import hashlib
 import json
 import re
+import subprocess
 import sys
-from pathlib import Path
 
-GATE_CONTEXT = (
-    "PUSH GATE: You are about to git push/commit without a complete "
-    "multi-model review. You MUST run BOTH on the diff first, dispatched in "
-    "PARALLEL (same message): Codex `code_review` (PRIMARY, authoritative) "
-    "and Antigravity `antigravity_review_pr` (SECONDARY, corroborating).\n"
-    "DISPATCH BLIND: send the DIFF and let them find the defects. Do NOT "
-    'write "I fixed X by doing Y, confirm that is right" — that buys '
-    "agreement, not review, and two models handed the same claim agree for "
-    "reasons unrelated to the code. Keep context and focus factual; put any "
-    "belief of your own in the caller_hypothesis parameter for an explicit "
-    "CONFIRMED/REFUTED/UNPROVEN verdict.\n"
-    "If the user explicitly said skip review, proceed. Otherwise STOP."
+GATE_REASON = (
+    "PUSH GATE: no completed Codex review found for the current tree. Run "
+    "Codex `code_review` on the diff first — dispatched BLIND (send the "
+    "DIFF, keep context/focus factual, put any belief of your own in "
+    "caller_hypothesis for an explicit CONFIRMED/REFUTED/UNPROVEN verdict) "
+    "— then push. Approve this prompt only to explicitly skip the review."
 )
 
-CODEX_PENDING_CONTEXT = (
-    "PUSH GATE: Codex's review has NOT RETURNED yet — the transcript shows "
-    "the call but no Codex result. Codex is the PRIMARY advisor and runs at "
-    "max reasoning, so long calls are moved to the background and come back "
-    "later as a task notification; that is normal, NOT a reason to proceed. "
-    "Antigravity answering first is not the review being done — it is the "
-    "SECONDARY advisor, corroboration only. Do NOT push/commit on it alone: "
-    "WAIT for Codex (Monitor the task / wait for the notification) and do "
-    "other work meanwhile, then fold its findings in. Push only once Codex "
-    "has actually answered — or the user explicitly says skip review."
+CODEX_PENDING_REASON = (
+    "PUSH GATE: Codex's review was dispatched but has NOT RETURNED. Codex "
+    "runs at max reasoning, so long calls are backgrounded and come back "
+    "later as a task notification; that is normal, not a reason to proceed. "
+    "Wait for the result and fold its findings in before pushing. "
+    "Approve this prompt only to explicitly skip waiting for the review."
 )
 
-# A real Codex ANSWER always carries this header (see server.py `_run_codex`);
-# the tool NAME appearing in the transcript only proves the call was made,
-# which is still true when the call was backgrounded and never came back.
-CODEX_RESULT_MARKERS = ("[Codex model:", "Codex TIMEOUT", "Codex health check FAILED")
+STALE_REASON = (
+    "PUSH GATE: the completed Codex review is STALE — the workspace changed "
+    "after Codex answered (tree digest mismatch), so that review no longer "
+    "vouches for what is being pushed. Re-run `code_review` on the current "
+    "diff. Approve this prompt only to explicitly push unreviewed changes."
+)
+
+# git followed by push/commit within one shell segment (no ; | & between) —
+# catches `npm test && git push`, `git -C /repo push`, `FOO=1 git commit`.
+GIT_PUSH_COMMIT_RE = re.compile(r"\bgit\b[^;|&\n]*\b(push|commit)\b")
+
+# Repository-redirection forms: the digest binds the review to the hook's
+# cwd, so a push aimed at ANOTHER repository must never be auto-opened by a
+# matching cwd digest — those always ask.
+GIT_OTHER_REPO_RE = re.compile(r"\bgit\b[^;|&\n]*\s(?:-C|--git-dir)\b|GIT_DIR=")
+
+# The server-stamped answer signature (order pinned by server.py
+# `_answer_sig`); only an ok-status code_review answer can open the gate.
+ANSWER_SIG_RE = re.compile(
+    r"\[Codex model: [^\]\n]*\| tool:code_review \| status:ok"
+    r" \| tree:([0-9a-fA-F]{4,64}|nogit|unknown)\]"
+)
+
+_HEX12_RE = re.compile(r"[0-9a-f]{12}")
+
+
+def _workspace_digest(cwd):
+    """12-hex digest of the workspace state (HEAD + tracked diff + status).
+
+    Behavioral twin of server.py `_workspace_digest` (hooks cannot import
+    the server module — it needs the mcp package); parity is pinned by
+    tests/test_push_gate.py.
+    """
+    try:
+        parts = []
+        for args in (("rev-parse", "HEAD"), ("diff", "HEAD"), ("status", "--porcelain")):
+            proc = subprocess.run(
+                ["git", "-C", cwd, *args],
+                capture_output=True, text=True, timeout=15,
+            )
+            if proc.returncode != 0:
+                # A digest over PARTIAL state is worse than no digest —
+                # every command must succeed or the digest is void.
+                return "nogit" if args[0] == "rev-parse" else "unknown"
+            parts.append(proc.stdout)
+        return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:12]
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+
+
+def _unwrap(text):
+    """Undo known MCP result wrappers: {'result': '...'} or ['...']."""
+    stripped = text.lstrip()
+    if stripped[:1] in ("{", "["):
+        try:
+            obj = json.loads(stripped)
+        except ValueError:
+            return text
+        if isinstance(obj, dict) and isinstance(obj.get("result"), str):
+            return obj["result"]
+        if isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, str) and "[Codex model:" in item:
+                    return item
+    return text
+
+
+def _texts(block):
+    """Every text payload inside a tool_result content field."""
+    content = block.get("content")
+    if isinstance(content, str):
+        yield content
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, str):
+                yield part
+            elif isinstance(part, dict) and part.get("type") == "text":
+                yield str(part.get("text") or "")
+
+
+def _review_state(transcript_path):
+    """Return (dispatched, answered_digests) from transcript evidence.
+
+    dispatched: an assistant tool_use whose name is an MCP code_review tool
+    (structural — file contents in the transcript cannot fabricate it).
+    answered_digests: tree digests from verified answer signatures, found in
+    tool_result payloads (foreground, possibly JSON-wrapped) or
+    queue-operation entries (backgrounded task notifications).
+    """
+    dispatched = False
+    answered_digests = set()
+    for line in open(transcript_path, encoding="utf-8", errors="ignore"):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        etype = entry.get("type")
+        if etype == "queue-operation":
+            for match in ANSWER_SIG_RE.finditer(str(entry.get("content") or "")):
+                answered_digests.add(match.group(1).lower())
+            continue
+        message = entry.get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if etype == "assistant" and block.get("type") == "tool_use":
+                name = str(block.get("name") or "")
+                if name.startswith("mcp__") and name.endswith("__code_review"):
+                    dispatched = True
+            elif block.get("type") == "tool_result":
+                for text in _texts(block):
+                    for match in ANSWER_SIG_RE.finditer(_unwrap(text)):
+                        answered_digests.add(match.group(1).lower())
+    return dispatched, answered_digests
 
 
 def main() -> int:
@@ -49,29 +189,43 @@ def main() -> int:
         return 0
     tool_input = data.get("tool_input") or {}
     command = tool_input.get("command") or ""
-    # ^-anchored per line, matching the original grep -E '^[[:space:]]*git[[:space:]]+(push|commit)'
-    if not re.search(r"^\s*git\s+(push|commit)\b", command, re.MULTILINE):
+    if not GIT_PUSH_COMMIT_RE.search(command):
         return 0
     transcript = data.get("transcript_path") or ""
-    context = GATE_CONTEXT
-    if transcript:
+    reason = GATE_REASON
+    if transcript and not GIT_OTHER_REPO_RE.search(command):
         try:
-            text = Path(transcript).read_text(encoding="utf-8", errors="ignore")
-            both_dispatched = "code_review" in text and "antigravity_review_pr" in text
-            codex_answered = any(m in text for m in CODEX_RESULT_MARKERS)
-            if both_dispatched and codex_answered:
-                return 0  # complete review: primary answered, secondary too
-            if both_dispatched:
-                # The tools were called but the PRIMARY never came back — the
-                # exact case where a fast Antigravity answer looks like a
-                # finished review. Say so precisely instead of generically.
-                context = CODEX_PENDING_CONTEXT
+            dispatched, answered_digests = _review_state(transcript)
+            current = _workspace_digest(data.get("cwd") or ".")
+            # Opening requires BOTH legs: the structural dispatch record
+            # (a forged tool_result alone is not evidence a review ran) AND
+            # a real digest match — if either side of the digest could not
+            # be computed (nogit/unknown), the binding is meaningless and
+            # the gate asks instead of trusting a vacuous match.
+            if (
+                dispatched
+                and _HEX12_RE.fullmatch(current)
+                and current in answered_digests
+            ):
+                return 0  # completed review vouches for exactly this tree
+            if answered_digests:
+                reason = STALE_REASON
+            elif dispatched:
+                reason = CODEX_PENDING_REASON
         except OSError:
             pass
+    elif transcript:
+        reason = (
+            GATE_REASON
+            + " (This push redirects to another repository via -C/--git-dir/"
+            "GIT_DIR — the gate cannot bind a review to it, so it always asks.)"
+        )
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "additionalContext": context,
+            "permissionDecision": "ask",
+            "permissionDecisionReason": reason,
+            "additionalContext": reason,
         }
     }))
     return 0

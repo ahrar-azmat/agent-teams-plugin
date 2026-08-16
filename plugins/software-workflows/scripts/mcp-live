@@ -1,20 +1,18 @@
 #!/bin/sh
-# mcp-live — watch codex-oracle + antigravity advisory runs in real time.
+# mcp-live — watch codex-oracle advisory runs in real time.
 #
 # Run it as a Claude Code BACKGROUND shell to get the same "Enter to view"
 # experience the Shells panel gives (MCP tasks have no output buffer to
 # open — the harness only streams stdout for shells, so this bridges the
-# servers' live logs into one):
+# server's live log into one):
 #     ask Claude: "run mcp-live in the background"
 # or in any plain terminal:
 #     mcp-live
 #
 # stream.log is the MERGED feed: every run (including concurrent ones,
 # across sessions/processes) appends its lines tagged with a run id like
-# [codex5·21746], so parallel advisors interleave chronologically in one
+# [codex5·21746], so parallel runs interleave chronologically in one
 # view. Focus on a single run instead with its per-run file:
-#     ls -t ~/.claude/logs/codex-oracle/ ~/.claude/logs/antigravity/
+#     ls -t ~/.claude/logs/codex-oracle/
 #     tail -F ~/.claude/logs/codex-oracle/latest.log   # newest run only
-exec tail -F \
-  "$HOME/.claude/logs/codex-oracle/stream.log" \
-  "$HOME/.claude/logs/antigravity/stream.log"
+exec tail -F "$HOME/.claude/logs/codex-oracle/stream.log"

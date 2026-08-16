@@ -1,40 +1,36 @@
 ---
 name: codex-review
-description: Multi-model code review workflow. Activates before committing or pushing code. Ensures Codex Oracle and Antigravity independently review all changes before they ship.
+description: Codex code review workflow. Activates before committing or pushing code. Ensures Codex Oracle independently reviews all changes before they ship.
 ---
 
-# Multi-Model Code Review
+# Codex Code Review
 
-Before committing or pushing any code changes, you MUST get **independent** reviews.
+Before committing or pushing any code changes, you MUST get an **independent** review.
 
-Independent is the operative word. Handing an advisor your diagnosis and asking it to check
+Independent is the operative word. Handing the advisor your diagnosis and asking it to check
 your work does not produce a review — it produces agreement. See Step 2.
 
 ## Step 1: Gather the diff
-Run `git diff` to collect all staged and unstaged changes. If the diff is large, also read the
-changed files so you can answer follow-ups without re-dispatching.
+Run `git diff HEAD` to collect all tracked changes — staged AND unstaged (plain `git diff`
+silently omits staged changes, so a staged-only commit would produce an empty review). Check
+`git status --short` for untracked files that belong to the change and include them. If the
+diff is large, also read the changed files so you can answer follow-ups without re-dispatching.
 
-## Step 2: Dispatch both reviewers — IN PARALLEL and BLIND
+## Step 2: Dispatch Codex — BLIND
 
-Batch both MCP calls in the **same message**. Neither advisor may see the other's answer before
-forming its own.
-
-- **Codex Oracle** — **PRIMARY, authoritative**: `code_review` with the diff
-- **Antigravity** — **SECONDARY, corroborating**: `antigravity_review_pr` (strictness: `strict`)
-  with the same diff
+- **Codex Oracle**: `code_review` with the diff
 
 > **The review is NOT complete until CODEX has answered.** Codex runs at max effort and often
 > takes many minutes; long calls are backgrounded and return later as a task notification —
-> that is normal. Antigravity nearly always answers first; **answering first is not being
-> right.** Never ship, commit, or declare the review done on Antigravity's answer alone. If
-> Codex is still running, WAIT for it (Monitor / the notification) and do other work meanwhile.
+> that is normal. Never ship, commit, or declare the review done while the call is pending.
+> WAIT for it (Monitor / the notification) and do other work meanwhile.
 
 **Send the diff. Do not send your conclusion.**
 
 | ❌ Anchored dispatch | ✅ Blind dispatch |
 |---------------------|------------------|
 | `context: "I fixed the N+1 by adding selectinload — confirm that's right"` | `context: "Loads order lines for the invoice grid. Runs under RLS."` |
-| `context: "The root cause was the missing await"` | (say nothing about cause — let them find it) |
+| `context: "The root cause was the missing await"` | (say nothing about cause — let it find it) |
 | `focus: "just double-check the lock is correct"` | `focus: "concurrency, correctness"` |
 
 `context` and `focus` are **factual scoping fields** — what the code does, which invariants hold,
@@ -49,14 +45,14 @@ If a result comes back with a **⚠️ ANCHORING WARNING** banner, you contamina
 Re-run it blind before trusting any agreement in it.
 
 ## Step 3: Expect real web research
-Both advisors run with live web search (Codex `web_search=live`; Antigravity `search_web`). A
-complete review checks the *current* upstream reality, not remembered API shapes:
+Codex runs with live web search (`web_search=live`). A complete review checks the *current*
+upstream reality, not remembered API shapes:
 
 - Are any APIs used here deprecated or changed upstream?
 - Does any dependency touched here have a known CVE?
 - Do version-specific claims come with a URL?
 
-Both servers require a **Sources** section. An external claim with no source was answered from
+The server requires a **Sources** section. An external claim with no source was answered from
 memory — push back and re-ask rather than acting on it.
 
 ## Step 4: Run the Runtime Capability check
@@ -79,41 +75,31 @@ Ask of this diff:
 - Is any parameter **accepted then ignored, clamped, or silently downgraded**?
 - Does the test coverage run on the **production engine**, or only on the library's default?
 
-Both servers inject this hunt into `code_review` and `review_pr` automatically — but check it
-yourself too, since it is the finding a fast reviewer most reliably misses.
+The server injects this hunt into `code_review` automatically — but check it yourself too,
+since it is the finding a fast reviewer most reliably misses.
 
 ## Step 5: Process findings
-0. **Confirm Codex actually answered.** If only Antigravity has returned, STOP — you have half a
-   review. Go back and wait.
-1. Collect all findings from both models
+0. **Confirm Codex actually answered.** A dispatched call is not an answered call — a
+   backgrounded call that never returned is no review at all. If there is no result yet,
+   STOP and wait.
+1. Collect all findings
 2. Categorize by severity: CRITICAL > HIGH > MEDIUM > LOW
 3. Any CRITICAL or HIGH finding MUST be addressed or explicitly acknowledged to the user
-4. **If both models flag the same issue AND both were dispatched blind — it's almost certainly
-   real, fix it.** If you anchored them, their agreement is one data point wearing two hats;
-   re-dispatch blind before relying on it.
-5. **Disagreement is always strong signal** — an advisor that contradicts you even after being
-   nudged toward you has found something. Investigate it before dismissing it.
-   **Where the two models contradict EACH OTHER, Codex carries** — unless you can disprove it by
-   MEASURING the deployed system (measurement outranks both; Codex has been wrong when it read
+4. **Where Codex contradicts YOU, Codex carries** — unless you can disprove it by MEASURING
+   the deployed system (measurement outranks the model; Codex has been wrong when it read
    newer upstream source instead of the installed binary).
-   **An Antigravity-only finding is still real** — verify it on its merits. "Codex didn't mention
-   it" is not a refutation; the secondary exists precisely to catch what the primary missed, and
-   it has (a symlink-traversal CRITICAL Codex missed, in the same session Codex caught a
-   secret-exfiltration CRITICAL Antigravity missed).
-6. Verify file:line citations in the tree that is canon for this task — Codex reads the whole
+5. Verify file:line citations in the tree that is canon for this task — Codex reads the whole
    workspace and can cite a sibling checkout.
 
 ## Step 6: Optional round 2 — adversarial
-Once both have answered blind, it is legitimate to go back with your hypothesis and ask them to
-refute it, or to put one model's finding to the other. Order matters: independent first,
-adversarial second.
+Once Codex has answered blind, it is legitimate to go back with your hypothesis and ask it to
+refute it. Order matters: independent first, adversarial second.
 
 ## Step 7: Present to user
 Summarize:
 - What Codex found
-- What Antigravity found
 - Your own assessment
-- Where they disagree — with both perspectives
+- Where you disagree — both perspectives, and what measurement would settle it
 - Which findings you've already fixed vs which need user input
 
 ## When upstream vendor source is part of the evidence
