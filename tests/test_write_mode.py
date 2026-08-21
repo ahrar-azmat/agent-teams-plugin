@@ -76,12 +76,17 @@ PASS = FAIL = 0
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
+    """Count for the standalone runner AND raise so pytest sees failures —
+    a printing-only check() let 5 real failures ride under a green pytest
+    run (round-2 review, 2026-08-21)."""
     global PASS, FAIL
     if cond:
         PASS += 1
-    else:
-        FAIL += 1
-        print(f"  FAIL: {name}" + (f" — {detail}" if detail else ""))
+        return
+    FAIL += 1
+    msg = f"  FAIL: {name}" + (f" — {detail}" if detail else "")
+    print(msg)
+    raise AssertionError(msg)
 
 
 def _argv(**kw) -> list[str]:
@@ -109,6 +114,13 @@ def test_sandbox_matrix() -> None:
               "sandbox_workspace_write.exclude_slash_tmp=true" in a)
         check(f"{tag}: $TMPDIR excluded",
               "sandbox_workspace_write.exclude_tmpdir_env_var=true" in a)
+        check(f"{tag}: windows sandbox explicitly sealed ELEVATED (the "
+              f"unelevated backend's egress seal is env-var advisory only)",
+              'windows.sandbox="elevated"' in a)
+        check(f"{tag}: shell children get minimal env (inherit=core)",
+              'shell_environment_policy.inherit="core"' in a)
+        check(f"{tag}: secret-name excludes stay active",
+              "shell_environment_policy.ignore_default_excludes=false" in a)
 
     c = _argv()
     check("read regression: read-only + isolation",
@@ -300,7 +312,8 @@ def _fake_exec(captured: dict, results=None):
     results = list(results or
                    [("implemented.", True, "", "", 0, None, False)])
 
-    async def fake(cmd, output_file, state, emit, ctx, model, extra_env=None):
+    async def fake(cmd, output_file, state, emit, ctx, model, extra_env=None,
+                   workdir="", request_started=None):
         calls = captured.setdefault("calls", [])
         calls.append({"cmd": cmd, "extra_env": dict(extra_env or {}),
                       "prompt": cmd[-1]})
@@ -375,6 +388,9 @@ def test_abraham_tool() -> None:
     real_cwd, real_exec, real_active = (
         server._get_cwd, server._exec_codex_once, server._active_write_run)
     real_acquire = server._acquire_write_lock
+    # Preseed the write-capability verdict: without it the probe gate would
+    # spawn a REAL codex process inside this hermetic test.
+    server._write_capability = (True, "preseeded for tests")
     try:
         res = asyncio.run(server.abraham(task="   "))
         check("empty task refused", "empty task" in res)
@@ -471,13 +487,20 @@ def test_resume_inherits_write() -> None:
         server._get_cwd = lambda: cwd
         server._run_codex = fake_run_codex
         server._active_write_run = lambda c, exclude_run="": ""
+        # order-independent: never let this test spawn a real probe
+        server._write_capability = (True, "preseeded for tests")
+        # has_start mirrors the real journal contract (every real run gets a
+        # start-phase record at spawn); the resume listing filters on it to
+        # exclude evidence-only groups (dispatch tracers, probe verdicts).
         rec = {"run": "w1", "cwd": cwd, "write": True, "thread_id": "t9",
-               "has_end": True, "status": "error", "prompt": "orig task",
-               "infra": False, "web_search": False}
+               "has_start": True, "has_end": True, "status": "error",
+               "prompt": "orig task", "infra": False, "web_search": False}
         server._journal_runs = lambda: {"w1": dict(rec)}
         asyncio.run(server.codex_resume_run(run="w1"))
         check("write run resumes as write", got.get("write") is True)
         check("same thread", got.get("resume_tid") == "t9")
+        check("resume anchors the request heartbeat deadline",
+              got.get("request_started") is not None)
         check("lock released after write resume",
               not server._write_lock_path(cwd).exists())
 
@@ -505,10 +528,279 @@ def test_resume_inherits_write() -> None:
         server._release_write_lock(f"/resume-test-{os.getpid()}")
 
 
+def test_heartbeat_geometry() -> None:
+    """The heartbeat must stop on the LIVE side of the client's ~120s
+    backgrounding boundary: with interval I and bound MAX, the last send
+    lands at ≤MAX and the next candidate tick (MAX+I) must still be ≤120 —
+    so no send can ever target a deregistered token (macOS kill 2026-08-09;
+    Windows stdio wedge 2026-08-21)."""
+    check(
+        "heartbeat stops before ~120s backgrounding",
+        server.PROGRESS_MAX_SECONDS + server.PROGRESS_INTERVAL_SECONDS <= 120,
+        f"MAX={server.PROGRESS_MAX_SECONDS} "
+        f"INTERVAL={server.PROGRESS_INTERVAL_SECONDS}",
+    )
+    joined_args = "\x00".join(_argv(write=True))
+    check(
+        "probe/implementation sandbox argv single-source parity",
+        "\x00".join(server.WRITE_SANDBOX_ARGS) in joined_args,
+    )
+
+
+def test_write_capability_probe() -> None:
+    import os as _os
+    import time as _time
+
+    async def _drive(ws: str) -> None:
+        real_runner = server._run_write_probe
+        key = _os.path.realpath(ws)
+        try:
+            server._write_capability = None  # override seam OFF
+            server._write_probe_cache.clear()
+
+            # INCONCLUSIVE (runner death): refuse, TTL-cached (a burst
+            # shares the answer), then a later dispatch re-probes
+            async def _boom(tmp):
+                raise RuntimeError("spawn failed")
+            server._run_write_probe = _boom
+            ok, why = await server._ensure_write_capability(ws)
+            check("probe fail-closed on runner error",
+                  not ok and "could not run" in why, why)
+            check("inconclusive is TTL-cached, not conclusive",
+                  server._write_probe_cache[key][3] is False)
+
+            # burst within TTL shares the inconclusive answer — no re-probe
+            calls = {"n": 0}
+            async def _counting_boom(tmp):
+                calls["n"] += 1
+                raise RuntimeError("spawn failed")
+            server._run_write_probe = _counting_boom
+            for _ in range(3):
+                await server._ensure_write_capability(ws)
+            check("inconclusive burst shares one answer (no re-probe)",
+                  calls["n"] == 0, f"re-probed {calls['n']}×")
+
+            # after TTL expiry the next dispatch re-probes — and can go green
+            ok_, detail_, _ts, concl_ = server._write_probe_cache[key]
+            server._write_probe_cache[key] = (
+                ok_, detail_, _time.monotonic() - 9999, concl_)
+            async def _would_pass(tmp):
+                (tmp / "probe.txt").write_text("ok")
+                return 0, "done"
+            server._run_write_probe = _would_pass
+            ok3, why3 = await server._ensure_write_capability(ws)
+            check("re-probe after TTL expiry can go green", ok3, why3)
+            check("capable verdict is conclusive-cached",
+                  server._write_probe_cache[key][3] is True)
+
+            # conclusive cache wins: a now-red runner must not flip it
+            async def _no_write(tmp):
+                return 0, ("patch rejected: writing is blocked by read-only "
+                           "sandbox; rejected by user approval settings")
+            server._run_write_probe = _no_write
+            ok4, _w = await server._ensure_write_capability(ws)
+            check("capable verdict memoized per process", ok4 is True)
+
+            # INCAPABLE: measured refusal marker, no file → conclusive red
+            server._write_probe_cache.clear()
+            ok, why = await server._ensure_write_capability(ws)
+            check("probe red without file", not ok, why)
+            check("probe red carries measured marker",
+                  "read-only sandbox" in why, why)
+            check("incapable is conclusive-cached",
+                  server._write_probe_cache[key][3] is True)
+
+            # per-workspace keying: a different workspace probes fresh
+            with tempfile.TemporaryDirectory() as ws2:
+                server._run_write_probe = _would_pass
+                ok5, _ = await server._ensure_write_capability(ws2)
+                check("second workspace gets its own verdict", ok5 is True)
+                ok6, _ = await server._ensure_write_capability(ws)
+                check("first workspace keeps its red verdict", ok6 is False)
+
+            # single-flight: concurrent first calls run the probe ONCE
+            server._write_probe_cache.clear()
+            calls = {"n": 0}
+            async def _slow_green(tmp):
+                calls["n"] += 1
+                await asyncio.sleep(0.05)
+                (tmp / "probe.txt").write_text("ok")
+                return 0, "done"
+            server._run_write_probe = _slow_green
+            results = await asyncio.gather(
+                server._ensure_write_capability(ws),
+                server._ensure_write_capability(ws),
+                server._ensure_write_capability(ws),
+            )
+            check("single-flight: one probe for concurrent dispatches",
+                  calls["n"] == 1, f"probe ran {calls['n']}×")
+            check("single-flight: all callers get the verdict",
+                  all(r[0] for r in results))
+
+            # probe dirs live under {ws}/.abraham and are cleaned up
+            leftovers = list((Path(ws) / ".abraham").glob("write-probe-*"))
+            check("probe dirs cleaned from the workspace", not leftovers,
+                  str(leftovers))
+
+            # env skip bypasses the probe entirely
+            server._write_probe_cache.clear()
+            _os.environ["CODEX_ORACLE_SKIP_WRITE_PROBE"] = "1"
+            try:
+                async def _never(tmp):
+                    raise AssertionError("probe must not run when skipped")
+                server._run_write_probe = _never
+                ok7, why7 = await server._ensure_write_capability(ws)
+                check("probe env-skip honored",
+                      ok7 and "SKIP_WRITE_PROBE" in why7, why7)
+            finally:
+                _os.environ.pop("CODEX_ORACLE_SKIP_WRITE_PROBE", None)
+        finally:
+            server._run_write_probe = real_runner
+            server._write_probe_cache.clear()
+            # leave the override green so later tests never spawn a probe
+            server._write_capability = (True, "preseeded for tests")
+
+    with tempfile.TemporaryDirectory() as ws:
+        asyncio.run(_drive(ws))
+
+
+def test_probe_spawn_never_inherits_mcp_stdin() -> None:
+    """The probe child must get DEVNULL stdin: the parent's stdin is the
+    MCP JSON-RPC channel and codex exec APPENDS piped stdin to its prompt
+    (round-2 CRITICAL, 2026-08-21)."""
+    captured: dict = {}
+    real_spawn = asyncio.create_subprocess_exec
+
+    class _FakeProc:
+        returncode = 0
+        async def communicate(self):
+            return b"no file written", None
+        def kill(self):
+            pass
+        async def wait(self):
+            return 0
+
+    async def _fake_spawn(*argv, **kw):
+        captured.update(kw, argv=argv)
+        return _FakeProc()
+
+    async def _drive() -> None:
+        asyncio.create_subprocess_exec = _fake_spawn
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                await server._run_write_probe(Path(td))
+        finally:
+            asyncio.create_subprocess_exec = real_spawn
+
+    asyncio.run(_drive())
+    check("probe stdin is DEVNULL (never the MCP JSON-RPC stream)",
+          captured.get("stdin") == asyncio.subprocess.DEVNULL,
+          f"stdin={captured.get('stdin')!r}")
+    check("probe argv carries the sealed sandbox",
+          "workspace-write" in captured.get("argv", ()))
+    check("probe child gets its own process group (kill-tree reapable)",
+          captured.get("start_new_session") is True
+          or "creationflags" in captured,
+          str({k: captured.get(k)
+               for k in ("start_new_session", "creationflags")}))
+
+
+def test_resume_write_gated_by_probe() -> None:
+    """A resumed write run must hit the same capability gate as a fresh
+    abraham dispatch (round-2 HIGH: resume bypassed it)."""
+    real_runs, real_run_codex, real_cwd, real_active = (
+        server._journal_runs, server._run_codex, server._get_cwd,
+        server._active_write_run)
+    ran = {"n": 0}
+
+    async def fake_run_codex(prompt, **kw):
+        ran["n"] += 1
+        return "resumed"
+
+    try:
+        cwd = f"/resume-gate-test-{os.getpid()}"
+        server._get_cwd = lambda: cwd
+        server._run_codex = fake_run_codex
+        server._active_write_run = lambda c, exclude_run="": ""
+        rec = {"run": "w1", "cwd": cwd, "write": True, "thread_id": "t9",
+               "has_start": True, "has_end": True, "status": "error",
+               "prompt": "orig task", "infra": False, "web_search": False}
+        server._journal_runs = lambda: {"w1": dict(rec)}
+        server._write_capability = (False, "sandbox cannot write (test)")
+        res = asyncio.run(server.codex_resume_run(run="w1"))
+        check("red probe blocks write resume",
+              "cannot WRITE" in res, res[:120])
+        check("blocked resume never dispatched codex", ran["n"] == 0)
+    finally:
+        server._write_capability = (True, "preseeded for tests")
+        server._journal_runs, server._run_codex, server._get_cwd, \
+            server._active_write_run = (
+                real_runs, real_run_codex, real_cwd, real_active)
+        server._release_write_lock(cwd)
+
+
+def test_heartbeat_request_scoped_deadline() -> None:
+    """Behavioral: the loop must send while the REQUEST is young and go
+    silent forever once the request deadline passed — even for a run that
+    starts late (abraham phase 2), whose per-run clock is fresh."""
+    import time as _time
+
+    real_interval = server.PROGRESS_INTERVAL_SECONDS
+    real_max = server.PROGRESS_MAX_SECONDS
+    sends: list = []
+    stops: list = []
+
+    class _Ctx:
+        async def report_progress(self, *a):
+            sends.append(a)
+
+    async def _drive() -> None:
+        server.PROGRESS_INTERVAL_SECONDS = 0.01
+        server.PROGRESS_MAX_SECONDS = 0.05
+        state = {"activity": "testing"}
+        now = _time.monotonic()
+
+        # young request: sends, then stops by itself
+        await asyncio.wait_for(
+            server._heartbeat_loop(_Ctx(), now, now, state, "m", stops.append),
+            timeout=5,
+        )
+        check("young request heartbeats then stops",
+              len(sends) >= 1 and len(stops) == 1,
+              f"sends={len(sends)} stops={len(stops)}")
+
+        # late-phase run (request began long ago): ZERO sends ever
+        sends.clear()
+        stops.clear()
+        await asyncio.wait_for(
+            server._heartbeat_loop(
+                _Ctx(), _time.monotonic() - 1000, _time.monotonic(),
+                state, "m", stops.append,
+            ),
+            timeout=5,
+        )
+        check("expired request sends NOTHING (dead-token guard)",
+              len(sends) == 0 and len(stops) == 1,
+              f"sends={len(sends)}")
+
+    try:
+        asyncio.run(_drive())
+    finally:
+        server.PROGRESS_INTERVAL_SECONDS = real_interval
+        server.PROGRESS_MAX_SECONDS = real_max
+
+
 if __name__ == "__main__":
     for fn in (test_sandbox_matrix, test_auto_compact, test_changes_report,
                test_active_write_run, test_write_lock, test_write_pipeline,
-               test_abraham_tool, test_resume_inherits_write):
-        fn()
+               test_abraham_tool, test_resume_inherits_write,
+               test_heartbeat_geometry, test_write_capability_probe,
+               test_probe_spawn_never_inherits_mcp_stdin,
+               test_resume_write_gated_by_probe,
+               test_heartbeat_request_scoped_deadline):
+        try:
+            fn()
+        except AssertionError:
+            pass  # already printed and counted by check()
     print(f"{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

@@ -41,7 +41,9 @@ import contextlib
 import itertools
 import hashlib
 import json
+import math
 import os
+import threading
 import re
 import shutil
 import signal
@@ -92,6 +94,20 @@ SUBPROCESS_BUFFER_LIMIT = 4 * 1024 * 1024  # 4 MiB
 # searches for a separator so it cannot overflow regardless of line length.
 READ_CHUNK_SIZE = 65_536  # 64 KiB per read
 
+def _env_seconds(name: str, default: float, minimum: float) -> float:
+    """Env-tunable seconds knob, validated: unparsable, non-finite, or
+    below-minimum values fall back to the default — a NaN/inf here would
+    disarm the heartbeat cutoff entirely, and a zero/negative interval
+    would busy-spin the loop."""
+    try:
+        value = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(value) or value < minimum:
+        return default
+    return value
+
+
 # Progress heartbeat interval. Claude Code aborts any MCP tool call that
 # produces no response AND no progress notification for 30 minutes
 # ("idle timeout 1800s") — long max-effort runs and laptop-sleep gaps both
@@ -99,28 +115,46 @@ READ_CHUNK_SIZE = 65_536  # 64 KiB per read
 # lid-close; the 60-min MAX_RUNTIME budget was unreachable through MCP
 # without progress). Heartbeats reset the client's idle timer and surface
 # liveness (elapsed time + output bytes). Env knob exists for the selftest.
-PROGRESS_INTERVAL_SECONDS = float(
-    os.environ.get("CODEX_ORACLE_PROGRESS_INTERVAL", "10")
+PROGRESS_INTERVAL_SECONDS = _env_seconds(
+    "CODEX_ORACLE_PROGRESS_INTERVAL", 10.0, 1.0
 )
 
-# STOP heartbeating once the client has BACKGROUNDED the call — measured
-# incident 2026-08-09. Claude Code moves an MCP call to a background task at
-# ~120s and DEREGISTERS that request's progress token. Our heartbeat kept
-# sending on it every 10s; each one came back as
-#   "Connection error: Received a progress notification for an unknown token"
-# and after enough of them the client KILLED THE SERVER
-#   ("SIGINT failed, sending SIGTERM to MCP server process")
-# taking every SIBLING in-flight run down with it
-#   ("Tool 'architect_review' failed after 269s: MCP error -32000: Connection
-#    closed").
+# STOP heartbeating BEFORE the client backgrounds the call — two measured
+# incidents, one per side of the boundary:
+#   2026-08-09 (macOS): Claude Code moves an MCP call to a background task at
+#   ~120s and DEREGISTERS that request's progress token. Our heartbeat kept
+#   sending on it every 10s; each came back as "Connection error: Received a
+#   progress notification for an unknown token", and after enough of them the
+#   client KILLED THE SERVER ("SIGINT failed, sending SIGTERM to MCP server
+#   process"), taking every SIBLING in-flight run down with it.
+#   2026-08-21 (Windows): the first fix stopped at 150s — the WRONG SIDE of
+#   the ~120s boundary, guaranteeing 2-3 dead-token sends per backgrounded
+#   call. macOS tolerated those few; on Windows the client's reaction WEDGED
+#   the stdio channel instead: completed results were never delivered (the
+#   background task read "running" forever) and NEW tool calls never reached
+#   dispatch — one bug wearing two costumes.
 # Heartbeats only ever existed to stop the client's 30-min idle-abort while it
-# WAITS on the call; once the call is backgrounded the client no longer waits
-# (it gets a completion notification instead), so further progress is useless
-# AND actively harmful. Stop just past the backgrounding threshold. The live
-# log keeps streaming regardless, so nothing observable is lost.
-PROGRESS_MAX_SECONDS = float(
-    os.environ.get("CODEX_ORACLE_PROGRESS_MAX_SECONDS", "150")
+# WAITS on the call; once the call is backgrounded the client no longer waits.
+# So stop while the token is still ALIVE: default 100s — with the 10s
+# interval the last send lands at ≤100s, a ≥20s margin under the ~120s
+# deregistration, and no send ever targets a dead token. The live log keeps
+# streaming regardless, so nothing observable is lost. Set 0 to disable
+# heartbeats entirely (the first tick exits before any send).
+PROGRESS_MAX_SECONDS = _env_seconds(
+    "CODEX_ORACLE_PROGRESS_MAX_SECONDS", 100.0, 0.0
 )
+
+# Combined-geometry invariant: a send can begin at ≤MAX and take up to one
+# INTERVAL (its wait_for bound), and the whole envelope must clear the
+# client's ~120s token deregistration. An unsafe env combination is CLAMPED,
+# not honored — these knobs tune cadence, never the safety boundary
+# (round-2 review, 2026-08-21: MAX=1000 would have restored dead-token
+# sends wholesale).
+_SAFE_PROGRESS_ENVELOPE = 115.0
+if PROGRESS_MAX_SECONDS + PROGRESS_INTERVAL_SECONDS > _SAFE_PROGRESS_ENVELOPE:
+    PROGRESS_MAX_SECONDS = max(
+        0.0, _SAFE_PROGRESS_ENVELOPE - PROGRESS_INTERVAL_SECONDS
+    )
 
 # ---------------------------------------------------------------------------
 # Timeouts
@@ -589,6 +623,220 @@ def _answer_sig(tool_name: str, status: str) -> str:
     if not tool_name:
         return ""
     return f" | tool:{tool_name} | status:{status} | tree:{_workspace_digest(_get_cwd())}"
+
+
+# The sealed write sandbox, verbatim — a single source shared by the
+# implementation phase (_build_exec_argv) and the write-capability probe
+# below, so the probe can never drift from what the real run executes.
+WRITE_SANDBOX_ARGS = (
+    "--sandbox", "workspace-write",
+    "--ignore-user-config",
+    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+    # Windows: sandbox mode DEFAULTS TO DISABLED in codex 0.147, and a
+    # disabled mode downgrades WorkspaceWrite → ReadOnly (upstream
+    # config_toml.rs; the enable normally lives in user config, which
+    # --ignore-user-config strips). Seal the intended mode explicitly —
+    # and it must be "elevated": the unelevated/restricted-token backend
+    # only INJECTS proxy/offline env vars (advisory — a raw-socket child
+    # ignores them, reproduced upstream in codex#35940), while firewall
+    # enforcement is tied to the elevated sandbox identities. abraham's
+    # air-gap promises OS-ENFORCED no-egress, so a machine that cannot run
+    # the elevated sandbox fails the write probe and abraham refuses —
+    # fail closed, never a silently advisory seal. Key calibrated on the
+    # installed 0.147.0 binary 2026-08-21: --strict-config accepts
+    # "elevated"/"unelevated", rejects others; non-Windows parses and
+    # ignores it.
+    "-c", 'windows.sandbox="elevated"',
+    # The sealed writer's SHELL CHILDREN get a minimal environment: codex
+    # 0.147 defaults shell subprocesses to inherit=all, so repository
+    # instructions or the phase-1 brief could otherwise read the parent's
+    # env (API keys, tokens) into tool output or the worktree (round-3
+    # review, 2026-08-21). core = HOME/PATH/USER-class vars only, and the
+    # default KEY/SECRET/TOKEN name excludes stay active. Both keys
+    # calibrated on the installed 0.147.0 binary: --strict-config accepts
+    # them ("core"/"all"/"none" variants), rejects bogus values.
+    "-c", 'shell_environment_policy.inherit="core"',
+    "-c", "shell_environment_policy.ignore_default_excludes=false",
+)
+
+WRITE_PROBE_TIMEOUT_SECONDS = _env_seconds(
+    "CODEX_ORACLE_WRITE_PROBE_TIMEOUT", 240.0, 30.0
+)
+
+# Test/override seam: when set, used verbatim for every workspace.
+_write_capability: tuple[bool, str] | None = None
+
+# Real cache, keyed by normalized workspace — a green proven on one volume
+# says nothing about another's ACLs/controlled folders (round-2 review).
+# Entry: (ok, detail, ts, conclusive). Conclusive verdicts live for the
+# process; inconclusive ones (auth/rate-limit/CLI noise) expire so a burst
+# of dispatches shares one probe but a later dispatch re-tests.
+_write_probe_cache: dict[str, tuple[bool, str, float, bool]] = {}
+_WRITE_PROBE_INCONCLUSIVE_TTL = 60.0
+
+# Single-flight per event loop: concurrent first dispatches must not each
+# launch a paid probe and race the memo. Keyed by loop id because tests run
+# separate asyncio.run() loops and a Lock cannot cross loops.
+_write_probe_locks: dict[int, asyncio.Lock] = {}
+
+
+def _write_probe_lock() -> asyncio.Lock:
+    return _write_probe_locks.setdefault(
+        id(asyncio.get_running_loop()), asyncio.Lock()
+    )
+
+
+async def _run_write_probe(tmp: Path) -> tuple[int | None, str]:
+    """Spawn ONE sealed low-effort codex write in ``tmp``; return
+    (returncode, output tail).
+
+    Uses the exact sealed sandbox argv (WRITE_SANDBOX_ARGS) plus the same
+    approval policy the real run carries — parity is the point. Low effort
+    is deliberate: the sandbox is built by the CLI layer, not the model, so
+    effort is orthogonal to the capability under test.
+    """
+    argv = [
+        *_codex_argv0(), "exec", *WRITE_SANDBOX_ARGS,
+        "--skip-git-repo-check", "--color", "never",
+        "-c", "approval_policy=never",
+        "-c", "model_reasoning_effort=low",
+        "-c", "web_search=disabled",
+        "Create a file named probe.txt containing exactly: ok\n"
+        "Do nothing else, then stop.",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *argv, cwd=str(tmp),
+        # NEVER inherit the parent's stdin: it is the MCP JSON-RPC channel,
+        # and codex exec APPENDS piped stdin to its prompt — inheriting it
+        # both corrupts the session and leaks client traffic into the model
+        # (round-2 review, 2026-08-21). Mirrors the real runner.
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=_codex_env(),
+        # Own process group: the npm shim forwards INT/TERM but not KILL,
+        # so only a group kill reaps the native binary underneath it.
+        **_new_group_kwargs(),
+    )
+    try:
+        out, _ = await asyncio.wait_for(
+            proc.communicate(), timeout=WRITE_PROBE_TIMEOUT_SECONDS
+        )
+    except BaseException:
+        # Timeout AND cancellation (CancelledError is not an Exception):
+        # the probe child must never outlive the request — kill the whole
+        # group and reap before propagating. The reap itself is bounded so
+        # an unkillable child cannot wedge the cleanup path.
+        _kill_tree(proc)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        raise
+    return proc.returncode, (out or b"")[-100_000:].decode(
+        "utf-8", errors="replace"
+    )
+
+
+async def _ensure_write_capability(workspace: str) -> tuple[bool, str]:
+    """Prove the deployed codex can actually WRITE under the sealed sandbox.
+
+    Measured on Windows 2026-08-21 (codex 0.147.0): ``--sandbox
+    workspace-write`` was ACCEPTED, the run EXITED 0 — and every write was
+    rejected by codex's own tool router ("patch rejected: writing is blocked
+    by read-only sandbox; rejected by user approval settings") because the
+    restricted-token sandbox could not be built on that machine. Flag
+    acceptance and exit code are union claims (Runtime Capability Law); the
+    only proof of the capability is a file APPEARING ON DISK. The verdict is
+    therefore structural — probe-file existence — and the rejection text
+    only enriches the refusal message. Fails CLOSED on any probe-infra
+    error (a machine where the probe cannot run cannot demonstrate writes
+    either). Memoized per server process; a reconnect re-probes.
+    CODEX_ORACLE_SKIP_WRITE_PROBE=1 bypasses — only for machines where
+    writes are already verified by hand.
+    """
+    if os.environ.get("CODEX_ORACLE_SKIP_WRITE_PROBE") == "1":
+        return True, "probe skipped (CODEX_ORACLE_SKIP_WRITE_PROBE=1)"
+    if _write_capability is not None:  # test/override seam
+        return _write_capability
+    key = os.path.realpath(workspace)
+    async with _write_probe_lock():
+        cached = _write_probe_cache.get(key)
+        if cached is not None:
+            ok, detail, ts, conclusive = cached
+            # monotonic: wall-clock rollback must not stretch a TTL
+            if conclusive or (
+                time.monotonic() - ts < _WRITE_PROBE_INCONCLUSIVE_TTL
+            ):
+                return ok, detail
+
+        def _record(ok: bool, detail: str, conclusive: bool,
+                    rc: int | None = None) -> tuple[bool, str]:
+            _write_probe_cache[key] = (
+                ok, detail, time.monotonic(), conclusive)
+            _journal({"run": "write-probe", "phase": "probe",
+                      "ts": time.time(), "workspace": key, "rc": rc,
+                      "conclusive": conclusive, "ok": ok,
+                      "detail": detail[:200]})
+            return ok, detail
+
+        tmp: Path | None = None
+        try:
+            try:
+                # Probe INSIDE the target workspace (its .abraham metadata
+                # dir): a green proven on some other volume says nothing
+                # about this repo's ACLs/controlled folders. No git setup —
+                # the probe argv carries --skip-git-repo-check. Removed in
+                # the finally so it never appears in a changes report.
+                base = Path(workspace) / ".abraham"
+                base.mkdir(parents=True, exist_ok=True)
+                tmp = Path(tempfile.mkdtemp(prefix="write-probe-", dir=base))
+                rc, output = await _run_write_probe(tmp)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Probe infrastructure failure: INCONCLUSIVE — refuse this
+                # dispatch (fail closed); the TTL cache shares this answer
+                # with a concurrent burst, then a later dispatch re-probes.
+                return _record(
+                    False,
+                    f"the write probe could not run ({exc!r}) — "
+                    "INCONCLUSIVE; a later dispatch re-probes.",
+                    conclusive=False,
+                )
+            if (tmp / "probe.txt").exists():
+                # CAPABLE — the only structural proof. Cached for process.
+                return _record(
+                    True, f"write probe green (exit {rc})",
+                    conclusive=True, rc=rc,
+                )
+            tail = output[-1500:]
+            marker = next(
+                (m for m in ("read-only sandbox",
+                             "rejected by user approval settings")
+                 if m in tail), "",
+            )
+            if marker:
+                # INCAPABLE — the measured sandbox refusal. Cached.
+                return _record(
+                    False,
+                    "codex ACCEPTED --sandbox workspace-write and exited "
+                    f"{rc}, but the probe file never appeared on disk "
+                    f'(codex reported "{marker}").',
+                    conclusive=True, rc=rc,
+                )
+            # No file AND no sandbox marker: auth, rate limiting, model
+            # noncompliance, or a CLI failure — INCONCLUSIVE.
+            return _record(
+                False,
+                f"the write probe exited {rc} without writing and without "
+                "a recognizable sandbox refusal — INCONCLUSIVE "
+                "(auth/rate-limit/CLI failure?); a later dispatch "
+                "re-probes.",
+                conclusive=False, rc=rc,
+            )
+        finally:
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1162,9 +1410,16 @@ RESUME_NUDGE = (
 )
 
 
+_journal_lock = threading.Lock()
+
+
 def _journal(rec: dict[str, Any]) -> None:
-    """Append one record to runs.jsonl, flushed so a kill cannot lose it."""
-    with contextlib.suppress(Exception):
+    """Append one record to runs.jsonl, flushed so a kill cannot lose it.
+
+    Serialized: journal writes now also come from worker threads
+    (asyncio.to_thread for the dispatch tracer), and two unlocked rotations
+    could clobber runs.jsonl.1."""
+    with contextlib.suppress(Exception), _journal_lock:
         LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
         _private(LIVE_LOG_DIR, 0o700)
         with contextlib.suppress(OSError):
@@ -1298,12 +1553,7 @@ def _build_exec_argv(
         # excluded from the writable roots — a /tmp artifact would outlive
         # the run OUTSIDE the reviewed diff; build tools get a TMPDIR
         # redirected inside the workspace instead (see _run_codex).
-        argv += [
-            "--sandbox", "workspace-write",
-            "--ignore-user-config",
-            "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
-            "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-        ]
+        argv += [*WRITE_SANDBOX_ARGS]
     elif infra:
         argv += ["--sandbox", "danger-full-access"]
     else:
@@ -1413,10 +1663,16 @@ def _kill_tree(proc) -> None:
             pass  # group already gone, or we can't signal it — fall through
     else:
         # Windows: no process groups to signal; taskkill /T walks the tree.
+        # Only a rc=0 taskkill actually killed anything — access-denied and
+        # not-found exit nonzero WITHOUT raising, and returning then left
+        # the root alive (round-3 review, 2026-08-21). Fall through to
+        # proc.kill() on any other outcome.
         with contextlib.suppress(Exception):
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                           capture_output=True, timeout=10)
-            return
+            done = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10)
+            if done.returncode == 0:
+                return
     with contextlib.suppress(ProcessLookupError):
         proc.kill()
 
@@ -1430,6 +1686,7 @@ async def _exec_codex_once(
     model: str,
     extra_env: dict[str, str] | None = None,
     workdir: str = "",
+    request_started: float | None = None,
 ) -> tuple[str, bool, str, str, int, str | None, bool]:
     """One codex exec attempt (spawn → stream → reap).
 
@@ -1529,41 +1786,16 @@ async def _exec_codex_once(
                 )
                 _kill_tree(proc)
 
-    async def _heartbeat() -> None:
-        """Emit MCP progress every PROGRESS_INTERVAL_SECONDS while codex runs.
-
-        Resets Claude Code's 30-min idle-abort timer (the cause of the
-        2026-07-27 "hangs") and gives the operator a live elapsed/output
-        signal. A failed notification must never affect the run itself.
-        """
-        assert ctx is not None
-        started = time.monotonic()
-        while True:
-            await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
-            elapsed = time.monotonic() - started
-            if elapsed > PROGRESS_MAX_SECONDS:
-                # Past the client's backgrounding threshold: the request's
-                # progress token is gone, and sending on it kills the whole
-                # server (see PROGRESS_MAX_SECONDS). Stop — the live log
-                # continues to carry every event.
-                emit(
-                    f"⏱ progress notifications stopped at {int(elapsed)}s "
-                    f"(call backgrounded by the client; live log continues)"
-                )
-                return
-            with contextlib.suppress(Exception):
-                await ctx.report_progress(
-                    min(elapsed, MAX_RUNTIME_SECONDS),
-                    MAX_RUNTIME_SECONDS,
-                    f"codex {model} · {int(elapsed)}s · "
-                    f"{state['activity'][:140]}",
-                )
-
     stdout_task = asyncio.create_task(_consume(proc.stdout, stdout_chunks, _feed_stdout))
     stderr_task = asyncio.create_task(_consume(proc.stderr, stderr_chunks, _feed_stderr))
     probe_task = asyncio.create_task(_startup_probe())
+    run_t0 = time.monotonic()
+    request_t0 = run_t0 if request_started is None else request_started
     heartbeat_task = (
-        asyncio.create_task(_heartbeat()) if ctx is not None else None
+        asyncio.create_task(
+            _heartbeat_loop(ctx, request_t0, run_t0, state, model, emit)
+        )
+        if ctx is not None else None
     )
 
     try:
@@ -1621,6 +1853,56 @@ async def _exec_codex_once(
 # Codex runner
 # ---------------------------------------------------------------------------
 
+async def _heartbeat_loop(
+    ctx: Any,
+    request_t0: float,
+    run_t0: float,
+    state: dict[str, Any],
+    model: str,
+    emit: Any,
+) -> None:
+    """Emit MCP progress while codex runs — module-level for testability.
+
+    The STOP deadline is measured from REQUEST start (``request_t0``), not
+    this run's start: one MCP request can span a capability probe, two
+    abraham phases, and retries, and the client's progress token dies ~120s
+    after the REQUEST began — a fresh per-run clock resurrected dead-token
+    sends in later phases (round-2 review, 2026-08-21). Display elapsed
+    stays run-relative for the operator. A failed notification must never
+    affect the run itself.
+    """
+    while True:
+        await asyncio.sleep(PROGRESS_INTERVAL_SECONDS)
+        now = time.monotonic()
+        if now - request_t0 > PROGRESS_MAX_SECONDS:
+            # Approaching the client's ~120s backgrounding threshold for
+            # the REQUEST: stop while the progress token is still alive
+            # (sending on a deregistered token killed the server on macOS
+            # 2026-08-09 and wedged stdio on Windows 2026-08-21). The live
+            # log continues to carry every event.
+            emit(
+                f"⏱ progress notifications stopped "
+                f"{int(now - request_t0)}s into the request "
+                f"(before the client backgrounds it; live log continues)"
+            )
+            return
+        run_elapsed = now - run_t0
+        with contextlib.suppress(Exception):
+            # Bounds THIS task's await so a blocking transport cannot
+            # wedge it (Windows, 2026-08-21). This is not a transport
+            # flush guarantee — staying under the request deadline with
+            # margin is what keeps sends off dead tokens.
+            await asyncio.wait_for(
+                ctx.report_progress(
+                    min(run_elapsed, MAX_RUNTIME_SECONDS),
+                    MAX_RUNTIME_SECONDS,
+                    f"codex {model} · {int(run_elapsed)}s · "
+                    f"{state['activity'][:140]}",
+                ),
+                timeout=PROGRESS_INTERVAL_SECONDS,
+            )
+
+
 async def _run_codex(
     prompt: str,
     infra: bool = False,
@@ -1633,6 +1915,7 @@ async def _run_codex(
     images: list[str] | None = None,
     tool_name: str = "",
     workdir: str = "",
+    request_started: float | None = None,
 ) -> str:
     """Run codex exec headlessly with clean final-message extraction.
 
@@ -1840,6 +2123,10 @@ async def _run_codex(
     })
 
     attempt = 0
+    # One request-time anchor for EVERY attempt: retries must not reset the
+    # heartbeat deadline (the client's progress token is request-scoped).
+    if request_started is None:
+        request_started = time.monotonic()
     final_message = ""
     clean_extraction = False
     stdout_text = stderr_text = ""
@@ -1864,7 +2151,8 @@ async def _run_codex(
             (final_message, clean_extraction, stdout_text, stderr_text,
              returncode, hung_reason, timed_out) = await _exec_codex_once(
                 cmd, output_file, state, _emit, ctx, model,
-                extra_env=extra_env, workdir=eff_cwd)
+                extra_env=extra_env, workdir=eff_cwd,
+                request_started=request_started)
         except asyncio.CancelledError:
             _journal({"run": run_tag, "phase": "end", "ts": time.time(),
                       "status": "cancelled"})
@@ -2541,6 +2829,21 @@ async def abraham(
     if not task.strip():
         return "[abraham refused: empty task — state what to implement.]"
 
+    # Anchor the heartbeat deadline to the REQUEST, not to each codex run:
+    # phase 2 starts long after the client's ~120s backgrounding, and a
+    # per-run clock would resurrect dead-token sends there.
+    request_t0 = time.monotonic()
+
+    # Dispatch tracer FIRST (global journal, off-thread so a slow disk
+    # cannot stall the event loop): "the call never entered the function"
+    # vs "entered and stalled later" must be decidable from artifacts alone
+    # (Windows, 2026-08-21 — valid-cwd dispatches left no trace anywhere).
+    await asyncio.to_thread(
+        _journal,
+        {"run": "abraham-dispatch", "phase": "dispatch",
+         "ts": time.time(), "cwd": _get_cwd(), "target": cwd},
+    )
+
     if cwd:
         base = Path(_get_cwd()).resolve()
         target = Path(cwd)
@@ -2577,6 +2880,23 @@ async def abraham(
             "Commit or stash first — or pass allow_dirty=true to accept "
             "the risk; the final report will separate this run's changes "
             "from the pre-existing dirt.]"
+        )
+
+    # The deployed codex must PROVE it can write under the sealed sandbox
+    # before anything runs — measured on Windows 2026-08-21: workspace-write
+    # silently downgraded to read-only + approval prompts and every write
+    # was rejected while the run still EXITED 0, so an unprobed abraham
+    # "succeeds" having written nothing.
+    can_write, probe_detail = await _ensure_write_capability(cwd)
+    if not can_write:
+        return (
+            "[abraham refused: this machine's codex cannot WRITE under the "
+            f"sealed sandbox — {probe_detail} A run here could complete "
+            "without writing anything. Fix the codex sandbox (on Windows "
+            "the ELEVATED sandbox backend must be available — the sealed "
+            "argv requires it because only that backend enforces the "
+            "no-egress air-gap), or set CODEX_ORACLE_SKIP_WRITE_PROBE=1 "
+            "only if you have verified writes AND egress sealing by hand.]"
         )
 
     # One writer per tree — the authoritative lock is held across BOTH
@@ -2645,6 +2965,7 @@ async def abraham(
             infra=infra, ctx=ctx, web_search=web_search,
             images=list(images or []),
             tool_name="abraham", workdir=cwd,
+            request_started=request_t0,
         )
         for marker in ("[Codex TIMEOUT", "[Codex error",
                        "[Codex health check FAILED"):
@@ -2683,6 +3004,7 @@ async def abraham(
             write=True, infra=False, ctx=ctx, web_search=False,
             images=list(images or []),
             tool_name="abraham", workdir=cwd,
+            request_started=request_t0,
         )
         return (
             "[abraham — phase 1 analyzed (read-only"
@@ -2756,6 +3078,12 @@ async def codex_resume_run(
     # workspace's prompts/answers — an untrusted repo could otherwise drive a
     # cross-project read. Scope discovery to the current cwd; an EXPLICIT id
     # from another workspace is refused rather than silently retrieved.
+    # Anchor the heartbeat deadline to THIS request's start: a write resume
+    # can spend up to WRITE_PROBE_TIMEOUT_SECONDS in the capability gate
+    # before codex spawns, and a fresh per-run clock there would resurrect
+    # dead-token sends (round-2 review, 2026-08-21).
+    request_t0 = time.monotonic()
+
     cwd = _get_cwd()
     all_runs = _journal_runs()
 
@@ -2773,7 +3101,11 @@ async def codex_resume_run(
             return False
         return base in target.parents
 
-    runs = {k: v for k, v in all_runs.items() if _in_workspace(str(v.get("cwd") or ""))}
+    # has_start excludes evidence-only journal groups (abraham-dispatch
+    # tracers, write-probe verdicts) — they are diagnostics, not runs, and
+    # cannot be resumed.
+    runs = {k: v for k, v in all_runs.items()
+            if _in_workspace(str(v.get("cwd") or "")) and v.get("has_start")}
 
     if run == "list":
         if not runs:
@@ -2913,6 +3245,16 @@ async def codex_resume_run(
     # server cwd would miss the tree the brief describes.
     run_cwd = str(rec.get("cwd") or cwd)
     if use_write:
+        # Same gate as a fresh abraham dispatch: a resumed write run on a
+        # machine whose sandbox cannot write reproduces the original
+        # exit-0/no-write failure (round-2 review, 2026-08-21). Keyed to
+        # the run's OWN tree — the thing that will actually be written.
+        can_write, probe_detail = await _ensure_write_capability(run_cwd)
+        if not can_write:
+            return (
+                "[resume refused: this machine's codex cannot WRITE under "
+                f"the sealed sandbox — {probe_detail}]"
+            )
         got_lock, holder = _acquire_write_lock(run_cwd, f"resume:{run}")
         if not got_lock:
             return (
@@ -2930,6 +3272,7 @@ async def codex_resume_run(
             parent_run=run,
             tool_name=str(rec.get("tool") or ""),
             workdir=run_cwd,
+            request_started=request_t0,
         )
     finally:
         if use_write:

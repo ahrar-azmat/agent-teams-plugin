@@ -3,6 +3,99 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.16.1] — 2026-08-21
+
+### Fixed — Windows field incident (three measured bugs from a second machine)
+- **Heartbeat stopped on the WRONG side of the backgrounding boundary.** v1.12.1 stopped
+  progress at 150s, but the client deregisters the progress token at ~120s — guaranteeing
+  2-3 dead-token sends per backgrounded call. macOS tolerated those few; on Windows the
+  client's reaction WEDGED the stdio channel: completed results never delivered (background
+  task "running" forever) and NEW tool calls never reached dispatch — one bug wearing two
+  costumes. Default is now **100s** (last send ≤100s, ≥20s margin under deregistration; no
+  send ever targets a dead token), each send is bounded by `asyncio.wait_for` so a blocking
+  transport can never wedge the heartbeat task, and `CODEX_ORACLE_PROGRESS_MAX_SECONDS=0`
+  is a documented kill-switch. Geometry pinned by test.
+- **abraham now PROVES write capability before running.** Measured on Windows (codex
+  0.147.0): `--sandbox workspace-write` was accepted and the run exited 0 while codex's own
+  tool router rejected every write ("writing is blocked by read-only sandbox; rejected by
+  user approval settings") — the restricted-token sandbox couldn't be built, and a write
+  run that wrote nothing looked like success. First abraham dispatch per server process now
+  runs a sealed low-effort probe in a temp git repo; the verdict is STRUCTURAL (probe file
+  exists on disk — flag acceptance and exit code are union claims), the refusal quotes the
+  measured marker, probe-infra failures fail CLOSED, and
+  `CODEX_ORACLE_SKIP_WRITE_PROBE=1` is the hand-verified escape hatch. The probe argv
+  shares `WRITE_SANDBOX_ARGS` with the real implementation phase (single source, parity
+  pinned by test).
+- **abraham journals a dispatch tracer at function entry**, so "the call never entered the
+  function" vs "entered and stalled later" is decidable from `runs.jsonl` alone — the
+  distinction this incident's diagnosis needed. Evidence-only journal groups
+  (dispatch tracers, probe verdicts) are excluded from the resume listing (`has_start`).
+- **Round-2 review hardening (2 CRITICAL + 4 HIGH, each verified before fixing):** the probe
+  child now gets `stdin=DEVNULL` — it previously inherited the MCP JSON-RPC stdin, which
+  codex exec APPENDS TO ITS PROMPT (session corruption + client-traffic leak; the real
+  runner already guarded this). The heartbeat deadline is REQUEST-scoped, not per-subprocess
+  (`_heartbeat_loop` extracted, `request_started` threaded through both abraham phases) —
+  a per-run clock resurrected dead-token sends in phase 2. `WRITE_SANDBOX_ARGS` now seals
+  `windows.sandbox="unelevated"` explicitly: in codex 0.147 the Windows sandbox mode
+  defaults to DISABLED (WorkspaceWrite silently downgrades to ReadOnly) and the enable
+  lives in the user config our `--ignore-user-config` strips — key calibrated on the
+  installed binary (accepts elevated/unelevated, rejects others; non-Windows parses and
+  ignores). Resumed write runs pass the same capability gate as fresh dispatches. The probe
+  verdict is tri-state: capable/incapable are cached, but a no-file-no-marker outcome
+  (auth, rate limit, CLI failure) is INCONCLUSIVE — refused but re-probed next dispatch.
+  Probe timeouts reap the process tree; concurrent first dispatches single-flight the
+  probe; the dispatch tracer journals off-thread; env knobs validate finite/positive;
+  `check()` now raises so pytest can no longer report green over failing checks (that
+  exact blindness hid 5 failures this round).
+- **Round-2b (2 more CRITICAL + 2 HIGH, verified in upstream source before fixing):**
+  `windows.sandbox` is sealed **"elevated"**, not "unelevated" — the unelevated backend
+  only injects proxy/offline env vars (advisory; a raw-socket child ignores them,
+  reproduced upstream in codex#35940), while real firewall enforcement is tied to the
+  elevated sandbox identities; abraham's air-gap promises OS-enforced no-egress, so a
+  machine that can't run the elevated sandbox fails the probe and abraham refuses (fail
+  closed). `codex_resume_run` anchors `request_started` at entry — its capability gate can
+  spend up to the probe timeout before codex spawns, and the un-anchored call recreated
+  dead-token sends. The probe spawns in its own process group and reaps on ANY
+  BaseException (CancelledError bypassed the old `except Exception`; the npm shim forwards
+  INT/TERM but not KILL). The probe now runs INSIDE the target workspace (`.abraham/`,
+  removed afterwards) with verdicts cached per normalized workspace — a green on some
+  other volume proves nothing about this repo's ACLs; inconclusive verdicts TTL-cache
+  (60s) so a dispatch burst shares one probe instead of serializing three; git setup
+  dropped from the probe (the argv carries --skip-git-repo-check). Journal writes are
+  thread-serialized (the tracer runs via to_thread). Env geometry is clamped to the safe
+  envelope (MAX + INTERVAL ≤ 115s) so no knob combination can restore dead-token sends.
+  Acknowledged, not built: incremental ring-buffer capture of probe output (the low-effort
+  probe's output is trivially small; communicate + tail-slice retained).
+- **Round-3 (the sealed writer's environment + kill-tree honesty):** `WRITE_SANDBOX_ARGS`
+  now also seals `shell_environment_policy.inherit="core"` +
+  `ignore_default_excludes=false` — codex 0.147 defaults shell children to inherit the FULL
+  parent environment with secret-name filtering off, so a prompt-injected phase-2 command
+  could read API keys into tool output (both keys calibrated on the installed binary; this
+  hardening gap predates this changeset — it shipped with abraham 1.13.0 and two advisors
+  passed it then). `_kill_tree` on Windows now falls through to `proc.kill()` unless
+  `taskkill` actually exited 0 (access-denied exits nonzero without raising and previously
+  left the root alive); the probe's reap is bounded. The inconclusive TTL uses the
+  monotonic clock. Refusal messages name the elevated backend and no longer claim every
+  failure "exits 0".
+  **Declined with reasons, for the record:** probing raw-socket/credential denial via a
+  model-driven probe (delegated to codex's elevated backend — a model-compliance-dependent
+  denial probe is theater); entry anchors for the four advisory tools (their pre-spawn
+  setup is in-memory string work, milliseconds against a 15-20s envelope margin);
+  cross-process journal file locks and git-toplevel canonicalization of lock/journal
+  identity (pre-existing 1.13.0 design, noted as follow-ups); executable-fingerprint cache
+  keys (a reconnect re-probes); transport-flush acknowledgment for heartbeats (the
+  envelope margin is the mitigation; disabling heartbeats would resurrect the 30-min
+  idle-abort).
+
+## [1.16.0] — 2026-08-21
+
+### Added
+- **abraham `cwd` parameter** — target a git repo BELOW the server's workspace root (for
+  multi-repo project roots that are not themselves work trees); fenced to the workspace
+  subtree, threaded as `workdir` through `_run_codex`/`_exec_codex_once`, journaled per
+  run; the resume listing scopes by workspace subtree. codex-oracle 1.16.0. (Shipped from
+  a second machine; folded into this changelog during the 1.16.1 rebase.)
+
 ## [1.15.0] — 2026-08-16
 
 ### Removed — Antigravity, per user ruling ("it's not a better model")
