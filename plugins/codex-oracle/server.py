@@ -1429,6 +1429,7 @@ async def _exec_codex_once(
     ctx: Context | None,
     model: str,
     extra_env: dict[str, str] | None = None,
+    workdir: str = "",
 ) -> tuple[str, bool, str, str, int, str | None, bool]:
     """One codex exec attempt (spawn → stream → reap).
 
@@ -1444,7 +1445,7 @@ async def _exec_codex_once(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=_get_cwd(),
+            cwd=workdir or _get_cwd(),
             limit=SUBPROCESS_BUFFER_LIMIT,
             env={**_codex_env(), **(extra_env or {})},
             # Own process group so _kill_tree reaps the node shim AND the
@@ -1631,8 +1632,13 @@ async def _run_codex(
     parent_run: str = "",
     images: list[str] | None = None,
     tool_name: str = "",
+    workdir: str = "",
 ) -> str:
     """Run codex exec headlessly with clean final-message extraction.
+
+    ``workdir`` overrides the run's working tree (abraham targeting a git
+    repo BELOW the server's cwd — e.g. a multi-repo project root that is
+    not itself a work tree). Empty = the server cwd, unchanged behavior.
 
     Uses codex-cli 0.118.0+ features (live-view additions verified 0.144.1):
     - ``--json`` — JSONL ThreadEvents on stdout, streamed to the per-run
@@ -1692,14 +1698,15 @@ async def _run_codex(
     # WRITE PRECONDITION: git is the only undo an autonomous write run has.
     # Refuse outside a work tree, and snapshot the dirty state so the final
     # report can attribute changes honestly (see _write_changes_report).
+    eff_cwd = workdir or _get_cwd()
     write_before: set[str] = set()
     write_head = ""
     extra_env: dict[str, str] = {}
     if write:
-        ok, write_before, write_head = _git_state(_get_cwd())
+        ok, write_before, write_head = _git_state(eff_cwd)
         if not ok:
             return (
-                f"[write run refused: {_get_cwd()} is not inside a git work "
+                f"[write run refused: {eff_cwd} is not inside a git work "
                 "tree. Autonomous writes without version control have no "
                 "undo. Run from a git checkout (or `git init` first), or use "
                 "the read-only tools instead.]"
@@ -1709,7 +1716,7 @@ async def _run_codex(
         # the reviewed diff. Build tools still need scratch space, so TMPDIR
         # points at a workspace-local dir — same sandbox, and anything left
         # behind is visible to the review.
-        tmp_dir = Path(_get_cwd()) / ".abraham" / "tmp"
+        tmp_dir = Path(eff_cwd) / ".abraham" / "tmp"
         with contextlib.suppress(OSError):
             tmp_dir.mkdir(parents=True, exist_ok=True)
             extra_env["TMPDIR"] = str(tmp_dir)
@@ -1811,7 +1818,7 @@ async def _run_codex(
                 f"# codex-oracle live view — {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
                 f"# model={model} effort={reasoning} "
                 f"mode={mode_str}{ac_note} "
-                f"web_search={'live' if web_search else 'disabled'} cwd={_get_cwd()}\n"
+                f"web_search={'live' if web_search else 'disabled'} cwd={eff_cwd}\n"
                 f"# prompt ({len(prompt)} chars): {prompt[:400]!r}\n\n"
             )
             live_fh.flush()
@@ -1828,7 +1835,7 @@ async def _run_codex(
         "tool": tool_name,
         "model": model, "reasoning": reasoning, "infra": infra, "write": write,
         "web_search": web_search, "parent_run": parent_run,
-        "images": list(images or []), "cwd": _get_cwd(),
+        "images": list(images or []), "cwd": eff_cwd,
         "prompt": prompt, "log": str(live_path or ""),
     })
 
@@ -1857,7 +1864,7 @@ async def _run_codex(
             (final_message, clean_extraction, stdout_text, stderr_text,
              returncode, hung_reason, timed_out) = await _exec_codex_once(
                 cmd, output_file, state, _emit, ctx, model,
-                extra_env=extra_env)
+                extra_env=extra_env, workdir=eff_cwd)
         except asyncio.CancelledError:
             _journal({"run": run_tag, "phase": "end", "ts": time.time(),
                       "status": "cancelled"})
@@ -1946,7 +1953,7 @@ async def _run_codex(
     # changed on disk: a timed-out run may still have written files, and the
     # caller's next step is reviewing exactly that.
     write_report = (
-        _write_changes_report(write_before, write_head, _get_cwd())
+        _write_changes_report(write_before, write_head, eff_cwd)
         if write else ""
     )
 
@@ -2473,6 +2480,7 @@ async def abraham(
     infra: bool = False,
     allow_dirty: bool = False,
     images: list[str] = [],
+    cwd: str = "",
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -2525,11 +2533,33 @@ async def abraham(
             safety envelope).
         images: Local image paths (mockups, error screenshots) — attached
             to both phases.
+        cwd: Target git work tree, when it is not the server's own cwd —
+            required for multi-repo project roots that are not themselves
+            git repos. Must be the server cwd itself or a directory BELOW
+            it (never outside the workspace). Empty = server cwd.
     """
     if not task.strip():
         return "[abraham refused: empty task — state what to implement.]"
 
-    cwd = _get_cwd()
+    if cwd:
+        base = Path(_get_cwd()).resolve()
+        target = Path(cwd)
+        if not target.is_absolute():
+            target = base / target
+        target = target.resolve()
+        if not target.is_dir():
+            return f"[abraham refused: cwd '{cwd}' is not a directory.]"
+        # Workspace fence: same reasoning as resume's scoping — a subtree of
+        # the current workspace IS this workspace; anything outside it is a
+        # different project and must be dispatched from there.
+        if target != base and base not in target.parents:
+            return (
+                f"[abraham refused: cwd '{target}' is outside the server's "
+                f"workspace ({base}). Dispatch from that project instead.]"
+            )
+        cwd = str(target)
+    else:
+        cwd = _get_cwd()
     ok, dirty, _head = _git_state(cwd)
     if not ok:
         return (
@@ -2614,7 +2644,7 @@ async def abraham(
             "\n".join(analysis_parts),
             infra=infra, ctx=ctx, web_search=web_search,
             images=list(images or []),
-            tool_name="abraham",
+            tool_name="abraham", workdir=cwd,
         )
         for marker in ("[Codex TIMEOUT", "[Codex error",
                        "[Codex health check FAILED"):
@@ -2652,7 +2682,7 @@ async def abraham(
             "\n".join(impl_parts),
             write=True, infra=False, ctx=ctx, web_search=False,
             images=list(images or []),
-            tool_name="abraham",
+            tool_name="abraham", workdir=cwd,
         )
         return (
             "[abraham — phase 1 analyzed (read-only"
@@ -2728,7 +2758,22 @@ async def codex_resume_run(
     # from another workspace is refused rather than silently retrieved.
     cwd = _get_cwd()
     all_runs = _journal_runs()
-    runs = {k: v for k, v in all_runs.items() if v.get("cwd") == cwd}
+
+    def _in_workspace(run_cwd: str) -> bool:
+        # A run whose tree is the workspace itself OR any directory below it
+        # belongs to this workspace (abraham's cwd targeting journals the
+        # subtree). Outside paths stay refused — that is the security fence.
+        if not run_cwd:
+            return False
+        if run_cwd == cwd:
+            return True
+        try:
+            base, target = Path(cwd).resolve(), Path(run_cwd).resolve()
+        except OSError:
+            return False
+        return base in target.parents
+
+    runs = {k: v for k, v in all_runs.items() if _in_workspace(str(v.get("cwd") or ""))}
 
     if run == "list":
         if not runs:
@@ -2863,8 +2908,12 @@ async def codex_resume_run(
             f"[CONTINUATION INSTRUCTIONS]\n{continuation}"
         )
 
+    # The continuation must run in the ORIGINAL run's tree (abraham may have
+    # targeted a subtree of this workspace) — locking or writing against the
+    # server cwd would miss the tree the brief describes.
+    run_cwd = str(rec.get("cwd") or cwd)
     if use_write:
-        got_lock, holder = _acquire_write_lock(cwd, f"resume:{run}")
+        got_lock, holder = _acquire_write_lock(run_cwd, f"resume:{run}")
         if not got_lock:
             return (
                 f"[resume refused: another write run holds this tree's "
@@ -2880,10 +2929,11 @@ async def codex_resume_run(
             resume_tid=tid,
             parent_run=run,
             tool_name=str(rec.get("tool") or ""),
+            workdir=run_cwd,
         )
     finally:
         if use_write:
-            _release_write_lock(cwd)
+            _release_write_lock(run_cwd)
 
 
 # ---------------------------------------------------------------------------
