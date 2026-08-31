@@ -3,6 +3,16 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.17.1] — 2026-08-31
+
+### Fixed — the plugin's hooks were dead on macOS too
+- `hooks/hooks.json` spawned `python` directly (v1.9.0 Windows form) for all three PreToolUse
+  hooks — the live-view nudge on every codex call, the plan gate, and the **git push gate** —
+  so on stock macOS each fired `Executable not found in $PATH: "python"` (non-blocking) and
+  did nothing: no live-view shell was ever suggested here, and pushes were never gated. Same
+  root cause as the 1.17.0 `.mcp.json` fix; same form now: `${CODEX_ORACLE_PYTHON:-python3}`
+  (Windows: `CODEX_ORACLE_PYTHON=python`). Pinned by `tests/test_detach.py`.
+
 ## [1.17.0] — 2026-08-31
 
 ### Added — runs survive MCP server restarts; run-operations tools

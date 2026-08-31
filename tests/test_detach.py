@@ -346,6 +346,10 @@ def test_plugin_mcp_registration() -> None:
           srv["command"] == "${CODEX_ORACLE_PYTHON:-python3}", srv["command"])
     check("launcher is the venv-bootstrapping run_server.py", srv["args"] == ["${CLAUDE_PLUGIN_ROOT}/run_server.py"])
     check("2h client timeout kept", srv.get("timeout") == 7200000)
+    hooks = json.loads((ROOT / "plugins" / "codex-oracle" / "hooks" / "hooks.json").read_text())
+    cmds = [hk["command"] for grp in hooks["hooks"]["PreToolUse"] for hk in grp["hooks"]]
+    check("every hook uses the same interpreter form as the MCP registration",
+          cmds and all(c == "${CODEX_ORACLE_PYTHON:-python3}" for c in cmds), str(cmds))
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "${CODEX_ORACLE_PYTHON:-python3}",
             "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/live_view_nudge.py"]
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "${CODEX_ORACLE_PYTHON:-python3}",
             "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/plan_gate.py"]
           }
         ]
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python",
+            "command": "${CODEX_ORACLE_PYTHON:-python3}",
             "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/push_gate.py"]
           }
         ]
