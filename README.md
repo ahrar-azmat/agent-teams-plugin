@@ -74,6 +74,24 @@ untrusted web content, full-disk read, and network egress must never share a pro
 (measured on codex 0.147.0: no mechanism exists for network without full disk read).
 Entirely optional — without the CLI, nothing changes.
 
+## Run operations and survivability (v1.17.0)
+
+A backgrounded oracle call used to be a child of the MCP server: Claude Code's `/mcp`
+reconnect (SIGINT, then SIGTERM ~100 ms later) killed the run and the caller saw
+"Connection closed" — a 25-minute max-effort review lost. Now codex runs on a **file-backed
+spool** (`~/.claude/logs/codex-oracle/runs/<run>/`) that the server tails, a **detached
+watchdog** enforces the runtime deadline with no server alive, the shutdown signal makes the
+cancel-cleanup **detach instead of kill**, and `codex_resume_run` **adopts** the run from
+the next connection — waiting for it if it is still running, returning its answer at no
+model cost. A caller cancel (no shutdown signal) still kills. Write runs are never detached.
+
+Operations tools, so nobody tails log files by hand: `codex_runs()` (status of every run —
+RUNNING / DETACHED / ok / error / cancelled / timeout), `codex_run_log(run, lines)` (the live
+log in-conversation; the MCP task panel is structurally silent once a call is backgrounded),
+`codex_cancel_run(run)`. `CODEX_ORACLE_CODEX_BIN` pins the codex executable (e.g. the
+ChatGPT.app-bundled build). E2E proof: `plugins/codex-oracle/selftest_detach.py [--real]`
+kills the server exactly like Claude Code does mid-call and collects the run afterwards.
+
 ## Upstream codex source as reference (map vs territory)
 
 The `openai/codex` CLI is Apache-2.0 open source, and its internals are the reference for
@@ -99,6 +117,12 @@ everything these plugins wrap. Two rules keep that reference honest:
 ```
 
 Then just ask for multi-agent work (e.g. *"Create an agent team to review this PR from security, performance, and test-coverage angles"*).
+
+The plugin registers its MCP server itself (`plugins/codex-oracle/.mcp.json`, launcher
+`run_server.py` bootstraps its venv). Its interpreter is `${CODEX_ORACLE_PYTHON:-python3}`:
+macOS/Linux need nothing; on Windows set `CODEX_ORACLE_PYTHON=python` (python.org builds
+ship no `python3.exe`). Do not add a second, direct `mcpServers` entry for the same server —
+two registrations give two tool sets.
 
 ## Requirements
 

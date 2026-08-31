@@ -83,6 +83,11 @@ Synthesize into ONE compact report. Do NOT dump the raw model output.
 One line per finding. Code snippets only for CRITICAL/HIGH fixes. Skip empty severity levels.
 
 ## Rules
+
+- **"Connection closed" from the review tool = the MCP server restarted, not a failed
+  review.** The codex process keeps running detached; call `codex_resume_run(run=<id>)`
+  (or with no argument) to collect its answer — never re-dispatch. `codex_runs()` /
+  `codex_run_log()` show what a run is doing; `codex_cancel_run()` stops one.
 - Never skip the review — always run Codex
 - Never downgrade severity — if Codex says CRITICAL, it stays CRITICAL
 - Any CRITICAL finding must be addressed before shipping

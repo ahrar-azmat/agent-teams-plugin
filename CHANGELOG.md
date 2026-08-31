@@ -3,6 +3,66 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.17.0] — 2026-08-31
+
+### Added — runs survive MCP server restarts; run-operations tools
+- **Root cause, measured.** A backgrounded oracle call is a child of the MCP server. Claude
+  Code's `/mcp` reconnect (also plugin reload / session exit) sends SIGINT then SIGTERM
+  ~100 ms apart (its mcp-logs), the caller sees "Connection closed", and the server's
+  cancel-cleanup SIGKILLed the codex tree — a 25-minute max-effort review lost and
+  re-dispatched from scratch (twice on 2026-08-31, in two sessions). Not killing was not
+  enough: an orphaned `codex exec --json` whose stdout pipe reader is gone panics with
+  "failed printing to stdout: Broken pipe" (measured).
+- **File-backed spool.** codex's stdout/stderr and its `--output-last-message` answer live in
+  `~/.claude/logs/codex-oracle/runs/<run>/attemptN.*`; the server TAILS them (fixed-size
+  reads, `CODEX_ORACLE_TAIL_POLL`), so the child holds no pipe to the server and outlives it.
+  Kept as evidence; pruned with the 7-day log retention. Spawn records (pid / pgid / spool /
+  deadline) are journaled per attempt.
+- **Detach on shutdown, kill on cancel.** `_install_shutdown_handlers` raises a flag on the
+  first SIGINT/SIGTERM/SIGHUP (then ignores the follow-up SIGTERM so the millisecond cleanup
+  is never torn) and takes the normal KeyboardInterrupt path; the cancel-cleanup sees the flag
+  and DETACHES (journal `detached`; the live log says how to collect) instead of killing. A
+  caller cancel with no signal still kills — "stop spending". Write (abraham) runs are never
+  detached: the one-writer lock's liveness is the server pid.
+  The process still exits promptly with the follow-up SIGTERM ignored: `__main__` exits as
+  soon as `mcp.run` unwinds and a 3 s daemon backstop `os._exit`s if the stdio reader thread
+  is stuck on a pipe the client kept open (measured: the server lingered >10 s otherwise).
+  Detachment never depends on that cleanup finishing: the spawn record carries the owning
+  server's pid, and "no end record + codex alive + owner dead" IS detached (`_is_detached`).
+- **Deadline with no server.** A detached `/bin/sh` watchdog per run SIGKILLs the process
+  group at the MAX_RUNTIME deadline (5 s ticks; exits when codex ends; reaped on a normal
+  finish). Windows keeps the in-server timeout only.
+- **Adoption.** `codex_resume_run` on a detached run waits for the process (heartbeating,
+  replaying its spool into an `adopt` live log) and returns its answer with the normal header —
+  no re-ask, no model call; a finished one returns immediately; one that died without an
+  answer falls back to the existing thread resume. A nudge while it still runs is refused (the
+  thread is being written). The "still running" guard now also checks pid liveness.
+- **Ops tools:** `codex_runs()` (RUNNING / DETACHED / ok / error / cancelled / timeout /
+  INTERRUPTED, elapsed, attempts, thread, activity, log path), `codex_run_log(run, lines)`
+  (the live log in-conversation — the MCP task panel is structurally silent once Claude Code
+  backgrounds a call), `codex_cancel_run(run)` (SIGKILL the group + watchdog, journal
+  cancelled; the thread stays resumable). `codex_resume_run(run="list")` delegates to
+  `codex_runs`.
+- `CODEX_ORACLE_CODEX_BIN` pins the codex executable (the ChatGPT.app-bundled build, or a
+  fake for tests). A run killed by a signal reports "codex process killed by signal N …"
+  instead of echoing raw JSONL as an answer.
+
+### Fixed — the plugin's own MCP registration was dead on macOS
+- `.mcp.json` used `"command": "python"` (v1.9.0 Windows work); stock macOS has only
+  `python3`, so the plugin-provided server failed ENOENT in every session since 2026-08-24 and
+  the tools only worked through a hand-added direct `~/.claude.json` entry (two registrations
+  = two tool sets whenever both connect). Now `"${CODEX_ORACLE_PYTHON:-python3}"` — Claude
+  Code expands `${VAR:-default}` in `command`; Windows sets `CODEX_ORACLE_PYTHON=python`.
+
+### Tests
+- `tests/fake_codex.py` — a stand-in speaking codex's `exec --json` contract (real
+  processes, no API spend). `tests/test_detach.py` (47 checks): spool + spawn journal,
+  caller-cancel kills, shutdown detaches + adoption of a running / finished / dead run,
+  watchdog deadline with no server, ops tools, signal handlers, registration.
+- `plugins/codex-oracle/selftest_detach.py [--real]` — E2E over real stdio: the server is
+  killed exactly like Claude Code does (SIGINT, +100 ms SIGTERM) mid-call; the run survives
+  and a second server collects it. `--real` proves it on the real codex CLI mid-turn.
+
 ## [1.16.2] — 2026-08-31
 
 ### Fixed — provider capacity sheds ("at capacity") were terminal on attempt 1
@@ -36,6 +96,37 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   schedule and budgets, same-thread resume with the model/effort pin held, budget exhaustion
   → hand-off + journal fields, amnesia guard under a shed, disconnect budget, non-transient
   no-retry, heartbeats during the wait, cancel during the wait.
+
+### Fixed after the Codex review of 1.16.2 (verdict: needs changes — all addressed)
+- **HIGH — a failed run's earlier commentary was returned as its answer.** `--json` runs
+  that fail after emitting assistant text promoted that text to `final_message`, so the
+  structured error (capacity counts, pin note, run id, resume hand-off) was skipped — true of
+  all four motivating logs. Every non-zero exit now goes through ONE renderer: the failure is
+  the message, prior output is appended as `[partial output before the failure — NOT the
+  answer]` (bounded), raw JSONL is never an answer, and `last_message` is reset per attempt so
+  attempt 1's commentary cannot leak into attempt 2's result.
+- **MEDIUM — classification read model output.** The transient class was derived from
+  stderr + the terminal error + the last 2,000 chars of stdout, so a quota/auth failure
+  preceded by text mentioning "at capacity" was retried as an overload. Now only the terminal
+  error event is classified (stderr as the sole fallback), never stdout.
+- **MEDIUM — catalog coverage.** Added the exact 0.151.0 renderings codex can surface after
+  its own retries are spent: `Connection failed: …`, `Error while reading the server
+  response: …`, `exceeded retry limit, last status: …` (503 → overload, otherwise
+  disconnect), `We're currently experiencing high demand…` (overload), `internal error; agent
+  loop died unexpectedly`, `request timed out`, `timeout waiting for child process`.
+- **LOW — budgets.** Per-class counters (overload 4, disconnect 2) plus an explicit total
+  ceiling `MAX_TOTAL_RETRIES`; `CODEX_ORACLE_OVERLOAD_RETRIES` is bounded (≤12); the ±20%
+  jitter is clamped under the 300 s cap; cancellation journal records carry `attempts`,
+  `retry_classes`, `capacity_wait_s`.
+- **Tests** now drive the REAL `_exec_codex_once` with `tests/fake_codex.py` emitting codex's
+  JSONL failure shapes (capacity / quota / disconnect, with prior commentary), cover the pinned
+  error catalog, and the source pin verifies the worktree tag matches the installed binary —
+  a mismatch is a printed SKIP, never a silent fallback.
+- **Hypothesis verdict UNPROVEN on the schedule itself, recorded as such:** the 30/60/120/240 s
+  ladder is a documented default for short blips; today's shed lasted ~3 h (12:16→~15:07 IST;
+  a probe at 15:45 answered in 6.7 s), which no in-request budget covers — that case is the
+  explicit `codex_resume_run` hand-off. There is no way to force a provider shed for a
+  calibrated probe; the classifier is calibrated on the four real rollouts instead.
 
 ### Verified — codex CLI 0.147.0 → 0.151.0 alignment (an install, not code)
 - The desktop app (ChatGPT.app bundle, `codex-cli 0.151.0-alpha.7.2`) and the npm CLI

@@ -1104,7 +1104,9 @@ def _private(path: Path, mode: int) -> None:
 
 
 def _prune_live_logs() -> None:
-    """Drop run logs older than the retention window. Never raises."""
+    """Drop run logs and run spool dirs older than the retention window.
+    A spool dir's age is its NEWEST file (a detached run keeps writing).
+    Never raises."""
     cutoff = time.time() - LIVE_LOG_RETENTION_DAYS * 86_400
     with contextlib.suppress(OSError):
         for p in LIVE_LOG_DIR.glob("*.log"):
@@ -1113,6 +1115,17 @@ def _prune_live_logs() -> None:
             with contextlib.suppress(OSError):
                 if p.stat().st_mtime < cutoff:
                     p.unlink()
+    with contextlib.suppress(OSError):
+        for d in _run_dir_root().glob("*"):
+            if not d.is_dir():
+                continue
+            with contextlib.suppress(OSError):
+                newest = max(
+                    (f.stat().st_mtime for f in d.iterdir()),
+                    default=d.stat().st_mtime,
+                )
+                if newest < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
 
 
 def _open_live_log(label: str) -> tuple[Path | None, TextIO | None, TextIO | None, str]:
@@ -1421,14 +1434,236 @@ MAX_TRANSIENT_RETRIES = 2
 # Schedule: base·2^i capped — 30s, 60s, 120s, 240s (≈7.5 min of waiting over
 # 4 retries). Derivation: rides out the short sheds (seconds to minutes) that
 # would otherwise throw away an hour-long max-effort run; a shed that outlives
-# the budget (today's ran ~3h) ends in the explicit codex_resume_run path,
+# the budget (2026-08-31's ran 12:16→~15:07 IST, ≈3 h; a 15:45 probe answered
+# in 6.7 s) ends in the explicit codex_resume_run path,
 # which continues the same thread later at no re-ask cost. Env-adjustable:
 # CODEX_ORACLE_OVERLOAD_BACKOFF=0 retries immediately, _RETRIES=0 disables.
-OVERLOAD_MAX_RETRIES = _env_int("CODEX_ORACLE_OVERLOAD_RETRIES", 4, 0)
+OVERLOAD_MAX_RETRIES = min(12, _env_int("CODEX_ORACLE_OVERLOAD_RETRIES", 4, 0))
 OVERLOAD_BACKOFF_BASE_SECONDS = _env_seconds(
     "CODEX_ORACLE_OVERLOAD_BACKOFF", 30.0, 0.0
 )
-OVERLOAD_BACKOFF_CAP_SECONDS = 300.0
+OVERLOAD_BACKOFF_CAP_SECONDS = 300.0  # the ceiling AFTER jitter
+# Per-class budgets (overload above; disconnect = MAX_TRANSIENT_RETRIES) and
+# one explicit total ceiling: a mixed failure sequence can never exceed it.
+MAX_TOTAL_RETRIES = OVERLOAD_MAX_RETRIES + MAX_TRANSIENT_RETRIES
+
+# ---- RUN SURVIVABILITY across MCP server restarts (1.17.0) ------------------
+# A backgrounded oracle call is a CHILD of this MCP server. Claude Code's
+# `/mcp` reconnect, a plugin reload, or a session exit sends SIGINT then
+# SIGTERM ~100 ms apart (its own log, 2026-08-31) and the caller sees
+# "Connection closed"; the old cleanup then SIGKILLed the codex tree — a
+# 25-minute max-effort review gone, re-dispatched from scratch. Two measured
+# facts decide the design: (1) an orphaned `codex exec --json` whose stdout
+# PIPE reader vanished panics with "failed printing to stdout: Broken pipe"
+# — so the child's stdio must be FILES that this server TAILS; (2) the codex
+# thread/rollout and the run journal are on disk — so a run that outlives
+# its server can be COLLECTED by the next one. Hence: a per-run spool dir,
+# a detached /bin/sh watchdog that enforces MAX_RUNTIME with no server
+# alive, a shutdown flag set by the signal handlers so the cancel-cleanup
+# DETACHES instead of killing, and adoption in codex_resume_run. A caller
+# cancel with no shutdown signal still kills (that is "stop spending");
+# write runs are never detached (the one-writer lock's liveness is THIS
+# server's pid). Knobs: CODEX_ORACLE_TAIL_POLL (spool poll interval),
+# CODEX_ORACLE_CODEX_BIN (pin the codex executable — e.g. the ChatGPT.app
+# bundled one, or a fake for tests).
+TAIL_POLL_SECONDS = _env_seconds("CODEX_ORACLE_TAIL_POLL", 0.25, 0.05)
+_SHUTDOWN = threading.Event()
+
+
+def _run_dir_root() -> Path:
+    return LIVE_LOG_DIR / "runs"
+
+
+def _run_spool_dir(run_tag: str) -> Path:
+    """Per-run private dir for the child's stdout/stderr spool + answer file.
+    Falls back to a temp dir rather than break the run."""
+    d = _run_dir_root() / run_tag.replace("·", "-")
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        _private(_run_dir_root(), 0o700)
+        _private(d, 0o700)
+        return d
+    except OSError:
+        return Path(tempfile.mkdtemp(prefix="codex-oracle-run-"))
+
+
+_WATCHDOG_SH = (
+    'pid=$1; pgid=$2; deadline=$3; s=; '
+    "trap 'kill $s 2>/dev/null; exit 0' TERM INT; "
+    'while kill -0 "$pid" 2>/dev/null; do '
+    'if [ "$(date +%s)" -ge "$deadline" ]; then '
+    'kill -9 -- "-$pgid" 2>/dev/null; exit 0; fi; '
+    'sleep 5 & s=$!; wait $s; done'
+)
+
+
+def _spawn_watchdog(pid: int, pgid: int, deadline_ts: float) -> subprocess.Popen | None:
+    """POSIX: a tiny detached /bin/sh that SIGKILLs the codex process group
+    at the run deadline, or exits within 5 s of codex ending on its own. The
+    MAX_RUNTIME bound therefore holds with NO server alive — a detached run
+    has none. Windows keeps the in-server timeout only (returns None)."""
+    if os.name == "nt":
+        return None
+    try:
+        wd = subprocess.Popen(
+            ["/bin/sh", "-c", _WATCHDOG_SH, "codex-oracle-watchdog",
+             str(pid), str(pgid), str(int(deadline_ts))],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+        )
+        return wd
+    except OSError:
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is this codex process still running? os.kill(0) plus, on POSIX, a
+    guard against pid reuse (the command line must still be a codex)."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    if os.name != "nt":
+        with contextlib.suppress(Exception):
+            out = subprocess.run(
+                ["ps", "-o", "command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            return "codex" in out.lower()
+    return True
+
+
+def _kill_pgid(pgid: int, pid: int) -> bool:
+    """SIGKILL a run's process group (falls back to the pid). Never raises."""
+    try:
+        if os.name != "nt" and pgid:
+            os.killpg(pgid, signal.SIGKILL)
+            return True
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True, timeout=10)
+        else:
+            os.kill(pid, signal.SIGKILL)
+        return True
+    except (ProcessLookupError, PermissionError, OSError, subprocess.SubprocessError):
+        return False
+
+
+def _feed_jsonl(linebuf: bytearray, chunk: bytes, state: dict[str, Any], emit) -> None:
+    """Split a `codex exec --json` byte stream into events and digest them
+    (shared by the live tail and by adoption replay)."""
+    linebuf.extend(chunk)
+    while True:
+        nl = linebuf.find(b"\n")
+        if nl < 0:
+            return
+        raw = bytes(linebuf[:nl]).strip()
+        del linebuf[:nl + 1]
+        if not raw:
+            continue
+        try:
+            ev = json.loads(raw)
+            line = _process_exec_event(ev, state)
+        except ValueError:
+            line = raw.decode("utf-8", errors="replace")
+        if line:
+            emit(line)
+
+
+def _run_in_workspace(run_cwd: str, cwd: str) -> bool:
+    """A run belongs to a workspace when its tree is the workspace itself or
+    any directory below it; outside paths stay refused (security fence)."""
+    if not run_cwd:
+        return False
+    if run_cwd == cwd:
+        return True
+    try:
+        base, target = Path(cwd).resolve(), Path(run_cwd).resolve()
+    except OSError:
+        return False
+    return base in target.parents
+
+
+SHUTDOWN_HARD_EXIT_SECONDS = 3.0
+
+
+def _install_shutdown_handlers(hard_exit: bool = False) -> None:
+    """First SIGINT/SIGTERM/SIGHUP: raise the shutdown flag, ignore further
+    signals so the ~100 ms-later SIGTERM cannot tear the cleanup mid-way,
+    then take the normal KeyboardInterrupt exit (anyio cancels the in-flight
+    tool tasks; their cleanup sees the flag and detaches instead of killing).
+    The cleanup is bounded (journal + log close, no waits on the child).
+
+    ``hard_exit`` (the real server only — never under tests): the process
+    MUST still die once the follow-up SIGTERM is ignored. The stdio reader
+    thread blocks on a pipe the client may keep open (measured: the server
+    lingered >10 s after SIGINT+SIGTERM), so a daemon thread ``os._exit``s
+    after SHUTDOWN_HARD_EXIT_SECONDS, and __main__ exits the moment
+    ``mcp.run`` unwinds. Detachment does not depend on the cleanup finishing
+    at all: the spawn record carries the owning server's pid, and a run
+    whose server is dead IS detached (see _is_detached)."""
+    sigs = [getattr(signal, n, None) for n in ("SIGINT", "SIGTERM", "SIGHUP")]
+    sigs = [s for s in sigs if s is not None]
+
+    def _handler(signum, frame):
+        _SHUTDOWN.set()
+        for s in sigs:
+            with contextlib.suppress(Exception):
+                signal.signal(s, signal.SIG_IGN)
+        if hard_exit:
+            def _backstop() -> None:
+                time.sleep(SHUTDOWN_HARD_EXIT_SECONDS)
+                os._exit(0)
+            threading.Thread(target=_backstop, name="shutdown-backstop",
+                             daemon=True).start()
+        raise KeyboardInterrupt
+
+    for s in sigs:
+        with contextlib.suppress(Exception):
+            signal.signal(s, _handler)
+
+
+def _server_alive(pid: int) -> bool:
+    """Is the codex-oracle server process that owns a run still alive?"""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    if os.name != "nt":
+        with contextlib.suppress(Exception):
+            out = subprocess.run(
+                ["ps", "-o", "command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.lower()
+            return "server.py" in out or "codex-oracle" in out or "run_server" in out
+    return True
+
+
+def _is_detached(rec: dict[str, Any]) -> bool:
+    """A run is DETACHED when it has no end record and either its cleanup
+    journaled the detach, or the server that spawned it is gone — the
+    latter needs no cooperation from a shutdown that may have been torn."""
+    if rec.get("has_end") or not rec.get("has_spawn"):
+        return False
+    if rec.get("has_detached"):
+        return True
+    owner = int(rec.get("server_pid") or 0)
+    return bool(owner) and owner != os.getpid() and not _server_alive(owner)
 RESUME_NUDGE = (
     "The previous process was interrupted before your answer arrived. "
     "Continue from where you left off and provide the complete final answer."
@@ -1470,6 +1705,10 @@ def _journal_runs() -> dict[str, dict[str, Any]]:
                     run = runs.setdefault(rec["run"], {})
                     run.update({k: v for k, v in rec.items() if k != "phase"})
                     run[f"has_{rec.get('phase', '?')}"] = True
+                    # `ts` is the LAST record's; keep the first and last
+                    # explicitly so elapsed time can be computed.
+                    run.setdefault("first_ts", rec.get("ts"))
+                    run["last_ts"] = rec.get("ts")
     return runs
 
 
@@ -1482,20 +1721,27 @@ def _journal_runs() -> dict[str, dict[str, Any]]:
 # CodexErr::ServerOverloaded — pinned by tests/test_transient_retry.py
 # against the installed codex source when that worktree is present.
 _OVERLOAD_SIGNALS = (
-    "at capacity",
-    "server_is_overloaded",
+    "at capacity",                     # ServerOverloaded (terminal in codex)
+    "server_is_overloaded",            # the 503 error codes behind it
     "slow_down",
+    "experiencing high demand",        # InternalServerError
+    " 503",                            # RetryLimit "last status: 503 …"
+    "service unavailable",
     "overloaded",
     "temporarily unavailable",
-    "service unavailable",
-    "error 503",
     " 429",
-    "rate limit",
+    "rate limit",                      # RateLimitExceeded "rate limit exceeded: …"
     "too many requests",
     "retry later",
 )
 _DISCONNECT_SIGNALS = (
-    "stream disconnected",
+    "stream disconnected",             # Stream
+    "connection failed",               # ConnectionFailed "Connection failed: …"
+    "error while reading the server response",  # ResponseStreamFailed
+    "exceeded retry limit",            # RetryLimit (non-503 statuses)
+    "agent loop died",                 # InternalAgentDied
+    "request timed out",               # RequestTimeout
+    "timeout waiting for child process",  # Timeout
     "stream closed",
     "connection reset",
     "connection closed",
@@ -1659,6 +1905,9 @@ def _codex_argv0() -> list[str]:
     cmd.exe. Fallbacks: node + codex.js, then the full-path .cmd shim
     (spawnable when given a full path — measured).
     """
+    override = os.environ.get("CODEX_ORACLE_CODEX_BIN", "").strip()
+    if override:
+        return [override]
     if os.name != "nt":
         return ["codex"]
     shim = shutil.which("codex")
@@ -1751,14 +2000,28 @@ async def _exec_codex_once(
     agent_message. Live-log handles stay OPEN — the orchestrator owns them
     across retry attempts.
     """
+    # FILE-BACKED STDIO (see RUN SURVIVABILITY): the child never holds a
+    # pipe to this process, so it survives us; we TAIL its spool files.
+    stdout_path = output_file.with_name(output_file.stem + ".stdout.jsonl")
+    stderr_path = output_file.with_name(output_file.stem + ".stderr.log")
+    try:
+        out_fh = open(stdout_path, "ab")
+        err_fh = open(stderr_path, "ab")
+    except OSError as e:
+        return (
+            "", False, "",
+            f"cannot open run spool files under {output_file.parent}: {e}",
+            1, None, False,
+        )
+    _private(stdout_path, 0o600)
+    _private(stderr_path, 0o600)
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdout=out_fh,
+            stderr=err_fh,
             cwd=workdir or _get_cwd(),
-            limit=SUBPROCESS_BUFFER_LIMIT,
             env={**_codex_env(), **(extra_env or {})},
             # Own process group so _kill_tree reaps the node shim AND the
             # vendored codex grandchild together (POSIX: setsid + killpg;
@@ -1766,14 +2029,35 @@ async def _exec_codex_once(
             **_new_group_kwargs(),
         )
     except FileNotFoundError:
-        output_file.unlink(missing_ok=True)
         return (
             "", False, "",
             "codex binary not found in PATH. Install with: npm i -g @openai/codex",
             127, None, False,
         )
+    finally:
+        out_fh.close()
+        err_fh.close()
+
+    pgid = proc.pid
+    if os.name != "nt":
+        with contextlib.suppress(OSError):
+            pgid = os.getpgid(proc.pid)
+    spawn_ts = time.time()
+    deadline_ts = spawn_ts + MAX_RUNTIME_SECONDS
+    watchdog = _spawn_watchdog(proc.pid, pgid, deadline_ts)
+    watchdog_pid = watchdog.pid if watchdog is not None else None
+    state["spawn"] = {
+        "pid": proc.pid, "pgid": pgid, "watchdog_pid": watchdog_pid,
+        "server_pid": os.getpid(),
+        "stdout": str(stdout_path), "stderr": str(stderr_path),
+        "output_file": str(output_file),
+        "spawn_ts": spawn_ts, "deadline_ts": deadline_ts,
+    }
+    state.pop("detached", None)
+    emit(f"▶ codex pid {proc.pid} (pgid {pgid}) spool={output_file.parent}")
 
     startup_seen = asyncio.Event()
+    exited = asyncio.Event()
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
     hung_reason: str | None = None
@@ -1781,24 +2065,7 @@ async def _exec_codex_once(
     stdout_linebuf = bytearray()
 
     def _feed_stdout(chunk: bytes) -> None:
-        """Split the JSONL event stream into lines and feed the live view."""
-        stdout_linebuf.extend(chunk)
-        while True:
-            nl = stdout_linebuf.find(b"\n")
-            if nl < 0:
-                return
-            raw = bytes(stdout_linebuf[: nl]).strip()
-            del stdout_linebuf[: nl + 1]
-            if not raw:
-                continue
-            try:
-                ev = json.loads(raw)
-                line = _process_exec_event(ev, state)
-            except ValueError:
-                # Not JSON (stray CLI noise) — show it verbatim.
-                line = raw.decode("utf-8", errors="replace")
-            if line:
-                emit(line)
+        _feed_jsonl(stdout_linebuf, chunk, state, emit)
 
     def _feed_stderr(chunk: bytes) -> None:
         text = chunk.decode("utf-8", errors="replace")
@@ -1806,27 +2073,45 @@ async def _exec_codex_once(
             if ln.strip():
                 emit(f"! {ln}")
 
-    async def _consume(
-        stream: asyncio.StreamReader,
-        buffer: list[bytes],
-        on_chunk,
-    ) -> None:
-        """Consume a subprocess stream using fixed-size reads.
+    async def _reaper() -> None:
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        exited.set()
 
-        Uses read(READ_CHUNK_SIZE) instead of readline() to avoid
-        LimitOverrunError — read() never searches for a separator so it
-        cannot overflow regardless of line length or buffer limit.
-        The live view must never break the run: feeder errors are swallowed.
-        """
+    def _read_more(path: Path, pos: int) -> bytes:
+        with contextlib.suppress(OSError):
+            with open(path, "rb") as fh:
+                fh.seek(pos)
+                return fh.read(READ_CHUNK_SIZE)
+        return b""
+
+    async def _tail(path: Path, buffer: list[bytes], on_chunk) -> None:
+        """Follow a spool file until the child has exited AND the file is
+        drained. Fixed-size reads: a line of any length cannot overrun a
+        buffer. The live view must never break the run: feeder errors are
+        swallowed."""
+        pos = 0
         while True:
-            chunk = await stream.read(READ_CHUNK_SIZE)
-            if not chunk:
-                return
-            if not startup_seen.is_set():
-                startup_seen.set()
-            buffer.append(chunk)
-            with contextlib.suppress(Exception):
-                on_chunk(chunk)
+            chunk = _read_more(path, pos)
+            if chunk:
+                pos += len(chunk)
+                if not startup_seen.is_set():
+                    startup_seen.set()
+                buffer.append(chunk)
+                with contextlib.suppress(Exception):
+                    on_chunk(chunk)
+                continue
+            if exited.is_set():
+                # Final drain: bytes written between our last read and exit.
+                while True:
+                    chunk = _read_more(path, pos)
+                    if not chunk:
+                        return
+                    pos += len(chunk)
+                    buffer.append(chunk)
+                    with contextlib.suppress(Exception):
+                        on_chunk(chunk)
+            await asyncio.sleep(TAIL_POLL_SECONDS)
 
     async def _startup_probe() -> None:
         """Wait up to STARTUP_PROBE_SECONDS for first output. Kill on silence."""
@@ -1841,8 +2126,9 @@ async def _exec_codex_once(
                 )
                 _kill_tree(proc)
 
-    stdout_task = asyncio.create_task(_consume(proc.stdout, stdout_chunks, _feed_stdout))
-    stderr_task = asyncio.create_task(_consume(proc.stderr, stderr_chunks, _feed_stderr))
+    reaper_task = asyncio.create_task(_reaper())
+    stdout_task = asyncio.create_task(_tail(stdout_path, stdout_chunks, _feed_stdout))
+    stderr_task = asyncio.create_task(_tail(stderr_path, stderr_chunks, _feed_stderr))
     probe_task = asyncio.create_task(_startup_probe())
     run_t0 = time.monotonic()
     request_t0 = run_t0 if request_started is None else request_started
@@ -1864,18 +2150,32 @@ async def _exec_codex_once(
         timed_out = True
         _kill_tree(proc)
     except asyncio.CancelledError:
-        _kill_tree(proc)
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        output_file.unlink(missing_ok=True)
+        if _SHUTDOWN.is_set() and not state.get("write"):
+            # DETACH: the server is going down, not the caller's interest.
+            # codex keeps running on its spool files; the watchdog keeps the
+            # deadline; codex_resume_run collects the answer later.
+            state["detached"] = True
+        else:
+            _kill_tree(proc)
+            with contextlib.suppress(Exception):
+                await proc.wait()
         raise
     finally:
-        # Always ensure process is reaped and watchdog tasks are cancelled.
-        if proc.returncode is None:
-            _kill_tree(proc)
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        for _task in (probe_task, heartbeat_task):
+        detached = bool(state.get("detached"))
+        # Always ensure the process is reaped (unless deliberately detached)
+        # and the watcher tasks are cancelled.
+        if not detached:
+            if proc.returncode is None:
+                _kill_tree(proc)
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            if watchdog is not None:
+                # Reap it too — a signalled-but-unwaited child is a zombie
+                # that still answers kill(0) (measured in the detach suite).
+                with contextlib.suppress(Exception):
+                    watchdog.terminate()
+                    watchdog.wait(timeout=3)
+        for _task in (probe_task, heartbeat_task, reaper_task):
             if _task is not None:
                 _task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1886,17 +2186,25 @@ async def _exec_codex_once(
 
     final_message = ""
     clean_extraction = False
-    try:
+    with contextlib.suppress(OSError):
         if output_file.exists() and output_file.stat().st_size > 0:
             final_message = output_file.read_text(encoding="utf-8", errors="replace").strip()
             clean_extraction = bool(final_message)
-    finally:
-        output_file.unlink(missing_ok=True)
+    # The spool (stdout/stderr/answer) is KEPT as evidence and for adoption;
+    # _prune_live_logs retires it with the run logs.
 
     if not final_message and not timed_out:
         # stdout is a JSONL event stream — the parsed last agent message is
-        # the meaningful fallback; raw stdout only as a last resort.
-        final_message = state["last_message"] or stdout_text
+        # the meaningful fallback; raw stdout only as a last resort, and
+        # NEVER for a process killed by a signal (codex_cancel_run / the
+        # watchdog): a JSONL fragment is not an answer, and the caller must
+        # see the kill, not a status:error header over event soup.
+        raw_ok = (
+            (proc.returncode or 0) == 0
+            and stdout_text
+            and not stdout_text.lstrip().startswith("{")  # JSONL is never an answer
+        )
+        final_message = state["last_message"] or (stdout_text if raw_ok else "")
 
     return (
         final_message, clean_extraction, stdout_text, stderr_text,
@@ -2169,10 +2477,12 @@ async def _run_codex(
     ) if write else ""
     live_path, live_fh, stream_fh, run_tag = _open_live_log(
         "abraham" if write else ("infra" if infra else "codex"))
-    state: dict[str, str] = {"activity": "launching codex", "last_message": "",
-                             "last_error": "", "usage": "", "thread_id": ""}
+    state: dict[str, Any] = {"activity": "launching codex", "last_message": "",
+                             "last_error": "", "usage": "", "thread_id": "",
+                             "write": "1" if write else ""}
 
     journaled_tid = ""
+    journaled_spawn_pid = 0
 
     def _emit(text: str) -> None:
         """One event → per-run log, tagged merged stream, session journal.
@@ -2182,7 +2492,7 @@ async def _run_codex(
         resumable handle behind. Regression-tested by the kill-then-recover
         case in the verification suite.
         """
-        nonlocal journaled_tid
+        nonlocal journaled_tid, journaled_spawn_pid
         _live_write(live_fh, t0, text)
         _live_write(stream_fh, t0, text, run_tag)
         tid = state.get("thread_id") or ""
@@ -2190,6 +2500,13 @@ async def _run_codex(
             journaled_tid = tid
             _journal({"run": run_tag, "phase": "session", "ts": time.time(),
                       "thread_id": tid})
+        # The spawn record (pid/pgid/spool paths/deadline) is what lets a
+        # LATER server adopt or cancel this process — journaled the instant
+        # the child exists, once per attempt.
+        sp = state.get("spawn")
+        if isinstance(sp, dict) and sp.get("pid") and sp.get("pid") != journaled_spawn_pid:
+            journaled_spawn_pid = int(sp["pid"])
+            _journal({"run": run_tag, "phase": "spawn", "ts": time.time(), **sp})
 
     if live_fh is not None:
         with contextlib.suppress(Exception):
@@ -2221,20 +2538,42 @@ async def _run_codex(
     attempt = 0
     retry_classes: list[str] = []  # journaled: what each retry recovered from
     overload_retries = 0
+    disconnect_retries = 0
     waited_total = 0.0
 
     def _cancelled(where: str) -> None:
-        """Bookkeeping for a caller cancel — mid-attempt or during a capacity
-        wait: journal it (the thread id is already journaled, so the run stays
-        resumable), say so in the live log, release the log handles."""
-        _journal({"run": run_tag, "phase": "end", "ts": time.time(),
-                  "status": "cancelled"})
-        with contextlib.suppress(Exception):
-            _emit(
-                "■ run cancelled by caller"
-                + (f" {where}" if where else "")
-                + " (resume later: codex_resume_run)"
-            )
+        """Bookkeeping for a cancel — mid-attempt or during a capacity wait.
+        Server SHUTDOWN (detached child): journal `detached` — no `end`, so
+        the run stays a resume candidate and codex_resume_run ADOPTS the
+        still-running process. Caller cancel: journal `end cancelled` (the
+        thread id is already journaled, so it stays resumable). Either way
+        say so in the live log and release the log handles."""
+        if state.get("detached"):
+            sp = state.get("spawn") or {}
+            remaining = int(max(0.0, float(sp.get("deadline_ts") or 0) - time.time()))
+            _journal({"run": run_tag, "phase": "detached", "ts": time.time(),
+                      "status": "detached", "pid": sp.get("pid"),
+                      "pgid": sp.get("pgid"), "attempts": attempt + 1,
+                      "retry_classes": list(retry_classes),
+                      "capacity_wait_s": int(waited_total)})
+            with contextlib.suppress(Exception):
+                _emit(
+                    f"■ server shutting down — codex keeps running DETACHED "
+                    f"(pid {sp.get('pid')}, hard deadline in {remaining}s). "
+                    f"Collect it from the next connection: "
+                    f"codex_resume_run(run=\"{run_tag}\")"
+                )
+        else:
+            _journal({"run": run_tag, "phase": "end", "ts": time.time(),
+                      "status": "cancelled", "attempts": attempt + 1,
+                      "retry_classes": list(retry_classes),
+                      "capacity_wait_s": int(waited_total)})
+            with contextlib.suppress(Exception):
+                _emit(
+                    "■ run cancelled by caller"
+                    + (f" {where}" if where else "")
+                    + " (resume later: codex_resume_run)"
+                )
         for _fh in (live_fh, stream_fh):
             if _fh is not None:
                 with contextlib.suppress(Exception):
@@ -2252,11 +2591,9 @@ async def _run_codex(
     timed_out = False
 
     while True:
-        tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False, prefix="codex-oracle-"
-        )
-        tmp.close()
-        output_file = Path(tmp.name)
+        # Per-run spool: answer file + the child's stdout/stderr live here
+        # (file-backed so the run survives this server; see RUN SURVIVABILITY).
+        output_file = _run_spool_dir(run_tag) / f"attempt{attempt}.txt"
         cmd = _build_exec_argv(
             model, reasoning, infra, web_search, output_file,
             prompt=prompt, resume_tid=resume_tid, images=images,
@@ -2264,6 +2601,7 @@ async def _run_codex(
         )
         expected_tid = resume_tid
         state["last_error"] = ""
+        state["last_message"] = ""  # attempt N's commentary is not attempt N+1's answer
         try:
             (final_message, clean_extraction, stdout_text, stderr_text,
              returncode, hung_reason, timed_out) = await _exec_codex_once(
@@ -2295,31 +2633,37 @@ async def _run_codex(
         # attempt already made. Recovery for write runs is the EXPLICIT
         # codex_resume_run path, where the caller first reconciles the
         # changed-files report against the tree.
-        klass = (
-            _transient_class(
-                f"{stderr_text}\n{state['last_error']}\n{stdout_text[-2000:]}"
-            )
-            if failed and not write else None
-        )
-        # One attempt counter, a budget chosen by what just failed: a shed
-        # gets the longer OVERLOAD budget, a blip the short one. Total
-        # retries stay bounded by the larger of the two.
-        budget = (
+        # Classify the TERMINAL error only (the `error`/`turn.failed` event;
+        # stderr as the sole fallback) — never model or tool output, whose
+        # prose can say "at capacity" while the actual failure is a quota
+        # denial (review of 1.16.2, MEDIUM).
+        terminal = state["last_error"] or stderr_text
+        klass = _transient_class(terminal) if failed and not write else None
+        class_budget = (
             OVERLOAD_MAX_RETRIES if klass == "overload" else MAX_TRANSIENT_RETRIES
         )
-        if klass is not None and attempt < budget:
+        class_used = overload_retries if klass == "overload" else disconnect_retries
+        if (
+            klass is not None
+            and class_used < class_budget
+            and attempt < MAX_TOTAL_RETRIES
+        ):
             attempt += 1
             retry_classes.append(klass)
             resume_tid = state.get("thread_id") or None
             wait = 0.0
             if klass == "overload":
-                # ±20% jitter: runs shed together must not come back together.
-                wait = (
+                # ±20% jitter so runs shed together do not return together;
+                # clamped so the cap is the cap.
+                wait = min(
+                    OVERLOAD_BACKOFF_CAP_SECONDS,
                     _overload_backoff_seconds(overload_retries)
-                    * random.uniform(0.8, 1.2)
+                    * random.uniform(0.8, 1.2),
                 )
                 overload_retries += 1
                 waited_total += wait
+            else:
+                disconnect_retries += 1
             what = (
                 "provider capacity shed" if klass == "overload"
                 else "transient failure"
@@ -2329,7 +2673,8 @@ async def _run_codex(
                 else "retrying fresh (failed before the session started)"
             )
             _emit(
-                f"⟲ {what} — {where} (attempt {attempt + 1}/{budget + 1}"
+                f"⟲ {what} — {where} ({klass} retry {class_used + 1}/{class_budget}, "
+                f"total attempt {attempt + 1}"
                 + (f", after a {int(wait)}s wait)" if wait else ")")
             )
             if wait:
@@ -2408,13 +2753,51 @@ async def _run_codex(
             f"{log_note}{write_report}"
         )
 
-    if returncode != 0 and not final_message:
-        detail = state["last_error"] or stderr_text
-        retry_note = (
-            f" after {attempt + 1} attempts" if attempt else ""
-        )
+    noise_patterns = (
+        "Loaded cached credentials",
+        "[INFO]",
+        "Reading additional input from stdin",
+        "OpenAI Codex v",
+        "workdir:",
+        "provider:",
+        "approval:",
+        "sandbox:",
+        "reasoning effort:",
+        "reasoning summaries:",
+        "session id:",
+        "tokens used",
+        "--------",
+    )
+
+    def _stderr_diagnostics() -> str:
+        """The noisy session stream, only when clean extraction failed on a
+        non-zero exit — i.e. when the diagnostic is needed."""
+        if clean_extraction or not stderr_text:
+            return ""
+        lines = [
+            line for line in stderr_text.splitlines()
+            if line.strip() and not any(pat in line for pat in noise_patterns)
+        ]
+        return ("\n\n[stderr]\n" + "\n".join(lines[-40:])) if lines else ""
+
+    if returncode != 0:
+        # ONE structured renderer for EVERY non-zero exit (review of 1.16.2,
+        # HIGH): a failed run that had already emitted assistant text used to
+        # return that text as if it were the answer, skipping the capacity
+        # note and the resume hand-off. The failure is the message; whatever
+        # the model said before it is PARTIAL OUTPUT — labelled and bounded.
+        terminal = state["last_error"] or stderr_text
+        detail = terminal
+        if returncode < 0 and not state["last_error"]:
+            detail = (
+                f"codex process killed by signal {-returncode} "
+                f"(codex_cancel_run, or the runtime watchdog at the "
+                f"{MAX_RUNTIME_SECONDS}s deadline)"
+                + (f"\n{stderr_text[-1500:]}" if stderr_text else "")
+            )
+        retry_note = f" after {attempt + 1} attempts" if attempt else ""
         overload_failures = retry_classes.count("overload") + (
-            1 if _transient_class(detail or "") == "overload" else 0
+            1 if _transient_class(terminal) == "overload" else 0
         )
         capacity_note = (
             f"\n[provider capacity: {model} answered 'at capacity' on "
@@ -2424,61 +2807,43 @@ async def _run_codex(
             f"returns]"
             if overload_failures else ""
         )
-        return (
-            f"[Codex error (exit {returncode}){retry_note}]\n{detail}"
-            f"{capacity_note}{log_note}\n"
+        partial = ""
+        if final_message:
+            snippet = final_message
+            if len(snippet) > 4000:
+                snippet = (
+                    snippet[:4000]
+                    + "\n… [partial output truncated; the full text is in the live log]"
+                )
+            partial = (
+                "\n\n[partial output before the failure — NOT the answer]\n" + snippet
+            )
+        result = (
+            f"[Codex error (exit {returncode}){retry_note}"
+            f"{_answer_sig(tool_name, 'error')}]\n{detail}"
+            f"{capacity_note}\n"
             f"[recoverable: call codex_resume_run to continue this run "
-            f"(run id: {run_tag})]{write_report}"
+            f"(run id: {run_tag})]{partial}{write_report}"
+            f"{_stderr_diagnostics()}{log_note}"
         )
-
-    # status:ok is EARNED by exit 0 — a non-zero run that still produced a
-    # final_message reaches this branch, and stamping it ok would let the
-    # push gate accept a failed review (probed in review round 3).
-    header = (
-        f"[Codex model: {model} | reasoning: {reasoning}"
-        f"{_answer_sig(tool_name, 'ok' if returncode == 0 else 'error')}]"
-    )
-    result = f"{header}\n\n{final_message}"
-    if attempt and returncode == 0:
-        recovered_from = (
-            f"a provider capacity shed (waited {int(waited_total)}s)"
-            if "overload" in retry_classes else "a transient failure"
+    else:
+        # status:ok is EARNED by exit 0 (the push gate reads the signature).
+        header = (
+            f"[Codex model: {model} | reasoning: {reasoning}"
+            f"{_answer_sig(tool_name, 'ok')}]"
         )
-        result += (
-            f"\n\n[note: recovered automatically after {recovered_from} — "
-            f"{attempt + 1} attempts, context preserved via codex session resume]"
-        )
-    if state["last_error"] and returncode != 0:
-        result += f"\n\n[run reported an error: {state['last_error']}]"
-    result += write_report
-    result += log_note
-
-    # Only surface the noisy session stream when the clean extraction path
-    # failed AND the process exited non-zero — i.e. we need the diagnostic
-    # for debugging. A successful clean extraction returns only the header
-    # and the final message; nothing else.
-    if not clean_extraction and returncode != 0 and stderr_text:
-        noise_patterns = (
-            "Loaded cached credentials",
-            "[INFO]",
-            "Reading additional input from stdin",
-            "OpenAI Codex v",
-            "workdir:",
-            "provider:",
-            "approval:",
-            "sandbox:",
-            "reasoning effort:",
-            "reasoning summaries:",
-            "session id:",
-            "tokens used",
-            "--------",
-        )
-        stderr_lines = [
-            line for line in stderr_text.splitlines()
-            if line.strip() and not any(pat in line for pat in noise_patterns)
-        ]
-        if stderr_lines:
-            result += "\n\n[stderr]\n" + "\n".join(stderr_lines)
+        result = f"{header}\n\n{final_message}"
+        if attempt:
+            recovered_from = (
+                f"a provider capacity shed (waited {int(waited_total)}s)"
+                if "overload" in retry_classes else "a transient failure"
+            )
+            result += (
+                f"\n\n[note: recovered automatically after {recovered_from} — "
+                f"{attempt + 1} attempts, context preserved via codex session resume]"
+            )
+        result += write_report
+        result += log_note
 
     # Truncate to avoid exceeding Claude Code's MCP result limit. ``reserve``
     # is the length of text the CALLER will prepend (the anchoring banner) —
@@ -3240,18 +3605,7 @@ async def codex_resume_run(
     all_runs = _journal_runs()
 
     def _in_workspace(run_cwd: str) -> bool:
-        # A run whose tree is the workspace itself OR any directory below it
-        # belongs to this workspace (abraham's cwd targeting journals the
-        # subtree). Outside paths stay refused — that is the security fence.
-        if not run_cwd:
-            return False
-        if run_cwd == cwd:
-            return True
-        try:
-            base, target = Path(cwd).resolve(), Path(run_cwd).resolve()
-        except OSError:
-            return False
-        return base in target.parents
+        return _run_in_workspace(run_cwd, cwd)
 
     # has_start excludes evidence-only journal groups (abraham-dispatch
     # tracers, write-probe verdicts) — they are diagnostics, not runs, and
@@ -3260,16 +3614,7 @@ async def codex_resume_run(
             if _in_workspace(str(v.get("cwd") or "")) and v.get("has_start")}
 
     if run == "list":
-        if not runs:
-            return "[No recorded codex runs for this workspace.]"
-        lines = ["Recent codex runs in this workspace (oldest → newest):"]
-        for rec in list(runs.values())[-10:]:
-            lines.append(
-                f"  • {rec.get('run', '?')}: {rec.get('status') or 'RUNNING/INTERRUPTED'}"
-                f" — {str(rec.get('prompt') or '')[:80]!r}"
-                + (f" [thread {rec.get('thread_id')}]" if rec.get("thread_id") else "")
-            )
-        return "\n".join(lines)
+        return await codex_runs()
 
     if run:
         rec = runs.get(run)
@@ -3300,6 +3645,14 @@ async def codex_resume_run(
     # only short-circuit when the caller wants THAT answer. An explicit nudge
     # means "continue this thread with new instructions"; returning the old
     # answer instead would silently discard the nudge.
+    # DETACHED (outlived its server): collect the still-running or finished
+    # process instead of re-asking the thread. Falls through to the thread
+    # resume below only when the detached process died without an answer.
+    if _is_detached(rec):
+        collected = await _collect_detached(rec, run, ctx, request_t0, nudge)
+        if collected is not None:
+            return collected
+        rec = _journal_runs().get(run, rec)
     result_file = str(rec.get("result_file") or "")
     if result_file and not nudge and Path(result_file).exists():
         stored = Path(result_file).read_text(encoding="utf-8", errors="replace").strip()
@@ -3353,6 +3706,13 @@ async def codex_resume_run(
     # processes on one rollout can corrupt it. A run with no end record whose
     # log grew in the last minute is alive, not orphaned.
     if not rec.get("has_end"):
+        if _pid_alive(int(rec.get("pid") or 0)) and not _is_detached(rec):
+            return (
+                f"[Run {run} is still RUNNING (codex pid {rec.get('pid')} is "
+                f"alive, attached to another call). Resuming a live thread can "
+                f"corrupt its session. Wait for it, watch it with "
+                f"codex_run_log, or stop it with codex_cancel_run first.]"
+            )
         log_path = str(rec.get("log") or "")
         with contextlib.suppress(OSError):
             if log_path and Path(log_path).is_file():
@@ -3432,8 +3792,328 @@ async def codex_resume_run(
 
 
 # ---------------------------------------------------------------------------
+# Detached-run adoption + run operations (1.17.0)
+# ---------------------------------------------------------------------------
+
+def _run_status(rec: dict[str, Any]) -> str:
+    """One word for a journal record: RUNNING / DETACHED / ok / error /
+    cancelled / timeout / hung / INTERRUPTED (no end record, process gone)."""
+    if rec.get("has_end"):
+        return str(rec.get("status") or "?")
+    alive = _pid_alive(int(rec.get("pid") or 0))
+    if _is_detached(rec):
+        return "DETACHED" if alive else "DETACHED-ENDED"
+    if alive:
+        return "RUNNING"
+    log_path = str(rec.get("log") or "")
+    with contextlib.suppress(OSError):
+        if log_path and time.time() - Path(log_path).stat().st_mtime < 60:
+            return "RUNNING"
+    return "INTERRUPTED"
+
+
+def _workspace_runs(limit: int = 0) -> list[dict[str, Any]]:
+    cwd = _get_cwd()
+    runs = [
+        r for r in _journal_runs().values()
+        if r.get("has_start") and _run_in_workspace(str(r.get("cwd") or ""), cwd)
+    ]
+    return runs[-limit:] if limit else runs
+
+
+def _replay_spool(rec: dict[str, Any], emit) -> dict[str, Any]:
+    """Digest a run's stdout spool from the start into a fresh state."""
+    state: dict[str, Any] = {"activity": "", "last_message": "", "last_error": "",
+                             "usage": "", "thread_id": ""}
+    path = Path(str(rec.get("stdout") or ""))
+    buf = bytearray()
+    with contextlib.suppress(OSError):
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(READ_CHUNK_SIZE)
+                if not chunk:
+                    break
+                _feed_jsonl(buf, chunk, state, emit)
+    return state
+
+
+async def _collect_detached(
+    rec: dict[str, Any], run: str, ctx: Any, request_t0: float, nudge: str,
+) -> str | None:
+    """Adopt a run that outlived its server: wait for the detached codex
+    process (heartbeating, replaying its spool into a fresh live log), then
+    deliver its answer exactly like a normal run — no model re-ask. Returns
+    None when the process died WITHOUT an answer so the caller can fall back
+    to a thread resume."""
+    pid = int(rec.get("pid") or 0)
+    pgid = int(rec.get("pgid") or 0)
+    model = str(rec.get("model") or "?")
+    reasoning = str(rec.get("reasoning") or "?")
+    tool_name = str(rec.get("tool") or "")
+    out = Path(str(rec.get("output_file") or ""))
+    deadline = float(rec.get("deadline_ts") or 0)
+    alive = _pid_alive(pid)
+    if alive and nudge:
+        return (
+            f"[Run {run} is still RUNNING detached (codex pid {pid}). Its thread "
+            f"cannot take new instructions while it is being written: call "
+            f"codex_resume_run(run=\"{run}\") without a nudge to wait for and "
+            f"collect its answer, or codex_cancel_run(run=\"{run}\") to stop it.]"
+        )
+    live_path, live_fh, stream_fh, tag = _open_live_log("adopt")
+    t0 = time.monotonic()
+
+    def _emit(text: str) -> None:
+        _live_write(live_fh, t0, text)
+        _live_write(stream_fh, t0, text, tag)
+
+    if live_fh is not None:
+        with contextlib.suppress(Exception):
+            live_fh.write(
+                f"# codex-oracle ADOPTION of detached run {run} — "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+                f"# model={model} effort={reasoning} pid={pid} "
+                f"alive={alive} spool={out.parent}\n\n"
+            )
+            live_fh.flush()
+    _emit(f"▶ adopting detached run {run} (pid {pid}, alive={alive})")
+    state = _replay_spool(rec, _emit)
+    state["activity"] = f"adopted detached run {run}: waiting for pid {pid}"
+    timed_out = False
+    hb = (
+        asyncio.create_task(_heartbeat_loop(ctx, request_t0, t0, state, model, _emit))
+        if ctx is not None else None
+    )
+    try:
+        spool = Path(str(rec.get("stdout") or ""))
+        pos = 0
+        with contextlib.suppress(OSError):
+            pos = spool.stat().st_size
+        buf = bytearray()
+        while _pid_alive(pid):
+            if deadline and time.time() > deadline + 30:
+                _kill_pgid(pgid, pid)
+                timed_out = True
+                _emit(f"■ detached run past its {MAX_RUNTIME_SECONDS}s deadline "
+                      f"— killed")
+                break
+            with contextlib.suppress(OSError):
+                with open(spool, "rb") as fh:
+                    fh.seek(pos)
+                    chunk = fh.read(READ_CHUNK_SIZE)
+                if chunk:
+                    pos += len(chunk)
+                    _feed_jsonl(buf, chunk, state, _emit)
+                    continue
+            await asyncio.sleep(1.0)
+        # Final drain after exit.
+        with contextlib.suppress(OSError):
+            with open(spool, "rb") as fh:
+                fh.seek(pos)
+                rest = fh.read()
+            if rest:
+                _feed_jsonl(buf, rest, state, _emit)
+    finally:
+        if hb is not None:
+            hb.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await hb
+    final = ""
+    with contextlib.suppress(OSError):
+        if out.exists() and out.stat().st_size > 0:
+            final = out.read_text(encoding="utf-8", errors="replace").strip()
+    if not final and not timed_out:
+        final = str(state.get("last_message") or "")
+    status = "ok" if (final and not timed_out and not state.get("last_error")) else (
+        "timeout" if timed_out else "error")
+    result_file = ""
+    if status == "ok" and live_path is not None:
+        with contextlib.suppress(Exception):
+            rf = live_path.with_suffix(".result.txt")
+            rf.write_text(final, encoding="utf-8")
+            _private(rf, 0o600)
+            result_file = str(rf)
+    _emit(f"■ adoption finished: status={status} {state.get('usage') or ''}".rstrip())
+    _journal({
+        "run": run, "phase": "end", "ts": time.time(), "status": status,
+        "returncode": 0 if status == "ok" else 1, "adopted": True,
+        "error": str(state.get("last_error") or ("timeout" if timed_out else ""))[:500]
+        if status != "ok" else "",
+        "result_file": result_file,
+    })
+    for _fh in (live_fh, stream_fh):
+        if _fh is not None:
+            with contextlib.suppress(Exception):
+                _fh.close()
+    log_note = f"\n\n[live log: {live_path}]" if live_path else ""
+    if status == "ok":
+        return (
+            f"[Codex model: {model} | reasoning: {reasoning}"
+            f"{_answer_sig(tool_name, 'ok')}]\n"
+            f"[collected from run {run}, which outlived its MCP call (server "
+            f"restart) — no re-ask, no new model call]{log_note}\n\n{final}"
+        )
+    if final:
+        return (
+            f"[Codex model: {model} | reasoning: {reasoning}"
+            f"{_answer_sig(tool_name, status)}]\n"
+            f"[collected from detached run {run} — it ended with "
+            f"{'a timeout' if timed_out else 'an error: ' + str(state.get('last_error'))[:300]}; "
+            f"partial output follows]{log_note}\n\n{final}"
+        )
+    return None  # died without an answer → caller falls back to a thread resume
+
+
+@mcp.tool()
+async def codex_runs(limit: int = 10) -> str:
+    """
+    Status of this workspace's codex runs, newest last — RUNNING (attached
+    to a live call), DETACHED (outlived its MCP call after a server restart
+    and is STILL RUNNING; collect it with codex_resume_run), ok / error /
+    cancelled / timeout, or INTERRUPTED — with elapsed time, attempts, the
+    current activity and the live-log path. Use this instead of tailing
+    ~/.claude/logs/codex-oracle by hand.
+
+    Args:
+        limit: How many most-recent runs to show (default 10).
+    """
+    runs = _workspace_runs(max(1, min(int(limit or 10), 50)))
+    if not runs:
+        return "[No recorded codex runs for this workspace.]"
+    lines = ["Codex runs in this workspace (oldest → newest):"]
+    now = time.time()
+    for rec in runs:
+        st = _run_status(rec)
+        started = float(rec.get("first_ts") or rec.get("ts") or 0)
+        ended = float(rec.get("last_ts") or now) if rec.get("has_end") else now
+        span_s = int(ended - started) if started else 0
+        activity = ""
+        if st in ("RUNNING", "DETACHED"):
+            tail = _run_log_lines(rec, 1)
+            activity = tail[-1][:120] if tail else ""
+        lines.append(
+            f"  • {rec.get('run', '?')} [{rec.get('tool') or '?'}] {st}"
+            f" · {span_s}s"
+            + (f" · attempts {rec.get('attempts')}" if rec.get("attempts") else "")
+            + (f" · thread {str(rec.get('thread_id'))[:13]}" if rec.get("thread_id") else "")
+            + (f" · pid {rec.get('pid')}" if st in ("RUNNING", "DETACHED") else "")
+            + (f"\n      now: {activity}" if activity else "")
+            + (f"\n      error: {str(rec.get('error'))[:120]}" if rec.get("error") else "")
+            + (f"\n      log: {rec.get('log')}" if rec.get("log") else "")
+        )
+    lines.append(
+        "Collect a DETACHED run: codex_resume_run(run=<id>). Watch one: "
+        "codex_run_log(run=<id>). Stop one: codex_cancel_run(run=<id>)."
+    )
+    return "\n".join(lines)
+
+
+def _run_log_lines(rec: dict[str, Any], lines: int) -> list[str]:
+    """Last N digested lines of a run: its live log, or — for a DETACHED run,
+    whose live log froze at detach — a replay of its stdout spool."""
+    out: list[str] = []
+    if _is_detached(rec) and rec.get("stdout"):
+        _replay_spool(rec, out.append)
+        return out[-lines:]
+    log_path = str(rec.get("log") or "")
+    with contextlib.suppress(OSError):
+        if log_path and Path(log_path).is_file():
+            text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            out = [ln for ln in text.splitlines() if ln.strip()]
+    return out[-lines:]
+
+
+@mcp.tool()
+async def codex_run_log(run: str = "", lines: int = 40) -> str:
+    """
+    What a codex run is doing RIGHT NOW — its live log (reasoning summaries,
+    commands, web searches, errors, retries), in-conversation, instead of
+    `tail -F` on ~/.claude/logs/codex-oracle. Works for running, detached and
+    finished runs. The MCP task panel goes silent once Claude Code backgrounds
+    a call (its progress token is deregistered at ~120 s); this is the
+    channel that keeps working.
+
+    Args:
+        run: Run id ("codex7·21746"); omit for the most recent run here.
+        lines: How many trailing lines (default 40, max 400).
+    """
+    runs = _workspace_runs()
+    if not runs:
+        return "[No recorded codex runs for this workspace.]"
+    rec = None
+    if run:
+        rec = next((r for r in runs if r.get("run") == run), None)
+        if rec is None:
+            return f"[Unknown run id '{run}' in this workspace. Try codex_runs().]"
+    else:
+        rec = runs[-1]
+    n = max(1, min(int(lines or 40), 400))
+    tail = _run_log_lines(rec, n)
+    st = _run_status(rec)
+    head = (
+        f"[{rec.get('run')} · {rec.get('tool') or '?'} · {st}"
+        + (f" · pid {rec.get('pid')}" if st in ("RUNNING", "DETACHED") else "")
+        + f" · last {len(tail)} lines"
+        + (f" · {rec.get('log')}" if rec.get("log") else "")
+        + "]"
+    )
+    body = "\n".join(tail) if tail else "(no log lines yet)"
+    if len(body) > 20000:
+        body = "…" + body[-20000:]
+    return f"{head}\n{body}"
+
+
+@mcp.tool()
+async def codex_cancel_run(run: str = "") -> str:
+    """
+    Stop a RUNNING or DETACHED codex run: SIGKILL its process group (and its
+    watchdog) and journal it as cancelled. Omit `run` to stop the most recent
+    live run in this workspace. The thread stays on disk, so the run remains
+    resumable with a nudge via codex_resume_run.
+
+    Args:
+        run: Run id from codex_runs / a failure message; "" = most recent live run.
+    """
+    runs = _workspace_runs()
+    live = [r for r in runs if _run_status(r) in ("RUNNING", "DETACHED")]
+    rec = None
+    if run:
+        rec = next((r for r in runs if r.get("run") == run), None)
+        if rec is None:
+            return f"[Unknown run id '{run}' in this workspace. Try codex_runs().]"
+        if _run_status(rec) not in ("RUNNING", "DETACHED"):
+            return f"[Run {run} is not running (status {_run_status(rec)}); nothing to stop.]"
+    else:
+        if not live:
+            return "[No running or detached codex run in this workspace.]"
+        rec = live[-1]
+    pid = int(rec.get("pid") or 0)
+    pgid = int(rec.get("pgid") or 0)
+    killed = _kill_pgid(pgid, pid) if pid else False
+    wd = int(rec.get("watchdog_pid") or 0)
+    if wd:
+        with contextlib.suppress(Exception):
+            os.kill(wd, signal.SIGTERM)
+    tag = str(rec.get("run"))
+    _journal({"run": tag, "phase": "end", "ts": time.time(), "status": "cancelled",
+              "cancelled_by": "codex_cancel_run", "returncode": -9})
+    return (
+        f"[Run {tag} stopped (pid {pid}, pgid {pgid}, killed={killed}). "
+        f"Its thread is on disk: codex_resume_run(run=\"{tag}\", nudge=...) "
+        f"continues it if needed.]"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    _install_shutdown_handlers(hard_exit=True)
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        if _SHUTDOWN.is_set():
+            # Cleanup has run (journals fsync'd, logs closed); do not wait
+            # for the stdio reader thread the client may never release.
+            os._exit(0)

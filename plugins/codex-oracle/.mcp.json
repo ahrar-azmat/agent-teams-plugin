@@ -2,7 +2,7 @@
   "mcpServers": {
     "codex-oracle": {
       "type": "stdio",
-      "command": "python",
+      "command": "${CODEX_ORACLE_PYTHON:-python3}",
       "args": ["${CLAUDE_PLUGIN_ROOT}/run_server.py"],
       "timeout": 7200000
     }

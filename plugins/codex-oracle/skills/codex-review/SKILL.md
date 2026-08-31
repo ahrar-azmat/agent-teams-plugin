@@ -112,5 +112,28 @@ drawn from the wrong ref have been wrong twice in this repo's history. Anything 
 still gets confirmed against the running binary (probe / `--strict-config` / registry), not
 the source alone.
 
+## Operations: watching, collecting and stopping runs (v1.17.0)
+
+Long Codex calls are backgrounded by Claude Code at ~120 s; the MCP task panel then only
+says "working" — the server's progress token is deregistered at that point, so nothing more
+can be pushed to it. Use the plugin's own tools instead of tailing log files:
+
+- `codex_runs()` — every run in this workspace: RUNNING / DETACHED / ok / error / cancelled /
+  timeout / INTERRUPTED, elapsed, attempts, thread id, current activity, live-log path.
+- `codex_run_log(run=..., lines=40)` — what the model is doing right now (reasoning
+  summaries, commands, web searches, errors, retries), in-conversation.
+- `codex_cancel_run(run=...)` — stop a run (SIGKILL its process group). Its thread stays on
+  disk, so `codex_resume_run(run=..., nudge=...)` can still continue it.
+- **"Connection closed" is NOT a failed review.** It means the MCP server restarted (`/mcp`
+  reconnect, plugin reload, session exit). The codex process keeps running DETACHED on a
+  file-backed spool with its own deadline watchdog. Do **not** re-dispatch: call
+  `codex_resume_run(run=<id>)` — or with no argument, for the most recent recoverable run —
+  from the new connection. It waits for the detached process if it is still running and
+  returns its answer with the normal header, at no model cost. `codex_runs()` shows it as
+  DETACHED meanwhile.
+- A provider capacity shed ("Selected model is at capacity") is retried automatically with
+  backoff on the SAME thread and model (v1.16.2). If it outlives the in-request budget the
+  failure message says so — resume later; never switch models.
+
 ## Skip conditions
 Only skip if the user explicitly says "skip review" or "just push it".
