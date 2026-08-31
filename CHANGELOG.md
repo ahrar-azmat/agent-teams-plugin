@@ -3,6 +3,54 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.16.2] — 2026-08-31
+
+### Fixed — provider capacity sheds ("at capacity") were terminal on attempt 1
+- **The transient classifier matched codex's error VARIANT NAME, never its rendered
+  MESSAGE.** codex maps HTTP 503 `{"error":{"code":"server_is_overloaded"|"slow_down"}}`
+  (and the `response.failed` SSE equivalent) to `CodexErr::ServerOverloaded`, rendered as
+  *"Selected model is at capacity. Please try a different model."* — and `is_retryable()`
+  returns **false** for it, so the CLI fails the turn on the spot with no internal retry
+  (`codex-rs/protocol/src/error.rs`, identical at `rust-v0.147.0` and `rust-v0.151.0`).
+  The wrapper is therefore the only retry layer, and its signal list had `"overloaded"`
+  (the variant) but not `"at capacity"` (the text): on 2026-08-31 four max-effort reviews
+  died 89s–1163s in with `attempts=1` and the resume machinery never engaged.
+- **Two transient classes, two responses.** `_transient_class()` → `overload`
+  (capacity / 429 / 503: WAIT with backoff, then resume the same thread) or `disconnect`
+  (dropped stream / reset / other 5xx: resume now). Overload budget `OVERLOAD_MAX_RETRIES=4`
+  with `30s·2^i` capped at 300s (30/60/120/240 ≈ 7.5 min, ±20% jitter so runs shed
+  together don't return together); env `CODEX_ORACLE_OVERLOAD_RETRIES` /
+  `CODEX_ORACLE_OVERLOAD_BACKOFF` (0 = immediate). Disconnects keep `MAX_TRANSIENT_RETRIES=2`
+  and no wait. **The model/effort pin is never touched** — a shed is ridden out on the
+  pinned model, not routed around; one that outlives the budget ends in the existing
+  explicit `codex_resume_run` hand-off, now with a capacity note (attempts, seconds
+  waited, pin unchanged). Write runs still never auto-retry.
+- **Waiting is not going dark.** `_wait_for_capacity` brackets the sleep with the same
+  request-scoped `_heartbeat_loop` (geometry unchanged) and sets the spinner activity; a
+  caller cancel during the wait is journaled exactly like a mid-attempt cancel
+  (`_cancelled`), so the run stays resumable.
+- Journal `end` records carry `retry_classes` + `capacity_wait_s`; success notes say what
+  was recovered from and how long it waited.
+- Tests: `tests/test_transient_retry.py` — pins the rendered ServerOverloaded text against
+  the installed codex source (`~/Documents/codex-installed`, tag-aligned) when present, the
+  schedule and budgets, same-thread resume with the model/effort pin held, budget exhaustion
+  → hand-off + journal fields, amnesia guard under a shed, disconnect budget, non-transient
+  no-retry, heartbeats during the wait, cancel during the wait.
+
+### Verified — codex CLI 0.147.0 → 0.151.0 alignment (an install, not code)
+- The desktop app (ChatGPT.app bundle, `codex-cli 0.151.0-alpha.7.2`) and the npm CLI
+  share `~/.codex/models_cache.json`, keyed by whole client version; 0.147.0 also required
+  a field the 0.151 schema dropped (`supports_parallel_tool_calls`), so every CLI run
+  logged `failed to load models cache` and re-fetched the catalog. Upgraded the CLI to
+  `@openai/codex@0.151.0` (npm `latest`; same as the Homebrew cask): calibrated known-red
+  1 error line per run → 0, `models cache: cache hit`. `--strict-config` accepts every
+  `-c` key this server sends at `max` (a planted bogus key exits 1); `exec --json` event
+  shape unchanged; `exec resume [SESSION_ID] [PROMPT]` grammar unchanged.
+  `scripts/codex_src.py` re-aligned the source worktree to `rust-v0.151.0`.
+- Gotcha (both versions, not a regression): `codex exec "<prompt>"` with a non-TTY **open**
+  stdin blocks on "Reading additional input from stdin..." until EOF — script it with
+  `</dev/null`. This server always spawns codex with `stdin=DEVNULL`.
+
 ## [1.16.1] — 2026-08-21
 
 ### Fixed — Windows field incident (three measured bugs from a second machine)

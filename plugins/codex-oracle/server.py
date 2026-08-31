@@ -43,6 +43,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import threading
 import re
 import shutil
@@ -1404,6 +1405,30 @@ RUNS_JOURNAL = LIVE_LOG_DIR / "runs.jsonl"
 RUNS_JOURNAL_MAX_BYTES = 5 * 1024 * 1024  # ~300 runs with full prompts; one
 # older generation kept as runs.jsonl.1 — recovery data, not an archive.
 MAX_TRANSIENT_RETRIES = 2
+# Provider LOAD-SHEDDING is a different failure from a dropped stream, and it
+# needs a different response. codex maps HTTP 503 {"error":{"code":
+# "server_is_overloaded"|"slow_down"}} — and the equivalent response.failed
+# SSE error — to CodexErr::ServerOverloaded, whose rendered text is
+# "Selected model is at capacity. Please try a different model.", and its
+# is_retryable() is FALSE (codex-rs/protocol/src/error.rs, identical at
+# rust-v0.147.0 and rust-v0.151.0): the CLI fails the turn on the spot with
+# no internal retry. This wrapper is therefore the ONLY retry layer there is.
+# 2026-08-31: four max-effort reviews died exactly this way (89s..1163s in,
+# attempts=1 each) because the classifier below matched the VARIANT NAME
+# ("overloaded") and never the rendered message. A shed is also not fixed by
+# an instant retry: wait, then resume the SAME thread (context intact) — and
+# never switch models; the model/effort pin is the point of this oracle.
+# Schedule: base·2^i capped — 30s, 60s, 120s, 240s (≈7.5 min of waiting over
+# 4 retries). Derivation: rides out the short sheds (seconds to minutes) that
+# would otherwise throw away an hour-long max-effort run; a shed that outlives
+# the budget (today's ran ~3h) ends in the explicit codex_resume_run path,
+# which continues the same thread later at no re-ask cost. Env-adjustable:
+# CODEX_ORACLE_OVERLOAD_BACKOFF=0 retries immediately, _RETRIES=0 disables.
+OVERLOAD_MAX_RETRIES = _env_int("CODEX_ORACLE_OVERLOAD_RETRIES", 4, 0)
+OVERLOAD_BACKOFF_BASE_SECONDS = _env_seconds(
+    "CODEX_ORACLE_OVERLOAD_BACKOFF", 30.0, 0.0
+)
+OVERLOAD_BACKOFF_CAP_SECONDS = 300.0
 RESUME_NUDGE = (
     "The previous process was interrupted before your answer arrived. "
     "Continue from where you left off and provide the complete final answer."
@@ -1448,39 +1473,69 @@ def _journal_runs() -> dict[str, dict[str, Any]]:
     return runs
 
 
-def _is_transient_error(text: str) -> bool:
-    """Failures worth an automatic resume/retry: infrastructure, not semantics.
+# Two transient classes, two responses. OVERLOAD = the provider is shedding
+# load (capacity, 429, 503): an instant retry lands on the same shed, so wait
+# with backoff, then resume. DISCONNECT = an infrastructure blip (dropped
+# stream, reset, 5xx other than 503): resume right away. Neither includes
+# auth (needs a human), usage/quota policy denials, or argument errors —
+# retrying cannot fix those. The first entry is the rendered text of
+# CodexErr::ServerOverloaded — pinned by tests/test_transient_retry.py
+# against the installed codex source when that worktree is present.
+_OVERLOAD_SIGNALS = (
+    "at capacity",
+    "server_is_overloaded",
+    "slow_down",
+    "overloaded",
+    "temporarily unavailable",
+    "service unavailable",
+    "error 503",
+    " 429",
+    "rate limit",
+    "too many requests",
+    "retry later",
+)
+_DISCONNECT_SIGNALS = (
+    "stream disconnected",
+    "stream closed",
+    "connection reset",
+    "connection closed",
+    "connection refused",
+    "connection error",
+    "network error",
+    "timed out",
+    "timeout",
+    "internal server error",
+    "bad gateway",
+    "gateway timeout",
+    "error 500",
+    "error 502",
+    "error 504",
+)
 
-    Deliberately excludes auth (needs a human), usage/quota policy denials,
-    and argument errors (retrying can't fix them).
-    """
+
+def _transient_class(text: str) -> str | None:
+    """'overload' | 'disconnect' | None — see the signal tables above."""
     t = text.lower()
-    signals = (
-        "stream disconnected",
-        "stream closed",
-        "connection reset",
-        "connection closed",
-        "connection refused",
-        "connection error",
-        "network error",
-        "timed out",
-        "timeout",
-        "temporarily unavailable",
-        "service unavailable",
-        "overloaded",
-        "internal server error",
-        "bad gateway",
-        "gateway timeout",
-        "error 500",
-        "error 502",
-        "error 503",
-        "error 504",
-        " 429",
-        "rate limit",
-        "too many requests",
-        "retry later",
+    if any(s in t for s in _OVERLOAD_SIGNALS):
+        return "overload"
+    if any(s in t for s in _DISCONNECT_SIGNALS):
+        return "disconnect"
+    return None
+
+
+def _is_transient_error(text: str) -> bool:
+    """Failures worth an automatic resume/retry: infrastructure, not semantics."""
+    return _transient_class(text) is not None
+
+
+def _overload_backoff_seconds(retry_index: int) -> float:
+    """Wait before overload retry #retry_index (0-based): base·2^i, capped."""
+    if OVERLOAD_BACKOFF_BASE_SECONDS <= 0:
+        return 0.0
+    return min(
+        OVERLOAD_BACKOFF_CAP_SECONDS,
+        OVERLOAD_BACKOFF_BASE_SECONDS * (2 ** retry_index),
     )
-    return any(s in t for s in signals)
 
 
 def _build_exec_argv(
@@ -1903,6 +1958,47 @@ async def _heartbeat_loop(
             )
 
 
+async def _wait_for_capacity(
+    seconds: float,
+    ctx: Any,
+    request_t0: float,
+    run_t0: float,
+    state: dict[str, Any],
+    model: str,
+    emit: Any,
+) -> None:
+    """Sit out a provider capacity shed WITHOUT going dark.
+
+    The spinner keeps saying what the run is doing, and while the request's
+    progress token is still alive heartbeats keep flowing — _heartbeat_loop
+    owns that geometry (same envelope as a running attempt); this only
+    brackets the sleep with it. Cancellation propagates to the caller, which
+    journals it exactly like a cancel during an attempt.
+    """
+    if seconds <= 0:
+        return
+    state["activity"] = (
+        f"provider at capacity — waiting {int(seconds)}s before resuming"
+    )
+    # Past PROGRESS_MAX_SECONDS the client has backgrounded the request and
+    # its token is gone; starting the loop then would only log a spurious
+    # "notifications stopped" line per wait. The live log carries the wait.
+    token_alive = (time.monotonic() - request_t0) <= PROGRESS_MAX_SECONDS
+    hb = (
+        asyncio.create_task(
+            _heartbeat_loop(ctx, request_t0, run_t0, state, model, emit)
+        )
+        if ctx is not None and token_alive else None
+    )
+    try:
+        await asyncio.sleep(seconds)
+    finally:
+        if hb is not None:
+            hb.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await hb
+
+
 async def _run_codex(
     prompt: str,
     infra: bool = False,
@@ -2123,6 +2219,27 @@ async def _run_codex(
     })
 
     attempt = 0
+    retry_classes: list[str] = []  # journaled: what each retry recovered from
+    overload_retries = 0
+    waited_total = 0.0
+
+    def _cancelled(where: str) -> None:
+        """Bookkeeping for a caller cancel — mid-attempt or during a capacity
+        wait: journal it (the thread id is already journaled, so the run stays
+        resumable), say so in the live log, release the log handles."""
+        _journal({"run": run_tag, "phase": "end", "ts": time.time(),
+                  "status": "cancelled"})
+        with contextlib.suppress(Exception):
+            _emit(
+                "■ run cancelled by caller"
+                + (f" {where}" if where else "")
+                + " (resume later: codex_resume_run)"
+            )
+        for _fh in (live_fh, stream_fh):
+            if _fh is not None:
+                with contextlib.suppress(Exception):
+                    _fh.close()
+
     # One request-time anchor for EVERY attempt: retries must not reset the
     # heartbeat deadline (the client's progress token is request-scoped).
     if request_started is None:
@@ -2154,14 +2271,7 @@ async def _run_codex(
                 extra_env=extra_env, workdir=eff_cwd,
                 request_started=request_started)
         except asyncio.CancelledError:
-            _journal({"run": run_tag, "phase": "end", "ts": time.time(),
-                      "status": "cancelled"})
-            with contextlib.suppress(Exception):
-                _emit("■ run cancelled by caller (resume later: codex_resume_run)")
-            for _fh in (live_fh, stream_fh):
-                if _fh is not None:
-                    with contextlib.suppress(Exception):
-                        _fh.close()
+            _cancelled("")
             raise
 
         # AMNESIA GUARD (measured): resume with an unknown id silently starts
@@ -2185,26 +2295,51 @@ async def _run_codex(
         # attempt already made. Recovery for write runs is the EXPLICIT
         # codex_resume_run path, where the caller first reconciles the
         # changed-files report against the tree.
-        if (
-            failed
-            and not write
-            and attempt < MAX_TRANSIENT_RETRIES
-            and _is_transient_error(
+        klass = (
+            _transient_class(
                 f"{stderr_text}\n{state['last_error']}\n{stdout_text[-2000:]}"
             )
-        ):
+            if failed and not write else None
+        )
+        # One attempt counter, a budget chosen by what just failed: a shed
+        # gets the longer OVERLOAD budget, a blip the short one. Total
+        # retries stay bounded by the larger of the two.
+        budget = (
+            OVERLOAD_MAX_RETRIES if klass == "overload" else MAX_TRANSIENT_RETRIES
+        )
+        if klass is not None and attempt < budget:
             attempt += 1
+            retry_classes.append(klass)
             resume_tid = state.get("thread_id") or None
-            if resume_tid:
-                _emit(
-                    f"⟲ transient failure — resuming thread {resume_tid} "
-                    f"(attempt {attempt + 1}/{MAX_TRANSIENT_RETRIES + 1})"
+            wait = 0.0
+            if klass == "overload":
+                # ±20% jitter: runs shed together must not come back together.
+                wait = (
+                    _overload_backoff_seconds(overload_retries)
+                    * random.uniform(0.8, 1.2)
                 )
-            else:
-                _emit(
-                    f"⟲ transient failure before the session started — "
-                    f"retrying fresh (attempt {attempt + 1}/{MAX_TRANSIENT_RETRIES + 1})"
-                )
+                overload_retries += 1
+                waited_total += wait
+            what = (
+                "provider capacity shed" if klass == "overload"
+                else "transient failure"
+            )
+            where = (
+                f"resuming thread {resume_tid}" if resume_tid
+                else "retrying fresh (failed before the session started)"
+            )
+            _emit(
+                f"⟲ {what} — {where} (attempt {attempt + 1}/{budget + 1}"
+                + (f", after a {int(wait)}s wait)" if wait else ")")
+            )
+            if wait:
+                try:
+                    await _wait_for_capacity(
+                        wait, ctx, request_started, t0, state, model, _emit
+                    )
+                except asyncio.CancelledError:
+                    _cancelled("during the capacity wait")
+                    raise
             continue
         break
 
@@ -2233,6 +2368,7 @@ async def _run_codex(
     _journal({
         "run": run_tag, "phase": "end", "ts": time.time(), "status": status,
         "returncode": returncode, "attempts": attempt + 1,
+        "retry_classes": retry_classes, "capacity_wait_s": int(waited_total),
         "error": (state["last_error"] or stderr_text)[:500] if status != "ok" else "",
         "result_file": result_file,
     })
@@ -2277,8 +2413,20 @@ async def _run_codex(
         retry_note = (
             f" after {attempt + 1} attempts" if attempt else ""
         )
+        overload_failures = retry_classes.count("overload") + (
+            1 if _transient_class(detail or "") == "overload" else 0
+        )
+        capacity_note = (
+            f"\n[provider capacity: {model} answered 'at capacity' on "
+            f"{overload_failures} attempt(s); waited {int(waited_total)}s between "
+            f"same-thread resumes; the model/effort pin was NOT changed — the shed "
+            f"outlived the in-request budget, resume the thread once capacity "
+            f"returns]"
+            if overload_failures else ""
+        )
         return (
-            f"[Codex error (exit {returncode}){retry_note}]\n{detail}{log_note}\n"
+            f"[Codex error (exit {returncode}){retry_note}]\n{detail}"
+            f"{capacity_note}{log_note}\n"
             f"[recoverable: call codex_resume_run to continue this run "
             f"(run id: {run_tag})]{write_report}"
         )
@@ -2292,8 +2440,12 @@ async def _run_codex(
     )
     result = f"{header}\n\n{final_message}"
     if attempt and returncode == 0:
+        recovered_from = (
+            f"a provider capacity shed (waited {int(waited_total)}s)"
+            if "overload" in retry_classes else "a transient failure"
+        )
         result += (
-            f"\n\n[note: recovered automatically after a transient failure — "
+            f"\n\n[note: recovered automatically after {recovered_from} — "
             f"{attempt + 1} attempts, context preserved via codex session resume]"
         )
     if state["last_error"] and returncode != 0:
