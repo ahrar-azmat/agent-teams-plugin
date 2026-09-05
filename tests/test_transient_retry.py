@@ -419,9 +419,9 @@ def test_wait_for_capacity_keeps_heartbeating() -> None:
     check("heartbeats flowed during the wait", len(progress) >= 1, str(len(progress)))
     check("heartbeat carries the wait as activity",
           any("provider at capacity" in m for m in progress), str(progress[:2]))
-    check("zero wait returns immediately without touching activity",
+    check("zero wait returns immediately without touching activity (no cancel seen)",
           asyncio.run(server._wait_for_capacity(0, Ctx(), t0, t0, {"activity": "a"},
-                                                "m", emitted.append)) is None)
+                                                "m", emitted.append)) is False)
     # Once the request is past PROGRESS_MAX_SECONDS its token is dead: no
     # heartbeat may start, and no "notifications stopped" line may be logged.
     progress.clear(); emitted.clear()
@@ -487,9 +487,13 @@ def test_cancel_during_the_wait_is_journaled_and_resumable() -> None:
     check("journal: cancelled", rec.get("status") == "cancelled", str(rec.get("status")))
     check("journal: thread id kept (resumable)", rec.get("thread_id") == "t-shed-1",
           str(rec.get("thread_id")))
-    check("journal: cancel record carries the retry telemetry",
-          rec.get("attempts") == 2 and rec.get("retry_classes") == ["overload"]
-          and isinstance(rec.get("capacity_wait_s"), int), str(rec)[:300])
+    # Round 36: attempt telemetry counts REAL spawns only — a wait that was
+    # cancelled never retried, so the record shows one attempt, no retry
+    # class, and the time actually waited (not the planned 5 s).
+    check("journal: cancel record counts the one real attempt and the actual wait",
+          rec.get("attempts") == 1 and rec.get("retry_classes") == []
+          and isinstance(rec.get("capacity_wait_s"), int) and rec.get("capacity_wait_s") < 5,
+          str(rec)[:300])
 
 
 # ---------------------------------------------------------------------------

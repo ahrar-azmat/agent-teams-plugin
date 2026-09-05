@@ -46,8 +46,10 @@ import os
 import random
 import threading
 import re
+import secrets
 import shutil
 import signal
+import stat as stat_mod
 import subprocess
 import sys
 import tempfile
@@ -165,11 +167,56 @@ if PROGRESS_MAX_SECONDS + PROGRESS_INTERVAL_SECONDS > _SAFE_PROGRESS_ENVELOPE:
 STARTUP_PROBE_SECONDS = 90
 
 # Wall-clock timeout: maximum total runtime for a single codex invocation.
-# Prevents zombie processes that start but never finish. 60 minutes covers
-# max effort (deepest single-agent reasoning) and infra-mode investigations
-# (SSH/DB/log exploration) while still preventing the multi-hour hangs we
-# observed with stuck processes.
-MAX_RUNTIME_SECONDS = 3600  # 60 minutes
+# RUN BUDGET — a MANAGED limit (Limits Doctrine), not a scoping cap.
+# Named threat: a run that never finishes (model loop, hung tool, stalled
+# transport) burning provider credits and holding the worktree write lock,
+# its claims and the caller's wait forever. Sized from MEASURED workloads
+# (SmartPay trains, 2026-09-02..04): healthy runs finish in 4–30 min; three
+# legitimate analysis-heavy runs were SIGKILLed at 62–66 min while still
+# working (exit -9, the old 60-min literal). Default 3 h = ≥2.7× the longest
+# observed legitimate need, and under the chained ceilings: the plugin's MCP
+# call timeout (.mcp.json, 4 h) and the host's own idle abort (~4 h
+# observed) — both of which a DETACHED run survives anyway. Adjustable
+# without a deploy: CODEX_ORACLE_MAX_RUNTIME_S (seconds). Out-of-band values
+# (< 300 s would kill every real run; > 12600 s would outlive the plugin's
+# 4 h MCP call timeout with no margin) are
+# REJECTED loudly — default + a startup warning on stderr — never clamped.
+# Observable: the live log warns at 80 % of the budget, `codex_runs` prints
+# the effective budget, and a deadline kill journals status "timeout" with
+# the budget and the knob in its message. Pinned by tests/test_detach.py.
+MAX_RUNTIME_DEFAULT_S = 3 * 3600
+MAX_RUNTIME_MIN_S = 300
+# CHAINED CEILING (round 32): the plugin's MCP call timeout (.mcp.json) is a
+# HARD 4 h per-call wall clock the client enforces; the band's maximum sits
+# 30 min under it so no allowed budget can outlive the call.
+MAX_RUNTIME_MAX_S = 12600
+# ONE budget per MCP REQUEST (round 32): retries and abraham's two phases
+# share it — an attempt that cannot get this much of it is refused.
+MIN_ATTEMPT_SECONDS = 120
+
+
+def _max_runtime_from_env() -> tuple[int, str]:
+    """(budget seconds, source): source is "default", "env", or a rejection
+    note naming the bad value — a rejection KEEPS the default (loud, never
+    clamped)."""
+    raw = os.environ.get("CODEX_ORACLE_MAX_RUNTIME_S")
+    if raw is None or raw.strip() == "":
+        return MAX_RUNTIME_DEFAULT_S, "default"
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return MAX_RUNTIME_DEFAULT_S, f"rejected CODEX_ORACLE_MAX_RUNTIME_S={raw!r} (not a number)"
+    if not math.isfinite(value) or not (MAX_RUNTIME_MIN_S <= value <= MAX_RUNTIME_MAX_S):
+        return MAX_RUNTIME_DEFAULT_S, (
+            f"rejected CODEX_ORACLE_MAX_RUNTIME_S={raw!r} "
+            f"(allowed {MAX_RUNTIME_MIN_S}..{MAX_RUNTIME_MAX_S} s)")
+    return int(value), "env"
+
+
+MAX_RUNTIME_SECONDS, MAX_RUNTIME_SOURCE = _max_runtime_from_env()
+if MAX_RUNTIME_SOURCE.startswith("rejected"):
+    sys.stderr.write(f"[codex-oracle] {MAX_RUNTIME_SOURCE}; using the default "
+                     f"{MAX_RUNTIME_DEFAULT_S}s run budget\n")
 
 # ---------------------------------------------------------------------------
 # Write mode (abraham): auto-compaction
@@ -177,7 +224,7 @@ MAX_RUNTIME_SECONDS = 3600  # 60 minutes
 # Implementation runs are LONG. codex only auto-compacts its own history at
 # 90% of the context window by default (0.147.0-generation source:
 # resolved_context_window * 9 / 10 in openai_models.rs; the registry carries
-# no per-model override for the gpt-5.6 family), which leaves the tail of a
+# no per-model override for the gpt-5.6 / gpt-6 families), which leaves the tail of a
 # long write run degraded. Write runs therefore pass an explicit
 # -c model_auto_compact_token_limit at AUTOCOMPACT_PCT of the window.
 #
@@ -192,7 +239,11 @@ MAX_RUNTIME_SECONDS = 3600  # 60 minutes
 #    derives from), never from recalled docs: gpt-5.6-sol is 272_000 there
 #    (measured 2026-08-14) while API-era docs suggest 400_000. A guessed 400k
 #    base would have put "65%" at 95.6% of the real window — LATER than the
-#    default it replaced.
+#    default it replaced. Same shape again for gpt-6-astra (measured
+#    2026-09-05, codex-cli 0.153.4 registry): 272_000 in models_cache.json
+#    while the API model page says 1,050,000 — and 272K is also the input
+#    size above which the API bills the long-context premium, so 65% of the
+#    registry window keeps write runs under both ceilings.
 # Precedence: CODEX_ORACLE_CONTEXT_WINDOW env (explicit operator override)
 # > models_cache.json exact-slug lookup > omit the flag (vendor default
 # governs). The chosen branch is recorded in the live-log header.
@@ -567,7 +618,10 @@ def _read_codex_config() -> dict[str, str]:
 
 def _get_codex_model() -> str:
     """Auto-detect the latest model from Codex config."""
-    return _read_codex_config().get("model", "gpt-5.6-sol")
+    # Fallback = the vendor's own bundled default (codex-cli 0.153.4 made
+    # GPT-6 Astra the bundled default, 2026-09-04); the pin normally comes
+    # from ~/.codex/config.toml, re-read on every mtime change.
+    return _read_codex_config().get("model", "gpt-6-astra")
 
 
 def _get_reasoning_effort() -> str:
@@ -587,33 +641,21 @@ def _get_cwd() -> str:
 
 
 def _workspace_digest(cwd: str) -> str:
-    """12-hex digest of the workspace state (HEAD + tracked diff + status).
-
-    Stamped into answer headers by ``_answer_sig`` and recomputed by the
-    push-gate hook at push time: a mismatch means the tree changed after the
-    answer, so a completed review no longer vouches for the push. Duplicated
-    in hooks/push_gate.py (hooks cannot import this module — it needs the
-    mcp package); tests/test_push_gate.py pins behavioral parity.
+    """12-hex CONTENT digest of the worktree — ONE implementation,
+    treedigest.py (loaded by path, shared with hooks/push_gate.py), computed
+    here in a child under a HARD deadline (round 31: no in-process deadline
+    can interrupt a blocking read); it reads bytes itself (no `git diff` /
+    `git status`, round 34: those run configured helper commands) and
+    ignores HEAD. Stamped into answer headers by ``_answer_sig`` and
+    recomputed by the push-gate hook at push time: a mismatch means the
+    CONTENT changed after the answer. "unknown" on any budget breach or failure.
     """
     try:
-        parts = []
-        for args in (("rev-parse", "HEAD"), ("diff", "HEAD"), ("status", "--porcelain")):
-            proc = subprocess.run(
-                ["git", "-C", cwd, *args],
-                capture_output=True, text=True, timeout=15,
-            )
-            if proc.returncode != 0:
-                # A digest over PARTIAL state is worse than no digest: a
-                # failed diff/status hashed as empty could still open the
-                # gate. Every command must succeed or the digest is void.
-                return "nogit" if args[0] == "rev-parse" else "unknown"
-            parts.append(proc.stdout)
-        return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:12]
-    except (OSError, subprocess.TimeoutExpired):
+        return _treedigest.digest_hard(cwd)
+    except Exception:
         return "unknown"
 
-
-def _answer_sig(tool_name: str, status: str) -> str:
+def _answer_sig(tool_name: str, status: str, tree: str | None = None) -> str:
     """Machine-verifiable answer signature, appended inside the result header.
 
     hooks/push_gate.py opens the push gate only for a header carrying
@@ -623,7 +665,24 @@ def _answer_sig(tool_name: str, status: str) -> str:
     """
     if not tool_name:
         return ""
-    return f" | tool:{tool_name} | status:{status} | tree:{_workspace_digest(_get_cwd())}"
+    # ``tree`` = the digest taken at DISPATCH (journaled with the run): the
+    # answer vouches for the tree the model actually read, not for whatever
+    # the workspace looks like when the answer is delivered (review of
+    # 1.17.0: adoption stamped the collection-time tree).
+    return f" | tool:{tool_name} | status:{status} | tree:{tree or _workspace_digest(_get_cwd())}"
+
+
+# The FULL-ACCESS write argv (user ruling 2026-09-05): codex's --yolo alias,
+# verbatim from `codex exec --help` on the installed 0.153.0 ("Skip all
+# confirmation prompts and execute commands without sandboxing"). The user
+# config is KEPT (as in infra mode) so the writer has the same MCP tools a
+# live investigation has. CODEX_ORACLE_WRITE_FULL_ACCESS=1 makes it the
+# default for every abraham call; `full_access` on the call overrides.
+FULL_ACCESS_WRITE_ARGS = ("--dangerously-bypass-approvals-and-sandbox",)
+
+
+def _full_access_default() -> bool:
+    return os.environ.get("CODEX_ORACLE_WRITE_FULL_ACCESS", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # The sealed write sandbox, verbatim — a single source shared by the
@@ -901,26 +960,41 @@ def _git(args: list[str], cwd: str) -> tuple[int, str]:
     reads at dispatch/return time, not part of the streamed run."""
     try:
         p = subprocess.run(
-            ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=15,
+            ["git", *_treedigest.GIT_SAFE_CONFIG, *args], cwd=cwd, env=_treedigest.git_env(),
+            capture_output=True, text=True, timeout=15,
         )
         return p.returncode, (p.stdout or "").strip()
     except (OSError, subprocess.SubprocessError):
         return 1, ""
 
 
+_GIT_STATE_REASON = ""  # why the last _git_state refused (for the messages that follow it)
+
+
 def _git_state(cwd: str) -> tuple[bool, set[str], str]:
-    """(is_work_tree, dirty porcelain lines, HEAD sha — '' on a repo with no
-    commits yet, which is still a valid write target)."""
-    rc, out = _git(["rev-parse", "--is-inside-work-tree"], cwd)
-    if rc != 0 or out != "true":
+    """(is_work_tree, porcelain-shaped dirty lines, HEAD sha — '' on a repo
+    with no commits yet, which is still a valid write target).
+
+    Round 36: computed by treedigest.worktree_status — the index and HEAD
+    listings plus this process's OWN byte reads — so no `git status` runs
+    here: status refreshes the index and runs a configured clean filter for
+    any file whose stat data changed (measured on 2.55.0), a helper command
+    the sealed writer could have configured into the very tree it wrote.
+    Vocabulary = porcelain's, plus ` ~` for a path whose bytes differ from
+    the index under a conversion attribute (treated as dirty; the report
+    carries the legend). ANY failure — budget, unreadable listing, an
+    unresolvable submodule — is NOT a clean tree: (False, ∅, '') refuses the
+    write target (fail closed, round 34), and the reason is kept for the
+    refusal message."""
+    global _GIT_STATE_REASON
+    try:
+        ok, lines, head, reason = _treedigest.worktree_status(cwd)
+    except Exception as exc:  # the module never raises; belt and braces
+        ok, lines, head, reason = False, set(), "", f"{type(exc).__name__}: {exc}"
+    _GIT_STATE_REASON = "" if ok else (reason or "unknown")
+    if not ok:
         return False, set(), ""
-    _, porcelain = _git(["status", "--porcelain"], cwd)
-    lines = {ln for ln in porcelain.splitlines() if ln.strip()}
-    # --verify --quiet: a repo with no commits yields rc!=0 and NO output.
-    # Plain `rev-parse HEAD` echoes the literal string "HEAD" there, which
-    # would masquerade as a sha (caught by the test suite).
-    rc, head = _git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd)
-    return True, lines, head if rc == 0 else ""
+    return True, set(lines), head
 
 
 _WRITE_REPORT_MAX_CHARS = 3500  # the report is a summary; the DIFF is the review surface
@@ -937,8 +1011,8 @@ def _write_changes_report(before: set[str], head_before: str, cwd: str) -> str:
     ok, after, head_after = _git_state(cwd)
     if not ok:
         return (
-            "\n\n[CHANGED FILES: git state unreadable after the run — "
-            "inspect the tree manually]"
+            "\n\n[CHANGED FILES: git state unreadable after the run "
+            f"({_GIT_STATE_REASON}) — inspect the tree manually]"
         )
     new_lines = sorted(after - before)
     gone_lines = sorted(before - after)
@@ -973,6 +1047,12 @@ def _write_changes_report(before: set[str], head_before: str, cwd: str) -> str:
             f"  HEAD unchanged ({head_before[:9] or 'no commits yet'}) — "
             "nothing was committed"
         )
+    if any(len(ln) > 1 and ln[1] == "~" for ln in (before | after)):
+        parts.append(
+            "  legend: ` ~` = bytes differ from the index but a conversion "
+            "attribute (filter/eol/ident/encoding) applies, so the comparison "
+            "is not authoritative without that helper — treated as dirty"
+        )
     report = "\n".join(parts)
     if len(report) > _WRITE_REPORT_MAX_CHARS:
         report = (
@@ -1003,70 +1083,470 @@ def _active_write_run(cwd: str, exclude_run: str = "") -> str:
     return ""
 
 
+def _tree_identity(cwd: str) -> str:
+    """Filesystem identity of the WORKTREE containing ``cwd``: the git
+    toplevel's (st_dev, st_ino). Case variants, symlink aliases and any
+    subdirectory of one checkout all map to one lock (review round 5:
+    realpath() is not an identity on case-insensitive APFS, and a
+    subdirectory got its own lock). Falls back to the realpath hash."""
+    root = cwd
+    with contextlib.suppress(Exception):
+        top = subprocess.run(
+            _treedigest.git_argv(cwd, ("rev-parse", "--show-toplevel")), env=_treedigest.git_env(),
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if top:
+            root = top
+    try:
+        st = os.stat(root)
+        return f"{st.st_dev}-{st.st_ino}"
+    except OSError:
+        return hashlib.sha1(os.path.realpath(root).encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def _write_lock_path(cwd: str) -> Path:
-    return (
-        LIVE_LOG_DIR / "write-locks"
-        / f"{hashlib.sha1(cwd.encode('utf-8', 'replace')).hexdigest()[:16]}.lock"
-    )
+    return LIVE_LOG_DIR / "write-locks" / f"tree-{_tree_identity(cwd)}.lock"
 
 
-def _acquire_write_lock(cwd: str, run_hint: str) -> tuple[bool, str]:
-    """One-writer-per-tree MUTUAL EXCLUSION, across server processes.
+def _legacy_write_lock_holder(cwd: str) -> str:
+    """A pre-1.17.2 server holds no kernel lock — its lock is a content FILE
+    keyed by the sha1 of the RAW cwd string, so a symlink / case / subdir
+    alias of one checkout lives under a DIFFERENT file name (round 6: the
+    exact-path probe missed those). Scan every legacy-format file in the
+    shared directory and match by the TREE its recorded cwd resolves to; a
+    live holder on our tree refuses us. A live holder whose cwd cannot be
+    parsed fails CLOSED (counts as ours)."""
+    my_tree = _tree_identity(cwd)
+    tree_cache: dict[str, str] = {}
+    try:
+        entries = list((LIVE_LOG_DIR / "write-locks").iterdir())
+    except OSError:
+        return ""
+    for entry in entries:
+        name = entry.name
+        if not name.endswith(".lock") or name.startswith("tree-"):
+            continue
+        try:
+            text = entry.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        live = ""
+        for key, skey, alive in (("child", "cstart", _pid_alive), ("pid", "pstart", _server_alive)):
+            mp = re.search(rf"\b{key}=(\d+)\b", text)
+            ms = re.search(rf"\b{skey}=(\S+)", text)
+            if mp and alive(int(mp.group(1)), ms.group(1) if ms and ms.group(1) != "-" else ""):
+                live = text
+                break
+        if not live:
+            continue
+        mc = re.search(r"\bcwd=(.+?) t=\d+", text) or re.search(r"\bcwd=(\S+)", text)
+        if mc:
+            rec_cwd = mc.group(1)
+            tree = tree_cache.get(rec_cwd)
+            if tree is None:
+                tree = tree_cache[rec_cwd] = _tree_identity(rec_cwd)
+            if tree != my_tree:
+                continue  # a live legacy writer, but on a DIFFERENT tree
+        return live  # our tree (or unprovably not ours — fail closed)
+    return ""
 
-    The journal liveness check in _active_write_run is advisory only — two
-    dispatches in the same second both pass it. This O_EXCL lockfile is the
-    authoritative gate (cross-model review finding: an mtime check is not a
-    lock). Staleness: no run outlives MAX_RUNTIME_SECONDS, so an older lock
-    belongs to a dead process and is broken. Unusable lock dir FAILS CLOSED —
-    write dispatch without mutual exclusion is not an acceptable fallback.
 
-    Returns (acquired, holder_description_when_refused).
-    """
-    path = _write_lock_path(cwd)
+# ---- kernel-held locks -----------------------------------------------------
+# Mutual exclusion across processes is an ADVISORY OS LOCK held on an open
+# descriptor (flock on POSIX, msvcrt.locking on Windows): exclusive while the
+# holder — or a child that inherited the descriptor — lives, and released by
+# the kernel on death. No pid, age, nonce or rename heuristics: three review
+# rounds showed every file-content protocol had a race (a live owner age-
+# expired; two recoverers of one stale file both acquiring; a fresh lock
+# renamed away). Lock files are never unlinked — an unlink races a fresh
+# opener onto a different inode and silently gives two holders.
+_HELD: dict[str, int] = {}  # lock path → descriptor this process holds
+PLUGIN_LOCK_PROTOCOL = "1.17.2"  # stamped into the server registry (write barrier)
+
+
+def _try_lock_fd(fd: int) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _acquire_os_lock(path: Path, payload: str) -> tuple[bool, str]:
+    """Take the lock at ``path`` for this process. Returns (acquired, holder
+    description when refused). The payload is diagnostics only — who holds
+    it — never a liveness input."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         _private(path.parent, 0o700)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     except OSError as e:
-        return False, f"write-lock dir unusable ({e}) — refusing to write unlocked"
-    payload = f"{run_hint} pid={os.getpid()} cwd={cwd} t={int(time.time())}\n"
-    for _ in range(2):
+        return False, f"lock dir unusable ({e})"
+    if not _try_lock_fd(fd):
+        holder = ""
+        with contextlib.suppress(OSError):
+            holder = os.read(fd, 4096).decode("utf-8", errors="replace").strip()
+        os.close(fd)
+        return False, holder or "held by another process"
+    with contextlib.suppress(OSError):
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload.encode("utf-8"))
+        os.fsync(fd)
+    _HELD[str(path)] = fd
+    return True, ""
+
+
+def _release_os_lock(path: Path) -> None:
+    """Close our descriptor. The kernel drops the lock when the LAST
+    descriptor on the open file description closes — so a child that
+    inherited it (a write run's codex) keeps the tree locked until it exits.
+    No explicit unlock: that would strip the child's protection."""
+    fd = _HELD.pop(str(path), None)
+    if fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _held_lock_fd(path: Path) -> int | None:
+    return _HELD.get(str(path))
+
+
+def _rewrite_held_payload(path: Path, payload: str) -> bool:
+    fd = _HELD.get(str(path))
+    if fd is None:
+        return False
+    with contextlib.suppress(OSError):
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, payload.encode("utf-8"))
+        os.fsync(fd)
+        return True
+    return False
+
+
+_PLANTED_LEGACY: dict[str, list[Path]] = {}  # tree lock path → legacy bridge files we planted
+
+
+def _server_registry_dir() -> Path:
+    return LIVE_LOG_DIR / "servers"
+
+
+def _register_server() -> None:
+    """Record this (1.17.2+) server process so the mixed-version write
+    barrier can tell registered new-code servers from pre-1.17.2 ones.
+    Best-effort: a missed registration only OVER-blocks writes (fail closed).
+    Called at real-server startup (__main__)."""
+    try:
+        d = _server_registry_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        _private(d, 0o700)
+        p = d / f"{os.getpid()}.json"
+        p.write_text(json.dumps({"pid": os.getpid(), "start": _SERVER_START,
+                                 "version": PLUGIN_LOCK_PROTOCOL}), encoding="utf-8")
+        _private(p, 0o600)
+        for e in d.glob("*.json"):  # opportunistic prune of dead entries
+            with contextlib.suppress(Exception):
+                rec = json.loads(e.read_text(encoding="utf-8"))
+                pid = int(rec.get("pid") or 0)
+                if pid != os.getpid() and not _pid_alive(pid, str(rec.get("start") or "")):
+                    e.unlink()
+    except Exception:
+        pass
+
+
+def _registered_server_pids() -> dict[int, str]:
+    out: dict[int, str] = {}
+    with contextlib.suppress(OSError):
+        for e in _server_registry_dir().glob("*.json"):
+            with contextlib.suppress(Exception):
+                rec = json.loads(e.read_text(encoding="utf-8"))
+                out[int(rec.get("pid") or 0)] = str(rec.get("start") or "")
+    return out
+
+
+def _ps_snapshot() -> str:
+    """`pid command` lines for this user's processes (tests inject their own).
+    A nonzero ps exit is an ERROR, never an empty-but-successful snapshot
+    (round 8: discarding returncode turned a failed ps into "no processes")."""
+    done = subprocess.run(
+        ["ps", "-U", str(os.getuid()), "-axo", "pid=,command="],
+        capture_output=True, text=True, timeout=10,
+    )
+    if done.returncode != 0:
+        raise OSError(f"ps exited {done.returncode}: {done.stderr.strip()[:120]}")
+    return done.stdout
+
+
+def _proc_comm(pid: int) -> str:
+    """The process's EXECUTABLE (ps comm — a single field, so a spaced path
+    cannot be mis-split). "" = the process is gone. Raises on a ps failure so
+    the caller fails closed. Injectable for tests."""
+    done = subprocess.run(
+        ["ps", "-o", "comm=", "-p", str(pid)],
+        capture_output=True, text=True, timeout=5,
+    )
+    if done.returncode != 0:
+        # ps exits nonzero BOTH for a dead pid and for its own failures
+        # (round 12): "gone" needs corroboration — kill(0) ESRCH. Anything
+        # else is an unverifiable candidate and must raise so the barrier
+        # fails closed.
+        if _kill0(pid) is False:
+            return ""  # genuinely gone
+        raise OSError(
+            f"ps -o comm= -p {pid} exited {done.returncode}"
+            f" ({done.stderr.strip()[:120] or 'no stderr'}) while kill(0) says the "
+            f"process exists")
+    return done.stdout.strip()
+
+
+def _pre_1172_server_running() -> str:
+    """Description of a live codex-oracle server process that predates the
+    registry (pre-1.17.2), or ''. Round 7: old code cannot be patched inside
+    running processes, and NO enumeration of path aliases can make its
+    content locks meet our inode locks — so while such a process exists,
+    write dispatch refuses outright. This is the mixed-version guarantee;
+    the legacy scan and planted bridge files remain as defense in depth.
+    POSIX only (write mode already fails closed on Windows)."""
+    if _IS_WINDOWS:
+        return ""
+    try:
+        out = _ps_snapshot()
+    except Exception as e:
+        return f"cannot enumerate processes (ps failed: {e})"
+    registered = _registered_server_pids()
+    rows: list[tuple[int, str]] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            with os.fdopen(fd, "w") as fh:
-                fh.write(payload)
-            return True, ""
-        except FileExistsError:
+            pid_s, cmd = line.split(None, 1)
+            rows.append((int(pid_s), cmd))
+        except ValueError:
+            continue
+    if os.getpid() not in {p for p, _ in rows}:
+        # A truthful snapshot of this user's processes must contain THIS
+        # process; one that does not is empty, partial, or from the wrong
+        # user — never proof that no old server exists (round 8).
+        return "process snapshot did not include this process (partial/invalid) — cannot rule out an old server"
+    for pid, cmd in rows:
+        if pid == os.getpid():
+            continue
+        # CANDIDATE = loose substring match (round 11: token positions
+        # guessed from a space-joined `ps command` line mis-split a spaced
+        # install path into a false NEGATIVE — the superset match cannot
+        # miss). What separates a real oracle server from a `codex exec`
+        # child whose PROMPT mentions these strings is the EXECUTABLE:
+        # servers run under a python; codex children run under codex/node.
+        # `ps comm` is a single field, immune to spaces.
+        low = cmd.lower()
+        if "run_server.py" not in low and "server.py" not in low:
+            continue
+        if "codex-oracle" not in low and "agent-teams" not in low:
+            continue
+        try:
+            comm = _proc_comm(pid)
+        except Exception as e:
+            return f"cannot verify candidate process {pid} (ps failed: {e})"
+        if not comm:
+            continue  # gone between snapshot and probe
+        exe = comm.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if not exe.startswith("python"):
+            continue  # codex/node/etc — an oracle CHILD, not a server
+        start = registered.get(pid)
+        if start is not None:
+            cur = _proc_start(pid)
+            if cur and cur == start:
+                continue  # verified registered 1.17.2+ server
+            # Unknown or mismatched identity: the registry entry may belong
+            # to a dead server whose pid was reused — NOT an exemption
+            # (round 8: unknowable identity must fail closed here).
+        if _kill0(pid) is False:
+            continue  # dead — a stale snapshot line
+        # RAW liveness only: _pid_alive's no-start fallback requires the
+        # command to LOOK like a codex process, but here the snapshot line
+        # is the identity evidence (measured: a live process read as dead).
+        return f"unregistered (pre-1.17.2) codex-oracle server pid {pid}: {cmd[:120]}"
+    return ""
+
+
+def _legacy_lock_paths_for(cwd: str) -> list[Path]:
+    """The legacy-format lock files a pre-1.17.2 server would consult for
+    this tree: one per plausible alias of the checkout (raw cwd, realpath,
+    git toplevel, its realpath), deduplicated by file name. An old server on
+    an alias OUTSIDE this set is not excluded — that hole exists between two
+    old servers as well and closes when every server is on 1.17.2."""
+    aliases = [cwd, os.path.realpath(cwd)]
+    with contextlib.suppress(Exception):
+        top = subprocess.run(
+            _treedigest.git_argv(cwd, ("rev-parse", "--show-toplevel")), env=_treedigest.git_env(),
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if top:
+            aliases += [top, os.path.realpath(top)]
+    out: list[Path] = []
+    seen: set[str] = set()
+    for alias in aliases:
+        path = (LIVE_LOG_DIR / "write-locks"
+                / f"{hashlib.sha1(alias.encode('utf-8', 'replace')).hexdigest()[:16]}.lock")
+        if path.name in seen:
+            continue
+        seen.add(path.name)
+        out.append(path)
+    return out
+
+
+def _plant_legacy_locks(cwd: str, run_hint: str) -> tuple[bool, str, list[Path]]:
+    """Occupy the LEGACY lock namespace for this tree while we hold the inode
+    lock, so a still-running pre-1.17.2 server refuses in BOTH acquisition
+    orders (round 6: it otherwise takes its content lock after we already
+    hold the — to it invisible — inode lock). Legacy files are content-based
+    by the OLD protocol's own definition: creating and unlinking them here
+    follows that protocol; the never-unlink law protects flock-held files,
+    not these. Returns (ok, live_holder_when_refused, planted_so_far)."""
+    planted: list[Path] = []
+    payload = (f"{run_hint} pid={os.getpid()} pstart={_SERVER_START or '-'} "
+               f"planted-by={os.getpid()} v=1.17.2-bridge cwd={cwd} "
+               f"t={int(time.time())}\n")
+    for path in _legacy_lock_paths_for(cwd):
+        occupied = False
+        for _ in range(2):
             try:
-                age = time.time() - path.stat().st_mtime
-                holder = path.read_text(encoding="utf-8", errors="replace").strip()
-            except OSError:
-                continue  # holder released between EXISTS and stat — retry
-            # A lock whose recorded holder PROCESS is dead is stale now, not
-            # in MAX_RUNTIME seconds — a crashed server must not block the
-            # recovery resume of its own run for an hour. (Age remains the
-            # fallback for unparseable payloads and pid reuse.)
-            holder_dead = False
-            m = re.search(r"\bpid=(\d+)\b", holder)
-            if m and os.name != "nt":
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    fh.write(payload)
+                planted.append(path)
+                occupied = True
+                break
+            except FileExistsError:
                 try:
-                    os.kill(int(m.group(1)), 0)
-                except ProcessLookupError:
-                    holder_dead = True
-                except (PermissionError, OSError):
-                    pass  # exists (or unknowable) — treat as alive
-            if holder_dead or age > MAX_RUNTIME_SECONDS:
+                    text = path.read_text(encoding="utf-8", errors="replace").strip()
+                except OSError:
+                    continue  # released between EXISTS and read — retry once
+                m = re.search(r"\bpid=(\d+)\b", text)
+                if (m and int(m.group(1)) != os.getpid()
+                        and _pid_alive(int(m.group(1)))):
+                    return False, text or "unknown legacy holder", planted
                 with contextlib.suppress(OSError):
-                    path.unlink()
+                    path.unlink()  # stale by the old protocol's own rules
                 continue
-            return False, holder or "unknown holder"
-        except OSError as e:
-            return False, f"write-lock unusable ({e}) — refusing to write unlocked"
-    return False, "lock contention"
+            except OSError as e:
+                # Round 7: an unplantable alias is a REFUSAL, not a skip — a
+                # partially occupied namespace is fail-open.
+                return False, f"cannot plant legacy bridge {path.name} ({e})", planted
+        if not occupied:
+            return False, f"could not occupy legacy bridge {path.name} (contention)", planted
+    return True, "", planted
+
+
+def _acquire_write_lock(cwd: str, run_hint: str) -> tuple[bool, str]:
+    """One-writer-per-tree MUTUAL EXCLUSION, across server processes AND
+    across plugin versions, held by the kernel for the holder's lifetime and
+    inherited by the codex child. Stable order for every new writer:
+    (1) refuse while any pre-1.17.2 content lock on this TREE names a live
+    holder; (2) take the authoritative inode lock; (3) occupy the legacy
+    namespace so an old writer starting LATER refuses too (round 6).
+    Unusable lock dir FAILS CLOSED — write dispatch without mutual exclusion
+    is not an acceptable fallback. Returns (acquired, holder_when_refused)."""
+    blocker = _pre_1172_server_running()
+    if blocker:
+        return False, (
+            f"mixed-version write barrier: {blocker} — old and new write "
+            "locks cannot exclude each other through unanticipated path "
+            "aliases (round 7); reconnect/reload that session onto 1.17.2 "
+            "first, then retry"
+        )
+    legacy = _legacy_write_lock_holder(cwd)
+    if legacy:
+        return False, f"legacy (pre-1.17.2) lock live: {legacy}"
+    payload = (f"{run_hint} pid={os.getpid()} pstart={_SERVER_START or '-'} "
+               f"cwd={cwd} t={int(time.time())}\n")
+    path = _write_lock_path(cwd)
+    ok, holder = _acquire_os_lock(path, payload)
+    if not ok:
+        if holder.startswith("lock dir unusable"):
+            return False, f"write-lock {holder} — refusing to write unlocked"
+        return False, holder
+    planted_ok, live_holder, planted = _plant_legacy_locks(cwd, run_hint)
+    if not planted_ok:
+        for p in planted:
+            with contextlib.suppress(OSError):
+                p.unlink()
+        _release_os_lock(path)
+        return False, f"legacy (pre-1.17.2) lock live: {live_holder}"
+    _PLANTED_LEGACY[str(path)] = planted
+    return True, ""
+
+
+def _note_write_child(cwd: str, pid: int) -> bool:
+    """Record the spawned codex child in the held lock's payload (who holds
+    the tree — diagnostics). False only if this process does not hold the
+    lock, which a write run must treat as fatal."""
+    path = _write_lock_path(cwd)
+    fd = _HELD.get(str(path))
+    if fd is None:
+        return False
+    with contextlib.suppress(OSError):
+        os.lseek(fd, 0, os.SEEK_SET)
+        text = os.read(fd, 4096).decode("utf-8", errors="replace").rstrip("\n")
+        # REPLACE the child identity (round 19): abraham publishes phase 1's
+        # child and then phase 2's under the same held lock — skipping when
+        # `child=` exists left the bridge naming a finished phase-1 pid.
+        text = re.sub(r"\s*child=\d+ cstart=\S+", "", text)
+        _rewrite_held_payload(path, f"{text} child={pid} cstart={_proc_start(pid) or '-'}\n")
+    # Re-point our planted LEGACY files at the child: if this server crashes,
+    # the child (holding the inherited inode lock) keeps the tree locked, and
+    # the legacy files must keep naming a LIVE pid so an old server's
+    # liveness probe still refuses instead of breaking a "stale" file.
+    # ALL-OR-NOTHING and durable (round 7): one un-repointed file is an
+    # unprotected crash window, so any failure returns False and the caller
+    # kills the child (which has not executed yet — see the execution
+    # barrier in _exec_codex_once).
+    cstart = _proc_start(pid) or "-"
+    for p in _PLANTED_LEGACY.get(str(path), []):
+        try:
+            txt = p.read_text(encoding="utf-8", errors="replace")
+            if f"planted-by={os.getpid()}" not in txt:
+                return False  # the bridge file is not ours any more
+            tail = txt[txt.index("cwd="):] if "cwd=" in txt else txt
+            data = (f"write-child pid={pid} pstart={cstart} child={pid} "
+                    f"cstart={cstart} planted-by={os.getpid()} "
+                    f"v=1.17.2-bridge {tail}")
+            wfd = os.open(p, os.O_WRONLY | os.O_TRUNC)
+            try:
+                os.write(wfd, data.encode("utf-8"))
+                os.fsync(wfd)
+            finally:
+                os.close(wfd)
+        except (OSError, ValueError):
+            return False
+    return True
+
+
+_LOCK_CUSTODY: set[str] = set()  # write-lock paths held past their run (survivors)
 
 
 def _release_write_lock(cwd: str) -> None:
-    with contextlib.suppress(OSError):
-        _write_lock_path(cwd).unlink()
+    path = _write_lock_path(cwd)
+    if str(path) in _LOCK_CUSTODY:
+        # CUSTODIAN (round 15): a run ended with group survivors — the
+        # descriptor stays held by this server so no second writer can start
+        # on a tree that may still be being written. codex_cancel_run
+        # releases custody once group death is verified and the run is
+        # terminalized.
+        return
+    for p in _PLANTED_LEGACY.pop(str(path), []):
+        with contextlib.suppress(OSError):
+            if f"planted-by={os.getpid()}" in p.read_text(encoding="utf-8",
+                                                          errors="replace"):
+                p.unlink()  # ours; content-based namespace (see _plant_legacy_locks)
+    _release_os_lock(path)
 
 
 # ---------------------------------------------------------------------------
@@ -1117,7 +1597,10 @@ def _prune_live_logs() -> None:
                     p.unlink()
     with contextlib.suppress(OSError):
         for d in _run_dir_root().glob("*"):
-            if not d.is_dir():
+            if not d.is_dir() or d.name in _MANAGED_DIRS:
+                # claims/ and cancel/ are coordination state: unlinking a
+                # LOCKED file leaves the lock on the old inode and lets a
+                # second process lock a new one under the same name (round 4).
                 continue
             with contextlib.suppress(OSError):
                 newest = max(
@@ -1137,7 +1620,9 @@ def _open_live_log(label: str) -> tuple[Path | None, TextIO | None, TextIO | Non
     run itself: any OS failure degrades to ``None`` handles.
     """
     seq = next(_live_log_seq)
-    tag = f"{label}{seq}·{os.getpid()}"
+    # pid + counter alone recurs after PID reuse (review of 1.17.0); the
+    # token keeps journal folds and spool dirs from merging two runs.
+    tag = f"{label}{seq}·{os.getpid()}·{secrets.token_hex(2)}"
     path: Path | None = None
     fh: TextIO | None = None
     stream_fh: TextIO | None = None
@@ -1223,6 +1708,7 @@ def _process_exec_event(ev: dict[str, Any], state: dict[str, str]) -> str | None
         state["activity"] = "thinking"
         return "turn started"
     if et == "turn.completed":
+        state["turn_completed"] = True
         usage = ev.get("usage") or {}
         if usage:
             state["usage"] = (
@@ -1467,7 +1953,13 @@ MAX_TOTAL_RETRIES = OVERLOAD_MAX_RETRIES + MAX_TRANSIENT_RETRIES
 # CODEX_ORACLE_CODEX_BIN (pin the codex executable — e.g. the ChatGPT.app
 # bundled one, or a fake for tests).
 TAIL_POLL_SECONDS = _env_seconds("CODEX_ORACLE_TAIL_POLL", 0.25, 0.05)
+SPOOL_COLLISION_MAX = 100        # suffixes tried before a private temp dir
+CAPTURE_MAX_BYTES = 512 * 1024   # in-memory tail of a run's stdout/stderr
+REPLAY_MAX_BYTES = 1024 * 1024   # how much of a spool status/adoption re-reads
 _SHUTDOWN = threading.Event()
+
+
+_MANAGED_DIRS = ("claims", "cancel")
 
 
 def _run_dir_root() -> Path:
@@ -1476,28 +1968,105 @@ def _run_dir_root() -> Path:
 
 def _run_spool_dir(run_tag: str) -> Path:
     """Per-run private dir for the child's stdout/stderr spool + answer file.
-    Falls back to a temp dir rather than break the run."""
-    d = _run_dir_root() / run_tag.replace("·", "-")
+    Created EXCLUSIVELY — a recurring tag must never append into an older
+    run's spool. Falls back to a temp dir rather than break the run."""
+    base = _run_dir_root() / run_tag.replace("·", "-")
+    d = base
     try:
-        d.mkdir(parents=True, exist_ok=True)
+        _run_dir_root().mkdir(parents=True, exist_ok=True)
         _private(_run_dir_root(), 0o700)
-        _private(d, 0o700)
-        return d
+        for i in range(SPOOL_COLLISION_MAX):
+            try:
+                d.mkdir(exist_ok=False)
+                _private(d, 0o700)
+                return d
+            except FileExistsError:
+                d = base.with_name(f"{base.name}-{i + 1}")
     except OSError:
-        return Path(tempfile.mkdtemp(prefix="codex-oracle-run-"))
+        pass
+    # Exclusive creation never succeeded: never hand back a dir we did not
+    # create (it may be another run's spool) — a private temp dir instead.
+    return Path(tempfile.mkdtemp(prefix="codex-oracle-run-"))
 
 
 _WATCHDOG_SH = (
-    'pid=$1; pgid=$2; deadline=$3; s=; '
+    # Deadline enforcer with NO server alive. Round-21 corrections:
+    # polling is not continuity — pids/pgids are reusable between 5s
+    # samples — so every group signal is anchored to the LEADER's IDENTITY
+    # (start token, captured before this watchdog spawned): killpg fires
+    # only while `ps -o lstart=` still matches; once it does not, kills are
+    # marker-verified pids only, forever. The marker scan is procenv.py
+    # `--list` (exact ENVIRONMENT reads — round 31: `ps -E` is BSD-only, so
+    # a ps text scan was never a Linux capability); a failed scan emits U:
+    # unknown keeps the loop alive and is logged, never read as quiescence.
+    'pid=$1; pgid=$2; deadline=$3; tag=$4; start=$5; flog=$6; '
+    'maxu=${7:-60}; PS=${8:-/bin/ps}; PY=${9:-}; PE=${10:-}; s=; '
+    # TICK BOUND (round 34): the wall clock (`date +%s`) can be rolled
+    # back under a detached enforcer; ticks (one per 5 s poll) cannot —
+    # the deadline fires on whichever comes first.
+    'maxt=${11:-0}; t=0; [ "$maxt" -gt 0 ] || maxt=$(( (deadline - $(date +%s)) / 5 + 2 )); '
+    # Absolute ps (deployment-verified /bin/ps on macOS and Linux) so a PATH
+    # accident cannot blind the enforcer (round 23); the bound `maxu` on
+    # CONSECUTIVE unknown scans is the termination policy below.
+    'lead() { [ -n "$start" ] && '
+    '[ "$("$PS" -o lstart= -p "$pid" 2>/dev/null | '
+    "awk '{$1=$1; gsub(/ /,\"_\"); print}')\" = \"$start\" ]; }; "
+    'marked() { [ -n "$PY" ] && [ -n "$PE" ] || { echo U; return; }; '
+    'o=$("$PY" "$PE" --list "$tag" 2>/dev/null) || { echo U; return; }; printf "%s\\n" "$o"; }; '
+    # verified(): EXACT env check through procenv.py (round 30) — the text
+    # scan above only nominates; a kill needs the marker in the process
+    # ENVIRONMENT. No interpreter / no verifier = unverifiable = no kill.
+    'verified() { [ -n "$PY" ] && [ -n "$PE" ] && "$PY" "$PE" "$1" "$tag" >/dev/null 2>&1; }; '
+    # alive(): an unknown scan (U) reads alive, but is COUNTED — a watchdog
+    # that cannot see for maxu consecutive ticks exits degraded (exit 2).
+    'alive() { if lead; then u=0; return 0; fi; mm=$(marked); '
+    'if [ "$mm" = U ]; then u=$((u+1)); '
+    'if [ "$u" -ge "$maxu" ]; then [ -n "$flog" ] && '
+    'echo "$(date +%s) run=$tag degraded ps-unavailable exit=2" >> "$flog" 2>/dev/null; '
+    'exit 2; fi; return 0; fi; u=0; '
+    '[ -n "$mm" ] && return 0; return 1; }; '
     "trap 'kill $s 2>/dev/null; exit 0' TERM INT; "
-    'while kill -0 "$pid" 2>/dev/null; do '
-    'if [ "$(date +%s)" -ge "$deadline" ]; then '
-    'kill -9 -- "-$pgid" 2>/dev/null; exit 0; fi; '
+    'while alive; do t=$((t+1)); '
+    'if [ "$(date +%s)" -ge "$deadline" ] || [ "$t" -ge "$maxt" ]; then '
+    'if lead; then kill -9 -- "-$pgid" 2>/dev/null; fi; '
+    # ENV-VERIFIED KILLS (round 30): the ps text scan nominates candidates
+    # (argv+env in one string), procenv.py confirms the marker is in the
+    # ENVIRONMENT before any signal; an unverified nominee is logged as
+    # `unverified-marked` (degraded custody, bounded by the 5-pass limit
+    # below) and never signalled — an argv decoy or an operator's grep is
+    # never killed by a watchdog either.
+    # Deadline sweep (round 22): UNKNOWN evidence never counts toward
+    # completion — a failed ps keeps the sweep alive (logged, throttled)
+    # until it can see again; only VERIFIED kill passes are bounded (5),
+    # after which unkillable survivors are logged and the watchdog exits.
+    'n=0; u=0; while :; do '
+    'ms=$(marked); [ -z "$ms" ] && break; '
+    'if [ "$ms" = U ]; then u=$((u+1)); '
+    '[ "$u" -le 3 ] && [ -n "$flog" ] && '
+    'echo "$(date +%s) run=$tag ps-unknown" >> "$flog" 2>/dev/null; '
+    # BOUNDED (round 23): after maxu CONSECUTIVE unknown scans the
+    # enforcer cannot see and must not pretend to enforce — it records a
+    # machine-readable DEGRADED state and exits 2; a dead watchdog makes
+    # the run ORPHANED (never adoptable, still stoppable via the server's
+    # own marker-verified cancel), the fail-closed direction.
+    'if [ "$u" -ge "$maxu" ]; then [ -n "$flog" ] && '
+    'echo "$(date +%s) run=$tag degraded ps-unavailable exit=2" >> "$flog" 2>/dev/null; '
+    'exit 2; fi; '
+    'sleep 5; continue; fi; u=0; '
+    'if [ "$n" -ge 5 ]; then [ -n "$flog" ] && '
+    'echo "$(date +%s) run=$tag unkillable-marked $ms" >> "$flog" 2>/dev/null; break; fi; '
+    'for p in $ms; do if verified "$p"; then kill -9 "$p" 2>/dev/null; '
+    'elif [ -n "$flog" ]; then echo "$(date +%s) run=$tag unverified-marked $p" >> "$flog" 2>/dev/null; fi; done; '
+    'sleep 1; n=$((n+1)); done; exit 0; fi; '
     'sleep 5 & s=$!; wait $s; done'
 )
 
 
-def _spawn_watchdog(pid: int, pgid: int, deadline_ts: float) -> subprocess.Popen | None:
+def _spawn_watchdog(pid: int, pgid: int, deadline_ts: float,
+                    run_tag: str = "", pid_start: str = "",
+                    max_unknown: int = 60, ps_bin: str = "/bin/ps",
+                    python_bin: str = "", procenv: str = "",
+                    max_ticks: int = 0) -> subprocess.Popen | None:
     """POSIX: a tiny detached /bin/sh that SIGKILLs the codex process group
     at the run deadline, or exits within 5 s of codex ending on its own. The
     MAX_RUNTIME bound therefore holds with NO server alive — a detached run
@@ -1507,7 +2076,9 @@ def _spawn_watchdog(pid: int, pgid: int, deadline_ts: float) -> subprocess.Popen
     try:
         wd = subprocess.Popen(
             ["/bin/sh", "-c", _WATCHDOG_SH, "codex-oracle-watchdog",
-             str(pid), str(pgid), str(int(deadline_ts))],
+             str(pid), str(pgid), str(int(deadline_ts)), run_tag, pid_start,
+             str(LIVE_LOG_DIR / "watchdog-failures.log"), str(max_unknown), ps_bin,
+             python_bin or sys.executable, procenv or str(PROCENV_PATH), str(max_ticks)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
         )
@@ -1516,19 +2087,116 @@ def _spawn_watchdog(pid: int, pgid: int, deadline_ts: float) -> subprocess.Popen
         return None
 
 
-def _pid_alive(pid: int) -> bool:
-    """Is this codex process still running? os.kill(0) plus, on POSIX, a
-    guard against pid reuse (the command line must still be a codex)."""
+def _proc_info_nt(pid: int) -> tuple[str, str]:
+    """Windows: (state, start) from the process handle — creation time is the
+    identity token, a zero-timeout wait is the liveness test (exit codes are
+    ambiguous: STILL_ACTIVE is a legal exit code). Exact ctypes prototypes
+    declared (HANDLE is pointer-sized; the int default would truncate).
+    UNMEASURED on Windows; non-destructive by construction."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.CloseHandle.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.GetProcessTimes.restype = wintypes.BOOL
+        k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        h = k32.OpenProcess(0x1000 | 0x100000, False, pid)  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+        if not h:
+            return "", ""
+        try:
+            ft = [wintypes.FILETIME() for _ in range(4)]
+            start = ""
+            if k32.GetProcessTimes(h, *[ctypes.byref(x) for x in ft]):
+                start = f"win:{(ft[0].dwHighDateTime << 32) | ft[0].dwLowDateTime}"
+            state = "R" if k32.WaitForSingleObject(h, 0) == 0x102 else "Z"  # WAIT_TIMEOUT = running
+            return state, start
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return "", ""
+
+
+def _proc_info(pid: int) -> tuple[str, str]:
+    """(state, start) of a process: on POSIX via one `ps -o stat=,lstart=`
+    call — state is the first letter of `stat` ("Z" = zombie: dead in every
+    sense that matters, yet kill(0) and lstart still answer for it), start is
+    the space-normalised `lstart` token; on Windows via the process handle.
+    ("", "") when UNKNOWN (ps denied/absent, handle refused) — callers must
+    treat unknown as alive for exclusion and as unkillable for destruction."""
     if not pid or pid <= 0:
-        return False
+        return "", ""
+    if os.name == "nt":
+        return _proc_info_nt(pid)
+    with contextlib.suppress(Exception):
+        out = subprocess.run(
+            ["ps", "-o", "stat=,lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.split()
+        if out:
+            return out[0][:1].upper(), "_".join(out[1:])
+    return "", ""
+
+
+def _proc_start(pid: int) -> str:
+    """Immutable process identity: its start time (POSIX `ps -o lstart=`),
+    space-normalised to one token. Empty when unknown (Windows, ps failure)
+    — callers then fall back to kill(0) + command-line checks. Together
+    with the pid this is what makes liveness and kill decisions PID-reuse
+    safe (review of 1.17.0: signal 0 is a permission check, not identity)."""
+    return _proc_info(pid)[1]
+
+
+_SERVER_START = _proc_start(os.getpid())
+_IS_WINDOWS = os.name == "nt"  # module flag so the refusal branches are testable
+
+
+def _kill0(pid: int) -> bool | None:
+    """True/False = exists/gone; None = exists but identity unknowable.
+    NEVER os.kill(pid, 0) on Windows: Python routes non-control signals to
+    TerminateProcess, so a "liveness probe" would kill the process (review
+    round 2). There we query the handle instead (unmeasured on Windows, but
+    non-destructive by construction)."""
+    if os.name == "nt":
+        stat, _ = _proc_info_nt(pid)
+        return None if not stat else stat != "Z"
     try:
         os.kill(pid, 0)
+        return True
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        return None
     except OSError:
         return False
+
+
+def _pid_alive(pid: int, start: str = "", strict: bool = False) -> bool:
+    """Is this codex process still running? kill(0), then the recorded start
+    time when we have one (a reused pid fails it), else the command line.
+    ``strict``: only a VERIFIED identity match counts — unknown is False.
+    Used where a wrong "alive" would AUTHORISE something (detaching an
+    unbounded child on the strength of its watchdog)."""
+    if not pid or pid <= 0:
+        return False
+    k = _kill0(pid)
+    if k is False:
+        return False
+    if k is None:
+        return not strict  # unknowable: alive for exclusion, never for authorisation
+    stat, cur = _proc_info(pid)
+    if not stat and not cur:
+        return not strict
+    if stat == "Z":
+        return False  # a zombie is not running
+    if strict:
+        return bool(start) and bool(cur) and cur == start
+    if start and cur:
+        return cur == start
     if os.name != "nt":
         with contextlib.suppress(Exception):
             out = subprocess.run(
@@ -1539,8 +2207,16 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _kill_pgid(pgid: int, pid: int) -> bool:
-    """SIGKILL a run's process group (falls back to the pid). Never raises."""
+def _kill_pgid(pgid: int, pid: int, start: str = "") -> bool:
+    """SIGKILL a run's process group (falls back to the pid). DESTRUCTIVE:
+    refuses unless a recorded identity exists AND is verified to match — a
+    record without a start token (legacy, or a platform that could not
+    produce one) is never killed by pid alone (review round 3). Never raises."""
+    if not start:
+        return False
+    cur = _proc_start(pid)
+    if not cur or cur != start:
+        return False
     try:
         if os.name != "nt" and pgid:
             os.killpg(pgid, signal.SIGKILL)
@@ -1549,23 +2225,48 @@ def _kill_pgid(pgid: int, pid: int) -> bool:
         pass
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                           capture_output=True, timeout=10)
-        else:
-            os.kill(pid, signal.SIGKILL)
+            done = subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                  capture_output=True, timeout=10)
+            return done.returncode == 0
+        os.kill(pid, signal.SIGKILL)
         return True
     except (ProcessLookupError, PermissionError, OSError, subprocess.SubprocessError):
         return False
 
 
+# One JSONL event is normally small (codex truncates tool output per event —
+# `truncation_policy` 10k tokens on this model catalog, ≈40 KB), but an
+# unterminated record must not grow the line buffer without bound (round 3).
+# 32 MiB = ~800× that norm: a ceiling for a runaway, never a working limit.
+JSONL_RECORD_MAX_BYTES = 32 * 1024 * 1024
+
+
 def _feed_jsonl(linebuf: bytearray, chunk: bytes, state: dict[str, Any], emit) -> None:
     """Split a `codex exec --json` byte stream into events and digest them
-    (shared by the live tail and by adoption replay)."""
+    (shared by the live tail and by adoption replay). An oversized record is
+    dropped LOUDLY and the stream re-synchronises at the next newline."""
     linebuf.extend(chunk)
+    if state.get("_skip_to_nl"):
+        nl = linebuf.find(b"\n")
+        if nl < 0:
+            linebuf.clear()
+            return
+        del linebuf[:nl + 1]
+        state["_skip_to_nl"] = False
+    if len(linebuf) > JSONL_RECORD_MAX_BYTES and b"\n" not in linebuf:
+        emit(f"⚠ oversized event dropped ({len(linebuf):,} bytes without a newline; "
+             f"cap {JSONL_RECORD_MAX_BYTES:,}) — stream re-syncs at the next record")
+        linebuf.clear()
+        state["_skip_to_nl"] = True
+        return
     while True:
         nl = linebuf.find(b"\n")
         if nl < 0:
             return
+        if nl > JSONL_RECORD_MAX_BYTES:
+            emit(f"⚠ oversized event dropped ({nl:,} bytes; cap {JSONL_RECORD_MAX_BYTES:,})")
+            del linebuf[:nl + 1]
+            continue
         raw = bytes(linebuf[:nl]).strip()
         del linebuf[:nl + 1]
         if not raw:
@@ -1632,26 +2333,165 @@ def _install_shutdown_handlers(hard_exit: bool = False) -> None:
             signal.signal(s, _handler)
 
 
-def _server_alive(pid: int) -> bool:
-    """Is the codex-oracle server process that owns a run still alive?"""
+def _server_alive(pid: int, start: str = "") -> bool:
+    """Is the codex-oracle server process that owns a run still alive? Our
+    own pid is alive by definition; a recorded start time settles identity;
+    otherwise the command line must still look like this server (macOS
+    `ps` reports the python framework binary for a venv python, so the
+    command-line test alone misjudged a live holder — measured)."""
     if not pid or pid <= 0:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+    if pid == os.getpid():
+        # Our own pid — but a recorded start that is not OURS means the
+        # record belongs to a previous incarnation of this pid.
+        return (not start) or (not _SERVER_START) or start == _SERVER_START
+    k = _kill0(pid)
+    if k is False:
         return False
-    except PermissionError:
+    if k is None:
         return True
-    except OSError:
+    stat, cur = _proc_info(pid)
+    if not stat and not cur:
+        return True  # UNKNOWN evidence (ps denied/absent) never reads as dead
+    if stat == "Z":
         return False
+    if start and cur:
+        return cur == start
     if os.name != "nt":
         with contextlib.suppress(Exception):
             out = subprocess.run(
                 ["ps", "-o", "command=", "-p", str(pid)],
                 capture_output=True, text=True, timeout=5,
             ).stdout.lower()
+            if not out.strip():
+                return True  # no evidence either way
             return "server.py" in out or "codex-oracle" in out or "run_server" in out
     return True
+
+
+def _pgid_alive(pgid: int) -> bool:
+    """Does the process GROUP still have a RUNNING member? killpg(0) alone is
+    not enough — a signalled-but-unreaped ZOMBIE still answers it (measured;
+    the same trap _pid_alive closed in round 2), so success is corroborated
+    by ps: at least one member whose stat is not Z. Unknown evidence stays
+    alive for exclusion."""
+    if os.name == "nt" or not pgid:
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        pass  # MEASURED: killpg(0) on a zombie-only group raises EPERM on
+        # macOS — non-ESRCH outcomes all defer to the ps corroboration.
+    try:
+        done = subprocess.run(["ps", "-eo", "pgid=,stat="],
+                              capture_output=True, text=True, timeout=5)
+        if done.returncode != 0:
+            return True  # unknown evidence is alive for exclusion
+        for line in done.stdout.splitlines():
+            parts = line.split(None, 1)
+            if (len(parts) == 2 and parts[0].strip() == str(pgid)
+                    and not parts[1].strip().startswith("Z")):
+                return True
+        return False
+    except Exception:
+        return True
+
+
+PROCENV_PATH = Path(__file__).resolve().with_name("procenv.py")
+
+
+def _load_sibling(name: str, path: Path):
+    """Import a sibling module BY PATH — server.py itself is loaded by path in
+    tests and by the plugin runtime, so a package-relative import is not
+    available; the file next to this one is the only stable reference."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_procenv = _load_sibling("codex_oracle_procenv", PROCENV_PATH)
+TREEDIGEST_PATH = Path(__file__).resolve().with_name("treedigest.py")
+_treedigest = _load_sibling("codex_oracle_treedigest", TREEDIGEST_PATH)
+RUN_MARKER_ENV = _procenv.RUN_MARKER_ENV  # ONE definition, shared with the watchdog CLI
+
+
+def _proc_env_has_marker(pid: int, run_tag: str) -> bool | None:
+    """EXACT env verification: does pid's ENVIRONMENT (not argv) contain
+    CODEX_ORACLE_RUN=<tag>? `ps -E` mixes argv and env in one string, so a
+    process whose ARGV merely mentions the marker (an operator's grep, a
+    decoy) classified as marked and was SIGKILLed (round 29). The single
+    implementation lives in procenv.py (macOS KERN_PROCARGS2 — MEASURED
+    both directions; Linux /proc/<pid>/environ) so the no-server watchdog
+    runs the very same check from /bin/sh (round 30). None = unverifiable
+    (counts as a survivor for DETECTION, is never a KILL target)."""
+    return _procenv.proc_env_has_marker(pid, run_tag)
+
+
+def _marked_survivors(run_tag: str) -> list[int]:
+    """Live pids still carrying this run's spawn-marker env var. Codex
+    0.151.0's shell tools call setsid() (upstream source, round 16) — they
+    leave our process group, so pgid checks cannot see them; the inherited
+    ENVIRONMENT survives both setsid and fd-closing, and procenv.py reads it
+    EXACTLY — macOS: KERN_PROCARGS2 per pid; Linux: a /proc scan (`ps -E` is
+    BSD-only and never existed on procps-ng — round 31). Same-user scope;
+    zombies excluded; RAISES when enumeration fails so callers fail closed.
+
+    TRUST MODEL (round 17, explicit): the marker is COOPERATIVE containment.
+    It reaches everything codex 0.151.0 itself leaves behind — same-group
+    leaks and its setsid() shell tools, which inherit the environment. A
+    descendant that deliberately SCRUBS its environment (env={} +
+    close_fds + new session) escapes every userspace channel at once; no
+    in-process mechanism can hold it (that is kernel custody — the 1.18
+    daemon's launchd/cgroup supervision). Until then that residual is
+    bounded by codex's own OS sandbox, which descendants inherit, and is
+    pinned by a regression test so it can never be mistaken for covered."""
+    if os.name == "nt" or not run_tag:
+        return []
+    return list(_procenv.marked_pids(run_tag))  # OSError propagates: fail closed
+
+
+def _kill_marked(run_tag: str, pids: list[int]) -> None:
+    """SIGKILL marker-identified processes after a FRESH marker re-scan
+    (round 17): a pid from an older snapshot whose process exited (and was
+    reused) is never signalled. This NARROWS the reuse window to the
+    scan→signal gap — it does not close it (round 18): pid-based signalling
+    has no atomic identity on POSIX; handle-based kills belong to the 1.18
+    daemon's supervisor.
+    """
+    if not pids:
+        return
+    try:
+        fresh = set(_marked_survivors(run_tag))
+    except Exception:
+        return  # cannot revalidate → kill nothing (the caller re-scans and fails closed)
+    for pid in pids:
+        # KILL only on POSITIVE env verification at signal time (round 29):
+        # an unverifiable candidate stays a detected survivor but is never
+        # a kill target — misidentified kills are worse than over-refusal.
+        if pid in fresh and _proc_env_has_marker(pid, run_tag) is True:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def _writer_alive(pid: int, start: str, pgid: int, spool: Path) -> bool:
+    """Is the run's WRITER still running? The recorded pid may be a LAUNCHER
+    (legacy shim-spawned records — round 12): when it is dead but its process
+    group still has members AND the spool is being written, the real writer
+    lives. A stale spool (>120s) with only group members left reads dead —
+    pgid recycling must not park a collector forever."""
+    if _pid_alive(pid, start):
+        return True
+    if not _pgid_alive(pgid):
+        return False
+    with contextlib.suppress(OSError):
+        return time.time() - spool.stat().st_mtime < 120
+    return False
 
 
 def _is_detached(rec: dict[str, Any]) -> bool:
@@ -1660,10 +2500,38 @@ def _is_detached(rec: dict[str, Any]) -> bool:
     latter needs no cooperation from a shutdown that may have been torn."""
     if rec.get("has_end") or not rec.get("has_spawn"):
         return False
+    if rec.get("write"):
+        # A write child that outlived a crashed server is ORPHANED, never
+        # adoptable: the one-writer contract has no owner to enforce it.
+        return False
+    if not rec.get("watchdog_pid"):
+        # No deadline enforcer was ever spawned (Windows, spawn failure):
+        # a survivor is unbounded — ORPHANED, to be stopped, not adopted.
+        return False
+    if _pid_alive(int(rec.get("pid") or 0), str(rec.get("pid_start") or "")) and not _pid_alive(
+            int(rec.get("watchdog_pid") or 0), str(rec.get("watchdog_start") or ""), strict=True):
+        # The child lives but its enforcer is gone or is not the recorded
+        # process: unbounded — ORPHANED (round 3: a bare nonzero pid was
+        # accepted as an enforcer).
+        return False
     if rec.get("has_detached"):
         return True
     owner = int(rec.get("server_pid") or 0)
-    return bool(owner) and owner != os.getpid() and not _server_alive(owner)
+    # No self-pid shortcut (round 11): _server_alive itself verifies the
+    # start token even for our own pid, so an OLD record whose owner pid was
+    # REUSED by this very server still reads detached.
+    return bool(owner) and not _server_alive(owner, str(rec.get("server_start") or ""))
+
+
+def _is_orphaned_write(rec: dict[str, Any]) -> bool:
+    if rec.get("has_end") or not rec.get("write") or not rec.get("has_spawn"):
+        return False
+    owner = int(rec.get("server_pid") or 0)
+    return (
+        _pid_alive(int(rec.get("pid") or 0), str(rec.get("pid_start") or ""))
+        and bool(owner)
+        and not _server_alive(owner, str(rec.get("server_start") or ""))
+    )
 RESUME_NUDGE = (
     "The previous process was interrupted before your answer arrived. "
     "Continue from where you left off and provide the complete final answer."
@@ -1673,23 +2541,27 @@ RESUME_NUDGE = (
 _journal_lock = threading.Lock()
 
 
-def _journal(rec: dict[str, Any]) -> None:
+def _journal(rec: dict[str, Any]) -> bool:
     """Append one record to runs.jsonl, flushed so a kill cannot lose it.
-
-    Serialized: journal writes now also come from worker threads
-    (asyncio.to_thread for the dispatch tracer), and two unlocked rotations
-    could clobber runs.jsonl.1."""
-    with contextlib.suppress(Exception), _journal_lock:
-        LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
-        _private(LIVE_LOG_DIR, 0o700)
-        with contextlib.suppress(OSError):
-            if RUNS_JOURNAL.exists() and RUNS_JOURNAL.stat().st_size > RUNS_JOURNAL_MAX_BYTES:
-                RUNS_JOURNAL.replace(RUNS_JOURNAL.with_suffix(".jsonl.1"))
-        with RUNS_JOURNAL.open("a", encoding="utf-8") as fh:
-            _private(RUNS_JOURNAL, 0o600)
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+    Returns False when the append could not be made durable — callers that
+    PUBLISH state others act on (the spawn record) must fail closed on it.
+    Serialized: journal writes also come from worker threads, and two
+    unlocked rotations could clobber runs.jsonl.1."""
+    try:
+        with _journal_lock:
+            LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
+            _private(LIVE_LOG_DIR, 0o700)
+            with contextlib.suppress(OSError):
+                if RUNS_JOURNAL.exists() and RUNS_JOURNAL.stat().st_size > RUNS_JOURNAL_MAX_BYTES:
+                    RUNS_JOURNAL.replace(RUNS_JOURNAL.with_suffix(".jsonl.1"))
+            with RUNS_JOURNAL.open("a", encoding="utf-8") as fh:
+                _private(RUNS_JOURNAL, 0o600)
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+        return True
+    except Exception:
+        return False
 
 
 def _journal_runs() -> dict[str, dict[str, Any]]:
@@ -1703,6 +2575,11 @@ def _journal_runs() -> dict[str, dict[str, Any]]:
                 with contextlib.suppress(Exception):
                     rec = json.loads(line)
                     run = runs.setdefault(rec["run"], {})
+                    if run.get("has_end") and rec.get("phase") != "end" and "status" in rec:
+                        # A terminal status is IMMUTABLE to non-terminal
+                        # records (round 9: a late `detached` append from a
+                        # slow shutdown overwrote `cancelled` in the fold).
+                        rec = {k: v for k, v in rec.items() if k != "status"}
                     run.update({k: v for k, v in rec.items() if k != "phase"})
                     run[f"has_{rec.get('phase', '?')}"] = True
                     # `ts` is the LAST record's; keep the first and last
@@ -1774,6 +2651,17 @@ def _is_transient_error(text: str) -> bool:
     return _transient_class(text) is not None
 
 
+def _retry_fits(request_started: float | None, wait: float) -> tuple[bool, float]:
+    """Can a `wait` plus one more attempt fit in the request's remaining
+    budget? (fits, seconds left). The attempt floor scales with the budget
+    exactly as the pre-spawn refusal does."""
+    if request_started is None:
+        return True, float(MAX_RUNTIME_SECONDS)
+    left = MAX_RUNTIME_SECONDS - (time.monotonic() - request_started)
+    floor = min(MIN_ATTEMPT_SECONDS, 0.5 * MAX_RUNTIME_SECONDS)
+    return (left - wait) >= floor, left
+
+
 def _overload_backoff_seconds(retry_index: int) -> float:
     """Wait before overload retry #retry_index (0-based): base·2^i, capped."""
     if OVERLOAD_BACKOFF_BASE_SECONDS <= 0:
@@ -1795,6 +2683,7 @@ def _build_exec_argv(
     images: list[str] | None = None,
     write: bool = False,
     auto_compact_limit: int | None = None,
+    full_access: bool = False,
 ) -> list[str]:
     """codex exec argv for a fresh run or a resume of an existing thread.
 
@@ -1842,7 +2731,20 @@ def _build_exec_argv(
     if resume_tid is None:
         for img in images or []:
             argv += ["-i", img]
-    if write:
+    if write and full_access:
+        # FULL-ACCESS implementation process (user ruling 2026-09-05, "allow
+        # codex to skip permission via --yolo"): codex's own
+        # --dangerously-bypass-approvals-and-sandbox — no sandbox, no
+        # approval prompts, network on, the user's own configuration and MCP
+        # servers, the caller's full privileges. Chosen because a sealed
+        # writer never touches the real system (PostgreSQL, Temporal, a
+        # browser), so every real-system defect surfaced one round later in
+        # the lead's rig (measured over 36 h: almost every red lived there).
+        # The git contract, the write lock and the changed-files report
+        # still apply; the no-egress / no-credentials guarantees of the
+        # sealed mode do NOT.
+        argv += [*FULL_ACCESS_WRITE_ARGS]
+    elif write:
         # SEALED implementation process (cross-model review verdict,
         # 2026-08-14: two independent advisors both required the air-gap
         # at the time).
@@ -1893,6 +2795,106 @@ def _build_exec_argv(
 
 
 
+_NATIVE_CODEX_CACHE: dict[tuple[str, float], str] = {}
+
+
+def _codex_target(platform_key: str | None = None,
+                  machine: str | None = None) -> tuple[str, str]:
+    """(platform package name, target triple), mirroring the npm shim's
+    PLATFORM_PACKAGE_BY_TARGET (read from the installed 0.151.0 codex.js).
+    ("", "") = unsupported platform — no native resolution. Parameters
+    default to THIS machine and exist so every mapping is testable from any
+    platform (round 14: the Windows branch was untestable and kept a
+    wildcard glob)."""
+    import platform as _platform
+    plat = platform_key if platform_key is not None else (
+        "win32" if os.name == "nt" else sys.platform)
+    mach = (machine if machine is not None else _platform.machine()).lower()
+    arch = {"x86_64": "x86_64", "amd64": "x86_64",
+            "arm64": "aarch64", "aarch64": "aarch64"}.get(mach, "")
+    if not arch:
+        return "", ""
+    npm_arch = "arm64" if arch == "aarch64" else "x64"
+    if plat == "darwin":
+        return f"codex-darwin-{npm_arch}", f"{arch}-apple-darwin"
+    if plat.startswith("linux"):
+        return f"codex-linux-{npm_arch}", f"{arch}-unknown-linux-musl"
+    if plat == "win32":
+        return f"codex-win32-{npm_arch}", f"{arch}-pc-windows-msvc"
+    return "", ""
+
+
+def _is_launcher_script(argv0: str) -> bool:
+    """True when argv0 (resolved via the CHILD env's PATH for a bare name —
+    the spawn resolves there, not in the parent's; round 13) is a #! script —
+    a LAUNCHER whose real writer would be a child our descriptors and pid
+    records never reach. Unreadable = True (fail closed for write gating)."""
+    path = argv0 if os.sep in argv0 else (
+        shutil.which(argv0, path=_codex_env().get("PATH")) or "")
+    if not path:
+        return False  # the spawn will fail loudly on its own
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)  # inspect the same file the spawn runs
+    try:
+        with open(os.path.realpath(path), "rb") as fh:
+            return fh.read(2) == b"#!"
+    except OSError:
+        return True
+
+
+def _native_codex_from_launcher(path: str) -> str:
+    """The vendored NATIVE codex binary behind an npm launcher script, or ''
+    when `path` is already a real executable or nothing better is found.
+
+    WHY (round 12, MEASURED on codex-cli 0.151.0): the npm `codex` is a node
+    script that spawns the native binary with stdio:"inherit" — Node passes
+    only fds 0-2 to the child, so the pass_fds lock/claim descriptors NEVER
+    reach the process that actually writes, and every recorded pid is the
+    LAUNCHER's: if node dies, the kernel releases the locks while the native
+    child keeps writing. Launching the native binary directly makes the
+    recorded pid, the inherited descriptors, the watchdog and the kill
+    target all refer to the real writer. Layout measured in the installed
+    package: <pkg>/node_modules/@openai/codex-<plat>/vendor/<triple>/bin/codex
+    (fallback <pkg>/vendor/<triple>/bin/codex, the shim's own fallback)."""
+    try:
+        real = os.path.realpath(path)
+        st_mtime = os.stat(real).st_mtime
+    except OSError:
+        return ""
+    key = (real, st_mtime)
+    if key in _NATIVE_CODEX_CACHE:
+        return _NATIVE_CODEX_CACHE[key]
+    result = ""
+    try:
+        with open(real, "rb") as fh:
+            is_script = fh.read(2) == b"#!"
+    except OSError:
+        is_script = False
+    if is_script:
+        pkg = Path(real).parent.parent  # <pkg>/bin/codex.js → <pkg>
+        exe = "codex.exe" if os.name == "nt" else "codex"
+        pkg_name, triple = _codex_target()
+        candidates = []
+        if pkg_name:
+            # EXACT paths for THIS machine's target only — a glob picked the
+            # lexicographically first package, which on a multi-architecture
+            # install can be the wrong binary (round 13). Unknown platform =
+            # no resolution = write runs refuse behind the launcher.
+            candidates = [
+                pkg / "node_modules" / "@openai" / pkg_name / "vendor" / triple / "bin" / exe,
+                pkg / "vendor" / triple / "bin" / exe,  # the shim's own fallback
+            ]
+        for cand in candidates:
+            with contextlib.suppress(OSError):
+                if cand.is_file() and os.access(cand, os.X_OK):
+                    with open(cand, "rb") as fh:
+                        if fh.read(2) != b"#!":
+                            result = str(cand)
+                            break
+    _NATIVE_CODEX_CACHE[key] = result
+    return result
+
+
 def _codex_argv0() -> list[str]:
     """Executable prefix for codex — usually one element, ["node", codex.js] as
     a fallback.
@@ -1907,19 +2909,46 @@ def _codex_argv0() -> list[str]:
     """
     override = os.environ.get("CODEX_ORACLE_CODEX_BIN", "").strip()
     if override:
-        return [override]
+        # ONE canonical absolute path before inspection or spawn (round 14:
+        # a relative override was inspected against the server cwd but
+        # spawned under the run's workdir — two different files). A bare
+        # name resolves in the child env's PATH, like everything else. The
+        # launcher resolution still applies; a native pin passes through.
+        if os.sep in override or (os.altsep and os.altsep in override):
+            override = os.path.abspath(override)
+        else:
+            resolved = shutil.which(override, path=_codex_env().get("PATH"))
+            # ABSOLUTE always (round 15): which() through a RELATIVE PATH
+            # entry returns a relative path, which the spawn would resolve
+            # under the run's workdir — a different file.
+            override = os.path.abspath(resolved) if resolved else override
+        return [_native_codex_from_launcher(override) or override]
     if os.name != "nt":
+        # Resolve against the CHILD env's PATH (round 13: the spawn env
+        # prepends /opt/homebrew/bin — a parent PATH without it made the
+        # probe see nothing while the child still found the JS launcher),
+        # and return the ABSOLUTE path so probe and spawn cannot diverge.
+        shim = shutil.which("codex", path=_codex_env().get("PATH"))
+        if shim:
+            shim = os.path.abspath(shim)  # a relative PATH entry yields a relative which()
+            return [_native_codex_from_launcher(shim) or shim]
         return ["codex"]
     shim = shutil.which("codex")
     if not shim:
         return ["codex"]  # spawn fails; the caller reports the install hint
+    shim = os.path.abspath(shim)  # a relative PATH entry yields a relative which()
     pkg = Path(shim).parent / "node_modules" / "@openai" / "codex"
-    for exe in sorted(pkg.glob("node_modules/@openai/codex-win32-*/vendor/*/bin/codex.exe")):
-        return [str(exe)]
+    pkg_name, triple = _codex_target()
+    if pkg_name:
+        # EXACT target only (round 14): the win32 wildcard glob picked the
+        # first architecture alphabetically on a multi-arch install.
+        exe = pkg / "node_modules" / "@openai" / pkg_name / "vendor" / triple / "bin" / "codex.exe"
+        if exe.is_file():
+            return [str(exe)]
     js = pkg / "bin" / "codex.js"
     node = shutil.which("node")
     if js.is_file() and node:
-        return [node, str(js)]
+        return [os.path.abspath(node), str(js)]
     return [shim]
 
 
@@ -1932,6 +2961,32 @@ def _codex_env() -> dict[str, str]:
     if sys.platform == "darwin":
         env["PATH"] = "/opt/homebrew/bin" + os.pathsep + env.get("PATH", "")
     return env
+
+
+def _inherit_lock_kwargs(state: dict[str, Any], workdir: str) -> dict[str, Any]:
+    """Descriptors the codex child must keep alive: the tree's write lock for
+    write runs, and the RUN CLAIM for a continuation (codex_resume_run) — so
+    a detached continuation still excludes a second resume of the same thread
+    after its collector is gone (review round 4). POSIX only."""
+    if os.name == "nt":
+        return {}
+    fds = []
+    if state.get("write") or state.get("custody_cwd"):
+        # Lock OWNERSHIP, not write mode (round 18): abraham's phase-1 READ
+        # run executes under the caller-held tree lock — its child must
+        # inherit the descriptor exactly like a write child, so a detached
+        # phase 1 keeps the tree locked after this server (and abraham's
+        # finally) are gone.
+        fd = _held_lock_fd(_write_lock_path(
+            str(state.get("custody_cwd") or "") or workdir or _get_cwd()))
+        if fd is not None:
+            fds.append(fd)
+    key = str(state.get("claim_key") or "")
+    if key:
+        fd = _held_lock_fd(_run_claim_path(key))
+        if fd is not None:
+            fds.append(fd)
+    return {"pass_fds": tuple(fds)} if fds else {}
 
 
 def _new_group_kwargs() -> dict[str, Any]:
@@ -2006,8 +3061,16 @@ async def _exec_codex_once(
     stderr_path = output_file.with_name(output_file.stem + ".stderr.log")
     try:
         out_fh = open(stdout_path, "ab")
+    except OSError as e:
+        return (
+            "", False, "",
+            f"cannot open run spool files under {output_file.parent}: {e}",
+            1, None, False,
+        )
+    try:
         err_fh = open(stderr_path, "ab")
     except OSError as e:
+        out_fh.close()
         return (
             "", False, "",
             f"cannot open run spool files under {output_file.parent}: {e}",
@@ -2015,24 +3078,74 @@ async def _exec_codex_once(
         )
     _private(stdout_path, 0o600)
     _private(stderr_path, 0o600)
+    # REQUEST-LEVEL BUDGET (round 32): MAX_RUNTIME_SECONDS is ONE budget per
+    # MCP request — retries and abraham's two phases share it (each attempt
+    # used to receive a fresh budget, so a request could outlive the client's
+    # hard per-call timeout). An attempt that cannot get MIN_ATTEMPT_SECONDS
+    # of what is left is refused as a timeout instead of being spawned.
+    def _left() -> float:
+        # the REQUEST's remaining budget read at the MOMENT OF USE (round 33:
+        # a duration computed before spawn/setup added that time back)
+        if request_started is None:
+            return float(MAX_RUNTIME_SECONDS)
+        return max(0.0, MAX_RUNTIME_SECONDS - (time.monotonic() - request_started))
+
+    request_elapsed = (0.0 if request_started is None
+                       else max(0.0, time.monotonic() - request_started))
+    attempt_budget = _left()
+    # the floor never exceeds half the configured budget (a 3 s test budget
+    # must still spawn its first attempt; a real budget is ≥ 300 s)
+    if attempt_budget < min(MIN_ATTEMPT_SECONDS, 0.5 * MAX_RUNTIME_SECONDS):
+        emit(f"■ request budget exhausted before this attempt "
+             f"({int(request_elapsed)}s of {MAX_RUNTIME_SECONDS}s used, "
+             f"CODEX_ORACLE_MAX_RUNTIME_S) — not spawning")
+        out_fh.close()
+        err_fh.close()
+        return "", False, "", "", -1, "request budget exhausted before the attempt", True
+    # EXECUTION BARRIER for write runs (round 7, POSIX): the child is spawned
+    # reading a pipe and execs codex only after this server releases it — so
+    # codex cannot run before its pid is journaled and every legacy bridge
+    # file durably names it. If this server dies first, the pipe closes, the
+    # read fails, and the child exits 97: fail closed, never an unpublished
+    # writer racing a bridge that still names a dead server.
+    barrier = bool(state.get("write") or state.get("custody_cwd")) and os.name != "nt"
+    if barrier:
+        cmd = ["/bin/sh", "-c", 'read _ok || exit 97; exec "$0" "$@" </dev/null',
+               cmd[0], *cmd[1:]]
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=(asyncio.subprocess.PIPE if barrier else asyncio.subprocess.DEVNULL),
             stdout=out_fh,
             stderr=err_fh,
             cwd=workdir or _get_cwd(),
-            env={**_codex_env(), **(extra_env or {})},
+            env={**_codex_env(), **(extra_env or {}),
+                 # Round 16: descendants that setsid() out of our group are
+                 # findable/killable only by this inherited marker.
+                 RUN_MARKER_ENV: str(state.get("run_tag") or "")},
             # Own process group so _kill_tree reaps the node shim AND the
             # vendored codex grandchild together (POSIX: setsid + killpg;
             # Windows: its own group, reaped via taskkill /T).
             **_new_group_kwargs(),
+            # A write run's codex INHERITS the tree's lock descriptor: the
+            # kernel keeps the tree locked while the child lives, even if
+            # this server dies (POSIX; Windows region locks do not inherit).
+            **_inherit_lock_kwargs(state, workdir),
         )
     except FileNotFoundError:
         return (
             "", False, "",
             "codex binary not found in PATH. Install with: npm i -g @openai/codex",
             127, None, False,
+        )
+    except OSError as e:
+        # PermissionError, ENOEXEC, descriptor exhaustion, ... (round 9): a
+        # spawn failure must become a durable terminal error, never an
+        # exception that unwinds past the end path with the claims held.
+        return (
+            "", False, "",
+            f"could not spawn codex ({type(e).__name__}: {e}) — nothing was executed",
+            1, None, False,
         )
     finally:
         out_fh.close()
@@ -2043,23 +3156,101 @@ async def _exec_codex_once(
         with contextlib.suppress(OSError):
             pgid = os.getpgid(proc.pid)
     spawn_ts = time.time()
-    deadline_ts = spawn_ts + MAX_RUNTIME_SECONDS
-    watchdog = _spawn_watchdog(proc.pid, pgid, deadline_ts)
+    attempt_budget = _left()  # re-read AFTER the spawn (round 33)
+    deadline_ts = spawn_ts + attempt_budget
+    leader_start = _proc_start(proc.pid)  # captured BEFORE the watchdog exists:
+    # it anchors every group kill to THIS leader's identity (round 21).
+    # TICK BOUND FROM THE PARENT (round 36): the enforcer's own wall clock
+    # can be rolled back, so the tick count is derived HERE from the
+    # monotonic attempt budget (one tick per 5 s poll, +2 slack) and passed
+    # in; the child never derives it from `date`.
+    max_ticks = int(attempt_budget // 5) + 2
+    watchdog = _spawn_watchdog(proc.pid, pgid, deadline_ts,
+                               str(state.get("run_tag") or ""), leader_start,
+                               max_ticks=max_ticks)
+    watchdog_start = _proc_start(watchdog.pid) if watchdog is not None else ""
+    if watchdog is not None and not watchdog_start:
+        # An enforcer whose identity cannot be recorded cannot be verified
+        # later: treat as absent (kill on shutdown, never detach).
+        with contextlib.suppress(Exception):
+            watchdog.terminate()
+        watchdog = None
     watchdog_pid = watchdog.pid if watchdog is not None else None
     state["spawn"] = {
         "pid": proc.pid, "pgid": pgid, "watchdog_pid": watchdog_pid,
-        "server_pid": os.getpid(),
+        "server_pid": os.getpid(), "server_start": _SERVER_START,
+        "pid_start": leader_start, "watchdog_start": watchdog_start,
         "stdout": str(stdout_path), "stderr": str(stderr_path),
         "output_file": str(output_file),
-        "spawn_ts": spawn_ts, "deadline_ts": deadline_ts,
+        "spawn_ts": spawn_ts, "deadline_ts": deadline_ts, "max_ticks": max_ticks,
     }
     state.pop("detached", None)
+    if (state.get("write") or state.get("custody_cwd")) and not _note_write_child(
+            str(state.get("custody_cwd") or "") or workdir or _get_cwd(), proc.pid):
+        # Either the tree's write lock is no longer ours, or a legacy bridge
+        # file could not be durably repointed at the child (round 7): both
+        # leave a window for a second writer, so nothing may execute.
+        _kill_tree(proc)
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        return (
+            "", False, "",
+            "write publication failed (lock no longer ours, or a legacy "
+            "bridge file could not be repointed) — refusing to write; "
+            "nothing was executed",
+            1, None, False,
+        )
+    if watchdog is None:
+        emit("⚠ no runtime watchdog (Windows, or spawn failed): this run will "
+             "be KILLED, not detached, if the server shuts down")
+    # PUBLISH the pid (the emit journals the spawn record) BEFORE checking
+    # for a cancel intent: a canceller that reads the journal after this
+    # point sees the pid and takes the kill path; one that wrote its intent
+    # before this point is caught by the check below. No window either way
+    # (review round 4).
     emit(f"▶ codex pid {proc.pid} (pgid {pgid}) spool={output_file.parent}")
+    if state.pop("publish_failed", False):
+        # Nobody can see this child (cancel, status, adoption all read the
+        # journal): an unrecorded run must not run.
+        _kill_tree(proc)
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        return ("", False, "", "could not record the spawn in the run journal — refusing to run unrecorded",
+                1, None, False)
+    if state.get("run_tag") and _cancel_requested(str(state["run_tag"])):
+        _kill_tree(proc)
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        return ("", False, "", "cancelled at spawn (codex_cancel_run)", -9, None, False)
+    if barrier:
+        # Publication complete (spawn journaled, bridge repointed, no cancel):
+        # release the execution barrier so the child execs codex.
+        try:
+            proc.stdin.write(b"go\n")
+            await proc.stdin.drain()
+        except Exception:
+            _kill_tree(proc)
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            return ("", False, "",
+                    "could not release the write execution barrier — nothing was executed",
+                    1, None, False)
+        with contextlib.suppress(Exception):
+            proc.stdin.close()
 
     startup_seen = asyncio.Event()
     exited = asyncio.Event()
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
+    captured = {"stdout": 0, "stderr": 0}
+
+    def _keep(buffer: list[bytes], chunk: bytes, key: str) -> None:
+        """In-memory capture is a bounded TAIL (the spool on disk is the full
+        record): oldest chunks are dropped past CAPTURE_MAX_BYTES."""
+        buffer.append(chunk)
+        captured[key] += len(chunk)
+        while captured[key] > CAPTURE_MAX_BYTES and len(buffer) > 1:
+            captured[key] -= len(buffer.pop(0))
     hung_reason: str | None = None
     timed_out = False
     stdout_linebuf = bytearray()
@@ -2092,12 +3283,18 @@ async def _exec_codex_once(
         swallowed."""
         pos = 0
         while True:
+            if state.get("fatal") and proc.returncode is None:
+                # A publication failure (session journal, thread claim) makes
+                # the run untrackable/unexcludable: fail closed, do not let
+                # the child run on (round 6).
+                state["last_error"] = str(state.get("last_error") or state["fatal"])
+                _kill_tree(proc)
             chunk = _read_more(path, pos)
             if chunk:
                 pos += len(chunk)
                 if not startup_seen.is_set():
                     startup_seen.set()
-                buffer.append(chunk)
+                _keep(buffer, chunk, "stdout" if buffer is stdout_chunks else "stderr")
                 with contextlib.suppress(Exception):
                     on_chunk(chunk)
                 continue
@@ -2108,7 +3305,7 @@ async def _exec_codex_once(
                     if not chunk:
                         return
                     pos += len(chunk)
-                    buffer.append(chunk)
+                    _keep(buffer, chunk, "stdout" if buffer is stdout_chunks else "stderr")
                     with contextlib.suppress(Exception):
                         on_chunk(chunk)
             await asyncio.sleep(TAIL_POLL_SECONDS)
@@ -2139,19 +3336,36 @@ async def _exec_codex_once(
         if ctx is not None else None
     )
 
+    async def _budget_sentinel() -> None:
+        # OBSERVABLE BEFORE SATURATION (Limits Doctrine): the live log warns
+        # at 80 % of the run budget so the first signal is never the kill.
+        await asyncio.sleep(0.8 * attempt_budget)
+        if proc.returncode is None:
+            emit(f"⚠ run at {int(time.monotonic() - run_t0)}s = 80% of its "
+                 f"{attempt_budget:.0f}s attempt budget (request budget "
+                 f"{MAX_RUNTIME_SECONDS}s, CODEX_ORACLE_MAX_RUNTIME_S, "
+                 f"{MAX_RUNTIME_SOURCE}); the watchdog kills it at the deadline")
+
+    budget_task = asyncio.create_task(_budget_sentinel())
+
     try:
         # Wall-clock timeout prevents zombie processes that start but never
         # finish (observed: research calls stuck for 6+ hours at xhigh).
         await asyncio.wait_for(
             asyncio.gather(stdout_task, stderr_task),
-            timeout=MAX_RUNTIME_SECONDS,
+            timeout=_left(),
         )
     except asyncio.TimeoutError:
         timed_out = True
         _kill_tree(proc)
     except asyncio.CancelledError:
-        if _SHUTDOWN.is_set() and not state.get("write"):
+        if (_SHUTDOWN.is_set() and not state.get("write")
+                and watchdog is not None and watchdog.poll() is None):
+            # poll() verifies the enforcer is ALIVE (round 21: a crashed
+            # watchdog left a non-null handle, detaching an unbounded child).
             # DETACH: the server is going down, not the caller's interest.
+            # Only with a watchdog alive to enforce the deadline; otherwise
+            # a detached run would have no bound at all (review of 1.17.0).
             # codex keeps running on its spool files; the watchdog keeps the
             # deadline; codex_resume_run collects the answer later.
             state["detached"] = True
@@ -2169,13 +3383,45 @@ async def _exec_codex_once(
                 _kill_tree(proc)
             with contextlib.suppress(Exception):
                 await proc.wait()
+            if os.name != "nt" and pgid:
+                # MARKER QUIESCENCE (rounds 14+16+21): codex can leave
+                # spawned processes running after its own exit — sweep by
+                # MARKER-verified pids only. The leader was just REAPED, so
+                # its pid (and, once the group empties, its pgid) is free
+                # for reuse: a post-reap numeric killpg could SIGKILL an
+                # unrelated group (POSIX reuse) — removed. `_pgid_alive`
+                # stays as detection evidence: a group that still reads
+                # alive after the marker sweep is either an unmarked leak or
+                # a reused id, and both directions land in the nonterminal
+                # survivor path (fail closed, operator resolves).
+                try:
+                    marked = _marked_survivors(str(state.get("run_tag") or ""))
+                except Exception:
+                    marked = [-1]  # unverifiable → fail closed below
+                _kill_marked(str(state.get("run_tag") or ""), [p for p in marked if p > 0])
+                sweep_end = time.monotonic() + 3.0
+                while time.monotonic() < sweep_end:
+                    still_marked: list[int] = []
+                    if marked:
+                        try:
+                            still_marked = _marked_survivors(str(state.get("run_tag") or ""))
+                        except Exception:
+                            still_marked = [-1]
+                    if not _pgid_alive(pgid) and not still_marked:
+                        marked = []
+                        break
+                    marked = still_marked or marked
+                    await asyncio.sleep(0.1)
+                if _pgid_alive(pgid) or marked:
+                    state["group_survivors"] = pgid
+                    state["marked_survivors"] = [p for p in marked if p > 0]
             if watchdog is not None:
                 # Reap it too — a signalled-but-unwaited child is a zombie
                 # that still answers kill(0) (measured in the detach suite).
                 with contextlib.suppress(Exception):
                     watchdog.terminate()
                     watchdog.wait(timeout=3)
-        for _task in (probe_task, heartbeat_task, reaper_task):
+        for _task in (probe_task, heartbeat_task, reaper_task, budget_task):
             if _task is not None:
                 _task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -2274,7 +3520,8 @@ async def _wait_for_capacity(
     state: dict[str, Any],
     model: str,
     emit: Any,
-) -> None:
+    run_tag: str = "",
+) -> bool:
     """Sit out a provider capacity shed WITHOUT going dark.
 
     The spinner keeps saying what the run is doing, and while the request's
@@ -2282,9 +3529,15 @@ async def _wait_for_capacity(
     owns that geometry (same envelope as a running attempt); this only
     brackets the sleep with it. Cancellation propagates to the caller, which
     journals it exactly like a cancel during an attempt.
+
+    The sleep is sliced so a codex_cancel_run intent is honoured within ~1s
+    instead of after up to the full backoff (round 6), and a liveness line
+    lands in the live log every 30s so status probes (the resume guard's
+    idle test, _active_write_run) keep seeing a run that is merely waiting.
+    Returns True when a cancel intent arrived during the wait.
     """
     if seconds <= 0:
-        return
+        return False
     state["activity"] = (
         f"provider at capacity — waiting {int(seconds)}s before resuming"
     )
@@ -2299,12 +3552,28 @@ async def _wait_for_capacity(
         if ctx is not None and token_alive else None
     )
     try:
-        await asyncio.sleep(seconds)
+        remaining = float(seconds)
+        waited = 0.0
+        next_note = 30.0
+        while remaining > 0:
+            step = min(1.0, remaining)
+            await asyncio.sleep(step)
+            waited += step
+            remaining -= step
+            if run_tag and _cancel_requested(run_tag):
+                emit("■ cancel intent found during the capacity wait — "
+                     "honouring it before the next attempt")
+                return True
+            if remaining > 0 and waited >= next_note:
+                next_note += 30.0
+                emit(f"⏳ capacity wait: {int(remaining)}s remaining "
+                     f"(a cancel intent is honoured within ~1s)")
     finally:
         if hb is not None:
             hb.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await hb
+    return False
 
 
 async def _run_codex(
@@ -2320,8 +3589,16 @@ async def _run_codex(
     tool_name: str = "",
     workdir: str = "",
     request_started: float | None = None,
+    claim_key: str = "",
+    custody_cwd: str = "",
+    full_access: bool = False,
 ) -> str:
     """Run codex exec headlessly with clean final-message extraction.
+
+    ``custody_cwd``: the tree whose WRITE LOCK the caller holds around this
+    run (abraham holds it across BOTH phases — round 17: a phase-1 READ run
+    with survivors must put that lock into custody too, or the finally
+    releases a tree an infra-mode survivor may still write).
 
     ``workdir`` overrides the run's working tree (abraham targeting a git
     repo BELOW the server's cwd — e.g. a multi-repo project root that is
@@ -2364,6 +3641,10 @@ async def _run_codex(
     """
     model = _get_codex_model()
     reasoning = _get_reasoning_effort()
+    if request_started is None:
+        # the REQUEST clock starts at ENTRY (round 33): digest, prompt and
+        # journal preparation below are part of the request, not free time
+        request_started = time.monotonic()
 
     # Coerce a lone string to a list — iterating a str yields characters,
     # which would produce a baffling per-character "not found".
@@ -2389,12 +3670,27 @@ async def _run_codex(
     write_before: set[str] = set()
     write_head = ""
     extra_env: dict[str, str] = {}
+    holds_tree_lock = bool(write or custody_cwd)
+    if holds_tree_lock and os.name != "nt" and _is_launcher_script(_codex_argv0()[0]):
+        # Round 12 (write) + round 19 (any lock-holding run): behind a
+        # launcher script the inherited tree lock and the recorded pid
+        # belong to the LAUNCHER, not the real codex — the one-writer
+        # guarantee would be fiction. Plain read runs proceed (their claims
+        # degrade, adoption stays spool-driven); lock holders refuse.
+        return (
+            "[lock-holding run refused: the codex on PATH is a launcher "
+            "SCRIPT and no vendored native binary could be resolved behind "
+            "it — the tree lock would never reach the real codex process. "
+            "Pin the native binary via CODEX_ORACLE_CODEX_BIN or reinstall "
+            "@openai/codex.]"
+        )
     if write:
         ok, write_before, write_head = _git_state(eff_cwd)
         if not ok:
             return (
                 f"[write run refused: {eff_cwd} is not inside a git work "
-                "tree. Autonomous writes without version control have no "
+                f"tree, or its state could not be read ({_GIT_STATE_REASON}). "
+                "Autonomous writes without version control have no "
                 "undo. Run from a git checkout (or `git init` first), or use "
                 "the read-only tools instead.]"
             )
@@ -2416,7 +3712,33 @@ async def _run_codex(
         if advisor_ctx:
             prompt = f"{advisor_ctx}\n\n{prompt}"
 
-    if write:
+    if write and full_access:
+        # FULL-ACCESS implementation phase (user ruling 2026-09-05): no
+        # sandbox, so the writer can run the project's REAL gates — that is
+        # the point — under the same git contract as the sealed mode.
+        prompt = (
+            "IMPLEMENTATION MODE — FULL ACCESS: this process runs WITHOUT a "
+            "sandbox, with the caller's own privileges, network and tools "
+            "(--dangerously-bypass-approvals-and-sandbox). Use that to VERIFY "
+            "your work against the real system before you report: run the "
+            "project's own gates (tests, migrations on a fresh database, "
+            "workflow suites, builds, linters) exactly as the project runs "
+            "them, and report their real exit codes and output — never a "
+            "claim of green without the run.\n"
+            "BOUNDARIES: edit files INSIDE this workspace only; never modify "
+            "another repository, a dotfile, a credential store or system "
+            "configuration; no destructive infrastructure actions (dropping "
+            "or truncating shared databases, deleting deployments or data) "
+            "unless the task explicitly orders them; treat any secret you "
+            "encounter as never-to-be-copied into files or output.\n"
+            "GIT CONTRACT (non-negotiable): leave ALL changes as uncommitted "
+            "working-tree edits for the caller to review. NEVER run git "
+            "commit, push, checkout, switch, restore, reset, stash, clean, "
+            "rebase, merge, or any branch/tag operation; never touch .git "
+            "internals; no bulk deletes. Violations are detected after the "
+            "run and reported to the caller.\n\n"
+        ) + prompt
+    elif write:
         # Sealed implementation phase. Ordered ahead of the infra branch: a
         # write run must get THIS scaffold and never danger-full-access —
         # infra/web belong to the separate read-only analysis phase.
@@ -2461,6 +3783,10 @@ async def _run_codex(
         ) + prompt
 
     t0 = time.monotonic()
+    # The digest of the tree the model will READ — the run's own tree, which
+    # abraham may target below the workspace (architect review: hashing the
+    # session cwd let a subtree run vouch for the wrong worktree).
+    tree_at_dispatch = _workspace_digest(eff_cwd)
     mode_str = ("write+infra" if write and infra else
                 "write" if write else
                 "infra" if infra else "read-only")
@@ -2479,7 +3805,9 @@ async def _run_codex(
         "abraham" if write else ("infra" if infra else "codex"))
     state: dict[str, Any] = {"activity": "launching codex", "last_message": "",
                              "last_error": "", "usage": "", "thread_id": "",
-                             "write": "1" if write else ""}
+                             "write": "1" if write else "", "run_tag": run_tag,
+                             "parent_run": parent_run or "", "claim_key": claim_key,
+                             "custody_cwd": custody_cwd}
 
     journaled_tid = ""
     journaled_spawn_pid = 0
@@ -2497,16 +3825,47 @@ async def _run_codex(
         _live_write(stream_fh, t0, text, run_tag)
         tid = state.get("thread_id") or ""
         if tid and tid != journaled_tid:
-            journaled_tid = tid
-            _journal({"run": run_tag, "phase": "session", "ts": time.time(),
-                      "thread_id": tid})
+            # Durability first: journaled_tid records what IS on disk, never
+            # what we hoped to write (round 6). Retries are bounded and
+            # IMMEDIATE (round 7): waiting for later events let a quiet
+            # child run on indefinitely after one failed append.
+            ok_sess = False
+            for sess_try in range(3):
+                if sess_try:
+                    time.sleep(0.05)
+                if _journal({"run": run_tag, "phase": "session", "ts": time.time(),
+                             "thread_id": tid}):
+                    ok_sess = True
+                    break
+            if ok_sess:
+                journaled_tid = tid
+                if not state.get("claim_key"):
+                    # A FRESH run claims its thread the moment the id exists
+                    # and holds the claim across every retry and backoff
+                    # (round 6: an idle backoff window let a concurrent
+                    # resume double-execute the thread). Continuations
+                    # arrive already holding it (claim_key).
+                    got_claim, claim_holder = _acquire_run_claim(_thread_claim_key(tid))
+                    if got_claim:
+                        state["own_claim"] = _thread_claim_key(tid)
+                        state["claim_key"] = _thread_claim_key(tid)  # later attempts' children inherit it
+                    else:
+                        state["fatal"] = (
+                            f"could not claim thread {tid} ({claim_holder}) "
+                            "— a concurrent continuation cannot be excluded")
+            else:
+                state["fatal"] = (
+                    "could not journal the codex session id after 3 "
+                    "attempts — the thread would be unresumable and "
+                    "uncancellable")
         # The spawn record (pid/pgid/spool paths/deadline) is what lets a
         # LATER server adopt or cancel this process — journaled the instant
         # the child exists, once per attempt.
         sp = state.get("spawn")
         if isinstance(sp, dict) and sp.get("pid") and sp.get("pid") != journaled_spawn_pid:
             journaled_spawn_pid = int(sp["pid"])
-            _journal({"run": run_tag, "phase": "spawn", "ts": time.time(), **sp})
+            if not _journal({"run": run_tag, "phase": "spawn", "ts": time.time(), **sp}):
+                state["publish_failed"] = True  # the spawn is not on record: fail closed
 
     if live_fh is not None:
         with contextlib.suppress(Exception):
@@ -2526,14 +3885,50 @@ async def _run_codex(
         run_tag,
     )
 
-    _journal({
+    # THE OWNER IS THE TERMINAL WRITER while attached (round 8): hold the
+    # run-terminal claim for the run's lifetime — and hold it BEFORE the
+    # start record becomes visible (round 10: publish-then-claim let a
+    # canceller find the apparently free claim of a just-published run,
+    # terminalize "never spawned", and clear the marker while the owner went
+    # on to spawn anyway). A canceller that cannot take the claim defers; one
+    # that CAN take it knows no task remains responsible.
+    got_term, term_holder = _acquire_run_claim(_run_terminal_claim_key(run_tag))
+    if not got_term:
+        for _fh in (live_fh, stream_fh):
+            if _fh is not None:
+                with contextlib.suppress(Exception):
+                    _fh.close()
+        return (
+            f"[dispatch refused: the fresh run tag {run_tag} is already "
+            f"claimed ({term_holder}) — state directory anomaly; retry.]"
+        )
+    if not _journal({
         "run": run_tag, "phase": "start", "ts": time.time(), "engine": "codex",
         "tool": tool_name,
         "model": model, "reasoning": reasoning, "infra": infra, "write": write,
+        "full_access": bool(write and full_access),
         "web_search": web_search, "parent_run": parent_run,
         "images": list(images or []), "cwd": eff_cwd,
         "prompt": prompt, "log": str(live_path or ""),
-    })
+        "tree": tree_at_dispatch,
+        "custody_cwd": custody_cwd,  # lock ownership, for cancel-time custody release (round 18)
+        # A continuation's start carries its thread id (round 6): a crash
+        # before the child's thread.started must still leave the claim and
+        # any later adoption keyed by the THREAD, not the run.
+        "thread_id": resume_tid or "",
+    }):
+        _release_run_claim(_run_terminal_claim_key(run_tag))
+        for _fh in (live_fh, stream_fh):
+            if _fh is not None:
+                with contextlib.suppress(Exception):
+                    _fh.close()
+        return (
+            "[dispatch refused: the run journal could not be written "
+            f"({RUNS_JOURNAL}) — an unrecorded run cannot be watched, "
+            "cancelled, resumed, or adopted (round 6: fail-closed covers "
+            "every publication phase, not just the spawn record). Fix the "
+            "state directory and retry.]"
+        )
 
     attempt = 0
     retry_classes: list[str] = []  # journaled: what each retry recovered from
@@ -2549,13 +3944,35 @@ async def _run_codex(
         thread id is already journaled, so it stays resumable). Either way
         say so in the live log and release the log handles."""
         if state.get("detached"):
+            cc = str(state.get("custody_cwd") or "")
+            if cc:
+                # A detached lock-held read (abraham phase 1) keeps the tree
+                # locked through the CHILD's inherited descriptor; putting
+                # the lock into CUSTODY makes the caller's finally a no-op,
+                # so our release cannot unplant the legacy bridges or close
+                # the last local handle while the child still runs
+                # (round 18). The dead server's custody entry dies with it;
+                # the child's flock dies with the child; stale bridge files
+                # self-heal on the next acquire.
+                _LOCK_CUSTODY.add(str(_write_lock_path(cc)))
             sp = state.get("spawn") or {}
             remaining = int(max(0.0, float(sp.get("deadline_ts") or 0) - time.time()))
+            # Publish the detached transition WHILE still holding the claims
+            # (round 9): released first, a collector could append a terminal
+            # end in the window and this late record would land after it.
             _journal({"run": run_tag, "phase": "detached", "ts": time.time(),
                       "status": "detached", "pid": sp.get("pid"),
                       "pgid": sp.get("pgid"), "attempts": attempt + 1,
                       "retry_classes": list(retry_classes),
                       "capacity_wait_s": int(waited_total)})
+            _release_run_claim(_run_terminal_claim_key(run_tag))
+            own_claim = str(state.pop("own_claim", "") or "")
+            if own_claim:
+                # Our descriptor only — a child that INHERITED it keeps the
+                # thread claimed; releasing ours lets the adopting server
+                # take the claim and collect (mirrors codex_resume_run's
+                # finally, which also releases on detach).
+                _release_run_claim(own_claim)
             with contextlib.suppress(Exception):
                 _emit(
                     f"■ server shutting down — codex keeps running DETACHED "
@@ -2563,14 +3980,52 @@ async def _run_codex(
                     f"Collect it from the next connection: "
                     f"codex_resume_run(run=\"{run_tag}\")"
                 )
-        else:
-            _journal({"run": run_tag, "phase": "end", "ts": time.time(),
-                      "status": "cancelled", "attempts": attempt + 1,
-                      "retry_classes": list(retry_classes),
-                      "capacity_wait_s": int(waited_total)})
+        elif state.get("group_survivors"):
+            # Round 14: the kill left group members alive — no terminal
+            # record over a possibly-writing group. The marker keeps the run
+            # CANCELLING and stoppable; a later codex_cancel_run verifies
+            # group death before terminalizing. Lock-holding runs put the
+            # tree's flock into CUSTODY (rounds 15+17) so no new writer can
+            # start — write phase or lock-held read phase alike.
+            if write or custody_cwd:
+                _LOCK_CUSTODY.add(str(_write_lock_path(custody_cwd or eff_cwd)))
+            _request_cancel(run_tag)
+            _journal({"run": run_tag, "phase": "cancel_requested",
+                      "ts": time.time(), "by_pid": os.getpid(),
+                      "survivors_pgid": state["group_survivors"]})
+            own_claim = str(state.pop("own_claim", "") or "")
+            if own_claim:
+                _release_run_claim(own_claim)
+            _release_run_claim(_run_terminal_claim_key(run_tag))
             with contextlib.suppress(Exception):
                 _emit(
-                    "■ run cancelled by caller"
+                    f"✖ cancel: process group {state['group_survivors']} still "
+                    f"has live members — NOT terminalizing; the run stays "
+                    f"stoppable (codex_cancel_run retries once the group dies)"
+                )
+        else:
+            # SHUTDOWN IS NOT A DECISION (round 10): a server going down
+            # during a capacity wait (no live child to detach) is
+            # `interrupted` — journaling it `cancelled` made the new
+            # bare-resume guard refuse the automatic recovery an ordinary
+            # restart deserves. `cancelled` is reserved for a caller's
+            # explicit stop.
+            shutdown = _SHUTDOWN.is_set() and not _cancel_requested(run_tag)
+            status_c = "interrupted" if shutdown else "cancelled"
+            if _journal({"run": run_tag, "phase": "end", "ts": time.time(),
+                         "status": status_c, "attempts": attempt + 1,
+                         "retry_classes": list(retry_classes),
+                         "capacity_wait_s": int(waited_total)}):
+                if not shutdown:
+                    _clear_cancel(run_tag)  # durable terminal record retires the intent
+            own_claim = str(state.pop("own_claim", "") or "")
+            if own_claim:
+                _release_run_claim(own_claim)
+            _release_run_claim(_run_terminal_claim_key(run_tag))
+            with contextlib.suppress(Exception):
+                _emit(
+                    ("■ run interrupted by server shutdown"
+                     if shutdown else "■ run cancelled by caller")
                     + (f" {where}" if where else "")
                     + " (resume later: codex_resume_run)"
                 )
@@ -2581,8 +4036,6 @@ async def _run_codex(
 
     # One request-time anchor for EVERY attempt: retries must not reset the
     # heartbeat deadline (the client's progress token is request-scoped).
-    if request_started is None:
-        request_started = time.monotonic()
     final_message = ""
     clean_extraction = False
     stdout_text = stderr_text = ""
@@ -2591,17 +4044,41 @@ async def _run_codex(
     timed_out = False
 
     while True:
-        # Per-run spool: answer file + the child's stdout/stderr live here
-        # (file-backed so the run survives this server; see RUN SURVIVABILITY).
-        output_file = _run_spool_dir(run_tag) / f"attempt{attempt}.txt"
-        cmd = _build_exec_argv(
-            model, reasoning, infra, web_search, output_file,
-            prompt=prompt, resume_tid=resume_tid, images=images,
-            write=write, auto_compact_limit=ac_limit,
-        )
+        try:
+            # Per-run spool: answer file + the child's stdout/stderr live
+            # here (file-backed so the run survives this server; see RUN
+            # SURVIVABILITY). Inside the containment (round 11): an OSError
+            # from the spool mkdir escaped _run_codex with the terminal
+            # claim held — the run was unkillable until server restart.
+            output_file = _run_spool_dir(run_tag) / f"attempt{attempt}.txt"
+            cmd = _build_exec_argv(
+                model, reasoning, infra, web_search, output_file,
+                prompt=prompt, resume_tid=resume_tid, images=images,
+                write=write, auto_compact_limit=ac_limit,
+                full_access=bool(write and full_access),
+            )
+        except Exception as e:
+            stderr_text = f"run machinery failure: {type(e).__name__}: {e}"
+            state["last_error"] = stderr_text
+            returncode = 1
+            final_message = ""
+            clean_extraction = False
+            with contextlib.suppress(Exception):
+                _emit(f"✖ {stderr_text}")
+            break
         expected_tid = resume_tid
         state["last_error"] = ""
         state["last_message"] = ""  # attempt N's commentary is not attempt N+1's answer
+        state.pop("turn_completed", None)  # completion evidence is ATTEMPT-scoped
+        state["usage"] = ""             # (round 16: attempt 1's turn.completed
+        #                                 signed attempt 2's partial as ok)
+        if _cancel_requested(run_tag):
+            # Cancel intent lodged before this attempt spawned: honour it
+            # here — the requester journaled an intent, not a result.
+            returncode, final_message = -9, ""
+            state["last_error"] = "cancelled before spawn (codex_cancel_run)"
+            _emit("■ cancel requested before spawn — honoured, nothing executed")
+            break
         try:
             (final_message, clean_extraction, stdout_text, stderr_text,
              returncode, hung_reason, timed_out) = await _exec_codex_once(
@@ -2611,6 +4088,28 @@ async def _run_codex(
         except asyncio.CancelledError:
             _cancelled("")
             raise
+        except Exception as e:
+            # Run-machinery failure (unexpected spawn error, tail bug, fd
+            # exhaustion): terminalize DURABLY instead of unwinding — an
+            # escaped exception left the terminal claim held until server
+            # restart, with the run unkillable and uncancellable (round 9).
+            stderr_text = f"run machinery failure: {type(e).__name__}: {e}"
+            state["last_error"] = stderr_text
+            returncode = 1
+            final_message = ""
+            clean_extraction = False
+            with contextlib.suppress(Exception):
+                _emit(f"✖ {stderr_text}")
+            break
+
+        if state.get("fatal"):
+            stderr_text = str(state["fatal"])
+            state["last_error"] = str(state.get("last_error") or stderr_text)
+            returncode = returncode or 1
+            final_message = ""
+            clean_extraction = False
+            _emit(f"✖ failed closed: {stderr_text}")
+            break
 
         # AMNESIA GUARD (measured): resume with an unknown id silently starts
         # a fresh context-less thread and exits 0 — that is NOT a resume.
@@ -2626,6 +4125,12 @@ async def _run_codex(
             _emit(f"✖ {stderr_text}")
             break
 
+        if state.get("group_survivors"):
+            # Round 20: NEVER spawn attempt N+1 over attempt N's live
+            # descendants — an infra-mode survivor retains danger-full-access
+            # and would overlap the retry's commands. The post-loop survivor
+            # path takes over (nonterminal, marker, custody).
+            break
         failed = returncode != 0 and hung_reason is None and not timed_out
         # NO AUTOMATIC RETRY FOR WRITE RUNS (cross-model review, CRITICAL):
         # replaying "implement X" after half of X was written is not
@@ -2648,9 +4153,6 @@ async def _run_codex(
             and class_used < class_budget
             and attempt < MAX_TOTAL_RETRIES
         ):
-            attempt += 1
-            retry_classes.append(klass)
-            resume_tid = state.get("thread_id") or None
             wait = 0.0
             if klass == "overload":
                 # ±20% jitter so runs shed together do not return together;
@@ -2660,10 +4162,17 @@ async def _run_codex(
                     _overload_backoff_seconds(overload_retries)
                     * random.uniform(0.8, 1.2),
                 )
-                overload_retries += 1
-                waited_total += wait
-            else:
-                disconnect_retries += 1
+            # ABSOLUTE REQUEST DEADLINE (round 33): the wait plus a retry must
+            # fit in what the request has LEFT — never a fresh clock. Retry
+            # state is mutated only for a retry that actually happens (round
+            # 34: a refused wait was journaled as an attempt and a full wait).
+            fits, left = _retry_fits(request_started, wait)
+            if not fits:
+                _emit(f"■ request budget cannot cover a {int(wait)}s wait plus a retry "
+                      f"({int(left)}s of {MAX_RUNTIME_SECONDS}s left) — giving up as a timeout")
+                timed_out = True
+                break
+            resume_tid = state.get("thread_id") or None
             what = (
                 "provider capacity shed" if klass == "overload"
                 else "transient failure"
@@ -2674,17 +4183,41 @@ async def _run_codex(
             )
             _emit(
                 f"⟲ {what} — {where} ({klass} retry {class_used + 1}/{class_budget}, "
-                f"total attempt {attempt + 1}"
+                f"total attempt {attempt + 2}"
                 + (f", after a {int(wait)}s wait)" if wait else ")")
             )
             if wait:
+                wait_t0 = time.monotonic()
                 try:
-                    await _wait_for_capacity(
-                        wait, ctx, request_started, t0, state, model, _emit
+                    cancel_seen = await _wait_for_capacity(
+                        wait, ctx, request_started, t0, state, model, _emit,
+                        run_tag=run_tag,
                     )
                 except asyncio.CancelledError:
+                    # a CANCELLED wait is journaled as the time actually spent
+                    waited_total += min(wait, time.monotonic() - wait_t0)
                     _cancelled("during the capacity wait")
                     raise
+                if cancel_seen:
+                    # A codex_cancel_run INTENT arrived during the wait (round
+                    # 36: the boolean was returned and ignored, so the run
+                    # spawned again over a lodged cancel): journal the time
+                    # actually waited and TERMINALIZE as cancelled — no spawn.
+                    waited_total += min(wait, time.monotonic() - wait_t0)
+                    returncode, final_message = -9, ""
+                    state["last_error"] = "cancelled during the capacity wait (codex_cancel_run)"
+                    _emit("■ cancel intent honoured during the capacity wait — no further attempt")
+                    break
+                waited_total += wait  # a completed wait IS the planned wait
+            # RETRY TELEMETRY (round 36): counted only now, immediately before
+            # the spawn the next iteration performs — a refused or cancelled
+            # wait never spawned, so it never counts as an attempt.
+            attempt += 1
+            retry_classes.append(klass)
+            if klass == "overload":
+                overload_retries += 1
+            else:
+                disconnect_retries += 1
             continue
         break
 
@@ -2699,6 +4232,65 @@ async def _run_codex(
                 _fh.close()
 
     log_note = f"\n\n[live log: {live_path}]" if live_path else ""
+    if state.get("group_survivors") and not state.get("detached"):
+        # Round 15: survivors make the run NONTERMINAL — a terminal record
+        # plus a released write lock made the tree eligible for another
+        # writer while descendants might still be modifying it. The cancel
+        # MARKER keeps the run CANCELLING/stoppable; codex_cancel_run
+        # verifies group death (round 13) and then terminalizes. For write
+        # runs the tree's flock goes into CUSTODY: this server keeps the
+        # descriptor, so new write dispatches and write resumes refuse until
+        # the group is resolved.
+        gp = state["group_survivors"]
+        _journal({"run": run_tag, "phase": "survivors", "ts": time.time(),
+                  "pgid": gp})
+        _request_cancel(run_tag)
+        custody_note = ""
+        if write or custody_cwd:
+            # Custody follows LOCK OWNERSHIP, not write mode (round 17).
+            _LOCK_CUSTODY.add(str(_write_lock_path(custody_cwd or eff_cwd)))
+            custody_note = (
+                " The tree's write lock stays HELD by this server as "
+                "custodian — write dispatches and write resumes on this "
+                "tree refuse until then.")
+        with contextlib.suppress(Exception):
+            _emit(f"✖ process group {gp} still has live members after the "
+                  f"SIGKILL sweep — NOT terminalizing (run stays stoppable)")
+        own_claim = str(state.pop("own_claim", "") or "")
+        if own_claim:
+            _release_run_claim(own_claim)
+        _release_run_claim(_run_terminal_claim_key(run_tag))
+        for _fh in (live_fh, stream_fh):
+            if _fh is not None:
+                with contextlib.suppress(Exception):
+                    _fh.close()
+        survivors_report = (
+            _write_changes_report(write_before, write_head, eff_cwd)
+            if write else ""
+        )
+        return (
+            f"[Codex run {run_tag}: the codex leader exited but its process "
+            f"group ({gp}) still reads alive after the marker sweep — "
+            f"survivors may still be modifying files. NOT terminalized: "
+            f"codex_cancel_run(run=\"{run_tag}\") kills MARKER-VERIFIED "
+            f"survivors (list them: python3 procenv.py --list {run_tag}) "
+            f"and records the terminal state once they are gone. Never signal "
+            f"the bare group id — it may already belong to another process."
+            f"{custody_note}]"
+            + (f"\n\n{survivors_report}" if survivors_report else "")
+            + log_note
+        )
+    if (returncode == 0 and not timed_out and hung_reason is None
+            and not (final_message
+                     and (clean_extraction or state.get("turn_completed")))):
+        # OK IS EARNED (round 15, matching the adoption rule): exit 0
+        # without a completed final answer is an error — otherwise the
+        # rendered "answer" is the log-note metadata, which abraham's gate
+        # would treat as a brief.
+        state["last_error"] = state.get("last_error") or (
+            "codex exited 0 without a completed final answer "
+            "(no output-last-message / turn.completed)")
+        returncode = 1
     status = (
         "ok" if (returncode == 0 and not timed_out and hung_reason is None)
         else ("timeout" if timed_out else ("hung" if hung_reason else "error"))
@@ -2710,13 +4302,33 @@ async def _run_codex(
             rf.write_text(final_message, encoding="utf-8")
             _private(rf, 0o600)
             result_file = str(rf)
-    _journal({
+    if status == "error" and returncode < 0:
+        # Killed by signal: a verified or intended cancellation (codex_cancel_run)
+        # is the terminal status, not "error".
+        prior = _journal_runs().get(run_tag, {})
+        if (prior.get("status") == "cancelled" and prior.get("cancelled_by")) or _cancel_requested(run_tag):
+            status = "cancelled"
+    if _journal({
         "run": run_tag, "phase": "end", "ts": time.time(), "status": status,
         "returncode": returncode, "attempts": attempt + 1,
         "retry_classes": retry_classes, "capacity_wait_s": int(waited_total),
         "error": (state["last_error"] or stderr_text)[:500] if status != "ok" else "",
         "result_file": result_file,
-    })
+    }):
+        # Only a DURABLE terminal record retires a cancel intent (round 6) —
+        # clearing on a failed append would leave the run live-looking with
+        # its cancel silently dropped.
+        _clear_cancel(run_tag)
+    else:
+        log_note += (
+            "\n[⚠ the run's terminal journal record could not be written — "
+            "status displays may show the run live, and any pending cancel "
+            "intent is retained]"
+        )
+    own_claim = str(state.pop("own_claim", "") or "")
+    if own_claim:
+        _release_run_claim(own_claim)
+    _release_run_claim(_run_terminal_claim_key(run_tag))
 
     # Every write-run outcome — success, timeout, hang, error — reports what
     # changed on disk: a timed-out run may still have written files, and the
@@ -2730,15 +4342,21 @@ async def _run_codex(
         if final_message:
             return (
                 f"[Codex model: {model} | reasoning: {reasoning}"
-                f"{_answer_sig(tool_name, 'timeout')}]\n"
-                f"[TIMEOUT after {MAX_RUNTIME_SECONDS}s — partial output recovered]"
+                f"{_answer_sig(tool_name, 'timeout', tree_at_dispatch)}]\n"
+                f"[TIMEOUT — the {MAX_RUNTIME_SECONDS}s REQUEST budget ran out "
+                f"(shared by every attempt and phase of this call; "
+                f"CODEX_ORACLE_MAX_RUNTIME_S, {MAX_RUNTIME_SOURCE}) — partial "
+                f"output recovered; codex_resume_run continues this thread]"
                 f"{log_note}\n\n"
                 f"{final_message}{write_report}"
             )
         return (
-            f"[Codex TIMEOUT: no response after {MAX_RUNTIME_SECONDS}s]\n"
-            f"The model may be overloaded or the query too complex. "
-            f"Try simplifying the prompt or reducing reasoning effort."
+            f"[Codex TIMEOUT: the {MAX_RUNTIME_SECONDS}s REQUEST budget ran out "
+            f"(shared by every attempt and phase of this call; "
+            f"CODEX_ORACLE_MAX_RUNTIME_S, {MAX_RUNTIME_SOURCE})]\n"
+            f"If the work was legitimately long, raise the budget in the server's "
+            f"environment and codex_resume_run this thread (its reasoning is kept); "
+            f"if it was stuck, narrow the task."
             f"{log_note}{write_report}"
         )
 
@@ -2792,7 +4410,7 @@ async def _run_codex(
             detail = (
                 f"codex process killed by signal {-returncode} "
                 f"(codex_cancel_run, or the runtime watchdog at the "
-                f"{MAX_RUNTIME_SECONDS}s deadline)"
+                f"{MAX_RUNTIME_SECONDS}s run budget, CODEX_ORACLE_MAX_RUNTIME_S)"
                 + (f"\n{stderr_text[-1500:]}" if stderr_text else "")
             )
         retry_note = f" after {attempt + 1} attempts" if attempt else ""
@@ -2820,7 +4438,7 @@ async def _run_codex(
             )
         result = (
             f"[Codex error (exit {returncode}){retry_note}"
-            f"{_answer_sig(tool_name, 'error')}]\n{detail}"
+            f"{_answer_sig(tool_name, 'error', tree_at_dispatch)}]\n{detail}"
             f"{capacity_note}\n"
             f"[recoverable: call codex_resume_run to continue this run "
             f"(run id: {run_tag})]{partial}{write_report}"
@@ -2830,7 +4448,7 @@ async def _run_codex(
         # status:ok is EARNED by exit 0 (the push gate reads the signature).
         header = (
             f"[Codex model: {model} | reasoning: {reasoning}"
-            f"{_answer_sig(tool_name, 'ok')}]"
+            f"{_answer_sig(tool_name, 'ok', tree_at_dispatch)}]"
         )
         result = f"{header}\n\n{final_message}"
         if attempt:
@@ -3286,6 +4904,7 @@ async def abraham(
     allow_dirty: bool = False,
     images: list[str] = [],
     cwd: str = "",
+    full_access: bool | None = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -3338,6 +4957,17 @@ async def abraham(
             safety envelope).
         images: Local image paths (mockups, error screenshots) — attached
             to both phases.
+        full_access: Run the IMPLEMENTATION phase with codex's
+            --dangerously-bypass-approvals-and-sandbox (its `--yolo` alias):
+            NO sandbox, no approval prompts, network on, your own codex
+            configuration and MCP servers, your full privileges — so the
+            writer can run the project's real gates (database migrations,
+            Temporal suites, browsers, builds) and verify before it reports.
+            The sealed guarantees (no egress, no credentials in the writer's
+            process) do NOT hold in this mode; the git contract, the one-
+            writer lock and the changed-files report still do. Default: the
+            CODEX_ORACLE_WRITE_FULL_ACCESS environment variable (1/true/on),
+            else False (sealed). A resume keeps the mode the run started in.
         cwd: Target git work tree, when it is not the server's own cwd —
             required for multi-repo project roots that are not themselves
             git repos. Must be the server cwd itself or a directory BELOW
@@ -3345,6 +4975,16 @@ async def abraham(
     """
     if not task.strip():
         return "[abraham refused: empty task — state what to implement.]"
+    if _IS_WINDOWS:
+        # Fail closed BEFORE any precondition: the one-writer lock cannot
+        # follow the codex child on Windows (a byte-range lock's ownership
+        # does not transfer with an inherited handle), so a write run could
+        # outlive its server unlocked. Write mode returns with the 1.18 daemon.
+        return (
+            "[abraham is unavailable on Windows in 1.17.x: the one-writer lock "
+            "cannot follow the codex child there. Write mode returns with the "
+            "1.18 daemon.]"
+        )
 
     # Anchor the heartbeat deadline to the REQUEST, not to each codex run:
     # phase 2 starts long after the client's ~120s backgrounding, and a
@@ -3383,7 +5023,8 @@ async def abraham(
     ok, dirty, _head = _git_state(cwd)
     if not ok:
         return (
-            f"[abraham refused: {cwd} is not inside a git work tree. "
+            f"[abraham refused: {cwd} is not inside a git work tree, or its "
+            f"state could not be read ({_GIT_STATE_REASON}). "
             "Autonomous writes without version control have no undo.]"
         )
     if dirty and not allow_dirty:
@@ -3404,7 +5045,13 @@ async def abraham(
     # silently downgraded to read-only + approval prompts and every write
     # was rejected while the run still EXITED 0, so an unprobed abraham
     # "succeeds" having written nothing.
-    can_write, probe_detail = await _ensure_write_capability(cwd)
+    full = _full_access_default() if full_access is None else bool(full_access)
+    if full:
+        # No sandbox to probe: the write-capability probe exists because the
+        # SEALED sandbox silently downgraded to read-only on some machines.
+        can_write, probe_detail = True, "no sandbox (full access)"
+    else:
+        can_write, probe_detail = await _ensure_write_capability(cwd)
     if not can_write:
         return (
             "[abraham refused: this machine's codex cannot WRITE under the "
@@ -3483,14 +5130,25 @@ async def abraham(
             images=list(images or []),
             tool_name="abraham", workdir=cwd,
             request_started=request_t0,
+            custody_cwd=cwd,  # abraham holds this tree's write lock NOW (round 17)
         )
-        for marker in ("[Codex TIMEOUT", "[Codex error",
-                       "[Codex health check FAILED"):
-            if marker in brief[:200]:
-                return (
-                    "[abraham: ANALYSIS phase failed — nothing was "
-                    f"written. Phase-1 result follows.]\n\n{brief}"
-                )
+        # POSITIVE gate (round 14): phase 2 starts only on the server-stamped
+        # ok signature with a nonempty brief body — enumerating failure
+        # prefixes let unmatched forms ("[dispatch refused: …]",
+        # status:timeout partials) through as the "implementation brief".
+        # ANCHORED (round 24): the FIRST LINE must be exactly the server's
+        # ok header — a substring search over the first 300 chars was
+        # forgeable by failure text that happened to contain the marker.
+        first_line, _, rest = brief.partition("\n")
+        ok_header = re.fullmatch(
+            r"\[Codex model: [^\]\n]* \| tool:abraham \| status:ok \| "
+            r"tree:(?:[0-9a-fA-F]{4,64}|nogit|unknown)\]", first_line)
+        brief_body = rest.strip()
+        if not ok_header or not brief_body:
+            return (
+                "[abraham: ANALYSIS phase failed — nothing was "
+                f"written. Phase-1 result follows.]\n\n{brief}"
+            )
 
         # ---- Phase 2: sealed implementation ----
         impl_parts = [
@@ -3518,16 +5176,20 @@ async def abraham(
 
         result = await _run_codex(
             "\n".join(impl_parts),
-            write=True, infra=False, ctx=ctx, web_search=False,
+            write=True, infra=False, ctx=ctx,
+            web_search=bool(web_search) if full else False,
             images=list(images or []),
             tool_name="abraham", workdir=cwd,
             request_started=request_t0,
+            full_access=full,
         )
         return (
             "[abraham — phase 1 analyzed (read-only"
             + (", infra" if infra else "")
             + (", live web" if web_search else "")
-            + "); phase 2 implemented (sealed: no web/network/MCP)]\n\n"
+            + ("); phase 2 implemented (FULL ACCESS: no sandbox, network and MCP on — "
+               "--dangerously-bypass-approvals-and-sandbox)]\n\n" if full
+               else "); phase 2 implemented (sealed: no web/network/MCP)]\n\n")
             + result
         )
     finally:
@@ -3616,6 +5278,22 @@ async def codex_resume_run(
     if run == "list":
         return await codex_runs()
 
+    if _IS_WINDOWS:
+        # Round 6: read-mode continuations lacked durable claims on Windows —
+        # a run claim there cannot be transferred to or survive its owning
+        # process (byte-range locks are not inherited, and a parent's exit
+        # does not end its children), so a second continuation of the same
+        # thread cannot be excluded. Refuse them all until the 1.18 daemon
+        # owns runs natively on Windows.
+        return (
+            "[continuations (resume/collect/adopt) are not available on "
+            "Windows in 1.17.x: the run claim cannot outlive or be handed "
+            "off from the owning process there, so a second continuation of "
+            "the same thread cannot be excluded. Inspect with codex_runs / "
+            "codex_run_log and re-dispatch the question; the 1.18 daemon "
+            "brings native Windows run ownership.]"
+        )
+
     if run:
         rec = runs.get(run)
         if rec is None:
@@ -3653,6 +5331,17 @@ async def codex_resume_run(
         if collected is not None:
             return collected
         rec = _journal_runs().get(run, rec)
+    if (rec.get("has_end") and str(rec.get("status") or "") == "cancelled"
+            and not nudge):
+        # CANCELLED IS A DECISION (round 9): a bare resume must not resurrect
+        # a thread someone deliberately stopped — the collector's None (a
+        # refold that found the canceller's terminal record) otherwise fell
+        # through to a fresh continuation of the cancelled thread. An
+        # explicit nudge is the deliberate override.
+        return (
+            f"[Run {run} was CANCELLED — not resuming it without explicit "
+            f"instructions. Pass a nudge to deliberately continue the thread.]"
+        )
     result_file = str(rec.get("result_file") or "")
     if result_file and not nudge and Path(result_file).exists():
         stored = Path(result_file).read_text(encoding="utf-8", errors="replace").strip()
@@ -3688,12 +5377,19 @@ async def codex_resume_run(
     # changes behind a read-only sandbox. Re-dispatch through the right tool
     # instead of flipping this axis mid-thread.
     use_write = bool(rec.get("write"))
+    use_full = bool(use_write and rec.get("full_access"))
+    if use_write and _IS_WINDOWS:  # unreachable (all Windows continuations refused above); second fence
+        return "[write runs cannot be resumed on Windows in 1.17.x (no inheritable lock); see abraham.]"
     if use_write:
-        # A write continuation is SEALED like every write process — even if
-        # the caller asked for infra/web, and regardless of what an older
-        # journal record claims. The analysis phase is where those lived.
+        # A write continuation keeps the MODE it started in: sealed stays
+        # sealed (even if the caller asked for infra/web — the analysis
+        # phase is where those lived), full access stays full access (a
+        # downgrade mid-implementation would strand half-applied changes
+        # behind a sandbox). infra never applies to a write continuation.
         use_infra = False
-        use_web = False
+        # full access keeps the analysis' web search unless THIS resume
+        # overrides it (round 40: an explicit web_search=False was overwritten)
+        use_web = (use_web if web_search is not None else bool(rec.get("web_search", False))) if use_full else False
         other = _active_write_run(cwd, exclude_run=run)
         if other:
             return (
@@ -3706,7 +5402,7 @@ async def codex_resume_run(
     # processes on one rollout can corrupt it. A run with no end record whose
     # log grew in the last minute is alive, not orphaned.
     if not rec.get("has_end"):
-        if _pid_alive(int(rec.get("pid") or 0)) and not _is_detached(rec):
+        if _pid_alive(int(rec.get("pid") or 0), str(rec.get("pid_start") or "")) and not _is_detached(rec):
             return (
                 f"[Run {run} is still RUNNING (codex pid {rec.get('pid')} is "
                 f"alive, attached to another call). Resuming a live thread can "
@@ -3756,28 +5452,58 @@ async def codex_resume_run(
     # targeted a subtree of this workspace) — locking or writing against the
     # server cwd would miss the tree the brief describes.
     run_cwd = str(rec.get("cwd") or cwd)
-    if use_write:
+    if use_write and not use_full:
         # Same gate as a fresh abraham dispatch: a resumed write run on a
         # machine whose sandbox cannot write reproduces the original
         # exit-0/no-write failure (round-2 review, 2026-08-21). Keyed to
-        # the run's OWN tree — the thing that will actually be written.
+        # the run's OWN tree — the thing that will actually be written. A
+        # FULL-ACCESS continuation has no sandbox to probe (round 39).
         can_write, probe_detail = await _ensure_write_capability(run_cwd)
         if not can_write:
             return (
                 "[resume refused: this machine's codex cannot WRITE under "
                 f"the sealed sandbox — {probe_detail}]"
             )
+    if use_write:
+        # EVERY write continuation takes the tree lock (round 40: the
+        # acquisition sat inside the sealed-only branch, so a full-access
+        # resume ran unlocked, failed its child publication at the execution
+        # barrier, and released a lock it never held).
         got_lock, holder = _acquire_write_lock(run_cwd, f"resume:{run}")
         if not got_lock:
             return (
                 f"[resume refused: another write run holds this tree's "
                 f"lock ({holder}). One writer per tree.]"
             )
+    # Claims in FIXED ORDER (round 8): the run-terminal claim first, then
+    # the THREAD claim (A → B → C are one thread; concurrent resumes of any
+    # two of them must collide — round 5). The continuation child inherits
+    # the thread-claim descriptor.
+    claimed, holder = _acquire_run_claim(_run_terminal_claim_key(run))
+    if not claimed:
+        if use_write:
+            _release_write_lock(run_cwd)
+        return (
+            f"[Run {run} is already owned by another call ({holder}) — being "
+            f"collected, resumed, or cancelled. Wait for that result "
+            f"(codex_runs() shows the status).]"
+        )
+    claimed_t, holder_t = _acquire_run_claim(_thread_claim_key(tid))
+    if not claimed_t:
+        _release_run_claim(_run_terminal_claim_key(run))
+        if use_write:
+            _release_write_lock(run_cwd)
+        return (
+            f"[Thread {tid} (run {run}) is already being resumed or collected by "
+            f"another call ({holder_t}). Two resumes of one thread double-execute "
+            f"it — wait for that result (codex_runs() shows the status).]"
+        )
     try:
         return note + await _run_codex(
             continuation,
             infra=use_infra,
             write=use_write,
+            full_access=use_full,
             ctx=ctx,
             web_search=use_web,
             resume_tid=tid,
@@ -3785,8 +5511,11 @@ async def codex_resume_run(
             tool_name=str(rec.get("tool") or ""),
             workdir=run_cwd,
             request_started=request_t0,
+            claim_key=_thread_claim_key(tid),
         )
     finally:
+        _release_run_claim(_thread_claim_key(tid))
+        _release_run_claim(_run_terminal_claim_key(run))
         if use_write:
             _release_write_lock(run_cwd)
 
@@ -3795,14 +5524,31 @@ async def codex_resume_run(
 # Detached-run adoption + run operations (1.17.0)
 # ---------------------------------------------------------------------------
 
+_STOPPABLE = ("RUNNING", "DETACHED", "DETACHED-ENDED", "ORPHANED", "ORPHANED-WRITE", "CANCELLING")
+
+
 def _run_status(rec: dict[str, Any]) -> str:
     """One word for a journal record: RUNNING / DETACHED / ok / error /
     cancelled / timeout / hung / INTERRUPTED (no end record, process gone)."""
     if rec.get("has_end"):
         return str(rec.get("status") or "?")
-    alive = _pid_alive(int(rec.get("pid") or 0))
+    if (rec.get("has_cancel_requested")
+            or _cancel_requested(str(rec.get("run") or ""))):
+        # ANY nonterminal record with a standing cancellation source — the
+        # journal record OR the on-disk marker — reads CANCELLING, BEFORE
+        # pid classification (round 12: a stale recorded pid pushed a
+        # marker-only state to INTERRUPTED, which is not stoppable, so the
+        # promised retry could never terminalize). CANCELLING is stoppable.
+        return "CANCELLING"
+    alive = _pid_alive(int(rec.get("pid") or 0), str(rec.get("pid_start") or ""))
+    if _is_orphaned_write(rec):
+        return "ORPHANED-WRITE"
     if _is_detached(rec):
         return "DETACHED" if alive else "DETACHED-ENDED"
+    owner = int(rec.get("server_pid") or 0)
+    if alive and owner and not _server_alive(
+            owner, str(rec.get("server_start") or "")):
+        return "ORPHANED"  # alive, owner gone, no watchdog — stop it
     if alive:
         return "RUNNING"
     log_path = str(rec.get("log") or "")
@@ -3821,20 +5567,122 @@ def _workspace_runs(limit: int = 0) -> list[dict[str, Any]]:
     return runs[-limit:] if limit else runs
 
 
-def _replay_spool(rec: dict[str, Any], emit) -> dict[str, Any]:
-    """Digest a run's stdout spool from the start into a fresh state."""
+def _replay_spool(rec: dict[str, Any], emit, max_bytes: int = REPLAY_MAX_BYTES) -> dict[str, Any]:
+    """Digest the TAIL of a run's stdout spool into a fresh state (bounded:
+    the terminal events — answer, turn.completed, errors — are at the end).
+    Returns the position replayed up to in state["_pos"]."""
     state: dict[str, Any] = {"activity": "", "last_message": "", "last_error": "",
                              "usage": "", "thread_id": ""}
     path = Path(str(rec.get("stdout") or ""))
     buf = bytearray()
+    pos = 0
     with contextlib.suppress(OSError):
+        size = path.stat().st_size
         with open(path, "rb") as fh:
+            start = max(0, size - max_bytes)
+            fh.seek(start)
+            if start:
+                # Discard through the first newline WITHIN the window using
+                # fixed-size reads — readline() on a newline-free region
+                # allocates it whole before the record cap applies (round 6).
+                scanned = 0
+                while scanned < max_bytes:
+                    probe = fh.read(min(READ_CHUNK_SIZE, max_bytes - scanned))
+                    if not probe:
+                        break
+                    nl = probe.find(b"\n")
+                    if nl >= 0:
+                        fh.seek(start + scanned + nl + 1)
+                        break
+                    scanned += len(probe)
+            pos = fh.tell()
             while True:
                 chunk = fh.read(READ_CHUNK_SIZE)
                 if not chunk:
                     break
+                pos += len(chunk)
                 _feed_jsonl(buf, chunk, state, emit)
+    if not state.get("thread_id"):
+        # thread.started is the FIRST record — a tail window on a spool
+        # larger than max_bytes never sees it (round 8). One bounded head
+        # read recovers it.
+        with contextlib.suppress(OSError):
+            with open(path, "rb") as hf:
+                head = hf.read(READ_CHUNK_SIZE)
+            for raw in head.split(b"\n")[:64]:
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(ev, dict) and ev.get("type") == "thread.started" and ev.get("thread_id"):
+                    state["thread_id"] = str(ev["thread_id"])
+                    break
+    state["_pos"] = pos
+    state["_buf"] = bytes(buf)  # an incomplete trailing record continues in adoption
     return state
+
+
+def _cancel_marker(run: str) -> Path:
+    return _run_dir_root() / "cancel" / (run.replace("·", "-") + ".cancel")
+
+
+def _request_cancel(run: str) -> bool:
+    """A cancellation INTENT: honoured by the run's owner before/at spawn
+    (round 3: a pre-spawn run was journaled 'cancelled' while its owner went
+    on to spawn). Returns False when the marker could not be written — the
+    caller must report that, never swallow it."""
+    try:
+        p = _cancel_marker(run)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _private(p.parent, 0o700)
+        p.write_text(f"pid={os.getpid()} t={int(time.time())}\n", encoding="utf-8")
+        _private(p, 0o600)
+        return True
+    except OSError:
+        return False
+
+
+def _cancel_requested(run: str) -> bool:
+    return _cancel_marker(run).exists()
+
+
+def _clear_cancel(run: str) -> None:
+    with contextlib.suppress(OSError):
+        _cancel_marker(run).unlink()
+
+
+def _run_claim_path(run: str) -> Path:
+    return _run_dir_root() / "claims" / (run.replace("·", "-") + ".lock")
+
+
+def _run_terminal_claim_key(run: str) -> str:
+    """Claim key for the right to WRITE this run's terminal record. Held by
+    the attached owner for the run's whole lifetime, by a collector for the
+    collection, and taken by a canceller before it terminalizes — so there is
+    exactly ONE terminal writer, with a STABLE identity (round 8: keying by
+    `thread_id or run` changed identity when replay recovered the thread id,
+    letting a collector and a canceller into their critical sections at
+    once). Prefixes are filename-safe on Windows (no colon)."""
+    return "run-" + run
+
+
+def _thread_claim_key(tid: str) -> str:
+    """Claim key for continuations of one codex THREAD (A→B→C are one
+    thread). Always acquired AFTER the run-terminal claim (fixed order —
+    no deadlock between a collector and a canceller)."""
+    return "tid-" + tid
+
+
+def _acquire_run_claim(run: str) -> tuple[bool, str]:
+    """One collector/resumer per run at a time (two collectors of a dead
+    detached run both fell through to a thread resume). A kernel-held lock:
+    exclusive for the holder's lifetime, gone with it."""
+    return _acquire_os_lock(
+        _run_claim_path(run), f"pid={os.getpid()} start={_SERVER_START or '-'} t={int(time.time())}\n")
+
+
+def _release_run_claim(run: str) -> None:
+    _release_os_lock(_run_claim_path(run))
 
 
 async def _collect_detached(
@@ -3850,9 +5698,14 @@ async def _collect_detached(
     model = str(rec.get("model") or "?")
     reasoning = str(rec.get("reasoning") or "?")
     tool_name = str(rec.get("tool") or "")
+    # A record without a dispatch-time digest (pre-1.17.2) must never vouch
+    # for whatever the tree looks like now: stamp `unknown`, which the push
+    # gate parses syntactically and can never render as VERIFIED.
+    tree = str(rec.get("tree") or "") or "unknown"
+    start = str(rec.get("pid_start") or "")
     out = Path(str(rec.get("output_file") or ""))
     deadline = float(rec.get("deadline_ts") or 0)
-    alive = _pid_alive(pid)
+    alive = _pid_alive(pid, start)
     if alive and nudge:
         return (
             f"[Run {run} is still RUNNING detached (codex pid {pid}). Its thread "
@@ -3860,6 +5713,43 @@ async def _collect_detached(
             f"codex_resume_run(run=\"{run}\") without a nudge to wait for and "
             f"collect its answer, or codex_cancel_run(run=\"{run}\") to stop it.]"
         )
+    # FIXED claim order (round 8): the STABLE run-terminal claim first, then
+    # the thread claim when the thread is already known. A thread id
+    # recovered later, during replay, is claimed then and released by the
+    # same finally (held list shared with the collection).
+    held: list[str] = []
+    keys = [_run_terminal_claim_key(run)]
+    tid0 = str(rec.get("thread_id") or "")
+    if tid0:
+        keys.append(_thread_claim_key(tid0))
+    for key in keys:
+        claimed, holder = _acquire_run_claim(key)
+        if not claimed:
+            for k in reversed(held):
+                _release_run_claim(k)
+            return (
+                f"[Run {run} is already being collected, resumed, or cancelled by "
+                f"another call ({holder}). Wait for that result instead — "
+                f"codex_runs() shows the run's status; a second collector would "
+                f"double-execute the thread.]"
+            )
+        held.append(key)
+    try:
+        return await _collect_detached_claimed(
+            rec, run, ctx, request_t0, pid, pgid, model, reasoning, tool_name,
+            tree, out, deadline, alive, start, held)
+    finally:
+        for k in reversed(held):
+            _release_run_claim(k)
+
+
+async def _collect_detached_claimed(
+    rec, run, ctx, request_t0, pid, pgid, model, reasoning, tool_name, tree,
+    out, deadline, alive, start="", held_keys: list[str] | None = None,
+) -> str | None:
+    rec = _journal_runs().get(run, rec)
+    if rec.get("has_end"):
+        return None  # another collector finished it while we waited for the claim
     live_path, live_fh, stream_fh, tag = _open_live_log("adopt")
     t0 = time.monotonic()
 
@@ -3886,16 +5776,36 @@ async def _collect_detached(
     )
     try:
         spool = Path(str(rec.get("stdout") or ""))
-        pos = 0
-        with contextlib.suppress(OSError):
-            pos = spool.stat().st_size
-        buf = bytearray()
-        while _pid_alive(pid):
+        pos = int(state.pop("_pos", 0) or 0)
+        buf = bytearray(state.pop("_buf", b"") or b"")
+        while _writer_alive(pid, start, pgid, spool):
             if deadline and time.time() > deadline + 30:
-                _kill_pgid(pgid, pid)
+                signalled = _kill_pgid(pgid, pid, start)
+                death = time.time() + 3.0
+                while ((_pid_alive(pid, start) or _pgid_alive(pgid))
+                       and time.time() < death):
+                    await asyncio.sleep(0.1)
+                if _pid_alive(pid, start) or _pgid_alive(pgid):
+                    # VERIFIED DEATH ONLY (round 11): journaling terminal
+                    # `timeout` over a live process lets a later resume
+                    # write the same thread concurrently with it.
+                    _emit(f"✖ deadline kill FAILED (signalled={signalled}, "
+                          f"pid {pid} still alive) — NOT terminalizing")
+                    for _fh in (live_fh, stream_fh):
+                        if _fh is not None:
+                            with contextlib.suppress(Exception):
+                                _fh.close()
+                    return (
+                        f"[collection of run {run} FAILED: it is past its "
+                        f"deadline but its process (pid {pid}) could not be "
+                        f"killed (signalled: {signalled}). Nothing was "
+                        f"finalized — the run stays stoppable; stop it from "
+                        f"the OS or retry codex_cancel_run(run=\"{run}\").]"
+                    )
                 timed_out = True
-                _emit(f"■ detached run past its {MAX_RUNTIME_SECONDS}s deadline "
-                      f"— killed")
+                _emit(f"■ detached run past its {MAX_RUNTIME_SECONDS}s run budget "
+                      f"(CODEX_ORACLE_MAX_RUNTIME_S) "
+                      f"— killed (death verified)")
                 break
             with contextlib.suppress(OSError):
                 with open(spool, "rb") as fh:
@@ -3906,26 +5816,122 @@ async def _collect_detached(
                     _feed_jsonl(buf, chunk, state, _emit)
                     continue
             await asyncio.sleep(1.0)
-        # Final drain after exit.
+        try:
+            marked_amb = _marked_survivors(run)
+        except Exception:
+            marked_amb = [-1]
+        if not _pid_alive(pid, start) and (_pgid_alive(pgid) or marked_amb):
+            # Round 13: _writer_alive's spool-freshness clause bounds the
+            # WAIT (pgid recycling must not park a collector forever) — it
+            # is not death evidence. A live group with a stale spool is
+            # AMBIGUOUS: no terminal record, the run stays stoppable.
+            _emit(f"✖ launcher pid {pid} is gone but group {pgid} still has "
+                  f"live members and the spool is stale — NOT terminalizing")
+            for _fh in (live_fh, stream_fh):
+                if _fh is not None:
+                    with contextlib.suppress(Exception):
+                        _fh.close()
+            return (
+                f"[collection of run {run} FAILED: its recorded pid is gone "
+                f"but its process group ({pgid}) still reads alive while the "
+                f"spool has gone quiet — the writer's state is ambiguous. "
+                f"Nothing was finalized; codex_cancel_run(run=\"{run}\") "
+                f"kills marker-verified survivors (python3 procenv.py --list "
+                f"{run} lists them), then collect again. "
+                f"Never signal the bare group id — it may have been reused.]"
+            )
+        # Final drain after exit (chunked, bounded by the spool tail).
         with contextlib.suppress(OSError):
             with open(spool, "rb") as fh:
                 fh.seek(pos)
-                rest = fh.read()
-            if rest:
-                _feed_jsonl(buf, rest, state, _emit)
+                while True:
+                    rest = fh.read(READ_CHUNK_SIZE)
+                    if not rest:
+                        break
+                    _feed_jsonl(buf, rest, state, _emit)
+    except asyncio.CancelledError:
+        # The CALLER stopped waiting; the run was not theirs to kill — it
+        # keeps running and stays collectable (codex_cancel_run stops it).
+        _journal({"run": run, "phase": "collect_cancelled", "ts": time.time(),
+                  "by_pid": os.getpid()})
+        _emit(f"■ collector cancelled by caller — run {run} keeps running "
+              f"(pid {pid}); collect again with codex_resume_run or stop it "
+              f"with codex_cancel_run")
+        for _fh in (live_fh, stream_fh):
+            if _fh is not None:
+                with contextlib.suppress(Exception):
+                    _fh.close()
+        raise
     finally:
         if hb is not None:
             hb.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await hb
+    if state.get("thread_id") and not str(rec.get("thread_id") or ""):
+        # A thread id recovered only from replay must land in the journal
+        # (round 6) — and the append must be CHECKED (round 7): terminalizing
+        # a run whose thread id never persisted would strand the thread.
+        sess_ok = False
+        for sess_try in range(3):
+            if sess_try:
+                await asyncio.sleep(0.05)
+            if _journal({"run": run, "phase": "session", "ts": time.time(),
+                         "thread_id": str(state["thread_id"])}):
+                sess_ok = True
+                break
+        if not sess_ok:
+            _emit("✖ could not journal the recovered thread id — NOT terminalizing")
+            for _fh in (live_fh, stream_fh):
+                if _fh is not None:
+                    with contextlib.suppress(Exception):
+                        _fh.close()
+            return (
+                f"[collection of run {run} FAILED: the replay-recovered thread id "
+                f"could not be journaled, so a terminal record would strand the "
+                f"thread. Nothing was finalized — fix the state directory and "
+                f"retry codex_resume_run(run=\"{run}\").]"
+            )
+        # The thread is known NOW: take its claim too (fixed order — we hold
+        # the run-terminal claim), so no resume can continue this thread
+        # while we finish, and no canceller keys past us (round 8). The
+        # shared held list makes the outer finally release it.
+        got_t, holder_t = _acquire_run_claim(_thread_claim_key(str(state["thread_id"])))
+        if not got_t:
+            _emit(f"✖ recovered thread is claimed elsewhere ({holder_t}) — NOT terminalizing")
+            for _fh in (live_fh, stream_fh):
+                if _fh is not None:
+                    with contextlib.suppress(Exception):
+                        _fh.close()
+            return (
+                f"[collection of run {run} deferred: its recovered thread is "
+                f"claimed by another call ({holder_t}). Nothing was finalized — "
+                f"retry codex_resume_run(run=\"{run}\") once that call ends.]"
+            )
+        if held_keys is not None:
+            held_keys.append(_thread_claim_key(str(state["thread_id"])))
     final = ""
     with contextlib.suppress(OSError):
         if out.exists() and out.stat().st_size > 0:
             final = out.read_text(encoding="utf-8", errors="replace").strip()
+    # OK is EARNED: the answer FILE (codex writes it only at turn end) AND a
+    # turn.completed event AND no terminal error. Anything less — an earlier
+    # agent_message, a spool that stops mid-turn — is PARTIAL, never signed ok
+    # (review of 1.17.0: partial commentary was signed status:ok).
+    completed = bool(final) and bool(state.get("turn_completed")) and not state.get("last_error")
     if not final and not timed_out:
         final = str(state.get("last_message") or "")
-    status = "ok" if (final and not timed_out and not state.get("last_error")) else (
-        "timeout" if timed_out else "error")
+    status = "ok" if (completed and not timed_out) else ("timeout" if timed_out else "error")
+    if status != "ok" and _cancel_requested(run):
+        # A canceller killed the process while we held the claim (round 7):
+        # we are the sole terminal writer, so WE fold the intent.
+        status = "cancelled"
+        state["last_error"] = str(
+            state.get("last_error") or "cancelled by codex_cancel_run during collection")
+    if status == "error" and not state.get("last_error"):
+        state["last_error"] = (
+            "the detached process ended without completing its turn "
+            "(no turn.completed / no answer file)"
+        )
     result_file = ""
     if status == "ok" and live_path is not None:
         with contextlib.suppress(Exception):
@@ -3934,7 +5940,7 @@ async def _collect_detached(
             _private(rf, 0o600)
             result_file = str(rf)
     _emit(f"■ adoption finished: status={status} {state.get('usage') or ''}".rstrip())
-    _journal({
+    end_ok = _journal({
         "run": run, "phase": "end", "ts": time.time(), "status": status,
         "returncode": 0 if status == "ok" else 1, "adopted": True,
         "error": str(state.get("last_error") or ("timeout" if timed_out else ""))[:500]
@@ -3945,21 +5951,46 @@ async def _collect_detached(
         if _fh is not None:
             with contextlib.suppress(Exception):
                 _fh.close()
+    late_cancel_note = ""
+    if status == "ok" and _cancel_requested(run):
+        # LINEARIZATION RULE (round 8): a cancel that lands after the run
+        # already completed loses — the answer file and turn.completed exist,
+        # and discarding finished work over a late kill is waste. Said out
+        # loud so the canceller's caller is not left expecting `cancelled`.
+        late_cancel_note = (
+            "\n[note: a cancel intent arrived after this run had already "
+            "completed — the answer wins and the run is journaled ok]"
+        )
+    if end_ok:
+        _clear_cancel(run)  # any durable terminal record retires the intent
     log_note = f"\n\n[live log: {live_path}]" if live_path else ""
+    if not end_ok:
+        log_note += ("\n[⚠ the adoption's terminal record could not be "
+                     "journaled — a later call may re-collect this run]")
+    if status == "cancelled":
+        # Never fall through to the thread-resume fallback: that would
+        # resurrect a run the caller just cancelled.
+        return (
+            f"[Run {run} was cancelled (codex_cancel_run) while being collected "
+            f"— no answer was produced. Resume deliberately with "
+            f"codex_resume_run(run=\"{run}\", nudge=...) if it is still wanted.]"
+            f"{log_note}"
+        )
     if status == "ok":
         return (
             f"[Codex model: {model} | reasoning: {reasoning}"
-            f"{_answer_sig(tool_name, 'ok')}]\n"
+            f"{_answer_sig(tool_name, 'ok', tree)}]\n"
             f"[collected from run {run}, which outlived its MCP call (server "
-            f"restart) — no re-ask, no new model call]{log_note}\n\n{final}"
+            f"restart) — no re-ask, no new model call]{late_cancel_note}{log_note}\n\n{final}"
         )
     if final:
+        snippet = final if len(final) <= 4000 else final[:4000] + "\n… [partial output truncated]"
         return (
-            f"[Codex model: {model} | reasoning: {reasoning}"
-            f"{_answer_sig(tool_name, status)}]\n"
-            f"[collected from detached run {run} — it ended with "
-            f"{'a timeout' if timed_out else 'an error: ' + str(state.get('last_error'))[:300]}; "
-            f"partial output follows]{log_note}\n\n{final}"
+            f"[Codex error (detached run {run}){_answer_sig(tool_name, status, tree)}]\n"
+            f"{'timed out' if timed_out else str(state.get('last_error'))[:300]}\n"
+            f"[recoverable: call codex_resume_run with a nudge to continue the thread "
+            f"(run id: {run})]\n\n[partial output before the failure — NOT the answer]\n{snippet}"
+            f"{log_note}"
         )
     return None  # died without an answer → caller falls back to a thread resume
 
@@ -3980,7 +6011,8 @@ async def codex_runs(limit: int = 10) -> str:
     runs = _workspace_runs(max(1, min(int(limit or 10), 50)))
     if not runs:
         return "[No recorded codex runs for this workspace.]"
-    lines = ["Codex runs in this workspace (oldest → newest):"]
+    lines = [f"Codex runs in this workspace (oldest → newest) — run budget "
+             f"{MAX_RUNTIME_SECONDS}s ({MAX_RUNTIME_SOURCE}; CODEX_ORACLE_MAX_RUNTIME_S):"]
     now = time.time()
     for rec in runs:
         st = _run_status(rec)
@@ -4003,7 +6035,10 @@ async def codex_runs(limit: int = 10) -> str:
         )
     lines.append(
         "Collect a DETACHED run: codex_resume_run(run=<id>). Watch one: "
-        "codex_run_log(run=<id>). Stop one: codex_cancel_run(run=<id>)."
+        "codex_run_log(run=<id>). Stop one: codex_cancel_run(run=<id>). "
+        "An ORPHANED-WRITE run (write child outlived its server) must be "
+        "stopped before any new write run in that tree; an ORPHANED run has "
+        "no deadline watchdog — stop it with codex_cancel_run."
     )
     return "\n".join(lines)
 
@@ -4071,17 +6106,22 @@ async def codex_cancel_run(run: str = "") -> str:
     live run in this workspace. The thread stays on disk, so the run remains
     resumable with a nudge via codex_resume_run.
 
+    While the run's owning server is alive, the terminal record is the
+    OWNER's to write: this call kills the live attempt and leaves a standing
+    cancel intent; codex_runs shows CANCELLING until the owner journals the
+    cancellation (within ~1s — its waits poll the intent every second).
+
     Args:
         run: Run id from codex_runs / a failure message; "" = most recent live run.
     """
     runs = _workspace_runs()
-    live = [r for r in runs if _run_status(r) in ("RUNNING", "DETACHED")]
+    live = [r for r in runs if _run_status(r) in _STOPPABLE]
     rec = None
     if run:
         rec = next((r for r in runs if r.get("run") == run), None)
         if rec is None:
             return f"[Unknown run id '{run}' in this workspace. Try codex_runs().]"
-        if _run_status(rec) not in ("RUNNING", "DETACHED"):
+        if _run_status(rec) not in _STOPPABLE:
             return f"[Run {run} is not running (status {_run_status(rec)}); nothing to stop.]"
     else:
         if not live:
@@ -4089,16 +6129,241 @@ async def codex_cancel_run(run: str = "") -> str:
         rec = live[-1]
     pid = int(rec.get("pid") or 0)
     pgid = int(rec.get("pgid") or 0)
-    killed = _kill_pgid(pgid, pid) if pid else False
-    wd = int(rec.get("watchdog_pid") or 0)
-    if wd:
-        with contextlib.suppress(Exception):
-            os.kill(wd, signal.SIGTERM)
+    start = str(rec.get("pid_start") or "")
     tag = str(rec.get("run"))
-    _journal({"run": tag, "phase": "end", "ts": time.time(), "status": "cancelled",
-              "cancelled_by": "codex_cancel_run", "returncode": -9})
+    if not _request_cancel(tag):
+        return f"[cancel FAILED for run {tag}: could not record the cancel intent (state dir unwritable).]"
+    # GENERATION-AWARE: an automatic retry spawns a new child per attempt, so
+    # the pid in any snapshot may be a previous, dead attempt while a newer
+    # one runs (review round 5). Re-fold the journal, kill the CURRENT live
+    # generation, and only journal a terminal cancellation once no live
+    # generation remains; otherwise leave the intent for the owner.
+    seen: set[int] = set()
+    killed_pids: list[int] = []
+    for _ in range(5):
+        fresh = _journal_runs().get(tag, rec)
+        rec = fresh
+        pid = int(fresh.get("pid") or 0)
+        pgid = int(fresh.get("pgid") or 0)
+        start = str(fresh.get("pid_start") or "")
+        if pid <= 0:
+            # OWNERSHIP TEST (round 9): a live owner holds the run-terminal
+            # claim from its start record on — if the claim is FREE and
+            # nothing ever spawned, the owner is gone and REQUESTED-forever
+            # helps nobody: terminalize here.
+            got_pre, _pre_holder = _acquire_run_claim(_run_terminal_claim_key(tag))
+            if got_pre:
+                try:
+                    refold0 = _journal_runs().get(tag, rec)
+                    if refold0.get("has_end"):
+                        _clear_cancel(tag)
+                        return (
+                            f"[Run {tag} already reached terminal status "
+                            f"{str(refold0.get('status') or '?')!r}; nothing to stop.]"
+                        )
+                    if not int(refold0.get("pid") or 0):
+                        if _journal({"run": tag, "phase": "end", "ts": time.time(),
+                                     "status": "cancelled",
+                                     "cancelled_by": "codex_cancel_run",
+                                     "returncode": -9}):
+                            _clear_cancel(tag)
+                            return (
+                                f"[Run {tag} cancelled before it ever spawned "
+                                f"(no live owner holds it).]"
+                            )
+                        # Round 10 MEDIUM: never report success over a failed
+                        # terminal append — the intent stays, the run stays
+                        # stoppable, and a retry terminalizes.
+                        return (
+                            f"[Run {tag}: no live owner and nothing spawned, but "
+                            f"the terminal record could NOT be journaled — the "
+                            f"cancel intent is retained. Re-run codex_cancel_run "
+                            f"once the state directory is writable.]"
+                        )
+                finally:
+                    _release_run_claim(_run_terminal_claim_key(tag))
+                continue  # a spawn appeared while we looked — re-enter the loop
+            _journal({"run": tag, "phase": "cancel_requested", "ts": time.time(),
+                      "by_pid": os.getpid()})
+            return (
+                f"[cancel REQUESTED for run {tag} — it has not spawned its codex "
+                f"process yet; its owner honours the request at spawn and journals "
+                f"the cancellation. codex_runs shows CANCELLING until then.]"
+            )
+        if pid in seen or not _pid_alive(pid, start):
+            break  # this generation is gone (and no newer one appeared since)
+        if not start:
+            return (
+                f"[stop REFUSED: run {tag} (pid {pid}) has no recorded process "
+                f"identity (legacy record or a platform without one); killing by "
+                f"pid alone could hit an unrelated process. Stop it from the OS; a "
+                f"cancel intent was recorded for its owner.]"
+            )
+        killed = _kill_pgid(pgid, pid, start)
+        deadline = time.time() + 3.0
+        while _pid_alive(pid, start) and time.time() < deadline:
+            await asyncio.sleep(0.1)
+        if _pid_alive(pid, start):
+            return (
+                f"[stop FAILED: run {tag} (pid {pid}, pgid {pgid}) is still alive "
+                f"(kill signalled: {killed}). Nothing was journaled; retry, or stop "
+                f"it from the OS.]"
+            )
+        gdeadline = time.time() + 3.0
+        while _pgid_alive(pgid) and time.time() < gdeadline:
+            await asyncio.sleep(0.1)
+        if _pgid_alive(pgid):
+            # Round 12: the recorded pid can be a LAUNCHER whose child is
+            # the real writer — the pid dying is not the run dying.
+            return (
+                f"[stop FAILED: run {tag}: pid {pid} is gone but its process "
+                f"group ({pgid}) still reads alive (a launcher's child "
+                f"survived the launcher, or the id was reused). Nothing was "
+                f"journaled; retry codex_cancel_run — it kills marker-verified "
+                f"survivors (python3 procenv.py --list {tag} lists them). "
+                f"Never signal the bare group id.]"
+            )
+        seen.add(pid)
+        killed_pids.append(pid)
+        await asyncio.sleep(0.2)  # let a retrying owner publish its next generation
+    fresh = _journal_runs().get(tag, rec)
+    live_pid = int(fresh.get("pid") or 0)
+    if live_pid and live_pid not in seen and _pid_alive(live_pid, str(fresh.get("pid_start") or "")):
+        _journal({"run": tag, "phase": "cancel_requested", "ts": time.time(), "by_pid": os.getpid()})
+        return (
+            f"[cancel REQUESTED for run {tag}: killed attempt(s) {killed_pids}, but a "
+            f"newer attempt (pid {live_pid}) is live; its owner honours the intent "
+            f"before the next attempt. Call again to stop it now.]"
+        )
+    # ONE TERMINAL WRITER, ONE OWNERSHIP TEST (rounds 7-8): whoever holds the
+    # STABLE run-terminal claim is responsible for the terminal record — the
+    # attached owner (which holds it for the run's whole lifetime, including
+    # capacity backoffs), or an active collector. If it is held, the kill is
+    # done and the standing intent makes that holder journal `cancelled`
+    # (a run that had already completed returns its answer instead — the
+    # answer wins the completion-boundary race). If it is free, no task
+    # remains responsible — dead owner, detached idle run, or an owner whose
+    # terminal append failed — and WE terminalize under the claim.
+    held_keys = [_run_terminal_claim_key(tag)]
+    claimed, holder = _acquire_run_claim(held_keys[0])
+    if not claimed:
+        _journal({"run": tag, "phase": "cancel_requested", "ts": time.time(),
+                  "by_pid": os.getpid()})
+        did = f"killed live attempt pid(s) {killed_pids}; " if killed_pids else ""
+        return (
+            f"[cancel of run {tag}: {did}terminalization is owned by another "
+            f"live call ({holder}) — it journals the terminal state; the "
+            f"standing intent marks it cancelled (a run that had already "
+            f"completed returns its answer). codex_runs shows CANCELLING "
+            f"until then; the thread stays resumable: "
+            f"codex_resume_run(run=\"{tag}\").]"
+        )
+    tid_f = str(fresh.get("thread_id") or "")
+    if tid_f:
+        got_t, holder_t = _acquire_run_claim(_thread_claim_key(tid_f))
+        if not got_t:
+            _release_run_claim(held_keys[0])
+            _journal({"run": tag, "phase": "cancel_requested", "ts": time.time(),
+                      "by_pid": os.getpid()})
+            return (
+                f"[cancel of run {tag}: killed pid(s) {killed_pids or [pid]}; its "
+                f"thread is claimed by another live call ({holder_t}) — that call "
+                f"owns the terminal state; the standing intent marks it cancelled.]"
+            )
+        held_keys.append(_thread_claim_key(tid_f))
+    try:
+        refold = _journal_runs().get(tag, fresh)
+        if refold.get("has_end"):
+            _clear_cancel(tag)  # someone else's durable terminal record retires the intent
+            did = (f" — this call killed attempt pid(s) {killed_pids} and the owner "
+                   f"journaled the cancellation") if killed_pids else ""
+            return (
+                f"[Run {tag} already reached terminal status "
+                f"{str(refold.get('status') or '?')!r} while stopping{did}; nothing more to do.]"
+            )
+        gpgid = int(refold.get("pgid") or 0)
+        try:
+            marked_left = _marked_survivors(tag)
+            if marked_left:
+                # Round 19: the canceller KILLS marked escapees (revalidated
+                # at signal time), then verifies — refusal is for what
+                # survives the kill, not for what was merely found.
+                _kill_marked(tag, marked_left)
+                kill_deadline = time.time() + 3.0
+                while time.time() < kill_deadline:
+                    marked_left = _marked_survivors(tag)
+                    if not marked_left:
+                        break
+                    await asyncio.sleep(0.1)
+        except Exception as e:
+            return (
+                f"[stop FAILED for run {tag}: survivor scan failed ({e}) — "
+                f"cannot verify the run's processes are gone. Nothing was "
+                f"journaled; the cancel intent is retained.]"
+            )
+        if marked_left:
+            return (
+                f"[stop FAILED for run {tag}: process(es) {marked_left} still "
+                f"carry its spawn marker (codex shell tools setsid out of the "
+                f"group — round 16). Nothing was journaled and the cancel "
+                f"intent is retained. Re-run codex_cancel_run — it kills marker-"
+                f"verified survivors at signal time (pids listed now: "
+                f"{marked_left}; inspect with python3 procenv.py --list {tag}). "
+                f"Never signal a pid from an old listing — it may have been reused.]"
+            )
+        if _pgid_alive(gpgid) and not _pid_alive(
+                int(refold.get("pid") or 0), str(refold.get("pid_start") or "")):
+            # Round 13: the recorded pid being dead is NOT the run being dead
+            # — a launcher's surviving child still holds the thread. No
+            # terminal record over a live group; the marker stays for the
+            # retry after the operator stops the group.
+            return (
+                f"[stop FAILED for run {tag}: its recorded pid is gone but "
+                f"its process group ({gpgid}) still reads alive (a launcher's "
+                f"child survived, or the id was reused). Nothing was journaled "
+                f"and the cancel intent is retained; re-run codex_cancel_run — "
+                f"it kills marker-verified survivors (python3 procenv.py --list "
+                f"{tag} lists them). Never signal the bare "
+                f"group id.]"
+            )
+        wd = int(rec.get("watchdog_pid") or 0)
+        if wd and _pid_alive(wd, str(rec.get("watchdog_start") or ""), strict=True):
+            # Only OUR watchdog (verified identity) — a reused pid is left alone.
+            with contextlib.suppress(Exception):
+                os.kill(wd, signal.SIGTERM)
+        end_ok = _journal({"run": tag, "phase": "end", "ts": time.time(), "status": "cancelled",
+                           "cancelled_by": "codex_cancel_run", "returncode": -9})
+        if end_ok:
+            _clear_cancel(tag)  # terminal record is durable; the intent has served
+            custody_tree = (str(refold.get("custody_cwd") or "")
+                            or (str(refold.get("cwd") or "") if refold.get("write") else ""))
+            if custody_tree:
+                lp = _write_lock_path(custody_tree)
+                if str(lp) in _LOCK_CUSTODY:
+                    # Group death was verified above (round 13's check) and
+                    # the run is durably terminal — custody ends. Lock-held
+                    # READS release via their journaled custody_cwd (round
+                    # 18: the write-only check wedged phase-1 custody).
+                    # Residual: custody is in-memory, so only the OWNING
+                    # server can release it — a cross-server cancel leaves
+                    # the owner's lock held (fail-closed over-hold) until
+                    # that server exits; the 1.18 daemon owns custody
+                    # durably.
+                    _LOCK_CUSTODY.discard(str(lp))
+                    _release_write_lock(custody_tree)
+    finally:
+        for k in reversed(held_keys):
+            _release_run_claim(k)
+    if not end_ok:
+        # Round 7 MEDIUM: never report success over a failed terminal append.
+        return (
+            f"[Run {tag}: process stopped (pid(s) {killed_pids or [pid]}), but the "
+            f"terminal record could NOT be journaled — the cancel intent is "
+            f"retained and status displays may show the run live. Re-run "
+            f"codex_cancel_run once the state directory is writable.]"
+        )
     return (
-        f"[Run {tag} stopped (pid {pid}, pgid {pgid}, killed={killed}). "
+        f"[Run {tag} stopped (pid(s) {killed_pids or [pid]}). "
         f"Its thread is on disk: codex_resume_run(run=\"{tag}\", nudge=...) "
         f"continues it if needed.]"
     )
@@ -4110,6 +6375,7 @@ async def codex_cancel_run(run: str = "") -> str:
 
 if __name__ == "__main__":
     _install_shutdown_handlers(hard_exit=True)
+    _register_server()  # mixed-version write barrier: mark this process 1.17.2+
     try:
         mcp.run(transport="stdio")
     finally:
