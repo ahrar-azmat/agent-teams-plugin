@@ -14,7 +14,10 @@ Knobs (env): FAKE_CODEX_SLEEP (seconds of "work" before answering, default
 0.3), FAKE_CODEX_FAIL=capacity|quota|disconnect (fail the turn with codex's
 exact rendered text for that class), FAKE_CODEX_PRELUDE (an agent_message
 emitted BEFORE the failure/answer — real failed runs carry commentary),
-FAKE_CODEX_THREAD (fixed thread id), FAKE_CODEX_ANSWER (answer text).
+FAKE_CODEX_THREAD (fixed thread id), FAKE_CODEX_ANSWER (answer text),
+FAKE_CODEX_FAIL_STDERR_ONLY=1 (with FAKE_CODEX_FAIL: the failure text reaches
+STDERR only — no `error`/`turn.failed` event — and the process exits 1; the
+shape of a stream that died outside the JSONL contract, round 47).
 """
 import json
 import os
@@ -70,6 +73,11 @@ def main(argv: list[str]) -> int:
         _emit({"type": "item.completed",
                "item": {"type": "command_execution", "command": f"sleep {step}",
                         "exit_code": 0}})
+    failed_cmd = os.environ.get("FAKE_CODEX_FAILED_COMMAND")
+    if failed_cmd:  # a tool command that exited non-zero (codex marks it status "failed")
+        _emit({"type": "item.completed",
+               "item": {"type": "command_execution", "command": failed_cmd, "status": "failed",
+                        "exit_code": 1, "aggregated_output": ""}})
     prelude = os.environ.get("FAKE_CODEX_PRELUDE")
     if prelude:
         _emit({"type": "item.completed", "item": {"type": "agent_message", "text": prelude}})
@@ -89,6 +97,15 @@ def main(argv: list[str]) -> int:
             "quota": "Quota exceeded. Check your plan and billing details.",
             "disconnect": "stream disconnected before completion: connection reset by peer",
         }.get(fail, fail)
+        if os.environ.get("FAKE_CODEX_FAIL_STDERR_ONLY"):
+            # No terminal event: the JSONL stream just stops and the text lands
+            # on stderr. This is the ONLY shape in which the run's terminal-
+            # error slot is not overwritten by an event, so it is the shape a
+            # regression test for that slot must use (round 47, MEDIUM: an
+            # event-emitting disconnect classified the same on the baseline).
+            sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+            return 1
         _emit({"type": "error", "message": msg})
         _emit({"type": "turn.failed", "error": {"message": msg}})
         return 1

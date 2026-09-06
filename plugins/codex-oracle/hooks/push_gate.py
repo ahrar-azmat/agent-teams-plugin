@@ -328,15 +328,56 @@ GIT_PUSH_COMMIT_RE = _PushCommitMatcher()
 _PREFILTER_RE = re.compile(r"(?i)git|push|commit|pwsh|powershell")
 
 
+# A `$'` occurrence is LIVE when a BACKSLASH appears between it and the next
+# `'` (or the end of the command). Round 49 replaced an escape-aware scan with
+# this parity-INDEPENDENT question; see `_ansi_c_quote`.
+def _ansi_c_quote(command):
+    """Is ANSI-C quoting PRESENT? Round 29: `$'` can build the verb itself
+    (`g$'\\x69t'`, `git $'\\x70\\x75\\x73\\x68'`), nothing literal survives
+    stripping, so its mere presence is detection.
+
+    FIVE attempts to exempt the blank-line idiom `grep -v '^\\s*$'` — where the
+    `$` is the last character of a single-quoted word and the `'` merely closes
+    it — were each REFUTED by blind review, and the arc is the finding:
+      * a quote-state scan (round 46, 2 HIGH) swallowed executable text inside
+        `$(...)`, backticks, `eval` strings and here-docs;
+      * a "closing shape" rule (round 47, 1 HIGH): the delimiter after `$'` can
+        be the string's FIRST character;
+      * requiring a TERMINATED body in raw text (round 48, 2 HIGH): reparsing
+        changes backslash PARITY, so three backslashes reach the inner shell as
+        two and the quote closes;
+      * a parity-INDEPENDENT span rule (round 49, 3 HIGH): parity was never the
+        property in question — `eval "g$'"''"\\x69t' ..."` invents no backslash,
+        it DELETES the empty quotes, so the span's closing quote never reaches
+        the inner shell;
+      * restricting the span rule to a "single-parse" command (round 51,
+        6 HIGH): a launcher denylist is defeated by `"eval"` and `/bin/bash`,
+        an expansion can supply a word SEPARATOR (`u='t pu'; g$'i'$u'sh'` is
+        `git push`), and a delimiter stack balances on QUOTED delimiters and
+        erases the real command.
+
+    Every refutation came through a mechanism that re-reads or expands text,
+    and three of them are not decidable from text at all, because the deciding
+    content is an expansion's VALUE. This module already says so — "a denylist
+    of launchers recurs forever; a whitelist of one shape ends it" — and the
+    trust model already places execution-boundary enforcement in the 1.18
+    daemon. So the exemption is WITHDRAWN rather than narrowed a sixth time:
+    a `$'` is detection, the idiom costs one acknowledgement, and a silent push
+    costs the acknowledgement itself. Over-detection is the designed failure
+    direction; under-detection never was."""
+    return "$'" in command
+
+
 def _maybe_git(command):
     """The PARENT's only look at the command (round 40): a LINEAR pre-filter
     that is a SUPERSET of every `_detected` channel — each of them needs one
-    of these words to survive de-escaping and quote/dollar stripping, or
-    ANSI-C quoting (`$'`) to be present — so the full detection and the
+    of these words to survive de-escaping and quote/dollar stripping, or a
+    `$'` to be present at all (`_ansi_c_quote`, an unconditional predicate:
+    `echo $'x'` passes here, as on 1.17.2) — so the full detection and the
     decision both run in the WORKER under the one deadline. Whatever passes
     here is examined there; whatever fails here cannot be a push/commit to
     any channel."""
-    if "$'" in command:
+    if _ansi_c_quote(command):
         return True
     return _PREFILTER_RE.search(re.sub(r"[\"'$]", "", _deescaped(command))) is not None
 
@@ -711,8 +752,14 @@ def _deescaped(command):
     backslash-newline pair WITHOUT inserting whitespace (round 25: a space
     turned `gi\\<nl>t` into `gi t`). PowerShell's escape and continuation
     character is the BACKTICK (`g`it`, "git `<newline>push"); both dialects
-    are normalized regardless of the hook's tool name — normalizing a
-    dialect the command is not in can only over-detect, never under-detect."""
+    are normalized regardless of the hook's tool name. Rounds 49-57 tried to
+    add POSIX readings beside this one — a substitution delimiter as a space,
+    a substitution elided — to catch a verb the shell assembles from pieces
+    (`git p$()ush`); six blind reviews found a new read-only denial from them
+    each time, because normalizing text discards the quote structure that says
+    which word is the COMMAND, and a full shell lexer is what five earlier
+    rounds showed cannot be written soundly here. They were WITHDRAWN in
+    round 58; the shapes they caught are recorded for the 1.18 daemon."""
     joined = re.sub(r"\\\r?\n", "", command)       # POSIX continuation: pair removed
     joined = re.sub(r"`\r?\n", "", joined)          # PowerShell continuation
     joined = re.sub(r"\\(.)", r"\1", joined)         # POSIX escape
@@ -787,13 +834,20 @@ def _detected(command):
     # presence of expansion machinery ($ \\ `) alongside a push/commit word
     # is itself detection; classification then fails closed and the gate
     # asks instead of staying silent.
+    # ...on the QUOTE-STRIPPED copy only. This rule needs no `git` word, which
+    # is why rounds 52-57's normalized readings were never allowed near it:
+    # they MANUFACTURED a verb inside quoted data (`printf '%s\n' 'p${x}ush'`
+    # read as `push`). Those readings were withdrawn in round 58; this rule
+    # and its input are exactly 1.17.2's.
     if (re.search(r"[$\\`]", command)
             and re.search(r"(?i)\b(?:push|commit)\b", stripped)):
         return True
-    if "$'" in command:
+    if _ansi_c_quote(command):
         # ANSI-C quoting can BUILD the verb itself (`git $'\\x70\\x75\\x73\\x68'`,
         # `g$'\\x69't p$'\\x75'sh`) — nothing literal survives stripping, so
-        # its mere presence is detection (round 29). A cooperative agent has
+        # a LIVE occurrence (a backslash before the next quote — rounds
+        # 46–49) is detection (round 29). An escape-free `$'abc'` is `'abc'`
+        # and the channels above already read it. A cooperative agent has
         # no reason to hex-assemble a command; the rare legitimate use costs
         # one prompt. Full evasion-proofing is impossible for a text hook
         # (documented trust model); execution-boundary enforcement is the

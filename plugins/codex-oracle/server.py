@@ -1767,7 +1767,11 @@ def _process_exec_event(ev: dict[str, Any], state: dict[str, str]) -> str | None
                     tail = out[-500:]
                     line += "\n" + "\n".join(f"  | {ln}" for ln in tail.splitlines())
                 if str(status) == "failed":
-                    state["last_error"] = f"command failed: {command} → exit {code}"
+                    # a failed TOOL command is the model's business, not a
+                    # terminal error of the run (round 46: it masked the real
+                    # reason a detached run ended and would have made a
+                    # completed detached run read status:error)
+                    state["last_command_failure"] = f"command failed: {command} → exit {code}"
                 return line
             return None
         if it == "mcp_tool_call":
@@ -1785,7 +1789,14 @@ def _process_exec_event(ev: dict[str, Any], state: dict[str, str]) -> str | None
         if it == "error":
             msg = str(item.get("message") or "")
             if msg:
-                state["last_error"] = msg
+                # DIAGNOSTIC, not terminal (round 50): codex emits non-fatal
+                # WARNINGS as completed `error` ITEMS while the turn keeps
+                # running, so writing them to `last_error` made a run that
+                # finished with a real answer collect as an error, and let a
+                # warning mask a later stderr-only disconnect from retry
+                # classification. Only `turn.failed` and a stream-level
+                # `error` EVENT are terminal.
+                state["last_item_error"] = msg
                 state["activity"] = "error"
                 return f"ERROR: {msg}"
             return None
@@ -3804,7 +3815,8 @@ async def _run_codex(
     live_path, live_fh, stream_fh, run_tag = _open_live_log(
         "abraham" if write else ("infra" if infra else "codex"))
     state: dict[str, Any] = {"activity": "launching codex", "last_message": "",
-                             "last_error": "", "usage": "", "thread_id": "",
+                             "last_error": "", "last_item_error": "",
+                             "usage": "", "thread_id": "",
                              "write": "1" if write else "", "run_tag": run_tag,
                              "parent_run": parent_run or "", "claim_key": claim_key,
                              "custody_cwd": custody_cwd}
@@ -5572,7 +5584,7 @@ def _replay_spool(rec: dict[str, Any], emit, max_bytes: int = REPLAY_MAX_BYTES) 
     the terminal events — answer, turn.completed, errors — are at the end).
     Returns the position replayed up to in state["_pos"]."""
     state: dict[str, Any] = {"activity": "", "last_message": "", "last_error": "",
-                             "usage": "", "thread_id": ""}
+                             "last_item_error": "", "usage": "", "thread_id": ""}
     path = Path(str(rec.get("stdout") or ""))
     buf = bytearray()
     pos = 0
@@ -5914,10 +5926,15 @@ async def _collect_detached_claimed(
         if out.exists() and out.stat().st_size > 0:
             final = out.read_text(encoding="utf-8", errors="replace").strip()
     # OK is EARNED: the answer FILE (codex writes it only at turn end) AND a
-    # turn.completed event AND no terminal error. Anything less — an earlier
-    # agent_message, a spool that stops mid-turn — is PARTIAL, never signed ok
-    # (review of 1.17.0: partial commentary was signed status:ok).
-    completed = bool(final) and bool(state.get("turn_completed")) and not state.get("last_error")
+    # turn.completed event. Anything less — an earlier agent_message, a spool
+    # that stops mid-turn — is PARTIAL, never signed ok (review of 1.17.0:
+    # partial commentary was signed status:ok). A RECOVERED error does not
+    # unearn it (round 52): codex emits RETRY notifications as top-level
+    # `error` events with will_retry, and the JSONL emitter serialises them
+    # like any other, so a run that retried once and then finished with a real
+    # answer was collected as an error. Both conditions above are written only
+    # at a successful turn end, so an error that PRECEDES them was survived.
+    completed = bool(final) and bool(state.get("turn_completed"))
     if not final and not timed_out:
         final = str(state.get("last_message") or "")
     status = "ok" if (completed and not timed_out) else ("timeout" if timed_out else "error")
@@ -5928,9 +5945,14 @@ async def _collect_detached_claimed(
         state["last_error"] = str(
             state.get("last_error") or "cancelled by codex_cancel_run during collection")
     if status == "error" and not state.get("last_error"):
+        lcf = str(state.get("last_command_failure") or "")
+        lie = str(state.get("last_item_error") or "")
         state["last_error"] = (
             "the detached process ended without completing its turn "
-            "(no turn.completed / no answer file)"
+            "(no turn.completed / no answer file; its exit status is not "
+            "observable after detachment)"
+            + (f"; last reported item error, for context: {lie}" if lie else "")
+            + (f"; last failed command, for context: {lcf}" if lcf else "")
         )
     result_file = ""
     if status == "ok" and live_path is not None:

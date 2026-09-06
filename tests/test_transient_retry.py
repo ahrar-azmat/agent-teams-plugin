@@ -561,6 +561,31 @@ def test_real_jsonl_capacity_failure_with_prior_commentary() -> None:
           and rec.get("retry_classes") == ["overload"] * n, str(rec)[:200])
 
 
+def test_failed_tool_command_does_not_mask_a_disconnect() -> None:
+    """Round 46 (Codex, measured): a `command_execution` item that codex marked
+    "failed" used to be written into the run's terminal-error slot, so a
+    later REAL disconnect that reached STDERR ONLY was shadowed — the run was
+    classified None and not retried where a disconnect earns
+    MAX_TRANSIENT_RETRIES. Round 47 (Codex, MEDIUM): the first pin used the
+    fake's event-emitting disconnect, whose `error`/`turn.failed` events
+    overwrite the slot on the baseline too — vacuous. The stderr-only shape
+    is the one that distinguishes: this test FAILS on 82fe2aa (one attempt,
+    class None; tests/check_retry_pin_sensitivity.py) and passes with tool failures out
+    of the slot."""
+    with _FakeCodex(FAKE_CODEX_FAIL="disconnect", FAKE_CODEX_FAIL_STDERR_ONLY="1", FAKE_CODEX_SLEEP="0",
+                    FAKE_CODEX_FAILED_COMMAND="rg -n nothing-matches src/") as h:
+        res = asyncio.run(server._run_codex("review this"))
+        runs = server._journal_runs()
+    rec = next(iter(runs.values()))
+    n = server.MAX_TRANSIENT_RETRIES
+    check("the stderr-only disconnect is classified and retried despite the earlier tool failure",
+          rec.get("attempts") == n + 1 and rec.get("retry_classes") == ["disconnect"] * n, str(rec)[:220])
+    check("no waits for a disconnect", h.waits == [], str(h.waits))
+    check("the terminal error is the disconnect, not the tool failure",
+          "stream disconnected" in str(rec.get("error")) and "command failed" not in str(rec.get("error")), str(rec.get("error"))[:200])
+    check("the rendered failure names the disconnect", "stream disconnected" in res and "codex_resume_run" in res, res[:300])
+
+
 def test_terminal_error_is_not_contaminated_by_model_output() -> None:
     # The model's own text mentions "at capacity"; the TERMINAL error is a
     # quota denial. Classification must read the terminal error only.

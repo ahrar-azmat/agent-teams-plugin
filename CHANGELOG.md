@@ -3,6 +3,94 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.17.3] — 2026-09-06
+
+### Push gate: behaviourally IDENTICAL to 1.17.2 — two exemptions attempted, both withdrawn, the arc recorded
+- MEASURED 2026-09-06 against the INSTALLED 1.17.2, not inferred: the shipped
+  hook denies `grep -v '^\s*$'` on read-only commands. The idiom carries `$'`
+  as the last character of a single-quoted word, and the round-29 rule (`$'`
+  anywhere is detection, since ANSI-C quoting can build the verb: `g$'\x69t'`)
+  fires on it. **That denial is NOT fixed in this release**, and the twelve
+  review rounds that established why are the deliverable.
+- **Five narrowings of the `$'` rule were refuted (rounds 46–51)**, each by a
+  mechanism that RE-READS or EXPANDS text: a quote-state scan (2 HIGH); a
+  "closing shape" rule (1 HIGH — the delimiter can be the string's FIRST
+  character); a terminated-body rule (2 HIGH — reparsing changes backslash
+  PARITY, three backslashes reach the inner shell as two); a parity-INDEPENDENT
+  span rule (3 HIGH — `eval "g$'"''"\x69t' …"` invents no backslash, it DELETES
+  the empty quotes, so the span's closing quote never reaches the inner shell);
+  and a single-parse restriction (6 HIGH — a launcher denylist falls to a quoted
+  `"eval"` and to `/bin/bash`, an expansion can supply a word SEPARATOR
+  (`u='t pu'; g$'i'$u'sh'` is `git push`), and a delimiter stack balances on
+  QUOTED delimiters). Three of those are not decidable from text, because the
+  deciding content is an expansion's VALUE. Round 52 WITHDREW the exemption:
+  a `$'` is detection, exactly as in 1.17.2.
+- **Six rounds of ADDITIVE readings were refuted too (rounds 52–57).** To catch
+  a verb the shell assembles from pieces (`git p$()ush`, `git p${x}ush`, nested
+  forms — all silent on 1.17.2), two normalized copies were OR'd into detection:
+  a substitution delimiter read as a space, and a substitution elided by a
+  single delimiter-stack pass. Each blind review found a new read-only denial
+  from them one position further along: a verb manufactured inside quoted data
+  (52), a manufactured `git` word too (53), an ordinary `rg` search through the
+  encoded-PowerShell branch (54), the ARGUMENT of `git grep -F 'p${x}ush'` (55),
+  `grep -e git -e 'p${x}ush'` (56), and then — with the copies anchored to the
+  command word — a quoted `;` that becomes a separator after quote removal, an
+  empty `""` argument that vanishes, and bare `--exec-path`, which terminates
+  git (57). Round 57 named the cause: the readings run AFTER normalization has
+  discarded the quote structure that says which word is the COMMAND. The fix is
+  to tokenize first and normalize within tokens — but a tokenizer that is both
+  quote-aware and substitution-aware is a full shell lexer, which rounds 46–51
+  showed cannot be written soundly here, and the quote-aware `shlex` path splits
+  `p$(echo $(true))ush` on its own space and loses the nested shapes anyway.
+  **Round 58 WITHDREW the readings.** A denylist of shapes recurs forever; this
+  module already said so.
+- **What ships in the gate:** nothing behavioural. A 300,000-command
+  differential against `82fe2aa` shows 0 lost and 0 added detections, the
+  parent pre-filter identical on 50,000 more, and every shape any review named
+  identical. A regression pins that identity in BOTH directions by loading the
+  baseline module, and lists the seven KNOWN MISSED shapes — each calibrated to
+  run a real push in bash 3.2.57 AND zsh 5.9 — asserted missed on both trees,
+  so the day one is caught it shows as a change. The `$'` docstring records the
+  twelve rounds so a thirteenth is not attempted.
+- **For the 1.18 daemon**, which decides at the execution boundary instead of
+  reading text: the read-only `$'` denial; a verb split by an empty expansion
+  (`git p``ush`, `git p$()ush`, `git p${x}ush`, nested); a verb completed by an
+  expansion's VALUE (`git p${x:-u}sh`); a word separator supplied by an
+  expansion; a command hidden inside a substitution body; a launcher assembled
+  by expansion (`p${x}wsh -e …`); and, if a text-side attempt is ever made
+  again, the tokenize-first design and the eleven false-positive shapes above
+  as its first fixtures.
+
+### Server: a failed tool command is context, never a run's terminal error
+- Round 50 (Codex, MEDIUM, pre-existing): a non-fatal WARNING is emitted by
+  the CLI as a completed `error` ITEM while the turn keeps running, and that
+  item was written to `last_error` too — so a run that finished with a real
+  answer collected as an error, and a warning could mask a later stderr-only
+  disconnect from retry classification exactly as a failed command had. Item
+  errors now land in `last_item_error` and appear as context; only
+  `turn.failed` and a stream-level `error` EVENT are terminal.
+- MEASURED 2026-09-06 (run codex40·31320): a detached run whose stream
+  stopped mid-turn — no answer file, no error event, empty stderr — was
+  collected as "ended with an error: command failed: … git check-ignore …
+  → exit 1": the run's last benign non-zero command, presented as the cause
+  (the "exit 1" is synthesised; a detached child's exit status is not
+  observable). The same slot made the adoption completion predicate refuse
+  status ok for any completed detached run that had run a failing command.
+  Tool failures now land in `last_command_failure`; the structural reason
+  ("ended without completing its turn; exit status not observable after
+  detachment") is stated, with the last failed command as context.
+- Round 46 measured a LIVE-path effect too: retry classification and the
+  error rendering read the same slot, so a failed tool command preceding a
+  real disconnect masked it — the run was NOT retried (class None) where a
+  disconnect earns one. Round 47 (Codex, MEDIUM) showed the first pin was
+  vacuous: the fake's disconnect emitted JSONL `error`/`turn.failed` events,
+  which overwrite the slot on the baseline too, so the test passed on both
+  trees. The masked shape is a disconnect that reaches STDERR ONLY (the
+  stream stops with no terminal event); `FAKE_CODEX_FAIL_STDERR_ONLY` models
+  it, and the test now fails on 82fe2aa (one attempt, class None) and passes
+  here (classified and retried) — `tests/check_retry_pin_sensitivity.py`
+  measures both trees.
+
 ## [1.17.2] — 2026-08-31
 
 ### Run budget (user, 2026-09-04): the 60-minute literal becomes a managed 3-hour limit

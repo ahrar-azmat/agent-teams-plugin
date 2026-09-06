@@ -25,6 +25,7 @@ import importlib.util
 import io
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -2658,8 +2659,10 @@ def test_detection_is_linear_and_inside_the_deadline(tmp_path):
     assert not gate._detected(plain) and not gate.GIT_PUSH_COMMIT_RE.search(plain)
     assert time.monotonic() - t0 < 2.0
     assert gate.GIT_PUSH_COMMIT_RE.search("pwsh -NoProfile -e aGk=") and not gate.GIT_PUSH_COMMIT_RE.search("pwsh -NoProfile -File x.ps1")
-    assert not gate._maybe_git("ls -la && echo done")
-    for cmd in ("g\\i\\t push", "echo $'x'", 'g""it push', "gi\\\nt push", "pwsh -e aGk=", "G=git; $G push"):
+    # round 52: the `$'` exemption is WITHDRAWN — five narrowings were refuted,
+    # so a `$'` is detection again and the pre-filter must carry it
+    assert not gate._maybe_git("ls -la && echo done") and gate._maybe_git("echo $'x'")
+    for cmd in ("g\\i\\t push", "echo $'\\x67'", 'g""it push', "gi\\\nt push", "pwsh -e aGk=", "G=git; $G push"):
         assert gate._maybe_git(cmd), cmd
     repo = _git_repo(tmp_path)
     env = {**_gate_env(tmp_path), "CODEX_PUSH_GATE_EVAL_DEADLINE_S": "5"}
@@ -2885,6 +2888,98 @@ def test_explicit_destination_is_resolved_by_the_remote(tmp_path):
     subprocess.run(["git", "-C", str(repo), "config", "branch.main.merge", "refs/heads/main"], check=True)
     subprocess.run(["git", "-C", str(repo), "config", "--unset", "push.default"], check=True)
     assert _VERIFIED(_run_gate(tmp_path, lines, command=_leased(repo), cwd=repo))
+
+
+def test_detection_is_identical_to_the_shipped_release(tmp_path):
+    """Rounds 46-58, the whole arc, pinned in one invariant.
+
+    Rounds 46-51 tried FIVE narrowings of the round-29 rule (`$'` anywhere is
+    detection) so the read-only idiom `grep -v '^\\s*$'` would stop being
+    denied; blind review refuted every one, each through a mechanism that
+    re-reads or expands text. Round 52 WITHDREW the exemption. Rounds 49-57
+    then tried ADDITIVE readings — a substitution delimiter as a space, a
+    substitution elided — to catch a verb the shell assembles from pieces
+    (`git p$()ush`); six blind reviews found a new read-only denial from them
+    each time (quoted data, a `git grep` argument, `grep -e git -e …`, a quoted
+    `;`, an empty `""` argument, bare `--exec-path`), because normalizing text
+    discards the quote structure that says which word is the COMMAND, and the
+    quote-aware tokenizer splits `p$(echo $(true))ush` on its own space. Round
+    58 WITHDREW those too.
+
+    What ships in the gate is therefore behaviourally IDENTICAL to 82fe2aa,
+    and this test pins that in BOTH directions: nothing lost (the deployed
+    gate never gets weaker) and nothing added (no read-only command starts
+    being denied). The shapes a text hook cannot see are listed below as
+    KNOWN MISSED — each calibrated to really run a push in bash AND zsh — and
+    asserted missed on both trees, so the day one of them is caught shows up
+    here as a change rather than passing silently. They are the 1.18 daemon's
+    work, which decides at the execution boundary instead of reading text."""
+    baseline = {}
+    src = subprocess.run(["git", "-C", str(ROOT), "show",
+                          "82fe2aa:plugins/codex-oracle/hooks/push_gate.py"],
+                         capture_output=True, text=True, check=True).stdout
+    exec(compile(src, "baseline_push_gate.py", "exec"), baseline)
+
+    log = tmp_path / "ran.log"
+    fn = f"unset x y\ngit() {{ printf '%s\\n' \"git $*\" >> {log}; }}"
+
+    def calibrate(shell, cmd):
+        log.write_text("")
+        script = fn + ("\nexport -f git" if shell == "/bin/bash" else "") + "\n" + cmd
+        argv = [shell, "-c", script] if shell == "/bin/bash" else [shell, "-f", "-c", script]
+        subprocess.run(argv, capture_output=True, text=True, timeout=30)
+        return "git push origin main" in log.read_text()
+
+    # every shape a review round ever named, in either direction
+    reviewed = [
+        "git push origin main", "echo hi", "ls -la && echo done",
+        "grep -v '^\\s*$' a | sed 's/x//'", "sed -n '1,80p' a | grep -v '^\\s*$' | head -3",  # the idiom: still denies
+        "g$'\\x69't p$'\\x75'sh origin main", "X=$' \\x67it'; Y=$' \\x70ush'; \"${X:1}\" \"${Y:1}\" origin main",
+        "g$'it' $'push'`true` origin main", "echo `eval $'g\\x69t p\\x75sh origin main # \\\\\\'`",
+        'ls "$HOME/.git"', 'test -d "$repo/.git"', "bash $i.sh", "cat out$n.log", "cp file$i.txt dest",
+        "printf '%s\\n' 'p${x}ush'", "printf '%s\\n' 'git p${x}ush'", "printf '%s\\n' 'g${x}it p${x}ush'",
+        "printf '%s\\n' 'pre`commit`hook'", "printf '%s\\n' 'p${x}wsh -e aGk='",
+        "rg -n 'pwsh.*(-e|-EncodedCommand)' f", "git grep -n -F 'p${x}ush' -- f",
+        "git log --oneline --fixed-strings --grep='p${x}ush'", "grep -Fn -e git -e 'p${x}ush' f",
+        "ls -d .git 'p${x}ush'", "grep -F 'example;git p${x}ush' f", 'git -C "" status \'p${x}ush\'',
+        "git --exec-path status 'p${x}ush'", "git --version 'p${x}ush'", "grep -r x .",
+    ]
+    for cmd in reviewed:
+        assert gate._detected(cmd) == baseline["_detected"](cmd), ("changed vs 1.17.2", cmd)
+        assert gate._maybe_git(cmd) == baseline["_maybe_git"](cmd), ("pre-filter changed vs 1.17.2", cmd)
+
+    # KNOWN MISSED: real pushes a text hook cannot see — missed on BOTH trees
+    known_missed = ["git p" + "`" * 2 + "ush origin main", "git p$()ush origin main",
+                    "git p${x}ush origin main", "git p$(echo $(true))ush origin main",
+                    "git p${x:-${y}}ush origin main", "git p$( (true) )ush origin main",
+                    "git p${x:-u}sh origin main"]
+    for cmd in known_missed:
+        assert calibrate("/bin/bash", cmd) and calibrate("/bin/zsh", cmd), ("does not run a push", cmd)
+        assert not gate._detected(cmd) and not baseline["_detected"](cmd), ("no longer missed — update this list", cmd)
+
+    # identity under FUZZ in both directions, and the pre-filter superset (round 40)
+    alphabet = ["git", "push", "commit", "g", "it", "p", "ush", "origin", "main", "echo", "true",
+                "`", "``", "$(", ")", "${", "}", "$", "'", '"', "\\", r"\x69", " ", ";", "|", "&",
+                "$'", "eval", "bash -c", "#", "a", "${x:-u}", "$(printf u)", "<<", "<(", '$"', ". ",
+                "source ", "\n", "-C", "--git-dir", "HEAD", "pwsh", "-e", "aGk=", "printf", "grep",
+                "-F", "-e", "--exec-path", "status", "example;git", '""']
+    rng = random.Random(4917)
+    for _ in range(20000):
+        fuzzed = "".join(rng.choice(alphabet) for _ in range(rng.randint(2, 14)))
+        assert gate._detected(fuzzed) == baseline["_detected"](fuzzed), ("changed vs 1.17.2", fuzzed)
+        # round 58 LOW: identity must hold for the PRE-FILTER too — a mutated
+        # `_PREFILTER_RE` adding `|status` changed 886 of these results and
+        # passed every other assertion here
+        assert gate._maybe_git(fuzzed) == baseline["_maybe_git"](fuzzed), ("pre-filter changed vs 1.17.2", fuzzed)
+        assert gate._maybe_git(fuzzed) or not gate._detected(fuzzed), fuzzed
+
+    # end to end through the real hook: a push is DENIED, read-only work is silent
+    repo = _git_repo(tmp_path)
+    for command, expect_deny in (("git push origin main", True), ("echo hi", False)):
+        payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": str(repo)})
+        proc = subprocess.run([sys.executable, str(GATE_PATH)], input=payload, capture_output=True,
+                              text=True, env=_gate_env(tmp_path), timeout=60)
+        assert proc.returncode == 0 and ('"deny"' in proc.stdout) is expect_deny, (command, proc.stdout[:200])
 
 
 def test_git_version_floor_and_lazy_fetch_env(tmp_path, monkeypatch):

@@ -551,6 +551,7 @@ def test_adoption_of_a_turn_cut_mid_way_is_not_ok() -> None:
     was killed mid-turn. The completion predicate alone must refuse ok."""
     with _Iso() as iso:
         os.environ["FAKE_CODEX_HANG_AFTER_PRELUDE"] = "8"
+        os.environ["FAKE_CODEX_FAILED_COMMAND"] = "git check-ignore artifacts/x"  # round 46: benign, never the cause
         proc = _spawn_fake_detached(iso, "codex8·1", sleep="0", prelude="halfway commentary")
         deadline = time.time() + 8
         spool = iso.td_path / "logs" / "runs" / "codex8-1" / "attempt0.stdout.jsonl"
@@ -561,6 +562,32 @@ def test_adoption_of_a_turn_cut_mid_way_is_not_ok() -> None:
         check("not ok", "status:ok" not in res and "status:error" in res, res[:200])
         check("labelled partial", "NOT the answer" in res and "halfway commentary" in res, res[-300:])
         check("reason names the incomplete turn", "without completing its turn" in res, res[:400])
+        check("the failed command is context, not the cause",
+              "last failed command, for context: command failed: git check-ignore" in res
+              and not res.split("without completing")[0].rstrip().endswith("git check-ignore artifacts/x → exit 1"), res[:400])
+        os.environ.pop("FAKE_CODEX_FAILED_COMMAND", None)
+        os.environ.pop("FAKE_CODEX_HANG_AFTER_PRELUDE", None)
+
+
+def test_adoption_ignores_a_failed_command_when_the_turn_completed() -> None:
+    """Round 46: a detached run whose model ran a command that exited non-zero
+    and then COMPLETED its turn (answer file + turn.completed) is ok — the
+    live path never counted tool failures, the adoption path did."""
+    with _Iso(FAKE_CODEX_SLEEP="0.3", FAKE_CODEX_ANSWER="DONE-AFTER-FAILED-GREP") as iso:
+        os.environ["FAKE_CODEX_FAILED_COMMAND"] = "rg -n nothing-matches src/"
+        try:
+            rec, _ = asyncio.run(_cancel_after_spawn(iso, "quickfail", shutdown=True))
+            pid = int(rec["pid"])
+            deadline = time.time() + 5
+            while _raw_alive(pid) and time.time() < deadline:
+                time.sleep(0.05)
+            check("detached process finished on its own", not _raw_alive(pid))
+            res = asyncio.run(server.codex_resume_run())
+            check("completed run with a failed command is collected ok",
+                  "DONE-AFTER-FAILED-GREP" in res and "collected from run" in res and "status:error" not in res
+                  and "command failed" not in res, res[:300])
+        finally:
+            os.environ.pop("FAKE_CODEX_FAILED_COMMAND", None)
 
 
 
