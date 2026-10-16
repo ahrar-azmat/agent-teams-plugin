@@ -3,6 +3,25 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 1.8.1] — 2026-10-16
+
+### No git worktrees: one writer per repository checkout (user ruling 2026-10-16)
+- The agent-teams skill offered `isolation: "worktree"` as the way to run
+  overlapping edits in parallel. New Critical Rule 16 forbids git worktrees
+  outright: no `isolation: "worktree"` on `Agent`, no `EnterWorktree`, no
+  `git worktree add`, in any prompt or script.
+- Teammates who write code work in the repository's own checkout, one writer
+  per checkout at a time. Parallel writers only in DIFFERENT repositories;
+  overlapping work in one repository runs in sequence. A paused writer hands
+  its work back as a patch file (never `git stash` / `git add -A` in a shared
+  checkout); a pristine copy of a commit is a read-only `git archive` export.
+- Rule 7, the `Agent` signature table, the implementation-team pattern, the
+  troubleshooting entries (plus a new recovery entry for a worktree that
+  appears anyway) and the pre-team checklist follow the rule.
+- Why: worktrees accumulated faster than anyone cleaned them up. One workspace
+  measured 201 trees, 116 of them holding uncommitted work, about 140 GB.
+- codex-oracle unchanged (1.17.3).
+
 ## [1.17.3] — 2026-09-06
 
 ### Push gate: behaviourally IDENTICAL to 1.17.2 — two exemptions attempted, both withdrawn, the arc recorded

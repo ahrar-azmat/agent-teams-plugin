@@ -19,7 +19,7 @@ If arguments were provided: "$ARGUMENTS" — use this as the task description an
 4. **`team_name` is deprecated and ignored** — the session has a single implicit team. Do not pass `team_name` to `Agent` or anything else.
 5. **Default to 2-3 teammates** — only go beyond 3 when the user explicitly asks for it or the work has clearly separate slices
 6. **ALL teammates use `model: "opus"`** — every agent gets the full Opus 1M context window. No exceptions. Sonnet is never used for teammates.
-7. **Avoid file conflicts** — each teammate should own different files; two teammates editing the same file leads to overwrites. (For parallel edits to the same area, give a teammate `isolation: "worktree"`.)
+7. **Avoid file conflicts** — each teammate should own different files; two teammates editing the same file leads to overwrites. Work that would overlap runs IN SEQUENCE, never in an isolated worktree (rule 16).
 8. **Use `general-purpose` subagent_type** for teammates that need to edit files; `Explore` or `Plan` for read-only work
 9. **Use `mode: "plan"` only when needed** — plan-mode teammates are expensive; prefer one architect/reviewer instead of multiple planners
 10. **Shut teammates down as soon as their tasks are complete** — idle teammates still consume tokens
@@ -28,6 +28,7 @@ If arguments were provided: "$ARGUMENTS" — use this as the task description an
 13. **Dispatch cross-model calls BLIND** — send the evidence and the question, never your own diagnosis. Anchoring an advisor with your conclusion turns an independent review into an echo. If you have a hypothesis, pass it in the `caller_hypothesis` parameter so it gets refuted, not confirmed. See **The Independence Protocol** below.
 14. **Demand live web research** — the advisor has live web search. Version/API/CVE/best-practice claims must be checked against primary sources with URLs, not recalled from training data. See **Mandatory web research** below.
 15. **"Present" is not "supported"** — a missing method fails at lint time in seconds; a present-but-unsupported one fails in production on a real customer's data. At every call into a swappable backend, verify the *deployed* engine implements it, not that the type stub declares it. See **The Runtime Capability Law** below.
+16. **NO GIT WORKTREES (user ruling 2026-10-16: "make sure we don't use worktrees from now on").** Never pass `isolation: "worktree"` to `Agent`, never use `EnterWorktree`, never run `git worktree add` (and never write a script that does). Teammates who WRITE code work in the repository's own checkout, **one writer per checkout at a time**: parallel writers are allowed only in DIFFERENT repositories (e.g. one backend implementer and one frontend implementer); every other concurrent teammate is read-only (researcher, architect, reviewer). Writers in the same repository run in sequence — a teammate that must pause hands its work back as a patch file and restores its own paths, never `git stash` / `git add -A` in the shared checkout. A pristine copy of a commit (a baseline run, a red-first check on the deployed bytes) is a read-only export (`git archive <sha> | tar -x -C <scratch dir>`), never a worktree.
 
 ## Tool Signatures — Exact Parameters (do NOT improvise)
 
@@ -35,7 +36,7 @@ These tools are **deferred** and schema-validated with `additionalProperties: fa
 
 | Tool | Required | Optional | NEVER pass |
 |------|----------|----------|------------|
-| `Agent` | `description`, `prompt` | `name`, `model`, `subagent_type`, `mode`, `run_in_background`, `isolation` | `team_name` (deprecated/ignored) |
+| `Agent` | `description`, `prompt` | `name`, `model`, `subagent_type`, `mode`, `run_in_background` | `team_name` (deprecated/ignored); `isolation: "worktree"` (forbidden — rule 16) |
 | `TaskCreate` | `subject`, `description` | `activeForm`, `metadata` | `team_name`, `blockedBy`, `owner`, `status` |
 | `TaskUpdate` | `taskId` | `status`, `owner`, `addBlockedBy`, `addBlocks`, `subject`, `description`, `activeForm`, `metadata` | `team_name`, `blockedBy` (use `addBlockedBy`) |
 | `TaskGet` | `taskId` | — | `team_name` |
@@ -547,6 +548,8 @@ Prefer a 3-teammate variant first:
 
 Use the 4+ teammate pattern only when backend, frontend, and validation are genuinely independent.
 
+One writer per repository checkout (rule 16): `implementer-1` and `implementer-2` may write at the same time only because they write DIFFERENT repositories (or, in a single repository, strictly disjoint work run in sequence). Within one repository, writers run one after another; the `tester` starts only after the implementers have finished.
+
 Tasks:
 - "Design architecture with Codex input, create task breakdown" → `architect` (plan mode)
 - "Implement backend API endpoints" → `implementer-1` (blocked by architect)
@@ -604,7 +607,9 @@ All tasks run in parallel.
 
 **Task stuck as blocked:** Check if the blocking task is actually done but wasn't marked completed. Use `TaskUpdate` to fix.
 
-**File conflicts:** Two teammates edited the same file. Break work so each teammate owns different files, or give one teammate `isolation: "worktree"`.
+**File conflicts:** Two teammates edited the same file. Break work so each teammate owns different files, or run the overlapping work in sequence in the one checkout. Never isolate a teammate in a git worktree (rule 16).
+
+**A worktree appeared anyway** (a teammate ran `git worktree add`, or an `Agent` call carried `isolation: "worktree"`): stop that teammate, save the tree's changes as a patch (`git -C <tree> diff` plus any untracked files), apply the patch in the real checkout by path, then `git worktree remove <tree>` and `git worktree prune`. Never delete a tree with plain `rm`.
 
 **Lead implementing instead of delegating:** Tell it: "Wait for your teammates to complete their tasks before proceeding."
 
@@ -629,7 +634,8 @@ Before starting a team:
 - [ ] Task calls use ONLY documented params — NO `team_name` or `blockedBy` on `TaskCreate`/`TaskUpdate`; set dependencies via `TaskUpdate(taskId=..., addBlockedBy=[...])`
 - [ ] `SendMessage` calls use `to` / `message` / `summary` — never `recipient` / `type` / `content` / `broadcast`; protocol `type` goes inside the `message` object
 - [ ] Tasks are specific and self-contained with full context in description
-- [ ] No two teammates will edit the same files (or the overlapping one uses `isolation: "worktree"`)
+- [ ] No two teammates will edit the same files, and at most ONE teammate writes in any repository checkout at a time
+- [ ] NO git worktrees: no `isolation: "worktree"`, no `EnterWorktree`, no `git worktree add` in any prompt or script (rule 16)
 - [ ] Each `Agent()` call has `description`, `name`, `model: "opus"`, `subagent_type`, `run_in_background: true`, `prompt` — and NO `team_name`
 - [ ] Teammate prompts START with a `ToolSearch(query="select:TaskList,TaskGet,TaskUpdate,TaskCreate,SendMessage")` step
 - [ ] Teammate prompts include: name, full workflow (TaskList → TaskGet → in_progress → work → completed → SendMessage)
