@@ -313,6 +313,45 @@ This project adheres to [Semantic Versioning](https://semver.org/).
     `! codex login`; with the server venv missing setup built it without a question, checked
     again and reported 6 of 6.
 
+### abraham: full access in both phases, always (user ruling 2026-10-18)
+- Every abraham run now has full access in both phases: no sandbox, network, live web
+  search, the person's MCP servers and live infrastructure. The implementation phase runs
+  with codex's `--dangerously-bypass-approvals-and-sandbox`. The analysis phase is read-only
+  by instruction and always gets the live-state and external-facts sections of the brief.
+- The sealed mode is gone ("let us remove the option wherein they can keep full access
+  off"). So are the write-capability probe, its cache and the `.abraham/tmp` TMPDIR redirect.
+  A request for the old mode is refused before anything reaches Codex, never ignored:
+  `full_access`, `infra` or `web_search` set to false on abraham, `infra` or `web_search`
+  false on a write `codex_resume_run`, or `CODEX_ORACLE_WRITE_FULL_ACCESS` set to a false
+  value. A run that began sealed under 1.x continues with full access, and the resume says so.
+- No folder fence: `cwd` may name any git repository on the machine. The run is journaled
+  with its target and the folder it was dispatched from (`dispatch_cwd`), so `codex_runs`,
+  `codex_run_log`, `codex_cancel_run` and `codex_resume_run` find it from either folder. The
+  writer is told to write inside its target repository and the repositories nested in it,
+  and to name a change another repository needs instead of making it. Git as the undo, the
+  tree's write lock and the changed-files report work in every repository.
+- The write report ends with the mode Codex recorded for each of the run's turns, read
+  back from the thread's rollout (`turn_context`: sandbox policy and approval policy). The
+  report says "full access" only when every turn ran `danger-full-access/never`. Anything
+  else is flagged ⚠, and no record at all reads UNVERIFIED. The modes are journaled as
+  `effective_modes`. A flag and an exit code are not evidence: the old sealed sandbox once
+  downgraded itself to read-only and still exited 0.
+- `context` carries the access paths the lead knows (a key-based SSH host, a `docker exec`
+  target, a local test database), never credentials. The writer's brief tells it the same.
+- Verified 2026-10-18 by real runs (codex-cli 0.163.0, gpt-6-astra at max):
+  - all four refusals (`full_access=false`; `infra` and `web_search` false; the variable set
+    to 0; a dirty tree) returned with nothing sent to Codex;
+  - dispatched from one folder against a repository outside it, abraham added `slug()` to
+    that repository's `lib.py`. The writer ran `python3 -c …` (printed `hello-world`, exit 0)
+    and `curl -sI https://example.com` (`HTTP/2 200`, exit 0). CHANGED FILES named `lib.py`,
+    HEAD stayed unmoved, and the effective mode read full access. The lead's own re-run
+    printed `hello-world a-b`;
+  - `codex_runs` listed both phases from the dispatching folder and from the target;
+    `codex_resume_run` from the target returned the stored answer; a write resume with
+    `infra=false` was refused;
+  - the read-back, calibrated: a read-only `code_review` thread gave `read-only/never` and the
+    ⚠ line; the write run gave `danger-full-access/never`, journaled the same.
+
 ## [software-workflows 1.8.1] — 2026-10-16
 
 ### No git worktrees: one writer per repository checkout (user ruling 2026-10-16)

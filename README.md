@@ -15,7 +15,7 @@ When you ask Claude Code to do anything involving 2+ agents, the `agent-teams` s
 
 It ships **role templates** (researcher, architect, implementer, reviewer, verifier, …) and **team patterns** (research, implementation, debug, review), plus an optional **cross-model advisory** layer that uses Codex Oracle as an independent senior advisor when its MCP server is present.
 
-The plugin also ships **`/abraham`** (v1.13.0): a write-capable mode that runs as two air-gapped codex phases — read-only deep analysis (codebase + live infra + live web) producing an implementation brief, then a sealed implementer (workspace-write file access, no network/web/MCP) that edits the working tree under git preconditions, a one-writer lock, and changed-files attribution for the orchestrator to review.
+The plugin also ships **`/abraham`**: a write-capable mode that runs as two codex phases, both with full access (no sandbox, network, live web, your MCP servers and live infrastructure) — deep analysis (read-only by instruction) producing an implementation brief, then an implementer that edits the target repository, runs the project's real checks and reports their results, under git preconditions, a one-writer lock, and changed-files attribution for the orchestrator to review.
 
 ## Why this exists (the v1.1.0 fix)
 
@@ -259,13 +259,16 @@ PATH is PROBED in a throwaway partial clone (a promisor helper must not run unde
 environment; the probe must go red without it) and checked against the CVE-2024-32465
 fixed-version policy; a git that fails either refuses every read.
 
-**Full-access writes (user ruling 2026-09-05):** `abraham(full_access=true)` — or
-`CODEX_ORACLE_WRITE_FULL_ACCESS=1` as the default — runs the implementation phase with codex's
-`--dangerously-bypass-approvals-and-sandbox` (`--yolo`): no sandbox, no prompts, network on,
-your MCP servers, your privileges, so the writer can run the project's real gates (fresh-database
-migrations, Temporal suites, browsers) and report real exit codes instead of a sealed guess. The
-git contract, one-writer lock, changed-files report and request budget still hold; the sealed
-mode's no-egress / no-credentials guarantees do not. Sealed stays the default.
+**Full-access writes (2.0):** every `abraham` run implements with codex's
+`--dangerously-bypass-approvals-and-sandbox` (`--yolo`): no sandbox, no prompts, network on, live
+web search, your MCP servers, your privileges, so the writer runs the project's real gates
+(fresh-database migrations, Temporal suites, browsers) and reports real exit codes. Its analysis
+phase has infra and live web too. The sealed mode is gone (user ruling 2026-10-18): `false` for
+`full_access`, `infra` or `web_search`, or `CODEX_ORACLE_WRITE_FULL_ACCESS` set to a false value,
+is refused. The target may be any git repository on the machine — the run is listed and resumable
+from the dispatching folder and from the target — and a run writes inside that repository. The
+git contract, one-writer lock, changed-files report and request budget still hold, and the report
+ends with the mode codex recorded for each turn, read back from the run's rollout.
 
 **Survivor-containment trust model (1.17.x):** runaway processes left behind by a codex run
 are contained COOPERATIVELY — the process group is swept, and descendants that `setsid()` out

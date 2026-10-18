@@ -680,231 +680,28 @@ def _answer_sig(tool_name: str, status: str, tree: str | None = None) -> str:
     return f" | tool:{tool_name} | status:{status} | tree:{tree or _workspace_digest(_get_cwd())}"
 
 
-# The FULL-ACCESS write argv (user ruling 2026-09-05): codex's --yolo alias,
-# verbatim from `codex exec --help` on the installed 0.153.0 ("Skip all
-# confirmation prompts and execute commands without sandboxing"). The user
-# config is KEPT (as in infra mode) so the writer has the same MCP tools a
-# live investigation has. CODEX_ORACLE_WRITE_FULL_ACCESS=1 makes it the
-# default for every abraham call; `full_access` on the call overrides.
+# The write argv (user rulings 2026-09-05 and 2026-10-18): codex's --yolo
+# alias, verbatim from `codex exec --help` on 0.163.0 ("Skip all confirmation
+# prompts and execute commands without sandboxing"). Every abraham write runs
+# this way since 2.0.0 ("let us remove the option wherein they can keep full
+# access off"): the sealed workspace-write mode, its write-capability probe and
+# the probe's cache are gone. The user config is KEPT (as in infra mode) so the
+# writer has the MCP tools a live investigation has. What the run really got
+# is read back from its rollout afterwards (_effective_modes).
 FULL_ACCESS_WRITE_ARGS = ("--dangerously-bypass-approvals-and-sandbox",)
 
 
-def _full_access_default() -> bool:
-    return os.environ.get("CODEX_ORACLE_WRITE_FULL_ACCESS", "").strip().lower() in ("1", "true", "yes", "on")
-
-
-# The sealed write sandbox, verbatim — a single source shared by the
-# implementation phase (_build_exec_argv) and the write-capability probe
-# below, so the probe can never drift from what the real run executes.
-WRITE_SANDBOX_ARGS = (
-    "--sandbox", "workspace-write",
-    "--ignore-user-config",
-    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
-    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-    # Windows: sandbox mode DEFAULTS TO DISABLED in codex 0.147, and a
-    # disabled mode downgrades WorkspaceWrite → ReadOnly (upstream
-    # config_toml.rs; the enable normally lives in user config, which
-    # --ignore-user-config strips). Seal the intended mode explicitly —
-    # and it must be "elevated": the unelevated/restricted-token backend
-    # only INJECTS proxy/offline env vars (advisory — a raw-socket child
-    # ignores them, reproduced upstream in codex#35940), while firewall
-    # enforcement is tied to the elevated sandbox identities. abraham's
-    # air-gap promises OS-ENFORCED no-egress, so a machine that cannot run
-    # the elevated sandbox fails the write probe and abraham refuses —
-    # fail closed, never a silently advisory seal. Key calibrated on the
-    # installed 0.147.0 binary 2026-08-21: --strict-config accepts
-    # "elevated"/"unelevated", rejects others; non-Windows parses and
-    # ignores it.
-    "-c", 'windows.sandbox="elevated"',
-    # The sealed writer's SHELL CHILDREN get a minimal environment: codex
-    # 0.147 defaults shell subprocesses to inherit=all, so repository
-    # instructions or the phase-1 brief could otherwise read the parent's
-    # env (API keys, tokens) into tool output or the worktree (round-3
-    # review, 2026-08-21). core = HOME/PATH/USER-class vars only, and the
-    # default KEY/SECRET/TOKEN name excludes stay active. Both keys
-    # calibrated on the installed 0.147.0 binary: --strict-config accepts
-    # them ("core"/"all"/"none" variants), rejects bogus values.
-    "-c", 'shell_environment_policy.inherit="core"',
-    "-c", "shell_environment_policy.ignore_default_excludes=false",
-)
-
-WRITE_PROBE_TIMEOUT_SECONDS = _env_seconds(
-    "CODEX_ORACLE_WRITE_PROBE_TIMEOUT", 240.0, 30.0
-)
-
-# Test/override seam: when set, used verbatim for every workspace.
-_write_capability: tuple[bool, str] | None = None
-
-# Real cache, keyed by normalized workspace — a green proven on one volume
-# says nothing about another's ACLs/controlled folders (round-2 review).
-# Entry: (ok, detail, ts, conclusive). Conclusive verdicts live for the
-# process; inconclusive ones (auth/rate-limit/CLI noise) expire so a burst
-# of dispatches shares one probe but a later dispatch re-tests.
-_write_probe_cache: dict[str, tuple[bool, str, float, bool]] = {}
-_WRITE_PROBE_INCONCLUSIVE_TTL = 60.0
-
-# Single-flight per event loop: concurrent first dispatches must not each
-# launch a paid probe and race the memo. Keyed by loop id because tests run
-# separate asyncio.run() loops and a Lock cannot cross loops.
-_write_probe_locks: dict[int, asyncio.Lock] = {}
-
-
-def _write_probe_lock() -> asyncio.Lock:
-    return _write_probe_locks.setdefault(
-        id(asyncio.get_running_loop()), asyncio.Lock()
-    )
-
-
-async def _run_write_probe(tmp: Path) -> tuple[int | None, str]:
-    """Spawn ONE sealed low-effort codex write in ``tmp``; return
-    (returncode, output tail).
-
-    Uses the exact sealed sandbox argv (WRITE_SANDBOX_ARGS) plus the same
-    approval policy the real run carries — parity is the point. Low effort
-    is deliberate: the sandbox is built by the CLI layer, not the model, so
-    effort is orthogonal to the capability under test.
-    """
-    argv = [
-        *_codex_argv0(), "exec", *WRITE_SANDBOX_ARGS,
-        "--skip-git-repo-check", "--color", "never",
-        "-c", "approval_policy=never",
-        "-c", "model_reasoning_effort=low",
-        "-c", "web_search=disabled",
-        "Create a file named probe.txt containing exactly: ok\n"
-        "Do nothing else, then stop.",
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *argv, cwd=str(tmp),
-        # NEVER inherit the parent's stdin: it is the MCP JSON-RPC channel,
-        # and codex exec APPENDS piped stdin to its prompt — inheriting it
-        # both corrupts the session and leaks client traffic into the model
-        # (round-2 review, 2026-08-21). Mirrors the real runner.
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        env=_codex_env(),
-        # Own process group: the npm shim forwards INT/TERM but not KILL,
-        # so only a group kill reaps the native binary underneath it.
-        **_new_group_kwargs(),
-    )
-    try:
-        out, _ = await asyncio.wait_for(
-            proc.communicate(), timeout=WRITE_PROBE_TIMEOUT_SECONDS
-        )
-    except BaseException:
-        # Timeout AND cancellation (CancelledError is not an Exception):
-        # the probe child must never outlive the request — kill the whole
-        # group and reap before propagating. The reap itself is bounded so
-        # an unkillable child cannot wedge the cleanup path.
-        _kill_tree(proc)
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(proc.wait(), timeout=10)
-        raise
-    return proc.returncode, (out or b"")[-100_000:].decode(
-        "utf-8", errors="replace"
-    )
-
-
-async def _ensure_write_capability(workspace: str) -> tuple[bool, str]:
-    """Prove the deployed codex can actually WRITE under the sealed sandbox.
-
-    Measured on Windows 2026-08-21 (codex 0.147.0): ``--sandbox
-    workspace-write`` was ACCEPTED, the run EXITED 0 — and every write was
-    rejected by codex's own tool router ("patch rejected: writing is blocked
-    by read-only sandbox; rejected by user approval settings") because the
-    restricted-token sandbox could not be built on that machine. Flag
-    acceptance and exit code are union claims (Runtime Capability Law); the
-    only proof of the capability is a file APPEARING ON DISK. The verdict is
-    therefore structural — probe-file existence — and the rejection text
-    only enriches the refusal message. Fails CLOSED on any probe-infra
-    error (a machine where the probe cannot run cannot demonstrate writes
-    either). Memoized per server process; a reconnect re-probes.
-    CODEX_ORACLE_SKIP_WRITE_PROBE=1 bypasses — only for machines where
-    writes are already verified by hand.
-    """
-    if os.environ.get("CODEX_ORACLE_SKIP_WRITE_PROBE") == "1":
-        return True, "probe skipped (CODEX_ORACLE_SKIP_WRITE_PROBE=1)"
-    if _write_capability is not None:  # test/override seam
-        return _write_capability
-    key = os.path.realpath(workspace)
-    async with _write_probe_lock():
-        cached = _write_probe_cache.get(key)
-        if cached is not None:
-            ok, detail, ts, conclusive = cached
-            # monotonic: wall-clock rollback must not stretch a TTL
-            if conclusive or (
-                time.monotonic() - ts < _WRITE_PROBE_INCONCLUSIVE_TTL
-            ):
-                return ok, detail
-
-        def _record(ok: bool, detail: str, conclusive: bool,
-                    rc: int | None = None) -> tuple[bool, str]:
-            _write_probe_cache[key] = (
-                ok, detail, time.monotonic(), conclusive)
-            _journal({"run": "write-probe", "phase": "probe",
-                      "ts": time.time(), "workspace": key, "rc": rc,
-                      "conclusive": conclusive, "ok": ok,
-                      "detail": detail[:200]})
-            return ok, detail
-
-        tmp: Path | None = None
-        try:
-            try:
-                # Probe INSIDE the target workspace (its .abraham metadata
-                # dir): a green proven on some other volume says nothing
-                # about this repo's ACLs/controlled folders. No git setup —
-                # the probe argv carries --skip-git-repo-check. Removed in
-                # the finally so it never appears in a changes report.
-                base = Path(workspace) / ".abraham"
-                base.mkdir(parents=True, exist_ok=True)
-                tmp = Path(tempfile.mkdtemp(prefix="write-probe-", dir=base))
-                rc, output = await _run_write_probe(tmp)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # Probe infrastructure failure: INCONCLUSIVE — refuse this
-                # dispatch (fail closed); the TTL cache shares this answer
-                # with a concurrent burst, then a later dispatch re-probes.
-                return _record(
-                    False,
-                    f"the write probe could not run ({exc!r}) — "
-                    "INCONCLUSIVE; a later dispatch re-probes.",
-                    conclusive=False,
-                )
-            if (tmp / "probe.txt").exists():
-                # CAPABLE — the only structural proof. Cached for process.
-                return _record(
-                    True, f"write probe green (exit {rc})",
-                    conclusive=True, rc=rc,
-                )
-            tail = output[-1500:]
-            marker = next(
-                (m for m in ("read-only sandbox",
-                             "rejected by user approval settings")
-                 if m in tail), "",
-            )
-            if marker:
-                # INCAPABLE — the measured sandbox refusal. Cached.
-                return _record(
-                    False,
-                    "codex ACCEPTED --sandbox workspace-write and exited "
-                    f"{rc}, but the probe file never appeared on disk "
-                    f'(codex reported "{marker}").',
-                    conclusive=True, rc=rc,
-                )
-            # No file AND no sandbox marker: auth, rate limiting, model
-            # noncompliance, or a CLI failure — INCONCLUSIVE.
-            return _record(
-                False,
-                f"the write probe exited {rc} without writing and without "
-                "a recognizable sandbox refusal — INCONCLUSIVE "
-                "(auth/rate-limit/CLI failure?); a later dispatch "
-                "re-probes.",
-                conclusive=False, rc=rc,
-            )
-        finally:
-            if tmp is not None:
-                shutil.rmtree(tmp, ignore_errors=True)
+def _sealed_env_refusal() -> str:
+    """A refusal when CODEX_ORACLE_WRITE_FULL_ACCESS asks for the removed
+    sealed mode; empty when it is unset, empty or true. A false value is
+    refused, never silently ignored."""
+    raw = os.environ.get("CODEX_ORACLE_WRITE_FULL_ACCESS", "").strip()
+    if not raw or raw.lower() in ("1", "true", "yes", "on"):
+        return ""
+    return (f"CODEX_ORACLE_WRITE_FULL_ACCESS={raw!r} asks for the sealed write "
+            "mode, which software-workflows 2.0.0 removed: every abraham write "
+            "runs with full access. Unset the variable (or set it to 1) in the "
+            "environment Claude Code starts the server with.")
 
 
 # ---------------------------------------------------------------------------
@@ -987,7 +784,7 @@ def _git_state(cwd: str) -> tuple[bool, set[str], str]:
     listings plus this process's OWN byte reads — so no `git status` runs
     here: status refreshes the index and runs a configured clean filter for
     any file whose stat data changed (measured on 2.55.0), a helper command
-    the sealed writer could have configured into the very tree it wrote.
+    the writer could have configured into the very tree it wrote.
     Vocabulary = porcelain's, plus ` ~` for a path whose bytes differ from
     the index under a conversion attribute (treated as dirty; the report
     carries the legend). ANY failure — budget, unreadable listing, an
@@ -2333,6 +2130,13 @@ def _run_in_workspace(run_cwd: str, cwd: str) -> bool:
     return base in target.parents
 
 
+def _run_belongs(rec: dict[str, Any], cwd: str) -> bool:
+    """A run belongs to a workspace through its target tree or through the
+    folder it was dispatched from (abraham may target any repository)."""
+    return (_run_in_workspace(str(rec.get("cwd") or ""), cwd)
+            or _run_in_workspace(str(rec.get("dispatch_cwd") or ""), cwd))
+
+
 SHUTDOWN_HARD_EXIT_SECONDS = 3.0
 
 
@@ -2723,7 +2527,6 @@ def _build_exec_argv(
     images: list[str] | None = None,
     write: bool = False,
     auto_compact_limit: int | None = None,
-    full_access: bool = False,
 ) -> list[str]:
     """codex exec argv for a fresh run or a resume of an existing thread.
 
@@ -2758,13 +2561,8 @@ def _build_exec_argv(
     AFTER ``exec``, where the following flag terminates the value list and the
     prompt stays a clean trailing positional.
 
-    Write modes (2026-08-14, probed live on 0.147.0 — see PLAN_ABRAHAM_WRITE_
-    MODE.md §10): ``write=True`` is the SEALED implementation phase — always
-    workspace-write + --ignore-user-config, never danger-full-access, and
-    ``infra`` deliberately does NOT open the network here (the read-only
-    analysis phase is where infra/web live). Probe: workspace-write created
-    files while ``curl`` could not resolve DNS (egress sealed); read-only
-    refused the same write (probe calibration). ``auto_compact_limit`` emits
+    ``write=True`` is the implementation phase, always with full access
+    (FULL_ACCESS_WRITE_ARGS) since 2.0.0. ``auto_compact_limit`` emits
     ``model_auto_compact_token_limit`` — the caller passes it ONLY when the
     model's window is known (see the auto-compaction notes above
     AUTOCOMPACT_PCT: on 0.163.0 the value can only lower the vendor's 90%
@@ -2773,32 +2571,16 @@ def _build_exec_argv(
     argv = [*_codex_argv0(), "exec"]
     for img in images or []:
         argv += ["-i", img]
-    if write and full_access:
-        # FULL-ACCESS implementation process (user ruling 2026-09-05, "allow
-        # codex to skip permission via --yolo"): codex's own
-        # --dangerously-bypass-approvals-and-sandbox — no sandbox, no
-        # approval prompts, network on, the user's own configuration and MCP
-        # servers, the caller's full privileges. Chosen because a sealed
-        # writer never touches the real system (PostgreSQL, Temporal, a
-        # browser), so every real-system defect surfaced one round later in
-        # the lead's rig (measured over 36 h: almost every red lived there).
-        # The git contract, the write lock and the changed-files report
-        # still apply; the no-egress / no-credentials guarantees of the
-        # sealed mode do NOT.
+    if write:
+        # The implementation process (user rulings 2026-09-05 and 2026-10-18):
+        # codex's own --dangerously-bypass-approvals-and-sandbox — no sandbox,
+        # no approval prompts, network on, the user's own configuration and
+        # MCP servers, the caller's full privileges — so the writer runs the
+        # project's real gates against the real system (a sealed writer never
+        # touched PostgreSQL, Temporal or a browser, and every real-system
+        # defect surfaced one round later in the lead's rig). The git
+        # contract, the write lock and the changed-files report still apply.
         argv += [*FULL_ACCESS_WRITE_ARGS]
-    elif write:
-        # SEALED implementation process (cross-model review verdict,
-        # 2026-08-14: two independent advisors both required the air-gap
-        # at the time).
-        # Write capability NEVER shares a process with untrusted external
-        # content or live credentials: no network egress, no web search
-        # (forced off below), no user config → no user MCP servers. The
-        # analysis phase (a separate read-only run) had the web/infra access;
-        # its brief travels here via the prompt. /tmp and $TMPDIR are
-        # excluded from the writable roots — a /tmp artifact would outlive
-        # the run OUTSIDE the reviewed diff; build tools get a TMPDIR
-        # redirected inside the workspace instead (see _run_codex).
-        argv += [*WRITE_SANDBOX_ARGS]
     elif infra:
         argv += ["--sandbox", "danger-full-access"]
     else:
@@ -3633,7 +3415,6 @@ async def _run_codex(
     request_started: float | None = None,
     claim_key: str = "",
     custody_cwd: str = "",
-    full_access: bool = False,
     session_out: dict[str, Any] | None = None,
 ) -> str:
     """Run codex exec headlessly with clean final-message extraction.
@@ -3646,9 +3427,9 @@ async def _run_codex(
     with survivors must put that lock into custody too, or the finally
     releases a tree an infra-mode survivor may still write).
 
-    ``workdir`` overrides the run's working tree (abraham targeting a git
-    repo BELOW the server's cwd — e.g. a multi-repo project root that is
-    not itself a work tree). Empty = the server cwd, unchanged behavior.
+    ``workdir`` overrides the run's working tree (abraham targeting another
+    git repo — below the server's cwd, as in a multi-repo project root that
+    is not itself a work tree, or anywhere else). Empty = the server cwd.
 
     Uses codex-cli 0.118.0+ features (live-view additions verified 0.144.1):
     - ``--json`` — JSONL ThreadEvents on stdout, streamed to the per-run
@@ -3715,6 +3496,7 @@ async def _run_codex(
     eff_cwd = workdir or _get_cwd()
     write_before: set[str] = set()
     write_head = ""
+    mode_since = 0
     extra_env: dict[str, str] = {}
     holds_tree_lock = bool(write or custody_cwd)
     if holds_tree_lock and os.name != "nt" and _is_launcher_script(_codex_argv0()[0]):
@@ -3740,15 +3522,12 @@ async def _run_codex(
                 "undo. Run from a git checkout (or `git init` first), or use "
                 "the read-only tools instead.]"
             )
-        # /tmp and $TMPDIR are excluded from the sandbox's writable roots
-        # (_build_exec_argv): a /tmp artifact would outlive the run OUTSIDE
-        # the reviewed diff. Build tools still need scratch space, so TMPDIR
-        # points at a workspace-local dir — same sandbox, and anything left
-        # behind is visible to the review.
-        tmp_dir = Path(eff_cwd) / ".abraham" / "tmp"
-        with contextlib.suppress(OSError):
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-            extra_env["TMPDIR"] = str(tmp_dir)
+        # where this run's own turns begin in the thread's rollout, for the
+        # effective-mode read-back after the run
+        prior = _rollout_path(resume_tid) if resume_tid else None
+        if prior is not None:
+            with contextlib.suppress(OSError):
+                mode_since = prior.stat().st_size
 
     # Inject the curated external-safe ADVISOR_CONTEXT.md (never CLAUDE.md or
     # memory — those carry live secrets). Fresh threads only: a resumed thread
@@ -3758,48 +3537,32 @@ async def _run_codex(
         if advisor_ctx:
             prompt = f"{advisor_ctx}\n\n{prompt}"
 
-    if write and full_access:
-        # FULL-ACCESS implementation phase (user ruling 2026-09-05): no
-        # sandbox, so the writer can run the project's REAL gates — that is
-        # the point — under the same git contract as the sealed mode.
+    if write:
+        # The implementation phase, always full access (user rulings
+        # 2026-09-05 and 2026-10-18): no sandbox, so the writer runs the
+        # project's REAL gates — that is the point — under the git contract.
         prompt = (
             "IMPLEMENTATION MODE — FULL ACCESS: this process runs WITHOUT a "
-            "sandbox, with the caller's own privileges, network and tools "
-            "(--dangerously-bypass-approvals-and-sandbox). Use that to VERIFY "
-            "your work against the real system before you report: run what "
-            "you changed for real (the app, command, endpoint or migration on "
-            "a fresh database) and the project's own existing checks (builds, "
-            "linters, whatever suites it already has) exactly as the project "
-            "runs them, and report their real exit codes and output — never a "
-            "claim of green without the run. Do not write test cases or test "
-            "harnesses unless the user explicitly asked for them: verification "
-            "is the real run and its results.\n"
-            "BOUNDARIES: edit files INSIDE this workspace only; never modify "
-            "another repository, a dotfile, a credential store or system "
+            "sandbox, with the caller's own privileges, network, live web "
+            "search and MCP servers (--dangerously-bypass-approvals-and-"
+            "sandbox). Read anything you need, anywhere, and reach the "
+            "project's infrastructure the way its docs describe. Use that to "
+            "VERIFY your work against the real system before you report: run "
+            "what you changed for real (the app, command, endpoint or "
+            "migration on a fresh database) and the project's own existing "
+            "checks (builds, linters, whatever suites it already has) exactly "
+            "as the project runs them, and report their real exit codes and "
+            "output — never a claim of green without the run. Do not write "
+            "test cases or test harnesses unless the user explicitly asked "
+            "for them: verification is the real run and its results.\n"
+            "BOUNDARIES: write inside this repository (the working directory "
+            "and the repositories nested in it); a change another repository "
+            "needs is its own run, so name it in your report instead of "
+            "making it. Never modify a dotfile, a credential store or system "
             "configuration; no destructive infrastructure actions (dropping "
             "or truncating shared databases, deleting deployments or data) "
             "unless the task explicitly orders them; treat any secret you "
             "encounter as never-to-be-copied into files or output.\n"
-            "GIT CONTRACT (non-negotiable): leave ALL changes as uncommitted "
-            "working-tree edits for the caller to review. NEVER run git "
-            "commit, push, checkout, switch, restore, reset, stash, clean, "
-            "rebase, merge, or any branch/tag operation; never touch .git "
-            "internals; no bulk deletes. Violations are detected after the "
-            "run and reported to the caller.\n\n"
-        ) + prompt
-    elif write:
-        # Sealed implementation phase. Ordered ahead of the infra branch: a
-        # write run must get THIS scaffold and never danger-full-access —
-        # infra/web belong to the separate read-only analysis phase.
-        prompt = (
-            "IMPLEMENTATION MODE — you may create, edit and delete files "
-            "INSIDE this workspace only (OS-enforced sandbox; writes outside "
-            "it will fail).\n"
-            "This process is deliberately SEALED: no shell network egress, "
-            "no web search, no external tools — untrusted external content "
-            "and live credentials never share a process with write access. "
-            "Every external fact you need is in your instructions; "
-            "everything local you may read from the workspace itself.\n"
             "GIT CONTRACT (non-negotiable): leave ALL changes as uncommitted "
             "working-tree edits for the caller to review. NEVER run git "
             "commit, push, checkout, switch, restore, reset, stash, clean, "
@@ -3957,9 +3720,12 @@ async def _run_codex(
         "run": run_tag, "phase": "start", "ts": time.time(), "engine": "codex",
         "tool": tool_name,
         "model": model, "reasoning": reasoning, "infra": infra, "write": write,
-        "full_access": bool(write and full_access),
+        "full_access": bool(write),
         "web_search": web_search, "parent_run": parent_run,
         "images": list(images or []), "cwd": eff_cwd,
+        # the session's folder, which may lie outside the target tree: the run
+        # is listed and resumable from both (_run_belongs)
+        "dispatch_cwd": _get_cwd(),
         "prompt": prompt, "log": str(live_path or ""),
         "tree": tree_at_dispatch,
         "custody_cwd": custody_cwd,  # lock ownership, for cancel-time custody release (round 18)
@@ -4106,7 +3872,6 @@ async def _run_codex(
                 model, reasoning, infra, web_search, output_file,
                 prompt=prompt, resume_tid=resume_tid, images=images,
                 write=write, auto_compact_limit=ac_limit,
-                full_access=bool(write and full_access),
             )
         except Exception as e:
             stderr_text = f"run machinery failure: {type(e).__name__}: {e}"
@@ -4360,12 +4125,18 @@ async def _run_codex(
         prior = _journal_runs().get(run_tag, {})
         if (prior.get("status") == "cancelled" and prior.get("cancelled_by")) or _cancel_requested(run_tag):
             status = "cancelled"
+    # What a write run REALLY ran with, read back from its rollout: a flag
+    # and an exit code are union claims (the old sealed sandbox once
+    # downgraded itself to read-only and still exited 0), the turn_context
+    # codex recorded for each turn is the measurement.
+    modes = _effective_modes(str(state.get("thread_id") or ""), mode_since) if write else []
     if _journal({
         "run": run_tag, "phase": "end", "ts": time.time(), "status": status,
         "returncode": returncode, "attempts": attempt + 1,
         "retry_classes": retry_classes, "capacity_wait_s": int(waited_total),
         "error": (state["last_error"] or stderr_text)[:500] if status != "ok" else "",
         "result_file": result_file,
+        **({"effective_modes": modes} if write else {}),
     }):
         # Only a DURABLE terminal record retires a cancel intent (round 6) —
         # clearing on a failed append would leave the run live-looking with
@@ -4386,7 +4157,7 @@ async def _run_codex(
     # changed on disk: a timed-out run may still have written files, and the
     # caller's next step is reviewing exactly that.
     write_report = (
-        _write_changes_report(write_before, write_head, eff_cwd)
+        _write_changes_report(write_before, write_head, eff_cwd) + _modes_line(modes)
         if write else ""
     )
 
@@ -4639,6 +4410,48 @@ def _session_stats(path: Path | None, since: int) -> dict[str, int]:
                            ("out", "output_tokens")):
             st[key] = max(0, int(t1.get(field) or 0) - int(t0.get(field) or 0))
     return st
+
+
+def _effective_modes(tid: str, since: int) -> list[str]:
+    """The sandbox and approval policy codex recorded for each turn of a
+    thread from byte ``since`` on ("danger-full-access/never"), distinct, in
+    order — read from the rollout's turn_context records."""
+    path = _rollout_path(tid)
+    try:
+        data = path.read_bytes() if path is not None else b""
+    except OSError:
+        data = b""
+    modes: list[str] = []
+    end = 0
+    for line in data.split(b"\n"):
+        start, end = end, end + len(line) + 1
+        if start < since or b"turn_context" not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        payload = rec.get("payload") if isinstance(rec, dict) else None
+        if not isinstance(payload, dict) or rec.get("type") != "turn_context":
+            continue
+        sandbox = payload.get("sandbox_policy")
+        mode = (f"{sandbox.get('type') if isinstance(sandbox, dict) else sandbox}"
+                f"/{payload.get('approval_policy')}")
+        if mode not in modes:
+            modes.append(mode)
+    return modes
+
+
+def _modes_line(modes: list[str]) -> str:
+    """The write report's line on what the run really ran with."""
+    if not modes:
+        return ("\n  effective mode: UNVERIFIED — the run's rollout recorded no turn "
+                "context (it may have failed before its first turn)")
+    if modes == ["danger-full-access/never"]:
+        return ("\n  effective mode: full access (sandbox danger-full-access, approvals "
+                "never), as codex recorded it for every turn")
+    return (f"\n  ⚠ effective mode: codex recorded {', '.join(modes)} — NOT plain full "
+            "access; commands or writes may have been refused (read the run log)")
 
 
 def _session_thread(tool: str, session: str) -> tuple[str, str, str, str]:
@@ -5192,28 +5005,25 @@ async def abraham(
     context: str = "",
     constraints: str = "",
     web_search: bool = True,
-    infra: bool = False,
+    infra: bool = True,
     allow_dirty: bool = False,
     images: list[str] = [],
     cwd: str = "",
-    full_access: bool | None = None,
+    full_access: bool = True,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
-    WRITE MODE — the one tool that EDITS FILES, as TWO air-gapped phases:
+    WRITE MODE — the one tool that EDITS FILES, as two phases in one call,
+    BOTH with full access: no sandbox, network, live web search, your MCP
+    servers and your live infrastructure (user ruling 2026-10-18; the sealed
+    mode was removed in 2.0.0):
 
-    1. ANALYSIS (read-only): codex investigates the codebase, the live web
-       (`web_search`), and live infrastructure (`infra` — SSH, DB, logs,
-       your MCP servers) and produces an implementation brief.
-    2. IMPLEMENTATION (sealed): a separate codex process with
-       workspace-write file access and NOTHING else — no network, no web,
-       no user MCP servers — implements the brief and reports. Untrusted
-       external content and live credentials never share a process with
-       write capability.
-
-    Mode algebra: read and write are separate TOOLS (structural
-    exclusivity); `infra`/`web_search` compose with abraham by governing
-    its ANALYSIS phase. The implementation phase is always sealed.
+    1. ANALYSIS: codex investigates the codebase, the live web and the live
+       infrastructure (read-only by instruction) and writes an
+       implementation brief.
+    2. IMPLEMENTATION: a second codex process implements the brief with
+       codex's --dangerously-bypass-approvals-and-sandbox, runs the
+       project's real checks and reports their real results.
 
     Safety envelope (enforced, not trusted): git work tree required; a
     DIRTY tree is refused unless `allow_dirty=true` (the implementer may
@@ -5223,9 +5033,11 @@ async def abraham(
     once a write process starts (a replay after partial writes
     double-applies); codex must not commit/push — every outcome ends with a
     CHANGED FILES report (this run's changes vs pre-existing dirt, HEAD
-    verified unmoved) for you to review with `git diff`. Long
-    implementation runs auto-compact codex's context at ~65% of the model
-    window (read from the deployed binary's own registry, never guessed).
+    verified unmoved) and the mode codex recorded for each of its turns,
+    read back from the run's rollout, for you to review with `git diff`.
+    Long implementation runs auto-compact codex's context at ~65% of the
+    model window (read from the deployed binary's own registry, never
+    guessed).
 
     This is a DIRECTIVE dispatch, not an advisory one: state the desired
     outcome plainly — no anchoring lint, no caller_hypothesis; the contract
@@ -5236,37 +5048,45 @@ async def abraham(
         task: What to build/fix/change, with the desired outcome and
             acceptance criteria; repro steps for bugfixes.
         context: What you already know — relevant paths, prior findings,
-            decisions already made and why. Feed `research` output here to
-            shorten the analysis phase (or to skip web entirely).
+            decisions already made and why, and the access paths you know
+            (a key-based SSH host, a `docker exec` target, a local test
+            database). Never credentials: codex finds its own way in from
+            the project's docs and your local configuration.
         constraints: Hard boundaries — files/areas NOT to touch, APIs to
             keep stable, scope rules beyond the repo's own docs.
-        web_search: Analysis-phase live-web verification of external
-            claims. The implementation phase never has web access either
-            way.
-        infra: Analysis-phase read-only live-infrastructure investigation.
-            The implementation phase never has infra access either way.
+        web_search: Live web search in both phases. Always on; False is
+            refused.
+        infra: Live-infrastructure access (SSH, databases, logs, your MCP
+            servers) in both phases. Always on; False is refused.
         allow_dirty: Accept a dirty working tree (default False — see
             safety envelope).
         images: Local image paths (mockups, error screenshots) — attached
             to both phases.
-        full_access: Run the IMPLEMENTATION phase with codex's
-            --dangerously-bypass-approvals-and-sandbox (its `--yolo` alias):
-            NO sandbox, no approval prompts, network on, your own codex
-            configuration and MCP servers, your full privileges — so the
-            writer can run the project's real gates (database migrations,
-            Temporal suites, browsers, builds) and verify before it reports.
-            The sealed guarantees (no egress, no credentials in the writer's
-            process) do NOT hold in this mode; the git contract, the one-
-            writer lock and the changed-files report still do. Default: the
-            CODEX_ORACLE_WRITE_FULL_ACCESS environment variable (1/true/on),
-            else False (sealed). A resume keeps the mode the run started in.
+        full_access: Always True; False is refused. For work that must not
+            write, use code_review, architect_review, research or
+            codex_query.
         cwd: Target git work tree, when it is not the server's own cwd —
-            required for multi-repo project roots that are not themselves
-            git repos. Must be the server cwd itself or a directory BELOW
-            it (never outside the workspace). Empty = server cwd.
+            any git repository on this machine: a repository below this
+            workspace (a multi-repo project root is not itself a work tree)
+            or another project. A relative path is taken from the server's
+            cwd. The run is listed and resumable from this session's folder
+            and from the target. Empty = server cwd.
     """
     if not task.strip():
         return "[abraham refused: empty task — state what to implement.]"
+    off = [name for name, value in (("full_access", full_access), ("infra", infra),
+                                    ("web_search", web_search)) if not value]
+    if off:
+        return (
+            f"[abraham refused: {', '.join(name + '=false' for name in off)} — every "
+            "abraham run has full access, infra and live web search in both "
+            "phases since 2.0.0 (user ruling 2026-10-18); there is no sealed "
+            "mode. For work that must not write, use code_review, "
+            "architect_review, research or codex_query.]"
+        )
+    sealed = _sealed_env_refusal()
+    if sealed:
+        return f"[abraham refused: {sealed}]"
     if _IS_WINDOWS:
         # Fail closed BEFORE any precondition: the one-writer lock cannot
         # follow the codex child on Windows (a byte-range lock's ownership
@@ -5294,21 +5114,17 @@ async def abraham(
     )
 
     if cwd:
-        base = Path(_get_cwd()).resolve()
+        # No workspace fence (user ruling 2026-10-18: "everything each and
+        # every repo"): any git work tree is a target. What keeps a write
+        # safe works in every repository — git as the undo, the tree's write
+        # lock, the changed-files report — and the run is journaled with
+        # both its target and this session's folder (dispatch_cwd).
         target = Path(cwd)
         if not target.is_absolute():
-            target = base / target
+            target = Path(_get_cwd()) / target
         target = target.resolve()
         if not target.is_dir():
             return f"[abraham refused: cwd '{cwd}' is not a directory.]"
-        # Workspace fence: same reasoning as resume's scoping — a subtree of
-        # the current workspace IS this workspace; anything outside it is a
-        # different project and must be dispatched from there.
-        if target != base and base not in target.parents:
-            return (
-                f"[abraham refused: cwd '{target}' is outside the server's "
-                f"workspace ({base}). Dispatch from that project instead.]"
-            )
         cwd = str(target)
     else:
         cwd = _get_cwd()
@@ -5323,36 +5139,13 @@ async def abraham(
         sample = "\n".join(f"  {ln}" for ln in sorted(dirty)[:10])
         more = f"\n  … +{len(dirty) - 10} more" if len(dirty) > 10 else ""
         return (
-            "[abraham refused: the working tree is DIRTY and the sealed "
-            "implementer may overwrite uncommitted work irrecoverably "
-            "(committed work is always recoverable).\n"
+            "[abraham refused: the working tree is DIRTY and the implementer "
+            "may overwrite uncommitted work irrecoverably (committed work is "
+            "always recoverable).\n"
             f"{sample}{more}\n"
-            "Commit or stash first — or pass allow_dirty=true to accept "
-            "the risk; the final report will separate this run's changes "
-            "from the pre-existing dirt.]"
-        )
-
-    # The deployed codex must PROVE it can write under the sealed sandbox
-    # before anything runs — measured on Windows 2026-08-21: workspace-write
-    # silently downgraded to read-only + approval prompts and every write
-    # was rejected while the run still EXITED 0, so an unprobed abraham
-    # "succeeds" having written nothing.
-    full = _full_access_default() if full_access is None else bool(full_access)
-    if full:
-        # No sandbox to probe: the write-capability probe exists because the
-        # SEALED sandbox silently downgraded to read-only on some machines.
-        can_write, probe_detail = True, "no sandbox (full access)"
-    else:
-        can_write, probe_detail = await _ensure_write_capability(cwd)
-    if not can_write:
-        return (
-            "[abraham refused: this machine's codex cannot WRITE under the "
-            f"sealed sandbox — {probe_detail} A run here could complete "
-            "without writing anything. Fix the codex sandbox (on Windows "
-            "the ELEVATED sandbox backend must be available — the sealed "
-            "argv requires it because only that backend enforces the "
-            "no-egress air-gap), or set CODEX_ORACLE_SKIP_WRITE_PROBE=1 "
-            "only if you have verified writes AND egress sealing by hand.]"
+            "Commit that work first — or pass allow_dirty=true to accept the "
+            "risk; the final report will separate this run's changes from the "
+            "pre-existing dirt.]"
         )
 
     # One writer per tree — the authoritative lock is held across BOTH
@@ -5376,27 +5169,20 @@ async def abraham(
         # ---- Phase 1: read-only analysis → implementation brief ----
         analysis_parts = [
             "PHASE 1 of 2 — ANALYSIS ONLY. You are a senior engineer "
-            "preparing an implementation. A SEPARATE, SEALED process will "
-            "do the writing: it has full read/write access to this "
-            "workspace but NO web search, NO network and NO external "
-            "tools, and it will see ONLY your final message. So your final "
-            "message must be a complete IMPLEMENTATION BRIEF:",
+            "preparing an implementation. A SEPARATE process will do the "
+            "writing, with the same full access you have (no sandbox, "
+            "network, live web search, MCP servers and live "
+            "infrastructure); it starts from ONLY your final message. So "
+            "your final message must be a complete IMPLEMENTATION BRIEF:",
             "",
             "## Findings — how the relevant system actually works, with "
             "file:line references (trace real call paths, don't guess).",
+            "## Live state — what the live infrastructure shows "
+            "(read-only investigation) where it bears on the task.",
+            "## External facts — every API/version/vendor behavior the "
+            "implementer must rely on, verified against current primary "
+            "sources, with URLs and EXACT values.",
         ]
-        if infra:
-            analysis_parts.append(
-                "## Live state — what the live infrastructure shows "
-                "(read-only investigation) where it bears on the task."
-            )
-        if web_search:
-            analysis_parts.append(
-                "## External facts — every API/version/vendor behavior the "
-                "implementer must rely on, verified against current "
-                "primary sources, with URLs and EXACT values (the "
-                "implementer cannot look anything up)."
-            )
         analysis_parts += [
             "## Plan — the minimal COMPLETE change: ordered edits per "
             "file, including error paths and edge cases; no artificial "
@@ -5420,7 +5206,7 @@ async def abraham(
 
         brief = await _run_codex(
             "\n".join(analysis_parts),
-            infra=infra, ctx=ctx, web_search=web_search,
+            infra=True, ctx=ctx, web_search=True,
             images=list(images or []),
             tool_name="abraham", workdir=cwd,
             request_started=request_t0,
@@ -5444,13 +5230,13 @@ async def abraham(
                 f"written. Phase-1 result follows.]\n\n{brief}"
             )
 
-        # ---- Phase 2: sealed implementation ----
+        # ---- Phase 2: implementation, full access ----
         impl_parts = [
             "PHASE 2 of 2 — IMPLEMENT. A read-only analysis run has "
             "already investigated this task; its brief is below. You have "
-            "full local code access — re-read anything you need — but no "
-            "web/network/external tools: every external fact you need is "
-            "in the brief.",
+            "full access: re-read the code, look things up and reach the "
+            "project's systems as you need — the brief is where you start, "
+            "not the only thing you may know.",
             "",
             "WORKFLOW: follow the brief's Plan (deviate only where the "
             "code proves it wrong, and say so); match the surrounding "
@@ -5470,20 +5256,16 @@ async def abraham(
 
         result = await _run_codex(
             "\n".join(impl_parts),
-            write=True, infra=False, ctx=ctx,
-            web_search=bool(web_search) if full else False,
+            write=True, infra=False, ctx=ctx, web_search=True,
             images=list(images or []),
             tool_name="abraham", workdir=cwd,
             request_started=request_t0,
-            full_access=full,
         )
         return (
-            "[abraham — phase 1 analyzed (read-only"
-            + (", infra" if infra else "")
-            + (", live web" if web_search else "")
-            + ("); phase 2 implemented (FULL ACCESS: no sandbox, network and MCP on — "
-               "--dangerously-bypass-approvals-and-sandbox)]\n\n" if full
-               else "); phase 2 implemented (sealed: no web/network/MCP)]\n\n")
+            "[abraham — phase 1 analyzed (read-only by instruction; infra, "
+            "live web, MCP servers); phase 2 implemented (FULL ACCESS: no "
+            "sandbox, network, live web and MCP servers — "
+            "--dangerously-bypass-approvals-and-sandbox)]\n\n"
             + result
         )
     finally:
@@ -5531,10 +5313,11 @@ async def codex_resume_run(
                          nudge="SSH to the app host and check the celery "
                                "queue depth, then finish the analysis")
 
-    Write runs (abraham) resume as write runs — sandbox, git contract and
-    changed-files report intact. The write axis itself has no override:
-    read runs cannot be escalated to write by resuming, and write runs
-    cannot be downgraded mid-implementation.
+    Write runs (abraham) resume as write runs, with full access, network
+    and live web search (a run that began sealed under 1.x continues with
+    full access), the git contract and the changed-files report intact.
+    The write axis itself has no override: read runs cannot be escalated to
+    write by resuming, and write runs cannot be downgraded.
 
     Args:
         run: The run id from the failure message ("run id: codex7·21746").
@@ -5553,24 +5336,20 @@ async def codex_resume_run(
     # on this machine. Listing or auto-resuming must not surface another
     # workspace's prompts/answers — an untrusted repo could otherwise drive a
     # cross-project read. Scope discovery to the current cwd; an EXPLICIT id
-    # from another workspace is refused rather than silently retrieved.
-    # Anchor the heartbeat deadline to THIS request's start: a write resume
-    # can spend up to WRITE_PROBE_TIMEOUT_SECONDS in the capability gate
-    # before codex spawns, and a fresh per-run clock there would resurrect
-    # dead-token sends (round-2 review, 2026-08-21).
+    # from another workspace is refused rather than silently retrieved. A run
+    # belongs to its target tree AND to the folder it was dispatched from.
+    # Anchor the heartbeat deadline to THIS request's start: a fresh per-run
+    # clock would resurrect dead-token sends (round-2 review, 2026-08-21).
     request_t0 = time.monotonic()
 
     cwd = _get_cwd()
     all_runs = _journal_runs()
 
-    def _in_workspace(run_cwd: str) -> bool:
-        return _run_in_workspace(run_cwd, cwd)
-
     # has_start excludes evidence-only journal groups (abraham-dispatch
-    # tracers, write-probe verdicts) — they are diagnostics, not runs, and
-    # cannot be resumed.
+    # tracers, the old write-probe verdicts) — they are diagnostics, not
+    # runs, and cannot be resumed.
     runs = {k: v for k, v in all_runs.items()
-            if _in_workspace(str(v.get("cwd") or "")) and v.get("has_start")}
+            if _run_belongs(v, cwd) and v.get("has_start")}
 
     if run == "list":
         return await codex_runs()
@@ -5674,19 +5453,27 @@ async def codex_resume_run(
     # changes behind a read-only sandbox. Re-dispatch through the right tool
     # instead of flipping this axis mid-thread.
     use_write = bool(rec.get("write"))
-    use_full = bool(use_write and rec.get("full_access"))
+    was_sealed = use_write and not rec.get("full_access")
     if use_write and _IS_WINDOWS:  # unreachable (all Windows continuations refused above); second fence
         return "[write runs cannot be resumed on Windows in 1.17.x (no inheritable lock); see abraham.]"
     if use_write:
-        # A write continuation keeps the MODE it started in: sealed stays
-        # sealed (even if the caller asked for infra/web — the analysis
-        # phase is where those lived), full access stays full access (a
-        # downgrade mid-implementation would strand half-applied changes
-        # behind a sandbox). infra never applies to a write continuation.
-        use_infra = False
-        # full access keeps the analysis' web search unless THIS resume
-        # overrides it (round 40: an explicit web_search=False was overwritten)
-        use_web = (use_web if web_search is not None else bool(rec.get("web_search", False))) if use_full else False
+        # A write continuation always runs with full access, network and
+        # live web search (2.0.0): a run that began sealed under 1.x gains
+        # capability, which strands nothing. An explicit false is refused,
+        # as abraham refuses it; infra is part of full access, so the read
+        # tools' infra switch has no separate meaning here.
+        off = [name for name, value in (("infra", infra), ("web_search", web_search))
+               if value is False]
+        if off:
+            return (
+                f"[resume refused: {', '.join(name + '=false' for name in off)} — "
+                "a write continuation always has full access, infra and live "
+                "web search since 2.0.0; there is no sealed mode.]"
+            )
+        sealed = _sealed_env_refusal()
+        if sealed:
+            return f"[resume refused: {sealed}]"
+        use_infra, use_web = False, True
         other = _active_write_run(cwd, exclude_run=run)
         if other:
             return (
@@ -5718,7 +5505,7 @@ async def codex_resume_run(
                         f"for it to finish), then resume.]"
                     )
 
-    switches = []
+    switches = ["sealed → full access (2.0.0 has no sealed mode)"] if was_sealed else []
     if use_infra != was_infra:
         switches.append(f"infra {was_infra} → {use_infra}")
     if use_web != bool(rec.get("web_search", True)):
@@ -5750,21 +5537,9 @@ async def codex_resume_run(
     # targeted a subtree of this workspace) — locking or writing against the
     # server cwd would miss the tree the brief describes.
     run_cwd = str(rec.get("cwd") or cwd)
-    if use_write and not use_full:
-        # Same gate as a fresh abraham dispatch: a resumed write run on a
-        # machine whose sandbox cannot write reproduces the original
-        # exit-0/no-write failure (round-2 review, 2026-08-21). Keyed to
-        # the run's OWN tree — the thing that will actually be written. A
-        # FULL-ACCESS continuation has no sandbox to probe (round 39).
-        can_write, probe_detail = await _ensure_write_capability(run_cwd)
-        if not can_write:
-            return (
-                "[resume refused: this machine's codex cannot WRITE under "
-                f"the sealed sandbox — {probe_detail}]"
-            )
     if use_write:
         # EVERY write continuation takes the tree lock (round 40: the
-        # acquisition sat inside the sealed-only branch, so a full-access
+        # acquisition once sat inside a sealed-only branch, so a full-access
         # resume ran unlocked, failed its child publication at the execution
         # barrier, and released a lock it never held).
         got_lock, holder = _acquire_write_lock(run_cwd, f"resume:{run}")
@@ -5801,7 +5576,6 @@ async def codex_resume_run(
             continuation,
             infra=use_infra,
             write=use_write,
-            full_access=use_full,
             ctx=ctx,
             web_search=use_web,
             resume_tid=tid,
@@ -5860,7 +5634,7 @@ def _workspace_runs(limit: int = 0) -> list[dict[str, Any]]:
     cwd = _get_cwd()
     runs = [
         r for r in _journal_runs().values()
-        if r.get("has_start") and _run_in_workspace(str(r.get("cwd") or ""), cwd)
+        if r.get("has_start") and _run_belongs(r, cwd)
     ]
     return runs[-limit:] if limit else runs
 
