@@ -229,11 +229,17 @@ if MAX_RUNTIME_SOURCE.startswith("rejected"):
 # -c model_auto_compact_token_limit at AUTOCOMPACT_PCT of the window.
 #
 # Two measured traps shape this code:
-# 1. A user-config value WINS OUTRIGHT over the model-derived default
-#    (config.model_auto_compact_token_limit.or_else(model default) — no min()
-#    with the window on that path), so a limit above the real window would
-#    simply NEVER fire, silently disabling compaction. The flag is only
-#    passed when the window is KNOWN.
+# 1. How a configured limit combines with the 90% default depends on the
+#    binary. On 0.163.0, under the default model_auto_compact_token_limit_scope
+#    `total`, it is CLAMPED: min(config, window * 9 / 10)
+#    (protocol/src/openai_models.rs:529-540, fed by
+#    models-manager/src/model_info.rs:29-31), so it can only lower the
+#    threshold; under `body_after_prefix` it is used as-is
+#    (core/src/session/context_window.rs:68-79). On the 0.147-generation
+#    binaries it won outright (config.model_auto_compact_token_limit.or_else
+#    (model default), no min()), so a limit above the real window NEVER
+#    fired, silently disabling compaction. The flag is therefore only passed
+#    when the window is KNOWN.
 # 2. The window must come from the deployed binary's OWN registry
 #    (models_cache.json under CODEX_HOME — the same base its 90% default
 #    derives from), never from recalled docs: gpt-5.6-sol is 272_000 there
@@ -1713,8 +1719,11 @@ def _process_exec_event(ev: dict[str, Any], state: dict[str, str]) -> str | None
         state["turn_completed"] = True
         usage = ev.get("usage") or {}
         if usage:
+            # On a resume codex reports the THREAD's cumulative usage here
+            # (measured 0.163.0); the per-turn figures live in the rollout.
             state["usage"] = (
-                f"tokens in={usage.get('input_tokens', '?')} "
+                ("thread total: " if state.get("resumed") else "")
+                + f"tokens in={usage.get('input_tokens', '?')} "
                 f"(cached {usage.get('cached_input_tokens', 0)}) "
                 f"out={usage.get('output_tokens', '?')}"
             )
@@ -2737,9 +2746,12 @@ def _build_exec_argv(
     config so codex has its own MCP tools (auth0, temporal, ...) for live
     investigation.
 
-    Images attach via ``-i`` on fresh runs only (vision verified live on
-    0.144.1); on resume the originals are already part of the persisted
-    thread, so re-attaching is unnecessary. ``--image`` is VARIADIC
+    Images attach via ``-i`` whenever the caller passes them (vision verified
+    live on 0.144.1), on a resume as well: 0.163.0 chains the parent's ``-i``
+    list into the resumed turn's input (exec/src/lib.rs:937-941), which is how
+    a follow-up turn in a continued advisory session sees a new screenshot. A
+    recovery resume (codex_resume_run) passes none — its images are already in
+    the thread. ``--image`` is VARIADIC
     (``<FILE>...``) — measured live: if the ``-i`` list sits immediately
     before the positional prompt, clap swallows the prompt as another image
     path and codex reports "No prompt provided via stdin". So images go RIGHT
@@ -2754,14 +2766,13 @@ def _build_exec_argv(
     files while ``curl`` could not resolve DNS (egress sealed); read-only
     refused the same write (probe calibration). ``auto_compact_limit`` emits
     ``model_auto_compact_token_limit`` — the caller passes it ONLY when the
-    model's window is known, because a user-config value beats the vendor's
-    90% default OUTRIGHT and a limit above the real window would never fire
-    at all.
+    model's window is known (see the auto-compaction notes above
+    AUTOCOMPACT_PCT: on 0.163.0 the value can only lower the vendor's 90%
+    threshold, on older binaries it replaced it outright).
     """
     argv = [*_codex_argv0(), "exec"]
-    if resume_tid is None:
-        for img in images or []:
-            argv += ["-i", img]
+    for img in images or []:
+        argv += ["-i", img]
     if write and full_access:
         # FULL-ACCESS implementation process (user ruling 2026-09-05, "allow
         # codex to skip permission via --yolo"): codex's own
@@ -3623,8 +3634,12 @@ async def _run_codex(
     claim_key: str = "",
     custody_cwd: str = "",
     full_access: bool = False,
+    session_out: dict[str, Any] | None = None,
 ) -> str:
     """Run codex exec headlessly with clean final-message extraction.
+
+    ``session_out``: filled with this run's live state dict (``run_tag``,
+    ``thread_id``) so an advisory caller can report the session it ran in.
 
     ``custody_cwd``: the tree whose WRITE LOCK the caller holds around this
     run (abraham holds it across BOTH phases — round 17: a phase-1 READ run
@@ -3843,6 +3858,8 @@ async def _run_codex(
                              "write": "1" if write else "", "run_tag": run_tag,
                              "parent_run": parent_run or "", "claim_key": claim_key,
                              "custody_cwd": custody_cwd}
+    if session_out is not None:
+        session_out["state"] = state
 
     journaled_tid = ""
     journaled_spawn_pid = 0
@@ -4101,6 +4118,7 @@ async def _run_codex(
                 _emit(f"✖ {stderr_text}")
             break
         expected_tid = resume_tid
+        state["resumed"] = resume_tid is not None
         state["last_error"] = ""
         state["last_message"] = ""  # attempt N's commentary is not attempt N+1's answer
         state.pop("turn_completed", None)  # completion evidence is ATTEMPT-scoped
@@ -4520,6 +4538,212 @@ async def _run_codex(
 
 
 # ---------------------------------------------------------------------------
+# Advisory sessions (2.0): a follow-up review continues its own codex thread
+# ---------------------------------------------------------------------------
+# A follow-up review is the next TURN of the earlier review's codex thread
+# (`codex exec resume <UUID> "<prompt>"`, the one native resume form: a name
+# lookup is cwd-scoped and a miss silently starts a new thread), so the
+# reviewer starts from its own earlier findings and reads of the code, not
+# from a restated summary. Codex itself replays the history, compacts it at
+# 90% of the window and refuses a second concurrent resume (measured on
+# 0.163.0). The plugin picks the thread, holds the thread claim so two calls
+# never race for one thread, and reports the session from its rollout.
+
+SESSION_DEFAULTS = {"code_review": "continue", "architect_review": "continue",
+                    "research": "new", "codex_query": "new"}
+_SESSION_LINE_RESERVE = 600  # the session line and note, out of the result budget
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_FOLLOW_UP = {
+    "code_review": (
+        "FOLLOW-UP REVIEW in this same session: your earlier turns above "
+        "reviewed earlier versions of this work. Start from them: say which of "
+        "your earlier findings are now fixed, which still stand, and what is "
+        "new. Never present an earlier finding as new."),
+    "architect_review": (
+        "FOLLOW-UP DESIGN REVIEW in this same session: your earlier turns above "
+        "reviewed earlier versions of this design. Start from them: say which "
+        "of your earlier concerns are resolved, which still stand, and what is "
+        "new. Never present an earlier concern as new."),
+}
+_FOLLOW_UP_OTHER = (
+    "FOLLOW-UP in this same session: build on your earlier answers above "
+    "instead of restating them, and say where this question changes them.")
+
+
+def _rollout_path(tid: str) -> Path | None:
+    """The thread's LIVE rollout, ``$CODEX_HOME/sessions/YYYY/MM/DD/
+    rollout-*-<tid>.jsonl``, or None: an archived thread lives in
+    archived_sessions/ and refuses ``exec resume`` (exit 1, measured 0.163.0).
+    The day directory is the thread's local creation date, which a UUIDv7
+    thread id carries in its first 48 bits; that one is tried first."""
+    if not _UUID_RE.fullmatch(tid):
+        return None
+    base = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")) / "sessions"
+    name = f"rollout-*-{tid}.jsonl"
+    with contextlib.suppress(ValueError, OverflowError, OSError):
+        day = time.strftime("%Y/%m/%d", time.localtime(int(tid[:8] + tid[9:13], 16) / 1000))
+        hits = sorted((base / day).glob(name))
+        if hits:
+            return hits[-1]
+    hits = sorted(base.glob(f"*/*/*/{name}"))
+    return hits[-1] if hits else None
+
+
+def _session_stats(path: Path | None, since: int) -> dict[str, int]:
+    """A thread's turns, compactions and token use, read from its rollout:
+    exec JSON shows no compaction on the remote path, and on a resume its
+    turn.completed carries the THREAD total. Records from byte ``since`` on
+    belong to this call. ``context`` is the last request's total_tokens,
+    codex's own tokens_in_context_window."""
+    st: dict[str, int] = {k: 0 for k in ("turns", "compactions", "new_compactions", "in",
+                                          "cached", "out", "context", "window")}
+    try:
+        data = path.read_bytes() if path is not None else b""
+    except OSError:
+        data = b""
+    before: dict[str, Any] = {}
+    after: dict[str, Any] = {}
+    end = 0
+    for line in data.split(b"\n"):
+        start, end = end, end + len(line) + 1
+        if b"task_started" not in line and b"compacted" not in line and b"token_count" not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        payload = rec.get("payload") if isinstance(rec, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        if rec.get("type") == "compacted":
+            st["compactions"] += 1
+            if start >= since:
+                st["new_compactions"] += 1
+        elif rec.get("type") != "event_msg":
+            continue
+        elif payload.get("type") == "task_started":
+            st["turns"] += 1
+        elif payload.get("type") == "token_count" and isinstance(payload.get("info"), dict):
+            info = payload["info"]
+            if start < since:
+                before = info
+            else:
+                after = info
+            last = int((info.get("last_token_usage") or {}).get("total_tokens") or 0)
+            if last:  # the record right after a compaction reports 0
+                st["context"], st["window"] = last, int(info.get("model_context_window") or 0)
+    if after:
+        t0 = before.get("total_token_usage") or {}
+        t1 = after.get("total_token_usage") or {}
+        for key, field in (("in", "input_tokens"), ("cached", "cached_input_tokens"),
+                           ("out", "output_tokens")):
+            st[key] = max(0, int(t1.get(field) or 0) - int(t0.get(field) or 0))
+    return st
+
+
+def _session_thread(tool: str, session: str) -> tuple[str, str, str, str]:
+    """(thread_id, run, note, refusal) for an advisory call's ``session``.
+
+    "new" is a fresh thread. "continue" is the thread of this workspace's
+    newest completed ``tool`` run, or a fresh thread (with a note when that
+    thread can no longer be resumed). A run id, a codex thread id, or a
+    unique prefix of 8+ characters of one names that thread among this
+    workspace's completed read-only runs; what it cannot honour is a
+    REFUSAL, never a silent fresh start."""
+    want = (session or "new").strip()
+    if want.lower() == "new":
+        return "", "", "", ""
+    cwd = _get_cwd()
+    done = [r for r in _journal_runs().values()
+            if r.get("has_start") and r.get("has_end") and r.get("status") == "ok"
+            and not r.get("write") and _UUID_RE.fullmatch(str(r.get("thread_id") or ""))
+            and _run_in_workspace(str(r.get("cwd") or ""), cwd)]
+    if want.lower() == "continue":
+        mine = [r for r in done if r.get("tool") == tool and r.get("cwd") == cwd]
+        if not mine:
+            return "", "", "", ""
+        rec = max(mine, key=lambda r: float(r.get("last_ts") or 0))
+        tid = str(rec["thread_id"])
+        if _rollout_path(tid) is None:
+            return "", "", (f"the last {tool} session ({tid}) is archived or "
+                            "deleted in codex, so this call started a new one"), ""
+        return tid, str(rec.get("run") or ""), "", ""
+    key = want.lower()
+    hits = [r for r in done if r.get("run") == want
+            or (len(key) >= 8 and str(r["thread_id"]).startswith(key))]
+    tids = {str(r["thread_id"]) for r in hits}
+    if len(tids) != 1:
+        return "", "", "", (
+            f"session {want!r} matches {len(tids)} completed read-only sessions "
+            "in this workspace. Pass a run id or a full codex thread id from an "
+            "earlier result's session line, or session=\"continue\" or \"new\".")
+    rec = max(hits, key=lambda r: float(r.get("last_ts") or 0))
+    tid = tids.pop()
+    if _rollout_path(tid) is None:
+        return "", "", "", (f"session {tid} is archived or deleted in codex "
+                            f"(`codex unarchive {tid}` restores an archived one).")
+    return tid, str(rec.get("run") or ""), "", ""
+
+
+async def _advise(prompt: str, tool_name: str, session: str, *, infra: bool,
+                  ctx: Any, web_search: bool, reserve: int, images: list[str]) -> str:
+    """Run an advisory tool in the codex session ``session`` names, then put
+    the session line right under the signed header (the push gate and
+    abraham's gate read only the FIRST line)."""
+    tid, prev_run, note, refusal = _session_thread(tool_name, session)
+    if refusal:
+        return f"[session refused, nothing was sent to codex: {refusal}]"
+    claim = _thread_claim_key(tid) if tid else ""
+    if claim:
+        got, holder = _acquire_run_claim(claim)
+        if not got:
+            if (session or "").strip().lower() != "continue":
+                return (f"[session refused, nothing was sent to codex: session "
+                        f"{tid} is in use by another call ({holder}). Wait for "
+                        f"it, or pass session=\"new\".]")
+            note = (f"the last {tool_name} session ({tid}) is in use by another "
+                    "call, so this call started a new one")
+            tid, prev_run, claim = "", "", ""
+    since = 0
+    if tid:
+        path = _rollout_path(tid)
+        if path is not None:
+            with contextlib.suppress(OSError):
+                since = path.stat().st_size
+        prompt = f"{_FOLLOW_UP.get(tool_name, _FOLLOW_UP_OTHER)}\n\n{prompt}"
+    out: dict[str, Any] = {}
+    try:
+        result = await _run_codex(
+            prompt, infra=infra, ctx=ctx, web_search=web_search,
+            reserve=reserve + _SESSION_LINE_RESERVE, images=images,
+            tool_name=tool_name, resume_tid=tid or None, parent_run=prev_run,
+            claim_key=claim, session_out=out)
+    finally:
+        if claim:
+            _release_run_claim(claim)
+    note_line = f"\n[session note: {note}]" if note else ""
+    ran = str((out.get("state") or {}).get("thread_id") or "")
+    if not ran:
+        return result + note_line
+    st = _session_stats(_rollout_path(ran), since if ran == tid else 0)
+    bits = [f"session {ran}",
+            "continued" if ran == tid else ("new" if not tid else f"a NEW thread, not {tid}"),
+            f"turn {st['turns']}"]
+    if st["in"] or st["out"]:
+        bits.append(f"this call: in {st['in']:,} ({st['cached']:,} cached), out {st['out']:,}")
+    if st["window"]:
+        bits.append(f"context {st['context']:,} of {st['window']:,}")
+    if st["compactions"]:
+        bits.append(f"compacted {st['compactions']}×" + (
+            f" ({st['new_compactions']} in this call)" if st["new_compactions"] else ""))
+    nxt = (f'the next {tool_name} continues it; session="new" starts fresh'
+           if SESSION_DEFAULTS.get(tool_name) == "continue"
+           else f'session="{ran}" continues it')
+    first, sep, rest = result.partition("\n")
+    return f"{first}\n[{' · '.join(bits)} — {nxt}]{note_line}{sep}{rest}"
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
@@ -4532,6 +4756,7 @@ async def architect_review(
     web_search: bool = True,
     infra: bool = False,
     images: list[str] = [],
+    session: str = "continue",
     ctx: Context = None,
 ) -> str:
     """
@@ -4567,6 +4792,16 @@ async def architect_review(
         infra: Enable live-infrastructure access (SSH, live DB, Dokploy,
             logs, MCP tools) for read-only investigation. Slower startup;
             use only when live state matters to the review.
+        session: Which codex session this review runs in. "continue"
+            (default): the next turn of this workspace's latest completed
+            architect_review session, so the reviewer starts from its own
+            earlier concerns and reads of the code; the result's second line
+            names the session, its turn count, this call's tokens and the
+            context size. "new": a fresh session, for an unrelated design or
+            a deliberately independent second opinion. A codex thread id
+            from an earlier session line (or a run id) continues that
+            session. A session another call is using falls back to a fresh
+            one, with a note.
     """
     hits = _detect_anchoring({"description": description, "concerns": concerns})
 
@@ -4621,11 +4856,10 @@ async def architect_review(
 
     banner = _anchor_warning_banner(hits)
     reserve = len(banner) + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0)
-    result = await _run_codex(
-        "\n".join(prompt_parts), infra=infra, ctx=ctx,
-        web_search=web_search, reserve=reserve,
+    result = await _advise(
+        "\n".join(prompt_parts), "architect_review", session, infra=infra,
+        ctx=ctx, web_search=web_search, reserve=reserve,
         images=list(images or []),
-        tool_name="architect_review",
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
@@ -4639,6 +4873,7 @@ async def code_review(
     web_search: bool = True,
     infra: bool = False,
     images: list[str] = [],
+    session: str = "continue",
     ctx: Context = None,
 ) -> str:
     """
@@ -4674,6 +4909,16 @@ async def code_review(
         infra: Enable live-infrastructure access (SSH, live DB, Dokploy,
             logs, MCP tools) for read-only investigation. Slower startup;
             use only when live state matters to the review.
+        session: Which codex session this review runs in. "continue"
+            (default): the next turn of this workspace's latest completed
+            code_review session, so the reviewer starts from its own earlier
+            findings and reads of the code; the result's second line names
+            the session, its turn count, this call's tokens and the context
+            size. "new": a fresh session, for an unrelated change or a
+            deliberately independent second opinion. A codex thread id from
+            an earlier session line (or a run id) continues that session. A
+            session another call is using falls back to a fresh one, with a
+            note.
     """
     hits = _detect_anchoring({"context": context, "focus": focus})
 
@@ -4734,11 +4979,10 @@ async def code_review(
 
     banner = _anchor_warning_banner(hits)
     reserve = len(banner) + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0)
-    result = await _run_codex(
-        "\n".join(prompt_parts), infra=infra, ctx=ctx,
-        web_search=web_search, reserve=reserve,
+    result = await _advise(
+        "\n".join(prompt_parts), "code_review", session, infra=infra,
+        ctx=ctx, web_search=web_search, reserve=reserve,
         images=list(images or []),
-        tool_name="code_review",
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
@@ -4751,6 +4995,7 @@ async def research(
     web_search: bool = True,
     infra: bool | None = None,
     images: list[str] = [],
+    session: str = "new",
     ctx: Context = None,
 ) -> str:
     """
@@ -4790,6 +5035,11 @@ async def research(
             dialogs) to attach — codex views them natively, so visual
             references beat prose descriptions. Missing paths are rejected
             loudly before any spend.
+        session: "new" (default): a fresh codex session. "continue": the next
+            turn of this workspace's latest completed research session, for a
+            follow-up that should build on the earlier answer. A codex thread
+            id from an earlier result's session line (or a run id) continues
+            that session.
     """
     # infra: None = AUTO (on only for live-systems questions), True/False =
     # explicit and always honoured. Never switch mode silently — an
@@ -4851,11 +5101,10 @@ async def research(
     banner = _anchor_warning_banner(hits)
     reserve = (len(banner) + len(infra_notice)
                + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0))
-    result = await _run_codex(
-        "\n".join(prompt_parts), infra=bool(infra), ctx=ctx,
-        web_search=web_search, reserve=reserve,
+    result = await _advise(
+        "\n".join(prompt_parts), "research", session, infra=bool(infra),
+        ctx=ctx, web_search=web_search, reserve=reserve,
         images=list(images or []),
-        tool_name="research",
     )
     return (banner + infra_notice
             + _verdict_missing_notice(caller_hypothesis, result) + result)
@@ -4868,6 +5117,7 @@ async def codex_query(
     web_search: bool = True,
     infra: bool = False,
     images: list[str] = [],
+    session: str = "new",
     ctx: Context = None,
 ) -> str:
     """
@@ -4899,6 +5149,11 @@ async def codex_query(
             dialogs) to attach — codex views them natively, so visual
             references beat prose descriptions. Missing paths are rejected
             loudly before any spend.
+        session: "new" (default): a fresh codex session. "continue": the next
+            turn of this workspace's latest completed codex_query session,
+            for a follow-up question that should build on the earlier
+            answer. A codex thread id from an earlier result's session line
+            (or a run id) continues that session.
     """
     hits = _detect_anchoring({"prompt": prompt})
 
@@ -4923,11 +5178,10 @@ async def codex_query(
     )
     banner = _anchor_warning_banner(hits)
     reserve = len(banner) + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0)
-    result = await _run_codex(
-        preamble + body, infra=infra, ctx=ctx,
-        web_search=web_search, reserve=reserve,
+    result = await _advise(
+        preamble + body, "codex_query", session, infra=infra,
+        ctx=ctx, web_search=web_search, reserve=reserve,
         images=list(images or []),
-        tool_name="codex_query",
     )
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
@@ -5259,10 +5513,13 @@ async def codex_resume_run(
     unless you pass a nudge, which continues the thread with your new
     instructions instead of replaying the old answer.
 
-    Every continuation RESTATES the original task from the run journal:
-    a hard-killed turn may have persisted none of its input vendor-side
-    (measured 2026-08-09), so the thread cannot be trusted to remember the
-    question. Threads that did retain context see a labelled duplicate.
+    A continuation of a failed or interrupted run RESTATES the original task
+    from the run journal: a hard-killed turn may have persisted none of its
+    input vendor-side (measured 2026-08-09), so the thread cannot be trusted
+    to remember the question. Threads that did retain context see a
+    labelled duplicate. A COMPLETED run's thread holds its task already, so
+    a nudge to one continues it as is (a follow-up question to an advisory
+    session is the tool's own `session` argument).
 
     SWITCH CAPABILITIES MID-COURSE. A resume may change the run's settings,
     so a run that turns out to need something it didn't have can be rescued
@@ -5478,7 +5735,8 @@ async def codex_resume_run(
     # thread that did retain context treats it as a stated duplicate.
     continuation = nudge or RESUME_NUDGE
     original_prompt = str(rec.get("prompt") or "")
-    if original_prompt:
+    completed = bool(rec.get("has_end")) and str(rec.get("status") or "") == "ok"
+    if original_prompt and not completed:
         continuation = (
             "[RECOVERY CONTEXT — this thread's interrupted turn may not have "
             "persisted its input. The original task is restated below; if "

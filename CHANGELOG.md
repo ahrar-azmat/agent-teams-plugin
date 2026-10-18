@@ -238,6 +238,43 @@ This project adheres to [Semantic Versioning](https://semver.org/).
     acknowledged commit;
   - `claude plugin validate --strict` passes for the plugin and the marketplace.
 
+### Reviews continue their own Codex session
+- A `code_review` or `architect_review` is now the next turn of this workspace's latest
+  completed review of the same kind: `codex exec resume <thread id>`, Codex's own resume, so
+  the reviewer starts from its earlier findings and its reads of the code instead of a
+  restated summary, and says which findings are fixed, which still stand and what is new.
+  `session="new"` starts a fresh session; a thread id (or a run id) continues that session;
+  `research` and `codex_query` start fresh unless given `session="continue"` or an id.
+- The result's second line names the session: thread id, new or continued, turn number,
+  this call's tokens (input, cached, output), the context size against the window, and how
+  often Codex compacted it. The figures come from the thread's rollout file, because on a
+  resume `turn.completed` carries the thread's total and the exec JSON shows no compaction.
+  The signed first line is unchanged, so the push gate and abraham's gate read it as before.
+- One call per thread: the plugin holds the thread claim while a session is continued. A
+  session another call is using falls back to a fresh one, with a note; an explicit id that
+  is busy, archived, unknown or ambiguous is refused before anything reaches Codex.
+- Images now attach to a continued turn too (`-i` before `resume`; codex 0.163.0 chains them
+  into the resumed turn's input).
+- `codex_resume_run` with a nudge on a run that completed no longer restates the original
+  task as a recovery block: the thread holds it.
+- The comment on auto-compaction is corrected for 0.163.0: a configured limit is clamped to
+  90 % of the window under the default scope, so it can only lower the threshold.
+- Verified 2026-10-18 by real runs (codex-cli 0.163.0, gpt-6-astra at max) against a scratch
+  repository:
+  - the first review started a session (turn 1); after a fix, the next one continued it as
+    turn 2, reported both earlier findings "STILL OPEN" and noted the empty-input change as
+    the behaviour it had earlier classed as an open question; nothing about the first review
+    was in its prompt;
+  - `session="new"` gave a different thread;
+  - of two reviews started 3 s apart, the first continued the session and the second started
+    a new one with the busy note;
+  - an explicit thread id with an image continued that session as turn 3; the image reached
+    the thread (0 → 2 `input_image` records) and the answer named its colour;
+  - `session="deadbeef"` was refused with nothing sent;
+  - `codex_resume_run` with a nudge on a completed review sent the nudge alone and was
+    answered from the thread's context;
+  - the push gate's parser read the signed first line of both continued answers.
+
 ## [software-workflows 1.8.1] — 2026-10-16
 
 ### No git worktrees: one writer per repository checkout (user ruling 2026-10-16)

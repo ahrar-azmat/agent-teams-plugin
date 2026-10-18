@@ -74,6 +74,19 @@ untrusted web content, full-disk read, and network egress must never share a pro
 (measured on codex 0.147.0: no mechanism exists for network without full disk read).
 Entirely optional — without the CLI, nothing changes.
 
+## Reviews continue their own session (2.0)
+
+A follow-up `code_review` or `architect_review` is the next turn of this workspace's latest
+review session — `codex exec resume <thread id>`, Codex's own resume — so the reviewer starts
+from its earlier findings and reads of the code, and says which are fixed, which still stand
+and what is new. The result's second line names the session: its thread id, turn number, this
+call's tokens, the context size and how often Codex compacted it. `session="new"` starts a fresh
+one (an unrelated change, or a deliberately independent opinion); a thread id from that line
+continues a particular session; a session another call is using falls back to a fresh one with
+a note. `research` and `codex_query` start fresh unless you pass `session="continue"` or an id.
+Codex itself replays the history, compacts it near its window and refuses two writers on one
+thread; the plugin only picks the thread and reports it.
+
 ## Run operations and survivability (v1.17.0)
 
 A backgrounded oracle call used to be a child of the MCP server: Claude Code's `/mcp`
