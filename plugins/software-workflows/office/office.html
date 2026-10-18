@@ -631,6 +631,7 @@ const STATUS = {
   error: { label: 'Failed', color: '#f87171', icon: '!' }, timeout: { label: 'Timed out', color: '#f87171', icon: '!' },
   hung: { label: 'Hung', color: '#f87171', icon: '!' }, interrupted: { label: 'Interrupted', color: '#a1a1aa', icon: 'z' },
   INTERRUPTED: { label: 'Interrupted', color: '#a1a1aa', icon: 'z' },
+  UNREACHABLE: { label: 'Coordinator unreachable', color: '#a1a1aa', icon: '?' },
 };
 const stInfo = st => STATUS[st] || { label: st || '?', color: '#a1a1aa', icon: '?' };
 const shownStatus = w => w.cancel_stuck ? 'CANCEL-STUCK' : w.status;  // a cancel nothing is finishing
@@ -685,7 +686,7 @@ function applyState(st) {
     sel.innerHTML = '<option value="">All workspaces</option>' + st.workspaces.map(p => `<option value="${esc(p)}" title="${esc(p)}">${esc(base(p))}  (${esc(home(p).split('/').slice(-3, -1).join('/') || '~')})</option>`).join('');
     sel.value = S.ws;
   }
-  $('#logdir').textContent = 'Reading ' + home(st.log_dir);
+  $('#logdir').textContent = 'Reading ' + home(st.log_dir) + (st.coordinator ? ' · ⚠ ' + st.coordinator : '');
   $('#ver').textContent = st.version ? 'v' + st.version : '';
   S.visible = filtered();
   renderStats();
@@ -1142,6 +1143,8 @@ const Panel = (() => {
       w.write ? ['✍ writes (full access)', 'abraham implementation run'] : w.infra ? ['🛠 live infra', 'shell, network and MCP servers'] : ['🔒 read-only', 'sandboxed read-only'],
       w.web ? ['🌐 live web', 'live web search'] : null,
       t.i ? [`⇅ ${tok(t.i)} in (${tok(t.c)} cached) · ${tok(t.o)} out`, 'tokens across finished turns'] : null,
+      w.native ? [`🧩 ${w.native.claims.length} claimed${w.native.unknown ? ` · ${w.native.unknown} UNKNOWN` : ''}${w.native.unread ? ` · ${w.native.unread} unread` : ''}`,
+        `On the writer coordinator: unit ${w.native.unit} (${w.native.unit_state})${w.native.claims.length ? ' holds ' + w.native.claims.join(', ') : ''}`] : null,
       [`📁 ${base(w.cwd)}`, w.cwd],
       [`#${w.run}`, 'run id — click to copy'],
       w.runs.length > 1 ? [`${w.runs.length} runs`, 'runs in this conversation'] : null,
@@ -1180,9 +1183,14 @@ const Panel = (() => {
       if (g !== gen) return false;
       if (!this.detail) { this.detail = d; this.intro(); }
       else { const { prompt, task, ...rest } = d; Object.assign(this.detail, rest); }
-      for (const a of d.spools || []) if (!this.att.has(a.n)) this.att.set(a.n, { n: a.n, offset: 0, size: a.size });
+      for (const a of d.spools || []) {
+        if (!this.att.has(a.n)) this.att.set(a.n, { n: a.n, offset: 0, size: a.size });
+        else this.att.get(a.n).size = Math.max(this.att.get(a.n).size, a.size);
+      }
       return true;
     }
+    // A native run continues on its own thread, so its feed reopens after it ended.
+    reopen() { this.ended = false; this.tail.replaceChildren(); }
     async pump(g) {
       for (const a of [...this.att.values()].sort((x, y) => x.n - y.n)) {
         for (let k = 0; k < 400; k++) {
@@ -1203,7 +1211,7 @@ const Panel = (() => {
     intro() {
       const d = this.detail, w = worker, idx = this.idx;
       const cont = !!d.parent_run || /^FOLLOW-UP/.test(d.prompt || '');
-      const phase = d.tool === 'abraham' ? (d.write ? 'writer' : 'analysis') : (d.tool || '');
+      const phase = d.native ? 'abraham on the writer coordinator · analysis, then writer' : d.tool === 'abraham' ? (d.write ? 'writer' : 'analysis') : (d.tool || '');
       const flags = [d.model, d.reasoning, d.write ? 'full access' : d.infra ? 'infra' : 'read-only', d.web_search ? 'live web' : ''].filter(Boolean).join(' · ');
       this.body.before(h('div', { class: 'divider' }, h('span', { title: d.run }, `Run ${idx + 1} · ${phase} · ${clock(d.first_ts)} · ${flags}`)));
       const task = d.task || '';
@@ -1222,7 +1230,7 @@ const Panel = (() => {
       const span = (d.last_ts || 0) - (d.first_ts || 0);
       const what = st === 'ok' ? 'Finished' : st === 'cancelled' ? 'Paused (cancelled) — the thread is kept; continue it with instructions below' : st === 'interrupted' ? 'Interrupted — its server stopped; continue it with instructions below' : i.label;
       const extra = [d.attempts ? `${d.attempts} attempt${d.attempts > 1 ? 's' : ''}` : '', d.capacity_wait_s ? `waited ${dur(d.capacity_wait_s)} for capacity` : '', d.cancelled_by ? `by ${d.cancelled_by}` : ''].filter(Boolean).join(' · ');
-      this.tail.append(h('div', { class: 'm-end ' + cls }, h('span', { class: 'ic', style: `color:${i.color}` }, i.icon),
+      this.tail.replaceChildren(h('div', { class: 'm-end ' + cls }, h('span', { class: 'ic', style: `color:${i.color}` }, i.icon),
         h('div', {}, h('div', {}, `${what} · ${dur(span)}`), extra ? h('div', { class: 'sm' }, extra) : null, d.error ? h('div', { class: 'sm' }, String(d.error).slice(0, 600)) : null,
           d.answer && st === 'ok' ? h('button', { class: 'linkbtn', type: 'button', onclick: () => { Panel.answerRun = this.run; showTab('answer'); } }, 'Open the answer') : null)));
       header();
@@ -1264,7 +1272,18 @@ const Panel = (() => {
           this.lastWarn = { text: ev.text, n: 1, el }; return;
         }
         case 'err': add(h('div', { class: 'card err' }, h('div', { class: 'hd' }, h('span', { class: 'ic' }, '✖'), h('span', { class: 'ttl' }, ev.text)))); return;
+        case 'user': {
+          // a native thread's turns: its first input is the task shown above; later ones are the
+          // writer brief, follow-ups and coordinator deliveries
+          this.users = (this.users || 0) + 1;
+          if (this.users === 1) return;
+          const bd = h('div', { class: 'body md open', html: md(String(ev.text || '').slice(0, 6000)) });
+          add(h('div', { class: 'm m-lead' }, h('div', { class: 'bb' }, h('div', { class: 'who2' }, 'Next turn · from Claude (lead) or the coordinator'), bd)));
+          return;
+        }
+        case 'tokens': this.usage = Object.assign({}, ev.total || {}); header(); return;  // a native thread's running totals
         case 'turn': {
+          if (ev.usage == null) { add(h('div', { class: 'm-turn' }, 'turn done')); header(); return; }
           const u = ev.usage || {};
           for (const k of Object.keys(u)) this.usage[k] = (this.usage[k] || 0) + (u[k] || 0);
           add(h('div', { class: 'm-turn' }, `turn done · ${tok(u.input_tokens)} in (${tok(u.cached_input_tokens)} cached) · ${tok(u.output_tokens)} out · ${tok(u.reasoning_output_tokens)} reasoning`));
@@ -1328,7 +1347,13 @@ const Panel = (() => {
           }
         });
         for (const f of feeds.values()) {
-          if (f.caughtUp) continue;
+          if (f.caughtUp) {
+            if (!(f.detail && f.detail.native)) continue;
+            await f.load(g);
+            if (g !== gen) return;
+            if (f.detail.has_end && [...f.att.values()].every(a => a.offset >= a.size)) continue;
+            f.reopen();
+          }
           if (!f.detail || !f.detail.has_end || f.att.size === 0) await f.load(g);
           if (g !== gen) return;
           await f.pump(g);
@@ -1359,12 +1384,15 @@ const Panel = (() => {
     const statusText = {
       queued: ['⏳', 'queued'], running: ['⏳', 'starting'], waiting: ['⏳', `waiting for ${worker.name} to finish this run`], stopping: ['⏸', 'pausing the current run…'],
       sending: ['▶', a.kind === 'cancel' ? 'pausing…' : 'delivered — the continuation runs below'],
-      done: a.kind === 'cancel' ? (a.run_status === 'cancelled' ? ['⏸', 'paused'] : ['⏸', `it had already stopped (${stInfo(a.run_status).label.toLowerCase()})`]) : ['✓', 'continuation answered'],
+      done: a.kind === 'cancel' ? (a.run_status === 'cancelled' ? ['⏸', 'paused'] : ['⏸', `it had already stopped (${stInfo(a.run_status).label.toLowerCase()})`])
+        : a.kind === 'steer' ? ['✓', 'entered the running turn'] : ['✓', 'continuation answered'],
+      delivering: ['▶', a.delivery === 'submitted' ? 'Codex has it — it enters the turn at its next model request…' : 'sending to the running turn…'],
+      held: ['⏳', 'not taken by the turn: ' + (a.error || '')], unconfirmed: ['?', 'unconfirmed: ' + (a.error || '')],
       continuing: ['▶', 'delivered — the continuation is still running below'],
       ended: a.run_status === 'cancelled' ? ['⏸', 'continuation paused before it answered'] : ['✖', `continuation ended: ${stInfo(a.run_status).label.toLowerCase()} — see the run below`],
       failed: ['✖', 'failed: ' + (a.error || '')], withdrawn: ['↩', 'withdrawn'],
     }[a.status] || ['?', a.status];
-    const kinds = { cancel: 'Pause', resume: 'Continue', interrupt: 'Interrupt & continue', after: 'When done' };
+    const kinds = { cancel: 'Pause', resume: 'Continue', interrupt: 'Interrupt & continue', after: 'When done', steer: 'Sent mid-turn' };
     if (!el) {
       el = h('div', { class: 'm m-you' });
       actionEls.set(a.id, el);
@@ -1441,11 +1469,14 @@ const Composer = (() => {
     w = worker;
     const live = worker.live, handoff = worker.status === 'HANDOFF';
     // Between abraham's phases there is nothing to interrupt: a note waits for the writer to finish.
-    $('#b-send').textContent = handoff ? 'Send when done' : live ? 'Interrupt & send' : 'Continue ▶';
+    const steer = live && worker.native && worker.status === 'RUNNING';  // a writer on the coordinator takes a note mid-turn
+    $('#b-send').textContent = handoff ? 'Send when done' : steer ? 'Send now' : live ? 'Interrupt & send' : 'Continue ▶';
     $('#b-after').hidden = !live || handoff;
     $('#opts').hidden = !!worker.write;
-    msg.placeholder = live ? `Tell ${worker.name} something — they pause the current step and carry on with your note…` : `Give ${worker.name} follow-up instructions — they pick the thread up where it stopped…`;
-    $('#c-hint').textContent = live
+    msg.placeholder = steer ? `Tell ${worker.name} something — it reaches the running turn, nothing stops…` : live ? `Tell ${worker.name} something — they pause the current step and carry on with your note…` : `Give ${worker.name} follow-up instructions — they pick the thread up where it stopped…`;
+    $('#c-hint').textContent = steer
+      ? '“Send now” puts your note into the turn that is running, without stopping it; “Send when done” delivers it after this run finishes. Images go as paths that Codex opens itself.'
+      : live
       ? (worker.tool === 'abraham' && !worker.write ? 'Planner (abraham analysis): interrupting ends this dispatch before the writer starts. “Send when done” waits for the writer to finish instead.' : '“Interrupt & send” pauses the run and continues the same thread with your note; “Send when done” delivers it after this run finishes.')
       : 'Continues the same Codex thread with all its context. Attach images (drop or paste) and @-reference files.';
   }
@@ -1563,7 +1594,7 @@ const Composer = (() => {
         if (onTo()) { if (revision(msg.value, atts, files) === sent) { msg.value = ''; atts = []; files = []; drawAtts(); autosize(); } }
         else if (storedRevision(to.id) === sent) store('draft.' + to.id, null);
       }
-      toast(kind === 'cancel' ? `Pausing ${to.name}…` : kind === 'after' ? `Queued for ${to.name} — delivered when this run finishes` : `Sent to ${to.name}`, 'good');
+      toast(kind === 'cancel' ? `Pausing ${to.name}…` : kind === 'after' ? `Queued for ${to.name} — delivered when this run finishes` : kind === 'steer' ? `Sending to ${to.name}'s running turn…` : `Sent to ${to.name}`, 'good');
     } catch (e) { toast(e.message, 'bad'); }
   }
   async function pause(worker) {
@@ -1572,7 +1603,7 @@ const Composer = (() => {
       : await confirmBox(`Pause ${worker.name}?`, `<p>Codex stops now (its process group is killed). The thread stays on disk: continue it with instructions any time from here.</p>${warnings('cancel', worker)}`, '⏸ Pause', 'cancel');
     if (ok) send('cancel', worker);
   }
-  form.addEventListener('submit', e => { e.preventDefault(); send(!w || !w.live ? 'resume' : w.status === 'HANDOFF' ? 'after' : 'interrupt'); });
+  form.addEventListener('submit', e => { e.preventDefault(); send(!w || !w.live ? 'resume' : w.status === 'HANDOFF' ? 'after' : w.native && w.status === 'RUNNING' ? 'steer' : 'interrupt'); });
   $('#b-after').onclick = () => send('after');
   return { reset, mode, pause };
 })();

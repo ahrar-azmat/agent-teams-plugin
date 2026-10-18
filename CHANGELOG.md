@@ -3,6 +3,167 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.3.0] — 2026-10-19
+
+### Added: the writer coordinator — several Codex writers in one checkout
+- **`abraham` runs each writer as a native Codex thread** through `codex app-server` (Codex 0.163),
+  under a per-user daemon, the writer coordinator. Its state is in `~/.local/state/software-workflows`
+  (`SOFTWARE_WORKFLOWS_STATE`). Several writers can share one checkout, each on its own claims. When
+  native admission fails, `abraham` falls back to the `codex exec` backend, which holds its checkout
+  alone, and says so at the top of its answer.
+- **Claims.** `abraham(claims=[…])` gives a writer its paths. An overlapping claim is refused, naming
+  its holder.
+- **Attribution ledger.** A writer's `apply_patch` edits are recorded exactly. Its commands are held in
+  custody until they, and every process they left behind, have exited. What nobody can explain is
+  UNKNOWN, and `coordinator_unit(action="restore")` puts back the last known content.
+- **Messages.** Writers and the lead talk through `coordinator_send` and `coordinator_inbox`. A
+  message records each stage: persisted, submitted, entered the turn, acknowledged.
+- **Publishing.** `coordinator_seal`, then `code_review(sealed_unit=…)`, then `coordinator_publish`,
+  which makes the commit.
+- **The lead's hooks.** In a registered checkout, Claude's Edit and Write are recorded as the lead's,
+  and refused on a path another writer claims. Bash is recorded too (see Fixed).
+- **New tools**: `coordinator_claims`, `coordinator_send`, `coordinator_inbox`, `coordinator_unit`,
+  `coordinator_seal` and `coordinator_publish`. Writers do not see them.
+- The verification record, with commands, exit codes and the limits left open, is
+  `plugins/software-workflows/coordinator/VERIFY.md`.
+
+### Added: the git gate knows the coordinator
+- **A commit that would take another writer's files is refused**, with no token. In a checkout the
+  coordinator has registered, a `git commit` that would take a path another live unit holds, or
+  content of unknown origin, is refused with the units and paths named. The reason says to publish
+  that work with the unit tools, or to leave those paths out.
+  - What a commit takes is read from its own arguments: the index, `-a`, or its pathspecs.
+  - Your own unit's paths and free paths get the usual decision.
+  - A command the gate can't read as one plain commit (a compound command, or a read-only one that
+    only mentions commit) keeps its token and gets the list as a note.
+  - A push is gated as before.
+- **Measured** on a live coordinator, with a scratch repository: two lead sessions held a.txt and b.txt,
+  and c.txt had an unexplained edit. Under `/usr/bin/python3` (3.9.6) and Homebrew python3 (3.15):
+  - The 2.2.0 gate, the calibration, gave a token for session A's commit of B's b.txt.
+  - The 2.3.0 gate refused, without a token:
+    - that commit, naming B's unit;
+    - a commit of c.txt, naming it as content of unknown origin;
+    - `commit -a`, naming both;
+    - a pathspec commit of b.txt.
+  - It gave the usual decision for:
+    - session B committing its own b.txt;
+    - a free path;
+    - a pathspec commit of A's own a.txt while b.txt and c.txt were dirty;
+    - a push;
+    - an uncoordinated repository;
+    - a machine with no coordinator state, with the same timing as 2.2.0.
+  - Through the git shim (`--argv`), the same refusals held.
+  - With the daemon stopped, the reason said it is not running.
+
+### Added: the office shows writers on the coordinator, and steers them live
+- **Writers on the coordinator are workers too.** The office asks the coordinator for its runs and reads
+  each conversation from the Codex thread's own rollout file: messages, reasoning, commands, file
+  changes, web searches, tool calls and each turn's input. The header shows the unit's claimed paths,
+  UNKNOWN content and unread messages. When the coordinator does not answer, its writers show as last
+  seen, and the page says so.
+- **Send now** puts a note into a running writer's turn without stopping it, through `coordinator_send`
+  (Codex's `turn/steer`). Pause and Continue act on these writers as on any other run.
+- **Measured** on two real native abraham runs (fixture provider, scratch state):
+  - One run showed live, then its whole stream, then "Finished".
+  - A Continue from the office reached the same thread, and the open page showed the new turn.
+  - "Send now" to the second, mid-turn, entered its running turn: the rollout records the
+    `C1_MESSAGE … from lead` input before the writer's next answer.
+  - Pause turned the third to cancelled.
+  - With the coordinator stopped, the page said so.
+
+### Changed: the agent-teams skill
+- Rules 7 and 16 now let Codex writers share the real checkout on disjoint claims. They coordinate by
+  message, the lead writes on paths no writer holds, and there are still no worktrees, no stash and no
+  `add -A`.
+- A new section, "Several writers in one checkout", covers:
+  - claims at dispatch, and the attribution block;
+  - the lead's tools;
+  - the lead's own edits;
+  - seal, `code_review(sealed_unit=…)` and publish;
+  - the gate's refusal;
+  - watching the writers.
+
+### Fixed: from the review of the coordinator
+- **A command's processes.** A process now counts as the writer's only with evidence: Codex's own
+  markers in its environment (`CODEX_SESSION_ID`, `CODEX_THREAD_ID`, `CODEX_TOOL_CALL_ID`), or
+  descent from the command. Unrelated processes starting elsewhere on a busy Mac no longer hold
+  custody open.
+  - Measured: `/bin/sleep 0.2` settled under churn of unrelated processes.
+  - A marked survivor that left the command's session and slept 8 s was held until it exited: its
+    call took 10.1 s. With its environment cleared, the same survivor was not held: 2.1 s.
+- **Git detection in a writer's commands.** `PYTHONPATH=. python -m …`, `env FOO=1 make` and plain
+  `env` are no longer refused as unestablished Git execution. A leading assignment that makes a
+  shell or interpreter run code the reading can't see (`BASH_ENV`, `PYTHONSTARTUP`, `LD_PRELOAD`,
+  `NODE_OPTIONS` and the like) is still refused.
+  - Measured on the classification matrix: 0 mismatches. The pre-fix copy, as calibration, gave 5
+    false refusals.
+- **A writer's MCP servers.** A server of yours that is down no longer stops every write. Only
+  servers that can expose the lead's tools must answer; the others are listed as unavailable and
+  stay hidden from the writer.
+  - Measured on the real configuration: verified in 6.0 s, with two servers down. Before, it refused.
+- **The lead's Bash.** A command that changes files, run while no writer is working, no command is
+  held and no other lead Bash command is running in that checkout, is recorded as the lead's
+  (`lead-command`), never as another unit's. Lead Bash hooks run one at a time per checkout, so no
+  other lead command starts between the quiet check and its use. A second completion for the same
+  call attributes nothing. Otherwise what it
+  changed stays UNKNOWN, as before. The checkout is reconciled before the command, so an edit made
+  earlier by something else stays UNKNOWN.
+  - Measured beside a native writer: alone, attributed; with a writer's turn running, UNKNOWN; an
+    outside edit followed by `pwd`, UNKNOWN.
+- **NotebookEdit** on a path another writer claims is refused as a claim conflict, as Edit and
+  Write are.
+- **A lost reply to a writer's first turn** no longer releases its claims. The run is marked
+  started before the turn is sent. (Read in the code; no lost reply was injected.)
+- **The push gate's commit scope**, from its review:
+  - Pathspecs are resolved by Git itself (`git ls-files --with-tree=HEAD`), including `:(top)`,
+    globs, `-C <dir>` and the pathspec flags.
+  - A commit whose scope can't be read (`--pathspec-from-file`, `--git-dir`) is judged on every
+    changed path.
+  - The paths a commit takes are reconciled with the coordinator before the decision, so an edit the
+    ledger hasn't seen yet is judged on its current content. If the answer after that is unusable,
+    the first answer stands, with a note: an outage never erases a known blocker.
+  - `git commit --only` without paths (`--amend` of the message, `--allow-empty`) and
+    `--fixup=reword:` take no staged change, and are judged on none. `--no-only`, `--no-all` and
+    `--no-include` cancel what came before them. `--fixup <commit>` is no longer read as a pathspec.
+  - Paths compare by the checkout's own case rule, as the coordinator compares them.
+  - A path the commit takes from the index, whose staged content differs from its working file,
+    gets a note: its staged bytes were not checked.
+  - Measured: 26 of 26 cases, the 2.2.0 gate as red calibration, and the git shim path.
+- **`codex_runs` doesn't start the coordinator to list nothing.** On a machine that has never run a
+  native writer, it gets an empty list. A daemon that stopped is started again to answer.
+- **A coordinator that can't start says why**: a socket path over macOS's 104 bytes is reported as
+  `SOCKET_CAPACITY` in 0.1 s, instead of `DAEMON_START` after 30 s. The diagnostic is written only
+  into a state folder that passes the state checks.
+- **The office, on native writers:**
+  - **Send now** waits for the note to enter the running turn: "entered the running turn", "Codex has
+    it — it enters the turn at its next model request" (measured: 36 s), or "not taken by the turn",
+    with the reason. When the coordinator stops answering, or the call's budget ends, the note reads
+    unconfirmed, never "send it again".
+  - **A pause after a Send now** that the turn never took no longer stays "settling". The note reads
+    `turn_ended`, and the run reads cancelled.
+  - **Pause** says so when the stop can't be confirmed, rather than reporting done.
+  - A run's answer is re-read when the run changes, across every page of its result. `run/list`
+    now carries each run's revision, so a run continued between two polls is read again.
+
+### Known limits
+- **A process that leaves its command's session and hides its environment is not held.** That covers
+  `setsid` with a cleared environment, and Apple system binaries, whose environment macOS does not
+  show. Its writer's hand-off does not wait for it, and what it writes later shows as UNKNOWN, or as
+  the lead's if it lands during a quiet lead Bash command. Codex ends a command's process group when
+  the command ends, so `( … &)` and `nohup` children do not outlive it. Codex's review rates this
+  HIGH.
+- **A lead Bash command in a quiet window** is recorded as the lead's, including what another program
+  (an editor saving a file, a background command still running) writes in the checkout while it
+  runs. A lead Bash command whose completion hook never arrives stops counting as running after
+  its host timeout plus 60 s.
+- **The push gate checks the working tree's content.** A path whose staged content differs from its
+  working file is not checked by its staged bytes; the gate says so in a note. Codex's review rates
+  this HIGH.
+- **Still UNVERIFIED from C3** (`coordinator/VERIFY.md`): settlement after a crash; a publication
+  crash at every boundary; a review crash at every SQLite write; every malformed lease frame; the
+  exec backend's automatic transient retry; the whole C2 matrix in one run; real-model image
+  understanding; any platform other than macOS.
+
 ## [software-workflows 2.2.0] — 2026-10-18
 
 ### Added: images on `codex_resume_run`

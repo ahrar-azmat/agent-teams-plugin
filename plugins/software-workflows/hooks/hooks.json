@@ -50,6 +50,32 @@
             "timeout": 90
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/coordinator_lead.py"
+            ],
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*(software-workflows|codex-oracle).*__(abraham|code_review|codex_runs|codex_run_log|codex_resume_run|codex_cancel_run|coordinator_claims|coordinator_send|coordinator_inbox|coordinator_unit|coordinator_seal|coordinator_publish)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/coordinator_lead.py"
+            ],
+            "timeout": 15
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -64,6 +90,19 @@
             ]
           }
         ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/coordinator_lead.py"
+            ],
+            "timeout": 15
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
@@ -76,6 +115,19 @@
             "args": [
               "${CLAUDE_PLUGIN_ROOT}/hooks/gate_notice.py"
             ]
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/coordinator_lead.py"
+            ],
+            "timeout": 15
           }
         ]
       }

@@ -624,6 +624,7 @@ def workers(runs, table, since=0.0):
             "activity": activity(cur) if live else "",
             "error": str(cur.get("error") or "")[:400],
         })
+    out += native_workers(since, overrides)
     names = names_for([w["id"] for w in out])
     for w in out:
         w["name"] = names[w["id"]]
@@ -760,11 +761,11 @@ def _line_end(fh, pos, size):
     return None
 
 
-def read_events(path, offset, ended=False):
+def read_events(path, offset, ended=False, digest=digest):
     """Digested events from `offset`, at most about CHUNK bytes (always whole lines; a single line
     longer than CHUNK is read whole). A last line with no newline is still being written, unless the
     run has `ended`: then it never will be, and it becomes one notice so the page can catch up.
-    Returns (events, new offset, file size)."""
+    `digest` may skip a line by returning None. Returns (events, new offset, file size)."""
     size = path.stat().st_size
     if offset >= size:
         return [], offset, size
@@ -783,8 +784,9 @@ def read_events(path, offset, ended=False):
     end = data.rfind(b"\n") + 1
     events, pos = [], offset
     for line in data[:end].split(b"\n")[:-1]:
-        if line.strip():
-            events.append(digest(line, pos))
+        ev = digest(line, pos) if line.strip() else None
+        if ev is not None:
+            events.append(ev)
         pos += len(line) + 1
     return events, offset + end, size
 
@@ -803,6 +805,266 @@ def read_line(path, offset):
                 break
             buf += chunk
     return json.loads(buf)
+
+
+# ---------------------------------------------------------------- native runs
+# abraham on the writer coordinator (2.3.0) runs as a Codex app-server thread, not a `codex exec` run,
+# so it is not in the journal. The coordinator lists those runs (run/list, run/status, run/result:
+# read-only, over its Python 3.9 client), and each thread's rollout file holds the whole conversation,
+# read here as a spool is.
+
+NATIVE_STATUS = {"completed": "ok", "failed": "error", "interrupted": "interrupted", "blocked": "error",
+                 "refused": "error", "cancelled": "cancelled", "admitting": "QUEUED", "cancelling": "CANCELLING"}
+NATIVE_TERMINAL = ("completed", "failed", "interrupted", "blocked", "refused", "cancelled")  # coordinator/writer.py
+NATIVE_TIMEOUT_S = 2.0   # each call answers from the coordinator's memory
+NATIVE_LIST_S = 1.5      # the page polls every 2 s; one listing serves the requests in between
+_native = {"listing": [], "records": {}, "answers": {}, "at": -NATIVE_LIST_S, "error": "", "present": False}
+_native_lock = threading.Lock()
+
+
+def coordinator_client():
+    """The writer coordinator's client (../coordinator, loaded by path under a private package name), or
+    None when its state directory does not exist: the coordinator never ran on this machine."""
+    state = os.environ.get("SOFTWARE_WORKFLOWS_STATE") or os.path.expanduser("~/.local/state/software-workflows")
+    if not os.path.isdir(state):
+        return None
+    import importlib
+    import importlib.util
+    name = "software_workflows_coordinator"
+    if name not in sys.modules:
+        root = ROOT / "coordinator"
+        spec = importlib.util.spec_from_file_location(name, str(root / "__init__.py"),
+                                                      submodule_search_locations=[str(root)])
+        if spec is None or spec.loader is None:
+            raise ImportError(str(root))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return importlib.import_module(name + ".client").Client(state=state, timeout=NATIVE_TIMEOUT_S)
+
+
+def native_runs(fresh=False):
+    """The coordinator's abraham runs on this machine: (listing, records by run). A record is read again
+    whenever its run's state or revision changes, or its rollout is not known yet. While the coordinator does not
+    answer, the last listing stands and `_native["error"]` says why."""
+    with _native_lock:
+        if not fresh and time.monotonic() - _native["at"] < NATIVE_LIST_S:
+            return _native["listing"], _native["records"]
+        _native["at"] = time.monotonic()
+        try:
+            client = coordinator_client()
+            if client is None:
+                _native.update(listing=[], error="", present=False)
+                return [], _native["records"]
+            _native["present"] = True
+            listing = client.call("run/list", {"cwd": "/", "limit": 100})["data"]
+            for s in listing:
+                rec = _native["records"].get(s["run"])
+                # a run continued between two polls reads the same state twice: its revision moved
+                if (rec is None or not rec.get("rollout") or rec.get("state") != s.get("state")
+                        or ("revision" in s and rec.get("_revision") != s["revision"])):
+                    _native["records"][s["run"]] = client.call("run/status", {"run": s["run"]})
+            _native.update(listing=listing, error="")
+        except (FileNotFoundError, ConnectionRefusedError):
+            _native["error"] = "it is not running"
+        except Exception as e:  # the coordinator stopped, or its client unreadable: shown, never a crash
+            _native["error"] = f"{getattr(e, 'code', '') or type(e).__name__}: {e}"[:200]
+        return _native["listing"], _native["records"]
+
+
+def native_status(s):
+    if s.get("state") in NATIVE_TERMINAL:
+        return NATIVE_STATUS[s["state"]]
+    if _native["error"]:
+        return "UNREACHABLE"  # its coordinator does not answer: neither live nor ended, as far as anyone here knows
+    return NATIVE_STATUS.get(s.get("state"), "RUNNING")
+
+
+def native_rollout(rec):
+    p = str((rec or {}).get("rollout") or "")
+    p = p[len("file://"):] if p.startswith("file://") else p
+    return Path(p) if p and os.path.isfile(p) else None
+
+
+def native_prompt(rec):
+    wf = (rec or {}).get("workflow") or {}
+    return str(wf.get("analysis") or (rec or {}).get("task") or "")
+
+
+def native_activity(path):
+    """The thread's latest step, from the end of its rollout."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 65536))
+            lines = fh.read().split(b"\n")[1:]
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        ev = digest_rollout(line, 0) if line.strip() else None
+        if not ev:
+            continue
+        if ev["k"] == "think" and ev["text"]:
+            return ("reasoning: " + ev["text"].split("\n")[0].strip("* ")).strip()[:200]
+        if ev["k"] == "cmd":
+            return ("$ " + ev["cmd"])[:200]
+        if ev["k"] == "file":
+            return "edited " + ", ".join(os.path.basename(str(c["path"])) for c in ev["changes"])[:190]
+        if ev["k"] in ("msg", "mcp", "web"):
+            return {"msg": "wrote a message", "mcp": f"called {ev.get('tool', '')}", "web": f"searched {ev.get('query', '')}"}[ev["k"]][:200]
+    return ""
+
+
+def _texts_of(content):
+    return "".join(str(c.get("text") or "") for c in content or [] if isinstance(c, dict))
+
+
+def digest_rollout(line, o):
+    """One rollout line as the chat events `digest` makes of a spool line, or None for lines that carry
+    nothing to show (the model's own copies of items, settings, world state)."""
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return None
+    if e.get("type") != "event_msg":
+        return None
+    p = e.get("payload") or {}
+    t = p.get("type")
+    if t == "task_started":
+        return {"o": o, "k": "turn_start"}
+    if t == "task_complete":
+        return {"o": o, "k": "turn", "usage": None}
+    if t == "token_count":
+        return {"o": o, "k": "tokens", "total": ((p.get("info") or {}).get("total_token_usage") or {})}
+    if t == "error":
+        return {"o": o, "k": "err", "text": str(p.get("message") or "")}
+    if t != "item_completed":
+        return None
+    it = p.get("item") or {}
+    typ = it.get("type")
+    base = {"o": o, "id": str(it.get("id") or o), "ev": "completed", "st": "completed"}
+    if typ == "AgentMessage":
+        return dict(base, k="msg", text=_texts_of(it.get("content")))
+    if typ == "UserMessage":
+        return dict(base, k="user", text=clip(_texts_of(it.get("content")), 20000))
+    if typ == "Reasoning":
+        return dict(base, k="think", text="\n".join(str(s) for s in it.get("summary_text") or []))
+    if typ == "CommandExecution":
+        cmd = it.get("command")
+        cmd = shlex.join(cmd) if isinstance(cmd, list) else str(cmd or "")
+        out = str(it.get("aggregated_output") or "")
+        return dict(base, k="cmd", cmd=unwrap(cmd), out=clip_mid(out, OUT_CLIP), out_len=len(out),
+                    exit=it.get("exit_code"))
+    if typ == "FileChange":
+        changes = it.get("changes") or {}
+        return dict(base, k="file", changes=[{"path": path, "kind": (c or {}).get("type")} for path, c in changes.items()]
+                    if isinstance(changes, dict) else [])
+    if typ == "Extension" and it.get("kind") == "web.search":
+        act = it.get("action") if isinstance(it.get("action"), dict) else {}
+        res = [{"title": r.get("title") or "", "url": r.get("url") or "", "domain": r.get("domain") or ""}
+               for r in it.get("results") or [] if isinstance(r, dict)]
+        return dict(base, k="web", query=it.get("query") or act.get("query") or "", action=act.get("type") or "",
+                    url=act.get("url") or "", pattern=act.get("pattern") or "", results=res[:20])
+    if typ in ("McpToolCall", "DynamicToolCall"):
+        result = it.get("result") if typ == "McpToolCall" else {"content": it.get("content_items")}
+        return dict(base, k="mcp", server=it.get("server") or "coordinator", tool=it.get("tool") or "",
+                    args=clip(json.dumps(it.get("arguments"), ensure_ascii=False), 2000),
+                    result=clip_mid(mcp_text(result), OUT_CLIP),
+                    error=clip(json.dumps(it["error"], ensure_ascii=False), 2000) if it.get("error")
+                    else ("" if it.get("success", True) is not False else "the tool reported failure"))
+    if typ == "ContextCompaction":
+        return dict(base, k="warn", text="Context compacted")
+    if typ == "ImageView":
+        return dict(base, k="raw", type="viewed image", text=str(it.get("path") or "").replace("file://", ""))
+    return dict(base, k="raw", type=str(typ or ""), text=clip(json.dumps(it, ensure_ascii=False), 800))
+
+
+def native_workers(since, overrides):
+    """The coordinator's abraham runs as workers: one thread each, both phases in it."""
+    listing, records = native_runs()
+    out = []
+    for s in listing:
+        rec = records.get(s["run"]) or {}
+        st = native_status(s)
+        live = st in LIVE
+        path = native_rollout(rec)
+        created = float(s.get("created") or 0)
+        try:
+            last_ts = path.stat().st_mtime if path else created
+        except OSError:
+            last_ts = created
+        if not live and last_ts < since:
+            continue
+        wf = rec.get("workflow") or {}
+        probe = {"run": s["run"], "prompt": native_prompt(rec), "has_start": bool(rec)}
+        kind, source = "abraham-write", "tool"
+        tagged = tagged_role(probe)
+        if tagged:
+            kind, source = tagged, "task"
+        if overrides.get(s["run"]) in ROLES:
+            kind, source = overrides[s["run"]], "office"
+        root = next((a for a in s.get("actors") or [] if a.get("id") == rec.get("root_actor")), {})
+        out.append({
+            "id": s["run"], "name": "", "tool": "abraham", "role": ROLES[kind], "kind": kind,
+            "base_kind": "abraham-write", "role_source": source, "title": title_of(probe), "status": st,
+            "live": live, "run": s["run"], "cancel_stuck": False, "dispatch": "",
+            "runs": [{"run": s["run"], "status": st, "write": True, "tool": "abraham"}],
+            "phase": "writer" if s.get("phase") == "implementation" else "analysis",
+            "write": True, "infra": True, "web": True, "model": wf.get("model") or "",
+            "reasoning": wf.get("effort") or "", "cwd": s.get("target_cwd") or "",
+            "dispatch_cwd": s.get("dispatch_cwd") or "", "thread": root.get("thread") or "",
+            "first_ts": created, "run_ts": created, "last_ts": last_ts, "attempts": 0,
+            "activity": native_activity(path) if live and path else "",
+            "error": str(rec.get("refusal") or rec.get("settlement_refusal") or "")[:400],
+            "native": {"unit": s.get("unit"), "unit_state": s.get("unit_state"),
+                       "claims": sorted(c.get("path") for c in s.get("claims") or []),
+                       "custody": len(s.get("custody") or []), "unknown": s.get("unknown_count") or 0,
+                       "unread": s.get("unread_messages") or 0, "coordinator": _native["error"]},
+        })
+    return out
+
+
+def native_detail(run, light=False):
+    """/api/run for a native run, in the journal record's shape, or None when the coordinator has no such run."""
+    listing, records = native_runs()
+    s = next((x for x in listing if x["run"] == run), None)
+    rec = records.get(run)
+    if s is None or rec is None:
+        return None
+    st = native_status(s)
+    path = native_rollout(rec)
+    wf = rec.get("workflow") or {}
+    # A continuation keeps the run id and rewrites its record: the answer is cached per record revision.
+    cached = (run, rec.get("_revision"), s.get("state"))
+    answer = _native["answers"].get(cached, "")
+    if not answer and s.get("state") in NATIVE_TERMINAL:
+        try:
+            parts, cursor = [], 0
+            while cursor is not None:
+                page = coordinator_client().call("run/result", {"run": run, "cursor": cursor}) or {}
+                parts.append(str(page.get("text") or ""))
+                cursor = page.get("next_cursor")
+            answer = "".join(parts)
+            _native["answers"][cached] = answer
+        except Exception as e:
+            answer = f"[The coordinator did not give this run's result: {getattr(e, 'code', '') or type(e).__name__}]"
+    prompt = native_prompt(rec)
+    try:
+        size, last_ts = (path.stat().st_size, path.stat().st_mtime) if path else (0, s.get("created"))
+    except OSError:
+        size, last_ts = 0, s.get("created")
+    return {"run": run, "tool": "abraham", "write": True, "infra": True, "web_search": True, "native": True,
+            "model": wf.get("model") or "", "reasoning": wf.get("effort") or "", "cwd": s.get("target_cwd") or "",
+            "dispatch_cwd": s.get("dispatch_cwd") or "", "first_ts": s.get("created"), "last_ts": last_ts,
+            "status": st, "title": title_of({"run": run, "prompt": prompt, "has_start": True}),
+            "prompt": "" if light else prompt, "task": "" if light else task_of(prompt),
+            "spools": [{"n": 0, "size": size}] if path else [], "answer": answer,
+            "has_end": s.get("state") in NATIVE_TERMINAL, "phase": s.get("phase"), "unit": s.get("unit"),
+            "rollout": str(path or ""), "error": str(rec.get("refusal") or "")[:400]}
 
 
 # ---------------------------------------------------------------- file references
@@ -1076,6 +1338,76 @@ def missing_attachments(a):
             if not os.path.exists(p if os.path.isabs(p) else os.path.join(a.get("cwd") or "", p))]
 
 
+def native_state(run):
+    """A native run's status as the coordinator says it now, or "?" when it does not know the run."""
+    listing, _ = native_runs(fresh=True)
+    s = next((x for x in listing if x["run"] == run), None)
+    return native_status(s) if s else "?"
+
+
+def native_refusal(res):
+    """The coordinator's refusal in a coordinator tool's reply, or "": the reply's JSON is either what was
+    done (a run summary, a message record) or an error envelope {"code", "message", "details", "kind"}."""
+    i = res.find("{")
+    try:
+        value = json.JSONDecoder().raw_decode(res[i:])[0] if i >= 0 else None
+    except ValueError:
+        value = None
+    if not isinstance(value, dict):
+        return res.strip()[:600] or "the server's reply carried no result"
+    if {"code", "message", "kind"} <= set(value):
+        return f"{value['code']}: {value['message']}"[:600]
+    return ""
+
+
+def reply_json(res):
+    """The first JSON object in a coordinator tool's reply, or None."""
+    i = res.find("{")
+    try:
+        value = json.JSONDecoder().raw_decode(res[i:])[0] if i >= 0 else None
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def message_outcome(run, message, progress=None):
+    """(how far a message sent to a native run got, why the wait stopped). How far, from its own
+    delivery events: entered_context (in the turn), turn_ended, delivery_uncertain, submitted or
+    persisted. Why: "event" for one of the first three, "ended" once the run reads stopped twice, a
+    poll apart, "unreachable" when the coordinator cannot say twice, "deadline" at the call budget;
+    only "ended" proves the turn is over. A running turn takes a steer at its next model request,
+    which at max effort can be minutes away (measured: 36 s on a fixture whose answer was held
+    50 s), so this waits for the turn, within the run's budget."""
+    deadline, cursor, kinds, ended, unread = time.time() + call_timeout(), 0, set(), 0, 0
+    while True:
+        try:
+            while True:
+                page = coordinator_client().call("run/events", {"run": run, "cursor": cursor, "limit": 400}) or {}
+                kinds |= {e.get("kind") for e in page.get("data") or [] if e.get("subject") == message}
+                cursor = page.get("cursor", cursor)
+                if not page.get("more"):
+                    break
+        except Exception:
+            pass
+        reached = next((k.split("/", 1)[1] for k in ("message/entered_context", "message/turn_ended", "message/delivery_uncertain",
+                                                     "message/submitted") if k in kinds), "persisted")
+        if progress:
+            progress(reached)
+        if reached in ("entered_context", "turn_ended", "delivery_uncertain"):
+            return reached, "event"
+        if time.time() >= deadline:
+            return reached, "deadline"
+        # the turn's end is read twice, a poll apart, so an echo recorded as it ended is not missed
+        st = native_state(run)
+        unread = unread + 1 if st in ("UNREACHABLE", "?") else 0
+        ended = ended + 1 if st not in LIVE and not unread else 0
+        if unread >= 2:
+            return reached, "unreachable"
+        if ended >= 2:
+            return reached, "ended"
+        time.sleep(1)
+
+
 def run_action(aid):
     path = ACTIONS / f"{aid}.json"
     a = read_json(path)
@@ -1091,6 +1423,7 @@ def run_action(aid):
     client = None
     try:
         run = a["run"]
+        nat = bool(a.get("native"))  # a run on the writer coordinator: its state is the coordinator's, not the journal's
         if a["kind"] == "after":
             save(status="waiting")
             quiet = None
@@ -1120,6 +1453,42 @@ def run_action(aid):
                 quiet = last
                 time.sleep(1)
             save(run=run)
+        if a["kind"] == "steer":
+            if decide(aid, "deliver") != "deliver":
+                save(status="withdrawn", ended=time.time())
+                return
+            with open(ACTIONS / f"{aid}.server.log", "ab") as log:
+                client = McpClient(a["cwd"], log)
+                save(server_pid=client.p.pid, status="sending")
+                # A message to a running native thread enters its active turn (turn/steer): nothing stops.
+                # It carries text only, so images go by path, for Codex's view_image tool.
+                nudge = compose_nudge(a.get("text") or "", a.get("images") or [], a.get("files") or [], a["cwd"])
+                save(images_via="view_image" if a.get("images") else "", nudge=nudge)
+                res, err = client.call("coordinator_send", {"recipient": run, "text": nudge, "wake": "none",
+                                                            "cwd": a.get("target_cwd") or a["cwd"]}, CANCEL_S)
+                why = res if err else native_refusal(res)
+                if why:
+                    save(status="failed", result=res, ended=time.time(), error=why[:600])
+                    return
+                # Sending only persists the message: report where it got, from its delivery events.
+                save(status="delivering", result=res)
+                reached, why = message_outcome(run, (reply_json(res) or {}).get("id", ""),
+                                               lambda r: a.get("delivery") == r or save(delivery=r))
+                if reached == "entered_context":
+                    save(status="done", delivery=reached, run_status=native_state(run), ended=time.time())
+                elif why in ("unreachable", "deadline"):
+                    # the turn's end is not known: never advise sending again what may still enter it
+                    save(status="unconfirmed", delivery=reached, run_status=native_state(run), ended=time.time(),
+                         error=("the coordinator stopped answering" if why == "unreachable" else
+                                "no outcome within the call's budget") + f" while the note read {reached}; it may still enter the turn")
+                else:
+                    save(status="unconfirmed" if reached == "delivery_uncertain" else "held", delivery=reached,
+                         run_status=native_state(run), ended=time.time(),
+                         error={"persisted": "the turn ended before it was sent; it waits for the writer's next turn",
+                                "submitted": "Codex had it, but the turn ended before taking it; send it again to deliver it",
+                                "turn_ended": "the turn ended (or was paused) before taking it; send it again to deliver it",
+                                "delivery_uncertain": "the coordinator could not tell whether it reached the turn"}[reached])
+                return
         if a["kind"] in ("resume", "interrupt"):
             why = handoff_refusal(group_of(run, journal.refresh(), processes()), run)
             if why:
@@ -1137,16 +1506,21 @@ def run_action(aid):
                 save(status="stopping")
                 res, err = client.call("codex_cancel_run", {"run": run}, CANCEL_S)
                 save(cancel_result=res)
-                if err:
-                    raise RuntimeError(f"codex_cancel_run failed: {res}")
-                deadline, st = time.time() + STOP_WAIT_S, "?"
+                why = res if err else native_refusal(res) if nat else ""
+                if why:
+                    raise RuntimeError(f"codex_cancel_run failed: {why}")
+                deadline, st, stopped = time.time() + STOP_WAIT_S, "?", False
                 while True:
-                    st = run_status(journal.refresh().get(run, {}), processes())
-                    if st not in LIVE or time.time() >= deadline:
+                    st = native_state(run) if nat else run_status(journal.refresh().get(run, {}), processes())
+                    # an unreachable coordinator, or a run it no longer lists, says nothing about the writer
+                    stopped = st not in LIVE and not (nat and st in ("UNREACHABLE", "?"))
+                    if stopped or time.time() >= deadline:
                         break
                     time.sleep(1)
-                if st in LIVE:
-                    raise RuntimeError(f"run {run} still reads {st} {STOP_WAIT_S:.0f} s after codex_cancel_run"
+                if not stopped:
+                    raise RuntimeError((f"run {run} still reads {st}" if st in LIVE else
+                                        f"run {run}'s stop could not be confirmed (it reads {st})")
+                                       + f" {STOP_WAIT_S:.0f} s after codex_cancel_run"
                                        + ("; nothing was sent" if a["kind"] == "interrupt" else "") + f". The server said: {res}")
                 if a["kind"] == "cancel":
                     save(status="done", result=res, run_status=st, ended=time.time())
@@ -1165,6 +1539,24 @@ def run_action(aid):
                 for k in ("infra", "web_search"):
                     if a.get(k) is not None:
                         args[k] = bool(a[k])
+            if nat:
+                # The coordinator submits the next turn on the same thread and answers at once: the run's
+                # own state, read back from the coordinator, is the proof.
+                try:
+                    res, err = client.call("codex_resume_run", args, call_timeout())
+                except NoAnswer as e:
+                    client.abort()
+                    st = native_state(run)
+                    save(status="failed", ended=time.time(), run_status=st, error=f"{e}; the run reads {st}")
+                    return
+                why = res if err else native_refusal(res)
+                st = native_state(run)
+                if why:
+                    save(status="failed", result=res, run_status=st, ended=time.time(), error=why[:600])
+                    return
+                save(status="continuing" if st in LIVE else "done" if st == "ok" else "ended", result=res,
+                     continuation=run, run_status=st, ended=time.time())
+                return
             before = run_status(journal.refresh().get(run, {}), processes())
             sent, budget = time.time(), call_timeout()
             try:
@@ -1205,11 +1597,21 @@ def run_action(aid):
 
 def new_action(body, runs):
     kind = body.get("kind")
-    if kind not in ("cancel", "resume", "interrupt", "after"):
+    if kind not in ("cancel", "resume", "interrupt", "after", "steer"):
         raise ValueError(f"unknown action {kind!r}")
     rec = runs.get(str(body.get("run") or ""))
+    native = False
+    if not rec:
+        listing, _ = native_runs()
+        s = next((x for x in listing if x["run"] == str(body.get("run") or "")), None)
+        if s:
+            native = True
+            rec = {"run": s["run"], "has_start": True, "write": True, "cwd": s.get("target_cwd"),
+                   "dispatch_cwd": s.get("dispatch_cwd")}
     if not rec or not rec.get("has_start"):
         raise ValueError("unknown run")
+    if kind == "steer" and not (native and native_state(rec["run"]) == "RUNNING"):
+        raise ValueError("“Send now” reaches a running writer on the coordinator; use Continue or Send when done")
     cwd = rec.get("dispatch_cwd") or rec.get("cwd") or str(Path.home())
     if not os.path.isdir(cwd):
         raise ValueError(f"the run's workspace {cwd} no longer exists")
@@ -1233,7 +1635,7 @@ def new_action(body, runs):
     action = {"id": aid, "kind": kind, "run": rec["run"], "target": rec["run"], "worker": body.get("worker") or "",
               "cwd": cwd, "write": bool(rec.get("write")), "text": text, "images": images, "files": files,
               "infra": body.get("infra"), "web_search": body.get("web_search"), "data": str(DATA),
-              "status": "queued", "created": time.time()}
+              "native": native, "target_cwd": rec.get("cwd") or "", "status": "queued", "created": time.time()}
     ACTIONS.mkdir(parents=True, exist_ok=True)
     write_json(ACTIONS / f"{aid}.json", action)
     spawn_detached([sys.executable, str(Path(__file__).resolve()), "act", aid, "--data", str(DATA)], ACTIONS / f"{aid}.out")
@@ -1252,7 +1654,7 @@ def list_actions(worker):
                 if a.get("status") in ("queued", "running", "waiting"):
                     if decision(a.get("id")) == "withdraw":
                         a["status"] = "withdrawn"
-                if a.get("status") in ("running", "waiting", "stopping", "sending") and a.get("pid"):
+                if a.get("status") in ("running", "waiting", "stopping", "sending", "delivering") and a.get("pid"):
                     table = table or processes()
                     if not alive(a["pid"], a.get("pid_start"), table):
                         a.update(status="failed", error="the action's process ended without recording an outcome "
@@ -1318,15 +1720,20 @@ class Handler(BaseHTTPRequestHandler):
                 since = float(one("since", "0") or 0)
                 runs = JOURNAL.refresh()
                 ws = workers(runs, processes(), since)
-                spaces = sorted({r.get("dispatch_cwd") or r.get("cwd") or "" for r in runs.values()
-                                 if r.get("has_start")} - {""})
-                return self._json({"now": time.time(), "workers": ws, "workspaces": spaces,
+                spaces = sorted(({r.get("dispatch_cwd") or r.get("cwd") or "" for r in runs.values()
+                                  if r.get("has_start")} | {s.get("dispatch_cwd") or "" for s in _native["listing"]})
+                                - {""})
+                coordinator = ("" if not _native["present"] else
+                               f"The writer coordinator does not answer ({_native['error']}); its runs show as last seen."
+                               if _native["error"] else "")
+                return self._json({"now": time.time(), "workers": ws, "workspaces": spaces, "coordinator": coordinator,
                                    "log_dir": str(LOG_DIR), "version": plugin_version(), "roles": ROLES})
             if u.path == "/api/run":
                 runs = JOURNAL.refresh()
                 rec = runs.get(one("run"))
                 if not rec:
-                    return self._json({"error": "unknown run"}, 404)
+                    native = native_detail(one("run"), light=one("light") == "1")
+                    return self._json(native) if native else self._json({"error": "unknown run"}, 404)
                 answer = ""
                 for k in ("result_file", "output_file"):
                     f = rec.get(k)
@@ -1342,6 +1749,17 @@ class Handler(BaseHTTPRequestHandler):
                                        spools=attempts_of(rec), answer=answer, has_end=bool(rec.get("has_end"))))
             if u.path in ("/api/events", "/api/item"):
                 rec = JOURNAL.refresh().get(one("run"))
+                if rec is None and one("run") in native_runs()[1]:
+                    run = one("run")
+                    p = native_rollout(_native["records"].get(run))
+                    if p is None:
+                        return self._json({"events": [], "offset": 0, "size": 0})
+                    if u.path == "/api/item":
+                        return self._json({"item": (read_line(p, int(one("o", "0"))).get("payload") or {}).get("item") or {}})
+                    s = next((x for x in _native["listing"] if x["run"] == run), {})
+                    events, off, size = read_events(p, int(one("offset", "0")), s.get("state") in NATIVE_TERMINAL,
+                                                    digest_rollout)
+                    return self._json({"events": events, "offset": off, "size": size})
                 d = spool_dir(rec) if rec else None
                 if not d:
                     return self._json({"error": "no spool for this run"}, 404)
@@ -1361,6 +1779,7 @@ class Handler(BaseHTTPRequestHandler):
                 cwd = one("cwd")
                 runs = JOURNAL.refresh()
                 known = {r.get("cwd") for r in runs.values()} | {r.get("dispatch_cwd") for r in runs.values()}
+                known |= {s.get(k) for s in _native["listing"] for k in ("dispatch_cwd", "target_cwd")}
                 if cwd not in known or not os.path.isdir(cwd):
                     return self._json({"error": "not a workspace of any run"}, 404)
                 files, partial = list_files(cwd)

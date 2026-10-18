@@ -127,6 +127,7 @@ indexes. The fetched content goes to Codex as cited context, never as a network 
 | `codex_query` | Anything else you want Codex's reasoning on. |
 | `abraham` | Codex implements a task in a git checkout (see below). |
 | `codex_runs`, `codex_run_log`, `codex_cancel_run`, `codex_resume_run` | See, watch, stop and collect runs. `codex_resume_run` continues a run's thread with a nudge, and with `images` too. |
+| `coordinator_claims`, `coordinator_send`, `coordinator_inbox`, `coordinator_unit`, `coordinator_seal`, `coordinator_publish` | Several writers in one checkout: claims, messages, a unit's state and content of unknown origin, and publishing a unit's work (see below). |
 
 **Dispatch blind.** A second opinion counts only if it was formed independently. So send Codex the
 evidence and the question, never your diagnosis. Put your own view in `caller_hypothesis`. Codex
@@ -182,7 +183,8 @@ What it guarantees:
   the folder you dispatched it from and from the target.
 - A dirty tree is refused unless you pass `allow_dirty=true`. Uncommitted edits Codex touches have no
   undo.
-- One writer per checkout, held by a lock across both phases.
+- Several writers can share a checkout, each on its own **claims** (next section). A run on the
+  fallback `codex exec` backend still holds its checkout alone, across both phases.
 - Codex never commits or pushes. Every run ends with a **CHANGED FILES** report, compared by
   content, inside submodules and across every index stage. The report also gives the mode Codex
   recorded for each turn. Review the diff, then record it yourself.
@@ -195,11 +197,55 @@ How the team works with it:
 - Put the access paths you know in `context`: a key-based SSH host, a `docker exec` target, a local
   test database. Never put credentials there; Codex finds its own way in from the project's docs and
   your configuration.
-- Run parallel writers in **different** repositories. Several writers sharing one checkout, with
-  claims, messages and attribution, come in the next release.
+- Run parallel writers in one checkout on disjoint claims, or in different repositories.
 
 Full access means full access. Processes a run leaves behind are swept cooperatively, but one that
 deliberately escapes keeps your user's rights. That is part of what full access accepts.
+
+## Several writers in one checkout: the writer coordinator
+
+The first `abraham` call starts the **writer coordinator**, a per-user daemon (state in
+`~/.local/state/software-workflows`). It runs each writer as a native Codex thread through
+`codex app-server` (Codex 0.163) and keeps a ledger of the checkout: who claimed which paths, which
+change each writer made, and what nobody can explain. When native admission fails, `abraham` falls
+back to `codex exec` and says so at the top of its answer.
+
+- **Claims.** `abraham(claims=["src/api/", "tests/api/"])` gives the writer those paths, relative to
+  the repository root. A claim that overlaps another writer's is refused, naming the holder. Writers
+  ask each other, and you, through messages (`coordinator_send`, `coordinator_inbox`).
+- **Attribution.** A writer's `apply_patch` edits are recorded exactly. Its commands are held in
+  custody: files they may have changed, until the command and anything it left running have exited.
+  Whatever nobody can explain is **UNKNOWN**.
+- **A writer's tools.** It sees your MCP servers, minus the lead's tools: no `abraham`, no
+  `coordinator_*` lead tools. A server of yours that fails to start does not stop a write.
+- **Your own edits.** In a checkout the coordinator has registered, Claude's Edit and Write go through
+  a hook. They are recorded as yours, and refused on a path another writer claims. A Bash command
+  that changes files is recorded as yours when, while it ran, no writer was working, no command was
+  held and no other lead Bash command was running in that checkout; otherwise what it changed is
+  UNKNOWN. A change made while a writer's run is under way is
+  UNKNOWN, and it stops that run's hand-off as blocked. So while writers run, change files with Edit
+  and Write.
+- **Publishing a unit.** A writer's work is published with `coordinator_seal`, then
+  `code_review(sealed_unit=…)`, then `coordinator_publish`, which makes the commit. The push gate
+  refuses a plain `git commit` that would take another writer's paths or UNKNOWN content (see Push
+  gate).
+- **UNKNOWN content.** `coordinator_unit(action="unknown")` lists it; `action="restore"` puts the last
+  known content back, and you then make the change again with Edit or Write.
+- **Watching.** The Codex Office shows these writers, and Send now puts a note into a running turn.
+
+Known limits, measured on macOS:
+
+- A process that leaves its command's session (`setsid`, a daemon) and whose environment cannot be
+  read is not held: it cleared its environment, or it is an Apple system binary, whose environment
+  macOS does not show. Its writer's hand-off does not wait for it, and what it writes later is not
+  the writer's: it shows as UNKNOWN, or as yours if it lands while one of your Bash commands runs in
+  a quiet window (next item). Codex itself ends a command's process group when the command ends, so
+  `( … &)` and `nohup` children do not outlive it.
+- While your Bash command runs with no writer working, another program writing in the checkout (an
+  editor saving a file, a background command still running) is recorded as yours.
+- The push gate checks the content in your working tree. When a commit takes a path whose staged
+  content differs from its working file (`git add`, then an edit), the staged bytes are not
+  checked; the gate says so in a note.
 
 ## The Codex Office
 
@@ -217,6 +263,10 @@ session and project.
   button, which ends it.
 - **One worker per conversation.** A conversation continued over several runs stays one worker. That
   covers a review session's turns, a resumed run, and abraham's analysis followed by its writer.
+- **Writers on the writer coordinator show too.** They are not `codex exec` runs, so the office asks
+  the coordinator for them and reads each one's conversation from its Codex thread's own rollout
+  file. Their header shows the paths they claim, and any UNKNOWN content or unread messages. When the
+  coordinator does not answer, they show as last seen, and the page says so.
 
 **Roles.** Each worker's role comes from the first of these that applies:
 1. The role you pick from the role menu in its header.
@@ -249,13 +299,15 @@ Tabs:
 | ⏸ Pause | Stops the run now. Its Codex thread stays on disk. |
 | Continue | Picks a stopped or finished thread up again, with your instructions. |
 | Interrupt & send | Pauses a live run, then continues the same thread with your note at once. |
+| Send now | For a writer on the coordinator: puts your note into the turn it is running, without stopping it (Codex's `turn/steer`). The note is text, so images go by path, for Codex to open itself. |
 | Send when done | Delivers your note when the current run finishes. Use this for abraham's planner: interrupting it ends the dispatch before the writer starts. A note sent while abraham hands over to its writer waits for the writer. The office knows the writer is still to come because abraham's call still holds the tree's write lock. Without `lsof` it can't read that, and the note is refused rather than sent to the analysis. Until a note is delivered, Withdraw takes it back. |
 | 📎, drop or paste | Attaches images and files. |
 | `@` | Picks a file from the worker's workspace. |
 
-Every action goes through this plugin's own `codex_cancel_run` and `codex_resume_run`, run by its
-own MCP server. So the run journal, the locks and the run budget work exactly as when Claude Code
-calls them. An action's outcome comes from the journal, not from the reply alone:
+Every action goes through this plugin's own `codex_cancel_run`, `codex_resume_run` and, for Send
+now, `coordinator_send`, run by its own MCP server. So the run journal, the locks and the run budget
+work exactly as when Claude Code calls them. An action's outcome comes from the journal, or for a
+writer on the coordinator from the coordinator's state of the run, not from the reply alone:
 - A pause is done once the run reads stopped.
 - A continuation is done once the run it started has answered. Only a run started by the action's own
   server counts, never another caller's continuation of the same thread.
@@ -271,8 +323,8 @@ going by the version. Against an older server, the note gives the images' paths 
 open each with its `view_image` tool. Codex's look at an image that way doesn't show in the stream,
 because `codex exec` reports no event for it.
 
-A note to a live worker interrupts it. Steering a live run without stopping it comes with the
-writer coordinator.
+A note to a live worker interrupts it, except for a writer on the coordinator: Send now reaches its
+running turn instead.
 
 The office and every action it sends run detached from Claude Code. Closing the page, ending the
 session or restarting Claude Code stops none of them. Manage the office with these commands:
@@ -328,6 +380,14 @@ works in all of them. The review states are:
 The acknowledgement is always yours to make. The token binds the whole decision: command, content,
 HEAD, index, branch, configuration, tracking ref, environment and review evidence.
 
+**In a checkout the writer coordinator has registered**, a `git commit` that would take another live
+unit's paths, or content of unknown origin, is refused with the units and paths named, and no token
+is given: publish that work with the unit tools, or leave those paths out. What a commit takes is
+read from its own arguments: the index, `-a`, or its pathspecs. Your own unit's paths and free paths
+get the usual decision. A command the gate can't read as one plain commit keeps its token and gets
+the list as a note. A push is gated as before. Without coordinator state on the machine, the check
+costs one directory lookup; with the coordinator down, the reason says so.
+
 **Where it runs.** A session-start hook puts the plugin's git shim first on the Bash tool's PATH,
 for the session, its subagents and teammates. `git commit` and `git push` reach the gate with their
 exact arguments, directory and environment. Aliases, scripts and tools that run git are seen too, and
@@ -361,6 +421,9 @@ Set these in the environment Claude Code starts with. Every one is optional.
 | `CODEX_ORACLE_MAX_RUNTIME_S` | A run's wall-clock budget, 300–12600 s (default 10800). |
 | `CODEX_PUSH_GATE_EVAL_DEADLINE_S` | The push gate's evaluation deadline (default 60 s). |
 | `CODEX_PUSH_ACK_DIR` | Where the push gate keeps its tokens (default `~/.claude/logs/codex-oracle/push-ack`). |
+| `SOFTWARE_WORKFLOWS_STATE` | The writer coordinator's state: its ledger and run records (default `~/.local/state/software-workflows`). |
+| `SOFTWARE_WORKFLOWS_RUNTIME` | Where the coordinator's sockets live (default `/tmp/c1-<uid>`). Keep it short: macOS limits a socket path to 104 bytes. |
+| `SOFTWARE_WORKFLOWS_PYTHON` | The Python (3.11+) the coordinator daemon runs on (default: the server's). |
 
 The server's venv lives in the plugin's data directory
 (`~/.claude/plugins/data/software-workflows-agent-teams/venv/`) and survives updates. A new one is
@@ -370,7 +433,7 @@ built when the requirements or the interpreter change.
 
 - **macOS:** everything, measured.
 - **Linux:** the same code. The git shim's Linux-specific paths have not yet been measured end to end
-  for 2.0.
+  for 2.0, nor the writer coordinator's process inventory for 2.3.
 - **Windows:** no WSL needed for the agent teams and the Codex tools.
   - Set `CODEX_ORACLE_PYTHON=python`: python.org builds ship no `python3.exe`.
   - The hooks need `python3` on PATH. Create a `python3` alias next to `python.exe`, or use the
@@ -391,6 +454,8 @@ built when the requirements or the interpreter change.
 | A Codex call seems stuck | `codex_runs` and `codex_run_log`, or the live view. Max-effort runs often take many minutes. |
 | A run shows DETACHED after a reconnect | `codex_resume_run(run=<id>)` collects its answer. |
 | Hooks never fire on Windows | Add a `python3` alias (see Platforms). |
+| A commit is refused as "content of unknown origin" | Something changed those files outside Edit and Write while a writer was working, or outside Claude. `coordinator_unit(action="unknown")` lists them; restore and redo the change with Edit or Write. |
+| `abraham` says "Native admission/startup failed" | It ran on `codex exec` instead; the reason follows. `DAEMON_START` with a long `SOFTWARE_WORKFLOWS_RUNTIME` path is the 104-byte socket limit. |
 
 ## For maintainers
 

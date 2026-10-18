@@ -38,6 +38,7 @@ Two properties are enforced by this server rather than left to the caller
 
 import asyncio
 import contextlib
+import functools
 import itertools
 import hashlib
 import json
@@ -598,13 +599,13 @@ def _read_codex_config() -> dict[str, str]:
     """
     global _config_cache, _config_mtime
 
-    config_path = Path.home() / ".codex" / "config.toml"
+    config_path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
     if not config_path.exists():
         _config_cache = {}
         return _config_cache
 
     try:
-        mtime = config_path.stat().st_mtime
+        mtime = (str(config_path), config_path.stat().st_mtime_ns)
     except OSError:
         _config_cache = {}
         return _config_cache
@@ -920,470 +921,32 @@ def _active_write_run(cwd: str, exclude_run: str = "") -> str:
     return ""
 
 
-def _tree_identity(cwd: str) -> str:
-    """Filesystem identity of the WORKTREE containing ``cwd``: the git
-    toplevel's (st_dev, st_ino). Case variants, symlink aliases and any
-    subdirectory of one checkout all map to one lock (review round 5:
-    realpath() is not an identity on case-insensitive APFS, and a
-    subdirectory got its own lock). Falls back to the realpath hash."""
-    root = cwd
-    with contextlib.suppress(Exception):
-        top = subprocess.run(
-            _treedigest.git_argv(cwd, ("rev-parse", "--show-toplevel")), env=_treedigest.git_env(),
-            capture_output=True, text=True, timeout=10,
-        ).stdout.strip()
-        if top:
-            root = top
-    try:
-        st = os.stat(root)
-        return f"{st.st_dev}-{st.st_ino}"
-    except OSError:
-        return hashlib.sha1(os.path.realpath(root).encode("utf-8", "replace")).hexdigest()[:16]
-
-
-def _write_lock_path(cwd: str) -> Path:
-    return LIVE_LOG_DIR / "write-locks" / f"tree-{_tree_identity(cwd)}.lock"
-
-
-def _legacy_write_lock_holder(cwd: str) -> str:
-    """A pre-1.17.2 server holds no kernel lock — its lock is a content FILE
-    keyed by the sha1 of the RAW cwd string, so a symlink / case / subdir
-    alias of one checkout lives under a DIFFERENT file name (round 6: the
-    exact-path probe missed those). Scan every legacy-format file in the
-    shared directory and match by the TREE its recorded cwd resolves to; a
-    live holder on our tree refuses us. A live holder whose cwd cannot be
-    parsed fails CLOSED (counts as ours)."""
-    my_tree = _tree_identity(cwd)
-    tree_cache: dict[str, str] = {}
-    try:
-        entries = list((LIVE_LOG_DIR / "write-locks").iterdir())
-    except OSError:
-        return ""
-    for entry in entries:
-        name = entry.name
-        if not name.endswith(".lock") or name.startswith("tree-"):
-            continue
-        try:
-            text = entry.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            continue
-        live = ""
-        for key, skey, alive in (("child", "cstart", _pid_alive), ("pid", "pstart", _server_alive)):
-            mp = re.search(rf"\b{key}=(\d+)\b", text)
-            ms = re.search(rf"\b{skey}=(\S+)", text)
-            if mp and alive(int(mp.group(1)), ms.group(1) if ms and ms.group(1) != "-" else ""):
-                live = text
-                break
-        if not live:
-            continue
-        mc = re.search(r"\bcwd=(.+?) t=\d+", text) or re.search(r"\bcwd=(\S+)", text)
-        if mc:
-            rec_cwd = mc.group(1)
-            tree = tree_cache.get(rec_cwd)
-            if tree is None:
-                tree = tree_cache[rec_cwd] = _tree_identity(rec_cwd)
-            if tree != my_tree:
-                continue  # a live legacy writer, but on a DIFFERENT tree
-        return live  # our tree (or unprovably not ours — fail closed)
-    return ""
-
-
-# ---- kernel-held locks -----------------------------------------------------
-# Mutual exclusion across processes is an ADVISORY OS LOCK held on an open
-# descriptor (flock on POSIX, msvcrt.locking on Windows): exclusive while the
-# holder — or a child that inherited the descriptor — lives, and released by
-# the kernel on death. No pid, age, nonce or rename heuristics: three review
-# rounds showed every file-content protocol had a race (a live owner age-
-# expired; two recoverers of one stale file both acquiring; a fresh lock
-# renamed away). Lock files are never unlinked — an unlink races a fresh
-# opener onto a different inode and silently gives two holders.
-_HELD: dict[str, int] = {}  # lock path → descriptor this process holds
-PLUGIN_LOCK_PROTOCOL = "1.17.2"  # stamped into the server registry (write barrier)
-
-
-def _try_lock_fd(fd: int) -> bool:
-    try:
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
-        else:
-            import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        return False
-
-
-def _acquire_os_lock(path: Path, payload: str) -> tuple[bool, str]:
-    """Take the lock at ``path`` for this process. Returns (acquired, holder
-    description when refused). The payload is diagnostics only — who holds
-    it — never a liveness input."""
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _private(path.parent, 0o700)
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError as e:
-        return False, f"lock dir unusable ({e})"
-    if not _try_lock_fd(fd):
-        holder = ""
-        with contextlib.suppress(OSError):
-            holder = os.read(fd, 4096).decode("utf-8", errors="replace").strip()
-        os.close(fd)
-        return False, holder or "held by another process"
-    with contextlib.suppress(OSError):
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, payload.encode("utf-8"))
-        os.fsync(fd)
-    _HELD[str(path)] = fd
-    return True, ""
-
-
-def _release_os_lock(path: Path) -> None:
-    """Close our descriptor. The kernel drops the lock when the LAST
-    descriptor on the open file description closes — so a child that
-    inherited it (a write run's codex) keeps the tree locked until it exits.
-    No explicit unlock: that would strip the child's protection."""
-    fd = _HELD.pop(str(path), None)
-    if fd is not None:
-        with contextlib.suppress(OSError):
-            os.close(fd)
-
-
-def _held_lock_fd(path: Path) -> int | None:
-    return _HELD.get(str(path))
-
-
-def _rewrite_held_payload(path: Path, payload: str) -> bool:
-    fd = _HELD.get(str(path))
-    if fd is None:
-        return False
-    with contextlib.suppress(OSError):
-        os.ftruncate(fd, 0)
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.write(fd, payload.encode("utf-8"))
-        os.fsync(fd)
-        return True
-    return False
-
-
-_PLANTED_LEGACY: dict[str, list[Path]] = {}  # tree lock path → legacy bridge files we planted
-
-
-def _server_registry_dir() -> Path:
-    return LIVE_LOG_DIR / "servers"
-
-
-def _register_server() -> None:
-    """Record this (1.17.2+) server process so the mixed-version write
-    barrier can tell registered new-code servers from pre-1.17.2 ones.
-    Best-effort: a missed registration only OVER-blocks writes (fail closed).
-    Called at real-server startup (__main__)."""
-    try:
-        d = _server_registry_dir()
-        d.mkdir(parents=True, exist_ok=True)
-        _private(d, 0o700)
-        p = d / f"{os.getpid()}.json"
-        p.write_text(json.dumps({"pid": os.getpid(), "start": _SERVER_START,
-                                 "version": PLUGIN_LOCK_PROTOCOL}), encoding="utf-8")
-        _private(p, 0o600)
-        for e in d.glob("*.json"):  # opportunistic prune of dead entries
-            with contextlib.suppress(Exception):
-                rec = json.loads(e.read_text(encoding="utf-8"))
-                pid = int(rec.get("pid") or 0)
-                if pid != os.getpid() and not _pid_alive(pid, str(rec.get("start") or "")):
-                    e.unlink()
-    except Exception:
-        pass
-
-
-def _registered_server_pids() -> dict[int, str]:
-    out: dict[int, str] = {}
-    with contextlib.suppress(OSError):
-        for e in _server_registry_dir().glob("*.json"):
-            with contextlib.suppress(Exception):
-                rec = json.loads(e.read_text(encoding="utf-8"))
-                out[int(rec.get("pid") or 0)] = str(rec.get("start") or "")
-    return out
-
-
-def _ps_snapshot() -> str:
-    """`pid command` lines for this user's processes (tests inject their own).
-    A nonzero ps exit is an ERROR, never an empty-but-successful snapshot
-    (round 8: discarding returncode turned a failed ps into "no processes")."""
-    done = subprocess.run(
-        ["ps", "-U", str(os.getuid()), "-axo", "pid=,command="],
-        capture_output=True, text=True, timeout=10,
-    )
-    if done.returncode != 0:
-        raise OSError(f"ps exited {done.returncode}: {done.stderr.strip()[:120]}")
-    return done.stdout
-
-
-def _proc_comm(pid: int) -> str:
-    """The process's EXECUTABLE (ps comm — a single field, so a spaced path
-    cannot be mis-split). "" = the process is gone. Raises on a ps failure so
-    the caller fails closed. Injectable for tests."""
-    done = subprocess.run(
-        ["ps", "-o", "comm=", "-p", str(pid)],
-        capture_output=True, text=True, timeout=5,
-    )
-    if done.returncode != 0:
-        # ps exits nonzero BOTH for a dead pid and for its own failures
-        # (round 12): "gone" needs corroboration — kill(0) ESRCH. Anything
-        # else is an unverifiable candidate and must raise so the barrier
-        # fails closed.
-        if _kill0(pid) is False:
-            return ""  # genuinely gone
-        raise OSError(
-            f"ps -o comm= -p {pid} exited {done.returncode}"
-            f" ({done.stderr.strip()[:120] or 'no stderr'}) while kill(0) says the "
-            f"process exists")
-    return done.stdout.strip()
-
-
-def _pre_1172_server_running() -> str:
-    """Description of a live codex-oracle server process that predates the
-    registry (pre-1.17.2), or ''. Round 7: old code cannot be patched inside
-    running processes, and NO enumeration of path aliases can make its
-    content locks meet our inode locks — so while such a process exists,
-    write dispatch refuses outright. This is the mixed-version guarantee;
-    the legacy scan and planted bridge files remain as defense in depth.
-    POSIX only (write mode already fails closed on Windows)."""
-    if _IS_WINDOWS:
-        return ""
-    try:
-        out = _ps_snapshot()
-    except Exception as e:
-        return f"cannot enumerate processes (ps failed: {e})"
-    registered = _registered_server_pids()
-    rows: list[tuple[int, str]] = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            pid_s, cmd = line.split(None, 1)
-            rows.append((int(pid_s), cmd))
-        except ValueError:
-            continue
-    if os.getpid() not in {p for p, _ in rows}:
-        # A truthful snapshot of this user's processes must contain THIS
-        # process; one that does not is empty, partial, or from the wrong
-        # user — never proof that no old server exists (round 8).
-        return "process snapshot did not include this process (partial/invalid) — cannot rule out an old server"
-    for pid, cmd in rows:
-        if pid == os.getpid():
-            continue
-        # CANDIDATE = loose substring match (round 11: token positions
-        # guessed from a space-joined `ps command` line mis-split a spaced
-        # install path into a false NEGATIVE — the superset match cannot
-        # miss). What separates a real oracle server from a `codex exec`
-        # child whose PROMPT mentions these strings is the EXECUTABLE:
-        # servers run under a python; codex children run under codex/node.
-        # `ps comm` is a single field, immune to spaces.
-        low = cmd.lower()
-        if "run_server.py" not in low and "server.py" not in low:
-            continue
-        if not any(name in low for name in ("codex-oracle", "software-workflows", "agent-teams")):
-            continue
-        try:
-            comm = _proc_comm(pid)
-        except Exception as e:
-            return f"cannot verify candidate process {pid} (ps failed: {e})"
-        if not comm:
-            continue  # gone between snapshot and probe
-        exe = comm.replace("\\", "/").rsplit("/", 1)[-1].lower()
-        if not exe.startswith("python"):
-            continue  # codex/node/etc — an oracle CHILD, not a server
-        start = registered.get(pid)
-        if start is not None:
-            cur = _proc_start(pid)
-            if cur and cur == start:
-                continue  # verified registered 1.17.2+ server
-            # Unknown or mismatched identity: the registry entry may belong
-            # to a dead server whose pid was reused — NOT an exemption
-            # (round 8: unknowable identity must fail closed here).
-        if _kill0(pid) is False:
-            continue  # dead — a stale snapshot line
-        # RAW liveness only: _pid_alive's no-start fallback requires the
-        # command to LOOK like a codex process, but here the snapshot line
-        # is the identity evidence (measured: a live process read as dead).
-        return f"unregistered (pre-1.17.2) codex-oracle server pid {pid}: {cmd[:120]}"
-    return ""
-
-
-def _legacy_lock_paths_for(cwd: str) -> list[Path]:
-    """The legacy-format lock files a pre-1.17.2 server would consult for
-    this tree: one per plausible alias of the checkout (raw cwd, realpath,
-    git toplevel, its realpath), deduplicated by file name. An old server on
-    an alias OUTSIDE this set is not excluded — that hole exists between two
-    old servers as well and closes when every server is on 1.17.2."""
-    aliases = [cwd, os.path.realpath(cwd)]
-    with contextlib.suppress(Exception):
-        top = subprocess.run(
-            _treedigest.git_argv(cwd, ("rev-parse", "--show-toplevel")), env=_treedigest.git_env(),
-            capture_output=True, text=True, timeout=10,
-        ).stdout.strip()
-        if top:
-            aliases += [top, os.path.realpath(top)]
-    out: list[Path] = []
-    seen: set[str] = set()
-    for alias in aliases:
-        path = (LIVE_LOG_DIR / "write-locks"
-                / f"{hashlib.sha1(alias.encode('utf-8', 'replace')).hexdigest()[:16]}.lock")
-        if path.name in seen:
-            continue
-        seen.add(path.name)
-        out.append(path)
-    return out
-
-
-def _plant_legacy_locks(cwd: str, run_hint: str) -> tuple[bool, str, list[Path]]:
-    """Occupy the LEGACY lock namespace for this tree while we hold the inode
-    lock, so a still-running pre-1.17.2 server refuses in BOTH acquisition
-    orders (round 6: it otherwise takes its content lock after we already
-    hold the — to it invisible — inode lock). Legacy files are content-based
-    by the OLD protocol's own definition: creating and unlinking them here
-    follows that protocol; the never-unlink law protects flock-held files,
-    not these. Returns (ok, live_holder_when_refused, planted_so_far)."""
-    planted: list[Path] = []
-    payload = (f"{run_hint} pid={os.getpid()} pstart={_SERVER_START or '-'} "
-               f"planted-by={os.getpid()} v=1.17.2-bridge cwd={cwd} "
-               f"t={int(time.time())}\n")
-    for path in _legacy_lock_paths_for(cwd):
-        occupied = False
-        for _ in range(2):
-            try:
-                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                with os.fdopen(fd, "w") as fh:
-                    fh.write(payload)
-                planted.append(path)
-                occupied = True
-                break
-            except FileExistsError:
-                try:
-                    text = path.read_text(encoding="utf-8", errors="replace").strip()
-                except OSError:
-                    continue  # released between EXISTS and read — retry once
-                m = re.search(r"\bpid=(\d+)\b", text)
-                if (m and int(m.group(1)) != os.getpid()
-                        and _pid_alive(int(m.group(1)))):
-                    return False, text or "unknown legacy holder", planted
-                with contextlib.suppress(OSError):
-                    path.unlink()  # stale by the old protocol's own rules
-                continue
-            except OSError as e:
-                # Round 7: an unplantable alias is a REFUSAL, not a skip — a
-                # partially occupied namespace is fail-open.
-                return False, f"cannot plant legacy bridge {path.name} ({e})", planted
-        if not occupied:
-            return False, f"could not occupy legacy bridge {path.name} (contention)", planted
-    return True, "", planted
-
-
-def _acquire_write_lock(cwd: str, run_hint: str) -> tuple[bool, str]:
-    """One-writer-per-tree MUTUAL EXCLUSION, across server processes AND
-    across plugin versions, held by the kernel for the holder's lifetime and
-    inherited by the codex child. Stable order for every new writer:
-    (1) refuse while any pre-1.17.2 content lock on this TREE names a live
-    holder; (2) take the authoritative inode lock; (3) occupy the legacy
-    namespace so an old writer starting LATER refuses too (round 6).
-    Unusable lock dir FAILS CLOSED — write dispatch without mutual exclusion
-    is not an acceptable fallback. Returns (acquired, holder_when_refused)."""
-    blocker = _pre_1172_server_running()
-    if blocker:
-        return False, (
-            f"mixed-version write barrier: {blocker} — old and new write "
-            "locks cannot exclude each other through unanticipated path "
-            "aliases (round 7); reconnect/reload that session onto 1.17.2 "
-            "first, then retry"
-        )
-    legacy = _legacy_write_lock_holder(cwd)
-    if legacy:
-        return False, f"legacy (pre-1.17.2) lock live: {legacy}"
-    payload = (f"{run_hint} pid={os.getpid()} pstart={_SERVER_START or '-'} "
-               f"cwd={cwd} t={int(time.time())}\n")
-    path = _write_lock_path(cwd)
-    ok, holder = _acquire_os_lock(path, payload)
-    if not ok:
-        if holder.startswith("lock dir unusable"):
-            return False, f"write-lock {holder} — refusing to write unlocked"
-        return False, holder
-    planted_ok, live_holder, planted = _plant_legacy_locks(cwd, run_hint)
-    if not planted_ok:
-        for p in planted:
-            with contextlib.suppress(OSError):
-                p.unlink()
-        _release_os_lock(path)
-        return False, f"legacy (pre-1.17.2) lock live: {live_holder}"
-    _PLANTED_LEGACY[str(path)] = planted
-    return True, ""
-
-
-def _note_write_child(cwd: str, pid: int) -> bool:
-    """Record the spawned codex child in the held lock's payload (who holds
-    the tree — diagnostics). False only if this process does not hold the
-    lock, which a write run must treat as fatal."""
-    path = _write_lock_path(cwd)
-    fd = _HELD.get(str(path))
-    if fd is None:
-        return False
-    with contextlib.suppress(OSError):
-        os.lseek(fd, 0, os.SEEK_SET)
-        text = os.read(fd, 4096).decode("utf-8", errors="replace").rstrip("\n")
-        # REPLACE the child identity (round 19): abraham publishes phase 1's
-        # child and then phase 2's under the same held lock — skipping when
-        # `child=` exists left the bridge naming a finished phase-1 pid.
-        text = re.sub(r"\s*child=\d+ cstart=\S+", "", text)
-        _rewrite_held_payload(path, f"{text} child={pid} cstart={_proc_start(pid) or '-'}\n")
-    # Re-point our planted LEGACY files at the child: if this server crashes,
-    # the child (holding the inherited inode lock) keeps the tree locked, and
-    # the legacy files must keep naming a LIVE pid so an old server's
-    # liveness probe still refuses instead of breaking a "stale" file.
-    # ALL-OR-NOTHING and durable (round 7): one un-repointed file is an
-    # unprotected crash window, so any failure returns False and the caller
-    # kills the child (which has not executed yet — see the execution
-    # barrier in _exec_codex_once).
-    cstart = _proc_start(pid) or "-"
-    for p in _PLANTED_LEGACY.get(str(path), []):
-        try:
-            txt = p.read_text(encoding="utf-8", errors="replace")
-            if f"planted-by={os.getpid()}" not in txt:
-                return False  # the bridge file is not ours any more
-            tail = txt[txt.index("cwd="):] if "cwd=" in txt else txt
-            data = (f"write-child pid={pid} pstart={cstart} child={pid} "
-                    f"cstart={cstart} planted-by={os.getpid()} "
-                    f"v=1.17.2-bridge {tail}")
-            wfd = os.open(p, os.O_WRONLY | os.O_TRUNC)
-            try:
-                os.write(wfd, data.encode("utf-8"))
-                os.fsync(wfd)
-            finally:
-                os.close(wfd)
-        except (OSError, ValueError):
-            return False
-    return True
-
-
-_LOCK_CUSTODY: set[str] = set()  # write-lock paths held past their run (survivors)
-
-
-def _release_write_lock(cwd: str) -> None:
-    path = _write_lock_path(cwd)
-    if str(path) in _LOCK_CUSTODY:
-        # CUSTODIAN (round 15): a run ended with group survivors — the
-        # descriptor stays held by this server so no second writer can start
-        # on a tree that may still be being written. codex_cancel_run
-        # releases custody once group death is verified and the run is
-        # terminalized.
-        return
-    for p in _PLANTED_LEGACY.pop(str(path), []):
-        with contextlib.suppress(OSError):
-            if f"planted-by={os.getpid()}" in p.read_text(encoding="utf-8",
-                                                          errors="replace"):
-                p.unlink()  # ours; content-based namespace (see _plant_legacy_locks)
-    _release_os_lock(path)
+# One implementation is shared with the independent native-writer custodian.
+from coordinator.compat import (
+    _tree_identity,
+    _write_lock_path,
+    _legacy_write_lock_holder,
+    _try_lock_fd,
+    _acquire_os_lock,
+    _release_os_lock,
+    _held_lock_fd,
+    _rewrite_held_payload,
+    _server_registry_dir,
+    _register_server,
+    _registered_server_pids,
+    _ps_snapshot,
+    _proc_comm,
+    _pre_1172_server_running,
+    _legacy_lock_paths_for,
+    _plant_legacy_locks,
+    _acquire_write_lock,
+    _note_write_child,
+    _release_write_lock,
+    _HELD,
+    _PLANTED_LEGACY,
+    _LOCK_CUSTODY,
+    PLUGIN_LOCK_PROTOCOL
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1400,7 +963,7 @@ def _release_write_lock(cwd: str) -> None:
 # to watch). Both verified live on codex-cli 0.144.1 headless exec mode:
 # events arrive incrementally and --output-last-message still works.
 
-LIVE_LOG_DIR = Path.home() / ".claude" / "logs" / "codex-oracle"
+LIVE_LOG_DIR = Path(os.environ.get("CODEX_ORACLE_LOG_DIR") or Path.home() / ".claude" / "logs" / "codex-oracle")
 LIVE_LOG_RETENTION_DAYS = 7
 # Merged viewer feed: every run ALSO appends tagged lines to stream.log so
 # `tail -F stream.log` shows ALL concurrent runs (across sessions/processes —
@@ -2412,7 +1975,7 @@ RESUME_NUDGE = (
     "The previous process was interrupted before your answer arrived. "
     "Continue from where you left off and provide the complete final answer."
 )
-# A resume given images and no nudge: images are an instruction in themselves.
+
 IMAGES_NUDGE = (
     "Images are attached to this turn. Look at each one, then continue from "
     "where you left off with them in mind."
@@ -2565,6 +2128,7 @@ def _build_exec_argv(
     images: list[str] | None = None,
     write: bool = False,
     auto_compact_limit: int | None = None,
+    role_config: dict | None = None,
 ) -> list[str]:
     """codex exec argv for a fresh run or a resume of an existing thread.
 
@@ -2591,9 +2155,8 @@ def _build_exec_argv(
     live on 0.144.1), on a resume as well: 0.163.0 chains the parent's ``-i``
     list into the resumed turn's input (exec/src/lib.rs:937-941), which is how
     a follow-up turn in a continued advisory session sees a new screenshot. A
-    recovery resume (codex_resume_run) re-attaches the images the journal
-    recorded for the interrupted turn (codex may never have received them) and
-    adds the caller's new ones. ``--image`` is VARIADIC
+    recovery resume re-attaches surviving interrupted-turn images and adds
+    the caller's new images. ``--image`` is VARIADIC
     (``<FILE>...``) — measured live: if the ``-i`` list sits immediately
     before the positional prompt, clap swallows the prompt as another image
     path and codex reports "No prompt provided via stdin". So images go RIGHT
@@ -2644,6 +2207,9 @@ def _build_exec_argv(
     ]
     if auto_compact_limit is not None:
         argv += ["-c", f"model_auto_compact_token_limit={auto_compact_limit}"]
+    if role_config:
+        from coordinator.native import override_args
+        argv += override_args(role_config)
     if resume_tid is not None:
         # The caller's nudge rides in ``prompt`` — same slot as a fresh run.
         # (A separate resume_prompt param existed here that no caller ever
@@ -2820,7 +2386,8 @@ def _codex_env() -> dict[str, str]:
     other platforms the parent PATH passes through untouched (the previous
     unconditional '/opt/homebrew/bin:' prefix corrupted the first PATH entry
     on Windows, where the separator is ';')."""
-    env = dict(os.environ)
+    from coordinator.native import environment
+    env = environment()
     if sys.platform == "darwin":
         env["PATH"] = "/opt/homebrew/bin" + os.pathsep + env.get("PATH", "")
     return env
@@ -3439,6 +3006,55 @@ async def _wait_for_capacity(
     return False
 
 
+IMPLEMENTATION_INSTRUCTIONS = (
+            "IMPLEMENTATION MODE — FULL ACCESS: this process runs WITHOUT a "
+            "sandbox, with the caller's own privileges, network, live web "
+            "search and MCP servers (--dangerously-bypass-approvals-and-"
+            "sandbox). Read anything you need, anywhere, and reach the "
+            "project's infrastructure the way its docs describe. Use that to "
+            "VERIFY your work against the real system before you report: run "
+            "what you changed for real (the app, command, endpoint or "
+            "migration on a fresh database) and the project's own existing "
+            "checks (builds, linters, whatever suites it already has) exactly "
+            "as the project runs them, and report their real exit codes and "
+            "output — never a claim of green without the run. Do not write "
+            "test cases or test harnesses unless the user explicitly asked "
+            "for them: verification is the real run and its results.\n"
+            "BOUNDARIES: write inside this repository (the working directory "
+            "and the repositories nested in it); a change another repository "
+            "needs is its own run, so name it in your report instead of "
+            "making it. Never modify a dotfile, a credential store or system "
+            "configuration; no destructive infrastructure actions (dropping "
+            "or truncating shared databases, deleting deployments or data) "
+            "unless the task explicitly orders them; treat any secret you "
+            "encounter as never-to-be-copied into files or output.\n"
+            "GIT CONTRACT (non-negotiable): leave ALL changes as uncommitted "
+            "working-tree edits for the caller to review. NEVER run git "
+            "commit, push, checkout, switch, restore, reset, stash, clean, "
+            "rebase, merge, or any branch/tag operation; never touch .git "
+            "internals; no bulk deletes. Violations are detected after the "
+            "run and reported to the caller.\n\n"
+        )
+
+INFRA_INSTRUCTIONS = (
+            "INFRA INVESTIGATION MODE — you have full shell and network access "
+            "plus your configured MCP tools. How to reach this project's "
+            "infrastructure (servers, databases, clusters, dashboards, logs) is "
+            "project-specific:\n"
+            "1. FIRST follow any access instructions given in the task below.\n"
+            "2. Otherwise DISCOVER them: read CLAUDE.md / AGENTS.md / README.md "
+            "in the working directory AND each parent directory up to $HOME "
+            "(workspace roots often document credentials that per-repo files "
+            "deliberately omit).\n"
+            "3. Also check standard local access: ~/.ssh/config, ~/.kube/config "
+            "+ kubectl contexts, docker contexts, cloud CLI profiles (aws/gcloud), "
+            "and .env files near the code.\n"
+            "Only conclude access is unavailable after steps 2-3.\n"
+            "STRICTLY READ-ONLY: observe and query only. Never write, restart, "
+            "delete, deploy, scale, or change any config, data, or service.\n\n"
+        )
+
+
 async def _run_codex(
     prompt: str,
     infra: bool = False,
@@ -3455,6 +3071,7 @@ async def _run_codex(
     claim_key: str = "",
     custody_cwd: str = "",
     session_out: dict[str, Any] | None = None,
+    review_job: str = "",
 ) -> str:
     """Run codex exec headlessly with clean final-message extraction.
 
@@ -3537,6 +3154,10 @@ async def _run_codex(
     mode_since = 0
     extra_env: dict[str, str] = {}
     holds_tree_lock = bool(write or custody_cwd)
+    if holds_tree_lock:
+        # An exclusive fallback is still a writer. Inherited local instances
+        # of this plugin must register only the advisory tool catalog.
+        extra_env["SOFTWARE_WORKFLOWS_ROLE"] = "writer"
     if holds_tree_lock and os.name != "nt" and _is_launcher_script(_codex_argv0()[0]):
         # Round 12 (write) + round 19 (any lock-holding run): behind a
         # launcher script the inherited tree lock and the recorded pid
@@ -3550,6 +3171,16 @@ async def _run_codex(
             "Pin the native binary via CODEX_ORACLE_CODEX_BIN or reinstall "
             "@openai/codex.]"
         )
+    role_config = {}
+    catalog = None
+    if holds_tree_lock:
+        try:
+            from coordinator.roles import exec_policy
+            role_config, catalog = await exec_policy(_codex_argv0(), eff_cwd, {
+                "model": model, "model_reasoning_effort": reasoning, "approval_policy": "never",
+                "sandbox_mode": "danger-full-access", "web_search": "live" if web_search else "disabled"})
+        except Exception as exc:
+            return "[Exec writer refused before inference: " + str(getattr(exc, "code", type(exc).__name__)) + "; restricted MCP catalog could not be verified.]"
     if write:
         write_before = _tree_snapshot(eff_cwd)
         if not write_before["ok"]:
@@ -3579,58 +3210,14 @@ async def _run_codex(
         # The implementation phase, always full access (user rulings
         # 2026-09-05 and 2026-10-18): no sandbox, so the writer runs the
         # project's REAL gates — that is the point — under the git contract.
-        prompt = (
-            "IMPLEMENTATION MODE — FULL ACCESS: this process runs WITHOUT a "
-            "sandbox, with the caller's own privileges, network, live web "
-            "search and MCP servers (--dangerously-bypass-approvals-and-"
-            "sandbox). Read anything you need, anywhere, and reach the "
-            "project's infrastructure the way its docs describe. Use that to "
-            "VERIFY your work against the real system before you report: run "
-            "what you changed for real (the app, command, endpoint or "
-            "migration on a fresh database) and the project's own existing "
-            "checks (builds, linters, whatever suites it already has) exactly "
-            "as the project runs them, and report their real exit codes and "
-            "output — never a claim of green without the run. Do not write "
-            "test cases or test harnesses unless the user explicitly asked "
-            "for them: verification is the real run and its results.\n"
-            "BOUNDARIES: write inside this repository (the working directory "
-            "and the repositories nested in it); a change another repository "
-            "needs is its own run, so name it in your report instead of "
-            "making it. Never modify a dotfile, a credential store or system "
-            "configuration; no destructive infrastructure actions (dropping "
-            "or truncating shared databases, deleting deployments or data) "
-            "unless the task explicitly orders them; treat any secret you "
-            "encounter as never-to-be-copied into files or output.\n"
-            "GIT CONTRACT (non-negotiable): leave ALL changes as uncommitted "
-            "working-tree edits for the caller to review. NEVER run git "
-            "commit, push, checkout, switch, restore, reset, stash, clean, "
-            "rebase, merge, or any branch/tag operation; never touch .git "
-            "internals; no bulk deletes. Violations are detected after the "
-            "run and reported to the caller.\n\n"
-        ) + prompt
+        prompt = IMPLEMENTATION_INSTRUCTIONS + prompt
     elif infra:
         # Infra mode: full sandbox (network + shell) so Codex can SSH to the
         # server, query the live DB, read container/Dokploy logs, etc., and
         # the MCP servers from ~/.codex/config.toml (auth0, temporal, ...)
         # stay enabled. Read-only DISCIPLINE is enforced via prompt only —
         # callers opt in per call and must trust the investigation prompt.
-        prompt = (
-            "INFRA INVESTIGATION MODE — you have full shell and network access "
-            "plus your configured MCP tools. How to reach this project's "
-            "infrastructure (servers, databases, clusters, dashboards, logs) is "
-            "project-specific:\n"
-            "1. FIRST follow any access instructions given in the task below.\n"
-            "2. Otherwise DISCOVER them: read CLAUDE.md / AGENTS.md / README.md "
-            "in the working directory AND each parent directory up to $HOME "
-            "(workspace roots often document credentials that per-repo files "
-            "deliberately omit).\n"
-            "3. Also check standard local access: ~/.ssh/config, ~/.kube/config "
-            "+ kubectl contexts, docker contexts, cloud CLI profiles (aws/gcloud), "
-            "and .env files near the code.\n"
-            "Only conclude access is unavailable after steps 2-3.\n"
-            "STRICTLY READ-ONLY: observe and query only. Never write, restart, "
-            "delete, deploy, scale, or change any config, data, or service.\n\n"
-        ) + prompt
+        prompt = INFRA_INSTRUCTIONS + prompt
 
     t0 = time.monotonic()
     # The digest of the tree the model will READ — the run's own tree, which
@@ -3661,6 +3248,14 @@ async def _run_codex(
                              "custody_cwd": custody_cwd}
     if session_out is not None:
         session_out["state"] = state
+    if review_job:
+        try:
+            await _coordinator_call("review/dispatch", {"job": review_job, "run": run_tag}, key=review_job + ":dispatch")
+        except Exception as exc:
+            for stream in (live_fh, stream_fh):
+                if stream:
+                    stream.close()
+            return f"[Bound review was not dispatched: {getattr(exc, 'code', type(exc).__name__)}. Collect review job {review_job} before retrying.]"
 
     journaled_tid = ""
     journaled_spawn_pid = 0
@@ -3761,6 +3356,7 @@ async def _run_codex(
         "full_access": bool(write),
         "web_search": web_search, "parent_run": parent_run,
         "images": list(images or []), "cwd": eff_cwd,
+        "writer_mcp_catalog": catalog,
         # the session's folder, which may lie outside the target tree: the run
         # is listed and resumable from both (_run_belongs)
         "dispatch_cwd": _get_cwd(),
@@ -3908,7 +3504,7 @@ async def _run_codex(
             output_file = _run_spool_dir(run_tag) / f"attempt{attempt}.txt"
             cmd = _build_exec_argv(
                 model, reasoning, infra, web_search, output_file,
-                prompt=prompt, resume_tid=resume_tid, images=images,
+                prompt=prompt, resume_tid=resume_tid, images=images, role_config=role_config,
                 write=write, auto_compact_limit=ac_limit,
             )
         except Exception as e:
@@ -4163,6 +3759,10 @@ async def _run_codex(
         prior = _journal_runs().get(run_tag, {})
         if (prior.get("status") == "cancelled" and prior.get("cancelled_by")) or _cancel_requested(run_tag):
             status = "cancelled"
+    if session_out is not None:
+        session_out["completion"] = {"run": run_tag, "thread": state.get("thread_id"), "status": status,
+            "completed": status == "ok" and bool(final_message) and bool(clean_extraction or state.get("turn_completed")),
+            "answer": final_message or "", "returncode": returncode}
     # What a write run REALLY ran with, read back from its rollout: a flag
     # and an exit code are union claims (the old sealed sandbox once
     # downgraded itself to read-only and still exited 0), the turn_context
@@ -4537,7 +4137,8 @@ def _session_thread(tool: str, session: str) -> tuple[str, str, str, str]:
 
 
 async def _advise(prompt: str, tool_name: str, session: str, *, infra: bool,
-                  ctx: Any, web_search: bool, reserve: int, images: list[str]) -> str:
+                  ctx: Any, web_search: bool, reserve: int, images: list[str],
+                  result_out: dict | None = None, review_job: str = "") -> str:
     """Run an advisory tool in the codex session ``session`` names, then put
     the session line right under the signed header (the push gate and
     abraham's gate read only the FIRST line)."""
@@ -4568,8 +4169,10 @@ async def _advise(prompt: str, tool_name: str, session: str, *, infra: bool,
             prompt, infra=infra, ctx=ctx, web_search=web_search,
             reserve=reserve + _SESSION_LINE_RESERVE, images=images,
             tool_name=tool_name, resume_tid=tid or None, parent_run=prev_run,
-            claim_key=claim, session_out=out)
+            claim_key=claim, session_out=out, review_job=review_job)
     finally:
+        if result_out is not None:
+            result_out.update(out)
         if claim:
             _release_run_claim(claim)
     note_line = f"\n[session note: {note}]" if note else ""
@@ -4597,6 +4200,18 @@ async def _advise(prompt: str, tool_name: str, session: str, *, infra: bool,
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
+def _lead_tool():
+    """Writer instances retain advisors, but cannot advertise lead authority."""
+    def register(function):
+        if os.environ.get("SOFTWARE_WORKFLOWS_ROLE") == "writer":
+            return function
+        @functools.wraps(function)
+        async def observed(*args, **kwargs):
+            return await _coordinator_notice(await function(*args, **kwargs))
+        return mcp.tool()(observed)
+    return register
+
 
 @mcp.tool()
 async def architect_review(
@@ -4715,9 +4330,9 @@ async def architect_review(
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
 
-@mcp.tool()
+@_lead_tool()
 async def code_review(
-    code_or_diff: str,
+    code_or_diff: str = "",
     context: str = "",
     focus: str = "",
     caller_hypothesis: str = "",
@@ -4725,6 +4340,9 @@ async def code_review(
     infra: bool = False,
     images: list[str] = [],
     session: str = "continue",
+    sealed_unit: str = "",
+    session_id: str = "",
+    cwd: str = "",
     ctx: Context = None,
 ) -> str:
     """
@@ -4771,6 +4389,18 @@ async def code_review(
             session another call is using falls back to a fresh one, with a
             note.
     """
+    job = None
+    if sealed_unit:
+        try:
+            status = await _coordinator_call("unit/status", {"unit": sealed_unit})
+            target = str(Path(cwd or _get_cwd()).resolve())
+            if str(Path(status["run"]["target_cwd"]).resolve()) != target:
+                return await _coordinator_notice("[Bound review refused: supply the sealed unit's checkout as cwd.]")
+            job = await _coordinator_call("review/prepare", {"unit": sealed_unit, "cwd": _get_cwd()})
+            code_or_diff = "IMMUTABLE CANDIDATE BINDING\n" + json.dumps(job["binding"], sort_keys=True) + "\n\nOBJECT DIFF\n" + job["diff"]
+            context += "\nReview the bound Git objects and complete object diff. Working-tree contents can belong to other writers. Every finding and verdict must refer to this candidate."
+        except Exception as exc:
+            return await _coordinator_notice("[Bound review refused before inference: " + str(getattr(exc, "code", type(exc).__name__)) + "]")
     hits = _detect_anchoring({"context": context, "focus": focus})
 
     prompt_parts = [
@@ -4830,12 +4460,22 @@ async def code_review(
 
     banner = _anchor_warning_banner(hits)
     reserve = len(banner) + (_VERDICT_NOTICE_LEN if caller_hypothesis else 0)
+    completion = {}
     result = await _advise(
         "\n".join(prompt_parts), "code_review", session, infra=infra,
         ctx=ctx, web_search=web_search, reserve=reserve,
-        images=list(images or []),
+        images=list(images or []), result_out=completion, review_job=job["job"] if job else "",
     )
-    return banner + _verdict_missing_notice(caller_hypothesis, result) + result
+    evidence = ""
+    if job:
+        try:
+            finished = await _coordinator_call("review/complete", {"job": job["job"],
+                "completion": completion.get("completion", {"run": (completion.get("state") or {}).get("run_tag"),
+                    "status": "failed", "completed": False, "answer": ""})})
+            evidence = "\n[Bound review]\n" + json.dumps(finished, sort_keys=True)
+        except Exception as exc:
+            evidence = f"\n[Review job {job['job']} requires result collection: {getattr(exc, 'code', type(exc).__name__)}. Passing evidence was not confirmed.]"
+    return await _coordinator_notice(banner + _verdict_missing_notice(caller_hypothesis, result) + result + evidence)
 
 
 @mcp.tool()
@@ -5064,7 +4704,341 @@ def _analysis_note(before: dict, after: dict, phase2: bool) -> str:
     )
 
 
-@mcp.tool()
+async def _coordinator_call(method: str, params: dict | None = None, *, start: bool = False,
+                            key: str | None = None, timeout: float = 90) -> Any:
+    from coordinator.client import Client
+    client = Client(timeout=timeout)
+    if start:
+        await asyncio.to_thread(client.ensure, python=sys.executable, inherited_fds=_VENV_LOCK_FDS)
+        deadline = time.monotonic() + 90
+        while not (await asyncio.to_thread(client.call, "daemon/status"))["ready"]:
+            if time.monotonic() >= deadline:
+                from coordinator.client import CoordinatorError
+                raise CoordinatorError("COORDINATOR_RECOVERING", "Coordinator recovery is still in progress")
+            await asyncio.sleep(0.2)
+    return await asyncio.to_thread(client.call, method, params, key)
+
+
+async def _coordinator_notice(text: str) -> str:
+    notice = "[Coordinator: unread lead messages; use coordinator_inbox to read and explicitly acknowledge.]"
+    if notice in text:
+        return text
+    try:
+        inbox = await _coordinator_call("message/inbox", {"recipient": "lead", "limit": 1}, timeout=2)
+        if inbox["unread"]:
+            return text.rstrip() + "\n" + notice
+    except Exception:
+        pass
+    return text
+
+
+async def _native_runs(limit: int = 50) -> dict:
+    from coordinator.client import state_root
+    if not state_root().exists():
+        # No coordinator state: no native run ever existed here, so the exec runs are all of them.
+        return {"available": True, "data": [], "reason": None}
+    try:
+        try:
+            result = await _coordinator_call("run/list", {"cwd": _get_cwd(), "limit": limit}, timeout=3)
+        except (FileNotFoundError, ConnectionRefusedError):
+            # Native runs outlive the daemon in its ledger (a reboot, a crash): start it to list them.
+            result = await _coordinator_call("run/list", {"cwd": _get_cwd(), "limit": limit}, start=True, timeout=3)
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            raise ValueError("Malformed native discovery")
+        return {"available": True, "data": result["data"], "reason": None}
+    except Exception as exc:
+        return {"available": False, "data": [], "reason": str(getattr(exc, "code", type(exc).__name__))}
+
+
+def _native_unavailable(discovery: dict) -> str:
+    return "[Native coordinator unavailable: " + discovery["reason"] + ". Native runs could not be inspected; explicit exec IDs remain usable.]"
+
+
+async def _native_run_action(method: str, run: str, **params) -> str:
+    try:
+        value = await _coordinator_call(method, dict(params, run=run, cwd=_get_cwd()), timeout=90)
+        text = value.get("text") if isinstance(value, dict) else None
+        if text is None:
+            text = json.dumps(value, ensure_ascii=False, indent=2)
+        elif value.get("next_cursor") is not None:
+            text += f"\n[Continue: codex_run_log(run='{run}', cursor={value['next_cursor']}, result=True).]"
+        return await _coordinator_notice(text)
+    except Exception as exc:
+        value = exc.envelope() if hasattr(exc, "envelope") else {"code": type(exc).__name__, "message": "Coordinator unavailable; durable state was not replayed"}
+        if method == "run/resume" and (params.get("text") or params.get("images")):
+            value["delivery"] = "Continuation not delivered or not confirmed; reconcile the saved input identity before retrying."
+        return await _coordinator_notice(json.dumps(value))
+
+
+async def _lead_request(method: str, params: dict, cwd: str = "", session_id: str = "",
+                        own: bool = False, unit: str = "") -> str:
+    """Typed MCP tools share setup and error notices; no arbitrary RPC is exposed."""
+    from coordinator.client import CoordinatorError
+    try:
+        if os.environ.get("SOFTWARE_WORKFLOWS_ROLE") == "writer":
+            raise CoordinatorError("LEAD_ONLY", "Lead controls are unavailable to writer instances")
+        checkout = await _coordinator_call("checkout/register", {"path": cwd or _get_cwd()}, start=True)
+        params = dict(params)
+        mapping = None
+        if session_id:
+            mapping = await _coordinator_call("lead/session", {"checkout": checkout["id"], "session_id": session_id})
+        if own:
+            if mapping is None:
+                raise CoordinatorError("CLAUDE_SESSION_REQUIRED", "This action needs the actual Claude session_id; the host hook supplies it")
+            params["actor"] = mapping["actor"]
+        if method.startswith("checkout/") or method in ("claim/list", "unknown/list", "run/status"):
+            params["checkout"] = checkout["id"]
+        if method.startswith("unit/") or method == "claim/handback":
+            unit = unit or (mapping or {}).get("unit", "")
+            if not unit:
+                raise CoordinatorError("UNIT_REQUIRED", "Supply a unit ID or the actual Claude session_id")
+            status = await _coordinator_call("unit/status", {"unit": unit})
+            if status["unit"]["checkout"] != checkout["id"]:
+                raise CoordinatorError("UNIT_SCOPE", "Unit belongs to another checkout; supply its cwd explicitly")
+            params["unit"] = unit
+        value = await _coordinator_call(method, params, timeout=180)
+        return await _coordinator_notice(json.dumps(value, ensure_ascii=False, indent=2))
+    except Exception as exc:
+        value = exc.envelope() if hasattr(exc, "envelope") else {"code": type(exc).__name__, "message": "Coordinator operation did not complete; inspect durable status"}
+        return await _coordinator_notice(json.dumps(value, ensure_ascii=False))
+
+
+@_lead_tool()
+async def coordinator_claims(action: str = "list", paths: list[str] | None = None, unit: str = "",
+                             cwd: str = "", session_id: str = "") -> str:
+    """List claims/custody; acquire paths for this Claude session; request release;
+    or authorize handback of an idle unit. Actions: list, acquire, release, handback.
+    A conflicting claim names its holder. Reading does not acknowledge messages.
+    """
+    methods = {"list": "claim/list", "acquire": "claim/acquire", "release": "claim/release-request", "handback": "claim/handback"}
+    if action not in methods:
+        return await _coordinator_notice("[Unknown claims action: use list, acquire, release or handback.]")
+    if action in ("acquire", "release") and not paths:
+        return await _coordinator_notice("[Supply a nonempty paths list for acquire or release. Handback omission selects all eligible claims; [] selects none.]")
+    return await _lead_request(methods[action], {"paths": paths} if action != "list" else {}, cwd, session_id,
+                               own=action in ("acquire", "release"), unit=unit)
+
+
+@_lead_tool()
+async def coordinator_send(recipient: str, text: str, wake: str = "none", cwd: str = "", session_id: str = "") -> str:
+    """Send to a run, unit, actor or lead. none leaves idle recipients idle;
+    queue stores a native queued turn; start explicitly wakes an idle recipient.
+    Persisted, submitted, entered_context and acknowledged are distinct states.
+    """
+    return await _lead_request("message/send", {"recipient": recipient, "text": text, "wake": wake}, cwd, session_id)
+
+
+@_lead_tool()
+async def coordinator_inbox(acknowledge: list[str] = [], cursor: str = "", limit: int = 100,
+                            cwd: str = "", session_id: str = "") -> str:
+    """Read lead messages with a cursor. Only IDs explicitly supplied in
+    acknowledge are marked acknowledged; reading status/inbox never does that.
+    """
+    for message in acknowledge:
+        answer = await _lead_request("message/ack", {"message": message}, cwd, session_id)
+        if '"code"' in answer:
+            return answer
+    return await _lead_request("message/inbox", {"recipient": "lead", "cursor": cursor, "limit": limit}, cwd, session_id)
+
+
+@_lead_tool()
+async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = "", session_id: str = "",
+                           paths: list[str] | None = None, unknown: str = "", revision: str = "",
+                           revisions: dict[str, str | None] | None = None, custody: str = "") -> str:
+    """Inspect status/object diff/UNKNOWN, reconcile effects or custody, restore a
+    known revision, reopen a seal, recover publication, or abandon an unapplied
+    publication. Actions: status, diff, unknown, reconcile, restore, reopen,
+    recover, abandon. Restoration writes the chosen known bytes and grants no
+    authorship to unexplained bytes. A new exact edit is still required.
+    """
+    methods = {"status": "unit/status" if unit or session_id else "run/status", "diff": "unit/diff",
+               "unknown": "unknown/list", "reconcile": "custody/reconcile" if custody else "checkout/reconcile",
+               "restore": "unknown/restore", "reopen": "unit/reopen", "recover": "unit/recover", "abandon": "unit/recover"}
+    if action not in methods:
+        return await _coordinator_notice("[Unsupported unit action.]")
+    params = {}
+    if action in ("unknown", "reconcile") and paths is not None:
+        params["paths"] = paths
+    if action == "reconcile" and custody:
+        params = {"custody": custody}
+    if action == "restore":
+        params = {"unknown": unknown, "revision": revision, "revisions": revisions or {}}
+    if action == "abandon":
+        params["action"] = "abandon"
+    return await _lead_request(methods[action], params, cwd, session_id, own=action == "restore", unit=unit)
+
+
+@_lead_tool()
+async def coordinator_seal(unit: str, validation: list[dict] = [], cwd: str = "", session_id: str = "") -> str:
+    """Freeze this idle unit's receipt-backed candidate and validation evidence.
+    UNKNOWN or unresolved effects refuse. Review the returned immutable candidate
+    with code_review(sealed_unit=unit) before publication.
+    """
+    return await _lead_request("unit/seal", {"validation": validation}, cwd, session_id, unit=unit)
+
+
+@_lead_tool()
+async def coordinator_publish(unit: str, review: str, metadata: dict, cwd: str = "", session_id: str = "") -> str:
+    """Publish the exact sealed/reviewed candidate using explicit metadata:
+    message, author_name, author_email, author_date, committer_name,
+    committer_email, committer_date. No acknowledgement bypass exists for stale
+    parent/seal/provenance, missing review or UNKNOWN. No working-file rewrite.
+    """
+    return await _lead_request("unit/publish", {"review": review, "metadata": metadata}, cwd, session_id, unit=unit)
+
+
+async def _native_abraham(task: str, context: str, constraints: str, images: list[str], cwd: str,
+                          claims: list[str] | None, allow_dirty: bool, session_id: str,
+                          ctx: Any, request_t0: float) -> tuple[str | None, str]:
+    """Return a durable native result, or a proven pre-dispatch fallback reason."""
+    from coordinator.client import CoordinatorError
+    import uuid
+    model = _get_codex_model()
+    runid = "run_" + uuid.uuid4().hex
+    phase = "startup"
+    live_path, live_fh, stream_fh, log_tag = _open_live_log("abraham-native")
+    def emit(message):
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{runid}] {message}\n"
+        for stream in (live_fh, stream_fh):
+            if stream:
+                with contextlib.suppress(OSError):
+                    stream.write(line)
+                    stream.flush()
+    activity = {"activity": "starting coordinator; first native admission takes tens of seconds"}
+    emit(activity["activity"])
+    heartbeat = asyncio.create_task(_heartbeat_loop(ctx, request_t0, request_t0, activity, model, emit)) if ctx else None
+    try:
+        top = await asyncio.to_thread(subprocess.run, _treedigest.git_argv(cwd, ("rev-parse", "--show-toplevel")),
+                                      env=_treedigest.git_env(), capture_output=True, text=True, timeout=10)
+        if top.returncode:
+            return None, "CHECKOUT_ROOT"
+        root = str(Path(top.stdout.strip()).resolve())
+        image_paths = [str(Path(p).resolve()) for p in images]
+        if any(not Path(p).is_file() for p in image_paths):
+            return "[Codex model: " + model + " | tool:abraham | status:error | tree:unknown]\nImage input is missing; nothing was dispatched.", ""
+        checkout = await _coordinator_call("checkout/register", {"path": root}, start=True)
+        compact, why = _auto_compact_limit(model)
+        workflow = {"kind": "abraham", "request_id": runid, "dispatch_cwd": str(Path(_get_cwd()).resolve()),
+                    "analysis": INFRA_INSTRUCTIONS + _advisor_context() + "\n\n" + _abraham_analysis_prompt(task, context, constraints, native=True),
+                    "implementation": IMPLEMENTATION_INSTRUCTIONS + _abraham_implementation_prompt(task, constraints, "<C2_ANALYSIS_BRIEF>"),
+                    "images": image_paths, "model": model, "effort": "max", "compact_limit": compact,
+                    "allow_dirty": allow_dirty, "deadline": time.time() + MAX_RUNTIME_SECONDS, "session_id": session_id}
+        params = {"checkout": checkout["id"], "mode": "native", "task": task, "paths": claims, "workflow": workflow}
+        if os.environ.get("SOFTWARE_WORKFLOWS_FIXTURE"):
+            params["fixture"] = os.environ["SOFTWARE_WORKFLOWS_FIXTURE"]
+        emit(f"admission requested; autocompact={compact or 'vendor-default'} ({why}); log={live_path}")
+        phase = "dispatch"
+        result = await _coordinator_call("run/start", params, key=runid, timeout=1800)
+        emit("durable native handle " + json.dumps(result))
+        phase = "observing"
+        previous = None
+        while True:
+            result = await _coordinator_call("run/result", {"run": runid})
+            current = (result["phase"], result["state"])
+            activity["activity"] = "native " + str(current) + " " + runid
+            if current != previous:
+                emit(activity["activity"])
+                previous = current
+            if result["state"] in {"completed", "failed", "blocked", "interrupted", "cancelled", "refused", "submission_uncertain"}:
+                text = result["text"]
+                if result.get("next_cursor") is not None:
+                    text += f"\n[Result continues: codex_run_log(run='{runid}', cursor={result['next_cursor']}, result=True).]"
+                return await _coordinator_notice(text), ""
+            if time.monotonic() - request_t0 >= MAX_RUNTIME_SECONDS:
+                return await _coordinator_notice(result["text"] + "\n[Observation budget ended. Collect this durable run with codex_resume_run; no phase will be replayed.]"), ""
+            await asyncio.sleep(1)
+    except CoordinatorError as exc:
+        emit("coordinator refusal " + exc.code)
+        if exc.code in {"DIRTY_UNEXPLAINED", "CLAIM_CONFLICT", "CLAIM_PATHS", "WORKFLOW_IMAGES", "WORKFLOW_FIELDS"}:
+            return await _coordinator_notice(f"[Codex model: {model} | tool:abraham | status:error | tree:unknown]\n" + json.dumps(exc.envelope())), ""
+        if phase == "startup" or exc.details.get("safe_to_fallback"):
+            return None, exc.code
+        return await _coordinator_notice(f"[Codex model: {model} | tool:abraham | status:error | tree:unknown]\n"
+                 f"Native dispatch requires reconciliation ({exc.code}). Durable handle: {runid}. "
+                 "Use codex_runs and codex_resume_run; execution was not replayed through exec."), ""
+    except (OSError, ValueError) as exc:
+        if phase == "startup":
+            return None, "COORDINATOR_START_" + type(exc).__name__
+        return f"[Codex model: {model} | tool:abraham | status:error | tree:unknown]\nNative handle {runid}; RPC outcome uncertain ({type(exc).__name__}). Collect or reconcile; do not redispatch.", ""
+    finally:
+        if heartbeat:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        for stream in (live_fh, stream_fh):
+            if stream:
+                stream.close()
+
+
+def _abraham_analysis_prompt(task: str, context: str, constraints: str, native: bool = False) -> str:
+    analysis_parts = [
+        "PHASE 1 of 2 — ANALYSIS ONLY. You are a senior engineer "
+        "preparing an implementation. A SEPARATE process will do the "
+        "writing, with the same full access you have (no sandbox, "
+        "network, live web search, MCP servers and live "
+        "infrastructure); it starts from ONLY your final message. So "
+        "your final message must be a complete IMPLEMENTATION BRIEF:",
+        "",
+        "## Findings — how the relevant system actually works, with "
+        "file:line references (trace real call paths, don't guess).",
+        "## Live state — what the live infrastructure shows "
+        "(read-only investigation) where it bears on the task.",
+        "## External facts — every API/version/vendor behavior the "
+        "implementer must rely on, verified against current primary "
+        "sources, with URLs and EXACT values.",
+    ]
+    analysis_parts += [
+        "## Plan — the minimal COMPLETE change: ordered edits per "
+        "file, including error paths and edge cases; no artificial "
+        "caps, no silently deferred scope.",
+        "## Risks — what could break, and what to check.",
+        "## Verification — how to see it work: the real runs to make "
+        "(the changed command, app or endpoint, plus the existing "
+        "build/linters) and the results to expect. No test cases "
+        "unless the user explicitly asked for them.",
+        "",
+        "Do NOT modify any file in this phase.",
+        "",
+        "## Task",
+        task,
+    ]
+    if context:
+        analysis_parts += ["", "## Context (from the caller)", context]
+    if constraints:
+        analysis_parts += [
+            "", "## Constraints (hard boundaries)", constraints]
+    prompt = "\n".join(analysis_parts)
+    if native:
+        prompt = prompt.replace("A SEPARATE process will do the writing", "A second turn in this native thread will do the writing").replace("it starts from ONLY your final message", "it receives your persisted final brief in the next turn")
+    return prompt
+
+
+def _abraham_implementation_prompt(task: str, constraints: str, brief: str) -> str:
+    impl_parts = [
+        "PHASE 2 of 2 — IMPLEMENT. A read-only analysis run has "
+        "already investigated this task; its brief is below. You have "
+        "full access: re-read the code, look things up and reach the "
+        "project's systems as you need — the brief is where you start, "
+        "not the only thing you may know.",
+        "",
+        "WORKFLOW: follow the brief's Plan (deviate only where the "
+        "code proves it wrong, and say so); match the surrounding "
+        "code's style; reuse existing helpers; then run the brief's "
+        "Verification checks that exist and fix what they catch; "
+        "finally REPORT: what changed and why, file by file; what you "
+        "verified and how; any deviation from the brief and its "
+        "reason.",
+        "",
+        "## Task",
+        task,
+    ]
+    if constraints:
+        impl_parts += ["", "## Constraints (hard boundaries)", constraints]
+    impl_parts += ["", "## Implementation brief (from the analysis phase)",
+                   brief]
+    return "\n".join(impl_parts)
+
+
+@_lead_tool()
 async def abraham(
     task: str,
     context: str = "",
@@ -5075,6 +5049,8 @@ async def abraham(
     images: list[str] = [],
     cwd: str = "",
     full_access: bool = True,
+    claims: list[str] | None = None,
+    session_id: str = "",
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -5086,28 +5062,28 @@ async def abraham(
     1. ANALYSIS: codex investigates the codebase, the live web and the live
        infrastructure (read-only by instruction) and writes an
        implementation brief.
-    2. IMPLEMENTATION: a second codex process implements the brief with
-       codex's --dangerously-bypass-approvals-and-sandbox, runs the
+    2. IMPLEMENTATION: the coordinator submits a second turn on the same
+       native thread after successful analysis and settled operations, runs the
        project's real checks and reports their real results.
 
-    Safety envelope (enforced, not trusted): git work tree required; a
-    DIRTY tree is refused unless `allow_dirty=true` (the implementer may
-    legitimately rewrite files, and uncommitted edits it touches have no
-    undo — committed work is always recoverable); one writer per tree via
-    an authoritative lockfile held across both phases; no automatic retry
-    once a write process starts (a replay after partial writes
-    double-applies); codex must not commit/push — every outcome ends with a
-    CHANGED FILES report (this run's changes vs pre-existing dirt, HEAD
-    verified unmoved) and the mode codex recorded for each of its turns,
-    read back from the run's rollout, for you to review with `git diff`.
+    A git work tree is required. Concurrent native writers coordinate path
+    claims, exact edit receipts and process custody. Unexplained dirt refuses
+    dispatch unless allow_dirty=true; this flag never grants attribution or
+    clears UNKNOWN. A supervisor-held compatibility lease excludes legacy exec
+    writers. Native results identify the run/unit, policy and receipt authors;
+    complete results and events remain retrievable through the run tools.
+    Startup/admission failure before production execution can select the
+    explicit, exclusive two-process exec fallback, with its failed check named.
+    Started or uncertain native work is never replayed through exec. All
+    outcomes leave changes uncommitted for the lead to review and record.
     Long implementation runs auto-compact codex's context at ~65% of the
     model window (read from the deployed binary's own registry, never
     guessed).
 
     This is a DIRECTIVE dispatch, not an advisory one: state the desired
     outcome plainly — no anchoring lint, no caller_hypothesis; the contract
-    is "implement", not "judge". While it runs, do NOT edit the tree
-    yourself; afterwards, review the diff before anything is committed.
+    is "implement", not "judge". Use the coordinator tools to exchange
+    messages, inspect claims and arrange handback before overlapping edits.
 
     Args:
         task: What to build/fix/change, with the desired outcome and
@@ -5136,6 +5112,10 @@ async def abraham(
             or another project. A relative path is taken from the server's
             cwd. The run is listed and resumable from this session's folder
             and from the target. Empty = server cwd.
+        claims: Initial repository-relative paths. Omit to acquire claims as
+            native edits declare their paths; an overlap names its holder.
+        session_id: Actual Claude session ID supplied by the host hook or
+            explicitly by the caller. It is never inferred from MCP transport.
     """
     if not task.strip():
         return "[abraham refused: empty task — state what to implement.]"
@@ -5200,11 +5180,16 @@ async def abraham(
             f"state could not be read ({_GIT_STATE_REASON}). "
             "Autonomous writes without version control have no undo.]"
         )
+    native_result, fallback = await _native_abraham(task, context, constraints, list(images or []), cwd,
+                                                   claims, allow_dirty, session_id, ctx, request_t0)
+    if native_result is not None:
+        return native_result
+    fallback_note = f"[Native admission/startup failed: {fallback}. Using the exclusive legacy exec backend.]\n"
     if dirty and not allow_dirty:
         sample = "\n".join(f"  {ln}" for ln in sorted(dirty)[:10])
         more = f"\n  … +{len(dirty) - 10} more" if len(dirty) > 10 else ""
         return (
-            "[abraham refused: the working tree is DIRTY and the implementer "
+            fallback_note + "[abraham refused: the working tree is DIRTY and the implementer "
             "may overwrite uncommitted work irrecoverably (committed work is "
             "always recoverable).\n"
             f"{sample}{more}\n"
@@ -5220,14 +5205,14 @@ async def abraham(
     live_run = _active_write_run(cwd)
     if live_run:
         return (
-            f"[abraham refused: write run {live_run} is still LIVE in this "
+            fallback_note + f"[abraham refused: write run {live_run} is still LIVE in this "
             "workspace (one writer per tree). Wait for it or cancel it; an "
             "interrupted write run is resumable via codex_resume_run.]"
         )
     got_lock, holder = _acquire_write_lock(cwd, "abraham")
     if not got_lock:
         return (
-            f"[abraham refused: another write run holds this tree's lock "
+            fallback_note + f"[abraham refused: another write run holds this tree's lock "
             f"({holder}). One writer per tree.]"
         )
     try:
@@ -5236,45 +5221,8 @@ async def abraham(
         # (architect review, 2026-10-18), so the tree is read on both sides.
         before0 = _tree_snapshot(cwd)
         # ---- Phase 1: read-only analysis → implementation brief ----
-        analysis_parts = [
-            "PHASE 1 of 2 — ANALYSIS ONLY. You are a senior engineer "
-            "preparing an implementation. A SEPARATE process will do the "
-            "writing, with the same full access you have (no sandbox, "
-            "network, live web search, MCP servers and live "
-            "infrastructure); it starts from ONLY your final message. So "
-            "your final message must be a complete IMPLEMENTATION BRIEF:",
-            "",
-            "## Findings — how the relevant system actually works, with "
-            "file:line references (trace real call paths, don't guess).",
-            "## Live state — what the live infrastructure shows "
-            "(read-only investigation) where it bears on the task.",
-            "## External facts — every API/version/vendor behavior the "
-            "implementer must rely on, verified against current primary "
-            "sources, with URLs and EXACT values.",
-        ]
-        analysis_parts += [
-            "## Plan — the minimal COMPLETE change: ordered edits per "
-            "file, including error paths and edge cases; no artificial "
-            "caps, no silently deferred scope.",
-            "## Risks — what could break, and what to check.",
-            "## Verification — how to see it work: the real runs to make "
-            "(the changed command, app or endpoint, plus the existing "
-            "build/linters) and the results to expect. No test cases "
-            "unless the user explicitly asked for them.",
-            "",
-            "Do NOT modify any file in this phase.",
-            "",
-            "## Task",
-            task,
-        ]
-        if context:
-            analysis_parts += ["", "## Context (from the caller)", context]
-        if constraints:
-            analysis_parts += [
-                "", "## Constraints (hard boundaries)", constraints]
-
         brief = await _run_codex(
-            "\n".join(analysis_parts),
+            _abraham_analysis_prompt(task, context, constraints),
             infra=True, ctx=ctx, web_search=True,
             images=list(images or []),
             tool_name="abraham", workdir=cwd,
@@ -5295,62 +5243,39 @@ async def abraham(
         brief_body = rest.strip()
         if not ok_header or not brief_body:
             return (
-                "[abraham: ANALYSIS phase failed — phase 2 never ran. "
-                "Phase-1 result follows.]\n\n"
+                brief.partition("\n")[0] + "\n" + fallback_note +
+                "[abraham: ANALYSIS phase failed — phase 2 never ran.]\n\n"
                 + _analysis_note(before0, _tree_snapshot(cwd), phase2=False)
-                + brief
+                + brief.partition("\n")[2]
             )
         phase1_note = _analysis_note(before0, _tree_snapshot(cwd), phase2=True)
 
         # ---- Phase 2: implementation, full access ----
-        impl_parts = [
-            "PHASE 2 of 2 — IMPLEMENT. A read-only analysis run has "
-            "already investigated this task; its brief is below. You have "
-            "full access: re-read the code, look things up and reach the "
-            "project's systems as you need — the brief is where you start, "
-            "not the only thing you may know.",
-            "",
-            "WORKFLOW: follow the brief's Plan (deviate only where the "
-            "code proves it wrong, and say so); match the surrounding "
-            "code's style; reuse existing helpers; then run the brief's "
-            "Verification checks that exist and fix what they catch; "
-            "finally REPORT: what changed and why, file by file; what you "
-            "verified and how; any deviation from the brief and its "
-            "reason.",
-            "",
-            "## Task",
-            task,
-        ]
-        if constraints:
-            impl_parts += ["", "## Constraints (hard boundaries)", constraints]
-        impl_parts += ["", "## Implementation brief (from the analysis phase)",
-                       brief]
-
         result = await _run_codex(
-            "\n".join(impl_parts),
+            _abraham_implementation_prompt(task, constraints, brief),
             write=True, infra=False, ctx=ctx, web_search=True,
             images=list(images or []),
             tool_name="abraham", workdir=cwd,
             request_started=request_t0,
         )
         return (
+            result.partition("\n")[0] + "\n" + fallback_note +
             "[abraham — phase 1 analyzed (read-only by instruction; infra, "
             "live web, MCP servers); phase 2 implemented (FULL ACCESS: no "
             "sandbox, network, live web and MCP servers — "
             "--dangerously-bypass-approvals-and-sandbox)]\n\n"
-            + phase1_note + result
+            + phase1_note + result.partition("\n")[2]
         )
     finally:
         _release_write_lock(cwd)
 
 
-@mcp.tool()
-async def codex_resume_run(
+async def _resume_run(
     run: str = "",
     nudge: str = "",
     infra: bool | None = None,
     web_search: bool | None = None,
-    images: list[str] = [],
+    images: list[str] | None = None,
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -5404,13 +5329,6 @@ async def codex_resume_run(
             shell/network + your MCP servers; False takes it away.
         web_search: Change live web search for the continuation. None
             inherits the original run's setting.
-        images: Local image file paths to attach to the continuation's turn
-            (screenshots, diagrams). Codex views them natively. Missing paths
-            are rejected loudly before any spend. Images without a nudge
-            continue the thread with a default one: they never ride the
-            stored-answer replay or the cancelled-run refusal. Continuing a
-            failed or interrupted run also re-attaches the images its
-            interrupted turn was given.
     """
     # WORKSPACE SCOPING (security): the journal is global across every project
     # on this machine. Listing or auto-resuming must not surface another
@@ -5421,14 +5339,29 @@ async def codex_resume_run(
     # Anchor the heartbeat deadline to THIS request's start: a fresh per-run
     # clock would resurrect dead-token sends (round-2 review, 2026-08-21).
     request_t0 = time.monotonic()
-    # Images are an explicit instruction: with no nudge they bring their own,
-    # so no short-circuit below (stored answer, cancelled refusal) drops them.
-    if isinstance(images, str):
-        images = [images]
-    images = list(images or [])
+    images = [images] if isinstance(images, str) else list(images or [])
+    if any(not isinstance(p, str) or not Path(p).is_file() for p in images):
+        missing = [str(p) for p in images if not isinstance(p, str) or not Path(p).is_file()]
+        return "[Not delivered: image paths do not exist: " + ", ".join(missing) + "]"
+    images = list(dict.fromkeys(str(Path(p).resolve()) for p in images))
     instructed = bool(nudge) or bool(images)
     if images and not nudge:
         nudge = IMAGES_NUDGE
+
+    if run.startswith("run_"):
+        if infra is False or web_search is False:
+            return await _coordinator_notice("[Not delivered: native Abraham preserves full access and live web; policy downgrades cannot be applied on resume.]")
+        return await _native_run_action("run/resume", run, text=nudge, images=images, deadline=time.time() + MAX_RUNTIME_SECONDS)
+    if not run:
+        discovery = await _native_runs()
+        if not discovery["available"]:
+            return _native_unavailable(discovery) + " Automatic resume refused because a newer native run may exist."
+        candidates = [r for r in discovery["data"] if r["state"] != "completed"]
+        latest_exec = max((float(r.get("first_ts") or r.get("ts") or 0) for r in _workspace_runs()), default=0)
+        if candidates and candidates[-1]["created"] >= latest_exec:
+            if infra is False or web_search is False:
+                return await _coordinator_notice("[Not delivered: native Abraham preserves full access and live web; policy downgrades cannot be applied on resume.]")
+            return await _native_run_action("run/resume", candidates[-1]["run"], text=nudge, images=images, deadline=time.time() + MAX_RUNTIME_SECONDS)
 
     cwd = _get_cwd()
     all_runs = _journal_runs()
@@ -5442,8 +5375,7 @@ async def codex_resume_run(
     if run == "list":
         listing = await codex_runs()
         if instructed:
-            listing += ("\n\n[Not delivered: run=\"list\" only lists runs; "
-                        "the nudge and images were not sent.]")
+            listing += '\n[Not delivered: run="list" only lists runs; the nudge and images were not sent.]'
         return listing
 
     if _IS_WINDOWS:
@@ -5496,15 +5428,7 @@ async def codex_resume_run(
         collected = await _collect_detached(rec, run, ctx, request_t0, nudge)
         if collected is not None:
             if instructed:
-                # Never accept-and-ignore: this call handled the detached run
-                # (collected it, or reported why it could not); the caller's
-                # instructions were not delivered.
-                collected += (
-                    "\n\n[Not delivered with this call: the nudge"
-                    + (" and images" if images else "")
-                    + " went nowhere, as this call handled the detached run "
-                    "above. Once that run has ended, call codex_resume_run on "
-                    "it again to continue with them.]")
+                collected += "\n[Not delivered with this call: the nudge and images were not sent because this call handled a detached run. Once it has ended, call codex_resume_run again to continue with them.]"
             return collected
         rec = _journal_runs().get(run, rec)
     if (rec.get("has_end") and str(rec.get("status") or "") == "cancelled"
@@ -5553,6 +5477,7 @@ async def codex_resume_run(
     # changes behind a read-only sandbox. Re-dispatch through the right tool
     # instead of flipping this axis mid-thread.
     use_write = bool(rec.get("write"))
+    resume_custody = str(rec.get("custody_cwd") or "") if not use_write else ""
     was_sealed = use_write and not rec.get("full_access")
     if use_write and _IS_WINDOWS:  # unreachable (all Windows continuations refused above); second fence
         return "[write runs cannot be resumed on Windows in 1.17.x (no inheritable lock); see abraham.]"
@@ -5623,20 +5548,20 @@ async def codex_resume_run(
     continuation = nudge or RESUME_NUDGE
     original_prompt = str(rec.get("prompt") or "")
     completed = bool(rec.get("has_end")) and str(rec.get("status") or "") == "ok"
-    restored_missing: list[str] = []
+    restored_missing = []
     if not completed:
-        # The interrupted turn's images go back too: codex may never have
-        # received them. One that is gone is said, not silently skipped.
         for img in rec.get("images") or []:
-            if not isinstance(img, str) or img in images:
+            if not isinstance(img, str):
                 continue
-            if Path(img).is_file():
-                images.append(img)
+            path = str(Path(img).resolve())
+            if path in images:
+                continue
+            if Path(path).is_file():
+                images.append(path)
             else:
                 restored_missing.append(img)
         if restored_missing:
-            note += ("[The interrupted turn's image(s) no longer exist and were "
-                     f"not re-attached: {', '.join(restored_missing)}]\n\n")
+            note += "[Interrupted-turn images no longer exist and were not re-attached: " + ", ".join(restored_missing) + "]\n\n"
     if original_prompt and not completed:
         continuation = (
             "[RECOVERY CONTEXT — this thread's interrupted turn may not have "
@@ -5651,12 +5576,14 @@ async def codex_resume_run(
     # targeted a subtree of this workspace) — locking or writing against the
     # server cwd would miss the tree the brief describes.
     run_cwd = str(rec.get("cwd") or cwd)
-    if use_write:
+    lock_cwd = resume_custody or run_cwd
+    needs_lock = use_write or bool(resume_custody)
+    if needs_lock:
         # EVERY write continuation takes the tree lock (round 40: the
         # acquisition once sat inside a sealed-only branch, so a full-access
         # resume ran unlocked, failed its child publication at the execution
         # barrier, and released a lock it never held).
-        got_lock, holder = _acquire_write_lock(run_cwd, f"resume:{run}")
+        got_lock, holder = _acquire_write_lock(lock_cwd, f"resume:{run}")
         if not got_lock:
             return (
                 f"[resume refused: another write run holds this tree's "
@@ -5668,8 +5595,8 @@ async def codex_resume_run(
     # the thread-claim descriptor.
     claimed, holder = _acquire_run_claim(_run_terminal_claim_key(run))
     if not claimed:
-        if use_write:
-            _release_write_lock(run_cwd)
+        if needs_lock:
+            _release_write_lock(lock_cwd)
         return (
             f"[Run {run} is already owned by another call ({holder}) — being "
             f"collected, resumed, or cancelled. Wait for that result "
@@ -5678,8 +5605,8 @@ async def codex_resume_run(
     claimed_t, holder_t = _acquire_run_claim(_thread_claim_key(tid))
     if not claimed_t:
         _release_run_claim(_run_terminal_claim_key(run))
-        if use_write:
-            _release_write_lock(run_cwd)
+        if needs_lock:
+            _release_write_lock(lock_cwd)
         return (
             f"[Thread {tid} (run {run}) is already being resumed or collected by "
             f"another call ({holder_t}). Two resumes of one thread double-execute "
@@ -5699,12 +5626,13 @@ async def codex_resume_run(
             request_started=request_t0,
             claim_key=_thread_claim_key(tid),
             images=images,
+            custody_cwd=resume_custody,
         )
     finally:
         _release_run_claim(_thread_claim_key(tid))
         _release_run_claim(_run_terminal_claim_key(run))
-        if use_write:
-            _release_write_lock(run_cwd)
+        if needs_lock:
+            _release_write_lock(lock_cwd)
 
 
 # ---------------------------------------------------------------------------
@@ -6192,8 +6120,8 @@ async def _collect_detached_claimed(
     return None  # died without an answer → caller falls back to a thread resume
 
 
-@mcp.tool()
-async def codex_runs(limit: int = 10) -> str:
+@_lead_tool()
+async def codex_runs(limit: int = 10, session_id: str = "") -> str:
     """
     Status of this workspace's codex runs, newest last — RUNNING (attached
     to a live call), DETACHED (outlived its MCP call after a server restart
@@ -6205,9 +6133,11 @@ async def codex_runs(limit: int = 10) -> str:
     Args:
         limit: How many most-recent runs to show (default 10).
     """
+    discovery = await _native_runs(max(1, min(int(limit or 10), 50)))
+    native_runs = discovery["data"]
     runs = _workspace_runs(max(1, min(int(limit or 10), 50)))
-    if not runs:
-        return "[No recorded codex runs for this workspace.]"
+    if not runs and not native_runs:
+        return "[No recorded codex runs for this workspace.]" if discovery["available"] else _native_unavailable(discovery) + " No recorded exec runs."
     lines = [f"Codex runs in this workspace (oldest → newest) — run budget "
              f"{MAX_RUNTIME_SECONDS}s ({MAX_RUNTIME_SOURCE}; CODEX_ORACLE_MAX_RUNTIME_S):"]
     now = time.time()
@@ -6237,7 +6167,125 @@ async def codex_runs(limit: int = 10) -> str:
         "stopped before any new write run in that tree; an ORPHANED run has "
         "no deadline watchdog — stop it with codex_cancel_run."
     )
-    return "\n".join(lines)
+    if not discovery["available"]:
+        lines.append(_native_unavailable(discovery))
+    if native_runs:
+        lines.append("Native coordinator runs (durable across MCP restarts):\n" + json.dumps(native_runs, ensure_ascii=False, indent=2))
+    return await _coordinator_notice("\n".join(lines))
+
+
+async def _collect_bound_reviews(run: str = "") -> str:
+    try:
+        jobs = (await _coordinator_call("review/jobs", {"cwd": _get_cwd(), "run": run}, timeout=3))["data"]
+        records = _journal_runs()
+        completed = []
+        for job in jobs:
+            if job["state"] != "dispatched":
+                continue
+            record = records.get(job["run"], {})
+            if not record.get("has_end") or not _run_belongs(record, _get_cwd()):
+                continue
+            answer = ""
+            if record.get("status") == "ok" and record.get("result_file"):
+                answer = Path(record["result_file"]).read_text(encoding="utf-8")
+            value = await _coordinator_call("review/complete", {"job": job["id"], "completion": {
+                "run": job["run"], "thread": record.get("thread_id"), "status": record.get("status"),
+                "completed": record.get("status") == "ok" and bool(answer), "answer": answer}})
+            completed.append(value)
+        return "\n[Collected bound reviews]\n" + json.dumps(completed) if completed else ""
+    except Exception as exc:
+        return "\n[Bound review collection unavailable: " + str(getattr(exc, "code", type(exc).__name__)) + "]" if run else ""
+
+
+@_lead_tool()
+async def codex_resume_run(run: str = "", nudge: str = "", infra: bool | None = None,
+                           web_search: bool | None = None, images: list[str] = [],
+                           ctx: Context = None, session_id: str = "") -> str:
+    """Continue a codex run that failed, timed out, or was interrupted —
+    WITH ITS ORIGINAL CONTEXT, not a re-ask.
+
+    Codex persists each run's session, so a run killed mid-flight (MCP
+    server restart, plugin reload, cancelled call, transient API error
+    that outlived the automatic retries) can be continued from where it
+    stopped. Never re-dispatch the whole question after a failure — resume
+    it: the model still has the reasoning and tool output it had built up.
+
+    A finished-but-undelivered run (e.g. the reload killed the call after
+    codex answered) returns its stored answer immediately, at no cost —
+    unless you pass a nudge, which continues the thread with your new
+    instructions instead of replaying the old answer.
+
+    A continuation of a failed or interrupted run RESTATES the original task
+    from the run journal: a hard-killed turn may have persisted none of its
+    input vendor-side (measured 2026-08-09), so the thread cannot be trusted
+    to remember the question. Threads that did retain context see a
+    labelled duplicate. A COMPLETED run's thread holds its task already, so
+    a nudge to one continues it as is (a follow-up question to an advisory
+    session is the tool's own `session` argument).
+
+    SWITCH CAPABILITIES MID-COURSE. A resume may change the run's settings,
+    so a run that turns out to need something it didn't have can be rescued
+    instead of restarted: cancel the call, then resume the SAME thread — all
+    its accumulated reasoning and tool output intact — with new settings and
+    new instructions. The classic case: research that needs the live system.
+
+        codex_resume_run(run="codex3·8123", infra=True,
+                         nudge="SSH to the app host and check the celery "
+                               "queue depth, then finish the analysis")
+
+    Write runs (abraham) resume as write runs, with full access, network
+    and live web search (a run that began sealed under 1.x continues with
+    full access), the git contract and the changed-files report intact.
+    The write axis itself has no override: read runs cannot be escalated to
+    write by resuming, and write runs cannot be downgraded.
+
+    Args:
+        run: The run id from the failure message ("run id: codex7·21746").
+            Omit to resume the most recent recoverable run. Pass "list" to
+            see the recent runs and their statuses instead.
+        nudge: Instructions for the continuation — additional direction, not
+            just "carry on". Default asks for the complete final answer from
+            where it left off.
+        infra: Change live-infrastructure access for the continuation.
+            None (default) inherits the original run's setting; True grants
+            shell/network + your MCP servers; False takes it away.
+        web_search: Change live web search for the continuation. None
+            inherits the original run's setting.
+        images: Local image file paths to attach to the continuation's turn
+            (screenshots, diagrams). Codex views them natively. Missing paths
+            are rejected loudly before any spend. Images without a nudge
+            continue the thread with a default one: they never ride the
+            stored-answer replay or the cancelled-run refusal. Continuing a
+            failed or interrupted run also re-attaches the images its
+            interrupted turn was given.
+
+    Native runs (run_ IDs) collect on an empty call without another model request,
+    including cancelled or interrupted runs. A nudge or images explicitly requests
+    continuation. Reconciliation must finish first: active, frozen, UNKNOWN or
+    uncertain submissions refuse a second turn and report non-delivery. Images use
+    native localImage inputs. Interrupted recovery restores surviving images from
+    the persisted phase, including earlier continuations, and names missing historical
+    paths. Missing newly supplied paths refuse before submission. No native RPC is
+    blindly retried. Native writers preserve full access and live web search.
+
+    Defaults: without images an exec recovery uses "The previous process was
+    interrupted before your answer arrived. Continue from where you left off and
+    provide the complete final answer." Images alone use "Images are attached to
+    this turn. Look at each one, then continue from where you left off with them in mind."
+    A completed exec run with no instructions returns its saved answer; a cancelled
+    exec run requires explicit instructions. List mode and detached collection do
+    not deliver supplied instructions or images and say so. Run discovery is scoped
+    to this dispatch folder or the target checkout. Bound review collection records
+    the original candidate's full answer, including after MCP restart.
+    """
+    answer = await _resume_run(run=run, nudge=nudge, infra=infra, web_search=web_search, images=images, ctx=ctx)
+    if not run.startswith("run_"):
+        answer += await _collect_bound_reviews(run)
+        if run and run != "list":
+            discovery = await _native_runs()
+            if not discovery["available"]:
+                answer += "\n" + _native_unavailable(discovery)
+    return await _coordinator_notice(answer)
 
 
 def _run_log_lines(rec: dict[str, Any], lines: int) -> list[str]:
@@ -6255,8 +6303,7 @@ def _run_log_lines(rec: dict[str, Any], lines: int) -> list[str]:
     return out[-lines:]
 
 
-@mcp.tool()
-async def codex_run_log(run: str = "", lines: int = 40) -> str:
+async def _codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result: bool = False, session_id: str = "") -> str:
     """
     What a codex run is doing RIGHT NOW — its live log (reasoning summaries,
     commands, web searches, errors, retries), in-conversation, instead of
@@ -6269,6 +6316,20 @@ async def codex_run_log(run: str = "", lines: int = 40) -> str:
         run: Run id ("codex7·21746"); omit for the most recent run here.
         lines: How many trailing lines (default 40, max 400).
     """
+    if run.startswith("run_"):
+        return await _native_run_action("run/result" if result else "run/events", run, cursor=cursor,
+                                        limit=50000 if result else max(1, min(int(lines or 40), 400)))
+    discovery = await _native_runs()
+    if not run and not discovery["available"]:
+        return _native_unavailable(discovery) + " Automatic selection refused; supply an explicit run ID."
+    native_runs = discovery["data"]
+    if not run and native_runs:
+        previous = _workspace_runs()
+        if not previous or native_runs[-1]["created"] >= float(previous[-1].get("first_ts") or previous[-1].get("ts") or 0):
+            run = native_runs[-1]["run"]
+    if run.startswith("run_"):
+        return await _native_run_action("run/result" if result else "run/events", run, cursor=cursor,
+                                        limit=50000 if result else max(1, min(int(lines or 40), 400)))
     runs = _workspace_runs()
     if not runs:
         return "[No recorded codex runs for this workspace.]"
@@ -6295,8 +6356,7 @@ async def codex_run_log(run: str = "", lines: int = 40) -> str:
     return f"{head}\n{body}"
 
 
-@mcp.tool()
-async def codex_cancel_run(run: str = "") -> str:
+async def _codex_cancel_run(run: str = "", session_id: str = "") -> str:
     """
     Stop a RUNNING or DETACHED codex run: SIGKILL its process group (and its
     watchdog) and journal it as cancelled. Omit `run` to stop the most recent
@@ -6311,6 +6371,19 @@ async def codex_cancel_run(run: str = "") -> str:
     Args:
         run: Run id from codex_runs / a failure message; "" = most recent live run.
     """
+    if run.startswith("run_"):
+        return await _native_run_action("run/interrupt", run)
+    discovery = await _native_runs()
+    if not run and not discovery["available"]:
+        return _native_unavailable(discovery) + " Automatic selection refused; supply an explicit run ID."
+    native_runs = discovery["data"]
+    if not run:
+        active = [r for r in native_runs if r["state"] not in {"completed", "failed", "cancelled", "refused", "blocked"}]
+        previous = [r for r in _workspace_runs() if _run_status(r) in _STOPPABLE]
+        if active and (not previous or active[-1]["created"] >= float(previous[-1].get("first_ts") or previous[-1].get("ts") or 0)):
+            run = active[-1]["run"]
+    if run.startswith("run_"):
+        return await _native_run_action("run/interrupt", run)
     runs = _workspace_runs()
     live = [r for r in runs if _run_status(r) in _STOPPABLE]
     rec = None
@@ -6568,6 +6641,49 @@ async def codex_cancel_run(run: str = "") -> str:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+@_lead_tool()
+async def codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result: bool = False, session_id: str = "") -> str:
+    """What a codex run is doing RIGHT NOW — its live log (reasoning summaries,
+    commands, web searches, errors, retries), in-conversation, instead of
+    `tail -F` on ~/.claude/logs/codex-oracle. Works for running, detached and
+    finished runs. The MCP task panel goes silent once Claude Code backgrounds
+    a call (its progress token is deregistered at ~120 s); this is the
+    channel that keeps working.
+
+    Args:
+        run: Run id ("codex7·21746"); omit for the most recent run here.
+        lines: How many trailing lines (default 40, max 400)."""
+    answer = await _codex_run_log(run=run, lines=lines, cursor=cursor, result=result, session_id=session_id)
+    if run and not run.startswith("run_"):
+        discovery = await _native_runs()
+        if not discovery["available"]:
+            answer += "\n" + _native_unavailable(discovery)
+    return await _coordinator_notice(answer)
+
+
+@_lead_tool()
+async def codex_cancel_run(run: str = "", session_id: str = "") -> str:
+    """Stop a RUNNING or DETACHED codex run: SIGKILL its process group (and its
+    watchdog) and journal it as cancelled. Omit `run` to stop the most recent
+    live run in this workspace. The thread stays on disk, so the run remains
+    resumable with a nudge via codex_resume_run.
+
+    While the run's owning server is alive, the terminal record is the
+    OWNER's to write: this call kills the live attempt and leaves a standing
+    cancel intent; codex_runs shows CANCELLING until the owner journals the
+    cancellation (within ~1s — its waits poll the intent every second).
+
+    Args:
+        run: Run id from codex_runs / a failure message; "" = most recent live run."""
+    answer = await _codex_cancel_run(run=run, session_id=session_id)
+    if run and not run.startswith("run_"):
+        discovery = await _native_runs()
+        if not discovery["available"]:
+            answer += "\n" + _native_unavailable(discovery)
+    return await _coordinator_notice(answer)
+
+
 
 if __name__ == "__main__":
     _install_shutdown_handlers(hard_exit=True)
