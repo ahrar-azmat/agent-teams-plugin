@@ -97,6 +97,7 @@ named `mcp__plugin_software-workflows_codex-oracle__<tool>`.
 | Agent `code-reviewer` | Dispatches a blind Codex review, verifies its findings and writes one report. |
 | `/software-workflows:setup` | The setup above. |
 | `/software-workflows:abraham` | Hands a task to Codex as the writer (see below). |
+| `/software-workflows:office` | Your Codex runs as a live pixel-art office in the browser, where you can read and steer each one (see [The Codex Office](#the-codex-office)). |
 | MCP server `codex-oracle` | The Codex tools below. The plugin registers it itself (`.mcp.json`); do not add a second `mcpServers` entry for it. |
 | Hooks | The plan gate, the push gate and its git shim, the session-start check, and a live-view nudge. |
 
@@ -199,6 +200,96 @@ How the team works with it:
 
 Full access means full access. Processes a run leaves behind are swept cooperatively, but one that
 deliberately escapes keeps your user's rights. That is part of what full access accepts.
+
+## The Codex Office
+
+`/software-workflows:office` opens a pixel-art office in your browser, at
+`http://127.0.0.1:8765/`. Every Codex run on this machine is a worker at a desk, from every
+session and project.
+
+- **Live workers** face their monitor and type. A bubble shows what they're doing right now:
+  thinking, a command, a web search, a file edit, or waiting for capacity.
+- **Finished workers** turn around and wear a badge: ✓ done, ! failed, ⏸ paused, z interrupted.
+- **Statuses follow the server's own rules**, the ones `codex_runs` uses, with two additions:
+  "Starting" for a run its server has taken but not spawned yet, and "Starting the writer" between
+  abraham's analysis and its writer. A run whose cancel never finished stays "Pausing". Once its
+  server and its Codex process are both gone, it shows "Cancel unfinished" with a **Retry cancel**
+  button, which ends it.
+- **One worker per conversation.** A conversation continued over several runs stays one worker. That
+  covers a review session's turns, a resumed run, and abraham's analysis followed by its writer.
+
+**Roles.** Each worker's role comes from the first of these that applies:
+1. The role you pick from the role menu in its header.
+2. A role its caller named with one line in the task or `context`, such as `Role: Product Manager`.
+3. The role its Codex tool implies: Builder (abraham writing), Planner (abraham's analysis),
+   Reviewer, Architect, Researcher or Analyst.
+
+The other roles are CEO, CTO, Project Manager, Product Manager, Business Analyst, QA Engineer,
+Security Engineer, DevOps Engineer, Designer, Data Analyst and Tech Writer. Each has its own look:
+the CEO wears a suit and tie, the Project Manager carries a clipboard, the Business Analyst a
+tablet. Executives get a gold-trimmed desk. The agent-teams skill tells Claude to name the role when
+a run does that role's work.
+
+The office doesn't guess a role from the task's wording. Measured on the real journal, keyword
+guesses mislabelled most of the runs they touched.
+
+**Click a worker** to read the whole conversation on the right. It shows Claude's task, Codex's
+messages, its reasoning steps, every command with its exit code and output, web searches, file
+changes and token use. You can filter what you see.
+
+Tabs:
+- **Answer**: the final answer.
+- **Prompt**: the exact text Codex received.
+- **Runs**: run ids, thread ids and log paths.
+
+**Act on a worker** from the composer under its conversation:
+
+| Control | What it does |
+|---|---|
+| ⏸ Pause | Stops the run now. Its Codex thread stays on disk. |
+| Continue | Picks a stopped or finished thread up again, with your instructions. |
+| Interrupt & send | Pauses a live run, then continues the same thread with your note at once. |
+| Send when done | Delivers your note when the current run finishes. Use this for abraham's planner: interrupting it ends the dispatch before the writer starts. A note sent while abraham hands over to its writer waits for the writer. The office knows the writer is still to come because abraham's call still holds the tree's write lock. Without `lsof` it can't read that, and the note is refused rather than sent to the analysis. Until a note is delivered, Withdraw takes it back. |
+| 📎, drop or paste | Attaches images and files. |
+| `@` | Picks a file from the worker's workspace. |
+
+Every action goes through this plugin's own `codex_cancel_run` and `codex_resume_run`, run by its
+own MCP server. So the run journal, the locks and the run budget work exactly as when Claude Code
+calls them. An action's outcome comes from the journal, not from the reply alone:
+- A pause is done once the run reads stopped.
+- A continuation is done once the run it started has answered. Only a run started by the action's own
+  server counts, never another caller's continuation of the same thread.
+- A refusal shows as failed, with the server's words.
+- A continuation gets as long as Claude Code gives the same call: the plugin's 4 h call timeout.
+- Continuing a detached run that had already finished first collects its answer, then delivers your
+  note.
+- An attachment or `@`-file that's gone by the time you send is refused by name, and your draft stays.
+
+Before sending images, the office asks the server whether `codex_resume_run` takes an `images`
+argument:
+- If it does, the images are attached to the continuation.
+- If it doesn't, the note gives their paths and asks Codex to open each with its `view_image` tool.
+  Codex's look at an image doesn't show in the stream, because `codex exec` reports no event for it.
+
+A note to a live worker interrupts it. Steering a live run without stopping it comes with the
+writer coordinator.
+
+The office and every action it sends run detached from Claude Code. Closing the page, ending the
+session or restarting Claude Code stops none of them. Manage the office with these commands:
+- `/software-workflows:office`: start it, or find the one already running.
+- `/software-workflows:office status`
+- `/software-workflows:office stop`
+
+Only you can run the command; Claude cannot start it on its own. The command never puts its argument
+into a shell command: Claude reads it and runs one of three fixed command lines, for start, stop or
+status. One office runs per data directory: a second start finds the first.
+
+Uploads, the action records and the running office's record live in the plugin's data directory,
+under `office/`.
+
+The office listens on 127.0.0.1 only. It refuses API calls without the per-start token its page
+carries, or with a foreign Host header. With Claude Code's Bash sandbox on, the command can't write
+the plugin's data directory, so it prints the command to run in your own terminal instead.
 
 ## The guards
 

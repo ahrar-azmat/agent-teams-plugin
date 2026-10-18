@@ -3,6 +3,74 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.1.0] — 2026-10-18
+
+### Added: the Codex Office (`/software-workflows:office`)
+- **The office.** A pixel-art office in the browser where every Codex run on the machine is a worker
+  at a desk. Live workers show what they're doing right now. Finished ones show how they ended.
+- **The conversation.** Click a worker for its whole conversation, read from the run's own event
+  spool: messages, reasoning, commands and their output, web searches, file changes and tokens. A
+  thread continued over several runs is one worker: review sessions, resumes, and abraham's analysis
+  with its writer.
+- **Controls.** Pause a worker, continue it with instructions, interrupt it with a note, or queue a
+  note for when it finishes. Attach images and files, and `@`-reference workspace files.
+- **How it acts.** Every action runs through the plugin's own `codex_cancel_run` and
+  `codex_resume_run`, on its own MCP server. Actions run detached: launchd is their parent, so a
+  Claude Code restart does not stop them.
+- **Images.** The office asks the server whether `codex_resume_run` takes `images`. If it does, the
+  images are attached; if not, their paths go to Codex's `view_image` tool.
+- **Measured** through the UI on a scratch conversation:
+  - An image plus an `@`-file continuation answered with the image's text and the file's secret.
+  - Interrupt & send cancelled the live run, and the same thread answered the new note 16 s after the
+    click.
+  - Pause cancelled a run in about 2 s.
+  - `$ARGUMENTS` reaching a command's `!` step, which `stop` and `status` rely on, was measured on
+    Claude Code 2.1.302.
+- **Roles.** Besides the six roles that follow the Codex tool, a worker can be one of eleven more:
+  CEO, CTO, Project Manager, Product Manager, Business Analyst, QA Engineer, Security Engineer,
+  DevOps Engineer, Designer, Data Analyst or Tech Writer. Each has its own sprite and gear.
+  - **How a role is chosen:** the person's pick in the office comes first, then a `Role: <name>` line
+    from the caller, then the tool's own role.
+  - **Claude names roles:** the agent-teams skill tells Claude to name one when a run does that
+    role's work.
+  - **No guessing:** guessing roles from a task's wording was tried on the real journal and dropped,
+    because it mislabelled most of the runs it touched.
+- **When the server goes away.** The page says so in a banner. It reloads itself when the office
+  restarts with a new token, and reopens the worker that was open.
+- **Safety.** It listens on 127.0.0.1 only. It needs the page's per-start token, and refuses a
+  foreign Host header. One office runs per data directory, and two starts never race.
+- **Only you start it, and its argument never reaches a shell.** The command is marked
+  `disable-model-invocation`, so Claude cannot run it on its own.
+  - Claude Code pastes `$ARGUMENTS` into a command's shell step as typed. Measured on 2.1.302, a plain
+    `!` step given `$(printf INJECTED)` ran the `printf`.
+  - A quoted heredoc stopped single-line expansions. A multi-line argument that repeats the
+    delimiter still ended it: under bypassPermissions the next line ran (measured), while the
+    default mode refused it.
+  - So the command has no shell step. Claude reads the argument and runs one of three fixed command
+    lines, for start, stop or status.
+- **Run status follows the server's rules.** Liveness, orphaned writers and detached runs read as in
+  `codex_runs`. A zombie counts as gone; a process table that can't be read counts as unknown, not
+  as everything gone. Without a recorded start time, the command line must name codex or the server,
+  as the server checks. The office adds two states:
+  - "Starting", for a run its server has taken but not spawned yet.
+  - "Starting the writer", between abraham's analysis and its writer. Its evidence is the abraham
+    call's tree write lock, still held by its server. A failed or unclear read of the lock counts as
+    unknown: every way of continuing the analysis then refuses, instead of guessing.
+- **A cancel that never finished stays CANCELLING**, as in `codex_runs`. When its server and process
+  are both gone, the office says "Cancel unfinished" and offers **Retry cancel**, which ends it.
+- **abraham's writer is joined to its analysis by the brief it was handed.** That brief ends with the
+  analysis run's own live-log path. All 37 writers in the journal joined their analysis this way.
+- **Outcomes come from the journal.**
+  - A pause is done when the journal shows the run stopped.
+  - A continuation is done when the journal shows the run that the action's own server started.
+    Another caller's continuation of the same run never counts.
+  - A refusal from the server arrives as ordinary text, and shows as failed with the server's words.
+  - A continuation waits as long as Claude Code's own call would: the plugin's 4 h call timeout.
+    Writing the request to the server counts against the same deadline.
+  - Continuing a detached run that had finished collects its answer first, then delivers the note.
+  - An attachment that's gone by the time it's sent is refused by name, and the draft stays.
+- **Drafts survive a reload.** An unsent note, its uploads and its `@`-files are kept per worker.
+
 ## [software-workflows 2.0.0] — 2026-10-18
 
 Not in 2.0.0: parallel Codex writers in one checkout. abraham still runs one writer per
