@@ -6742,6 +6742,16 @@ session B, attaching it changed A's fingerprint; with 16,000 files, A's scan fin
 
 Both runs exited 0 and left no daemon.
 
+### 2.3.3: unprepared edits and replayed hooks (review turn 10)
+
+| Check | 2.3.2 (tag export), calibration | 2.3.3 |
+| --- | --- | --- |
+| `lead_bash7.py` (`BULK=20000`): B's NotebookEdit refused by the adapter, written by the host, Post during A's scan | `bulk/019999.txt` = `lead-command` for A: **red** | UNKNOWN |
+| `lead_hooks_edge.py`: the same denied Pre replayed | `LEAD_HOOK_UNCERTAIN`: **red** | `CLAIM_CONFLICT` with conflicts |
+| `lead_hooks_edge.py`: second Post of an unprepared NotebookEdit | `OPERATIONAL_FAILURE`: **red** | `LEAD_PRE_MISSING` |
+
+Every run exited 0 and left no daemon. A claim lost inside `custody.acquire` was not staged.
+
 ### Commands and exit codes for the lead record
 
 The scripts are lead scratch in the session's scratchpad (`…/scratchpad/m3/`), not part of the

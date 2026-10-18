@@ -217,6 +217,23 @@ async def dispatch(daemon, payload):
             return {"coordinated": True, "observed": ident, "executed_again": False}
     path = normalize(checkout, target)["path"]
     if event == "PreToolUse":
+        def refused():  # denied: it writes nothing
+            daemon.store.put("lead_hook", ident, {"tool": tool, "state": "refused", "input_digest": signature,
+                             "checkout": checkout["id"]})
+
+        def refuse(conflicts):
+            refused()
+            raise CoordinatorError("CLAIM_CONFLICT", "Scope held by " + conflicts[0]["holder"] +
+                                   "; send a message to that holder or the lead, then request lead-authorized handback",
+                                   {"conflicts": conflicts})
+        if record and record["state"] == "refused":
+            # a replayed denial is decided again, never turned into an allowing warning
+            conflicts = daemon.custody.conflicts(checkout["id"], actor["unit"], [normalize(checkout, path)])
+            if conflicts:
+                refuse(conflicts)
+            record = None
+            daemon.store.put("lead_hook", ident, {"tool": tool, "state": "received", "input_digest": signature,
+                             "checkout": checkout["id"], "window": None, "deadline": time.time() + FILE_HOOK_S})
         if record:
             if record["state"] not in ("prepared", "verified") or daemon.store.get(record["operation"])["state"] not in ("prepared", "verified"):
                 raise CoordinatorError("LEAD_HOOK_UNCERTAIN", "Prior intent is uncertain; do not replay this tool use")
@@ -225,18 +242,19 @@ async def dispatch(daemon, payload):
         # (an uncalibrated adapter, an encoding), so that refusal must never hide the claim.
         conflicts = daemon.custody.conflicts(checkout["id"], actor["unit"], [normalize(checkout, path)])
         if conflicts:
-            daemon.store.put("lead_hook", ident, {"tool": tool, "state": "refused", "input_digest": signature,
-                             "checkout": checkout["id"]})  # denied: it writes nothing
-            raise CoordinatorError("CLAIM_CONFLICT", "Scope held by " + conflicts[0]["holder"] +
-                                   "; send a message to that holder or the lead, then request lead-authorized handback",
-                                   {"conflicts": conflicts})
+            refuse(conflicts)
         if tool == "NotebookEdit":
             intended(tool, data, b"")  # Concrete refusal before taking a claim.
         pre = await asyncio.to_thread(read_path, daemon.store, checkout, path)
         raw = daemon.store.read_blob(pre["blob"]) if pre["blob"] else b""
         content = intended(tool, data, raw)
         image = {"blob": daemon.store.blob(content), "mode": pre["mode"] or "100644"}
-        await daemon.custody.acquire(actor, [path])
+        try:
+            await daemon.custody.acquire(actor, [path])
+        except CoordinatorError as exc:
+            if exc.code == "CLAIM_CONFLICT" and exc.details.get("conflicts"):
+                refused()  # lost the claim to a concurrent edit: the hook denies it too
+            raise
         operation = await daemon.ledger.prepare(actor, "lead-edit", {"expected": {path: image}, "host_tool": tool, "input_digest": signature}, [path],
                                                 native={"session_id": session, "tool_use_id": call})
         if operation["pre"][path] != pre:
@@ -245,13 +263,14 @@ async def dispatch(daemon, payload):
         daemon.store.put("lead_hook", ident, {"unit": actor["unit"], "actor": actor["id"], "tool": tool,
                          "state": "prepared", "input_digest": signature, "operation": operation["id"]}, actor["unit"])
         return {"coordinated": True, "operation": operation["id"]}
-    if not record or record["state"] in ("received", "refused"):
-        # no prepared intent: its Pre was refused (an uncalibrated adapter, an encoding) or never
-        # finished, and the host went ahead
-        if record:
+    if not record or record["state"] in ("received", "refused", "unrecorded"):
+        # No prepared intent: its Pre was refused (an uncalibrated adapter, an encoding) or never
+        # finished, and the host went ahead. It counts as possibly writing until this reconcile
+        # has recorded its bytes; a failed reconcile leaves it counting until its deadline.
+        await daemon.ledger.reconcile(checkout, [path], reason="lead post hook without prepared intent")
+        if record and record["state"] != "unrecorded":
             record["state"] = "unrecorded"
             daemon.store.save(record)
-        await daemon.ledger.reconcile(checkout, [path], reason="lead post hook without prepared intent")
         raise CoordinatorError("LEAD_PRE_MISSING", "No matching prepared host intent; matching bytes cannot acquire authorship")
     operation = daemon.store.get(record["operation"])
     if record["state"] == "verified":

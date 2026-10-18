@@ -3,6 +3,28 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.3.3] — 2026-10-19
+
+### Fixed: from the review of 2.3.2
+- **An edit that was never prepared keeps counting as possibly writing until its Post has
+  recorded its bytes.** In 2.3.2 its Post stopped counting it before waiting for the ledger, so
+  another session's Bash completion, scanning meanwhile, could be credited with it.
+- **A replayed denied edit is denied again.** The same Pre for a path another unit claims answered
+  "uncertain" the second time, which the hook does not deny.
+- **An edit that loses its claim to a concurrent edit** is recorded as denied, so it no longer keeps
+  other lead commands from being quiet for 180 s.
+- **A second completion of an unprepared edit** answers `LEAD_PRE_MISSING` again instead of failing.
+
+### Measured (2.3.2 as calibration, then 2.3.3)
+- **The race**, 20,000-file schedule (one full reconcile: 4.6–7.7 s): session B's NotebookEdit is
+  refused by the adapter, the host writes anyway, and its Post arrives while A's Bash completion is
+  scanning. 2.3.2: the file recorded as `lead-command` for A. 2.3.3: UNKNOWN.
+- **Through the daemon's own dispatch**: the replayed denied Pre answered `LEAD_HOOK_UNCERTAIN` on
+  2.3.2 and `CLAIM_CONFLICT` with its conflicts on 2.3.3; the second Post of an unprepared
+  NotebookEdit answered `OPERATIONAL_FAILURE` on 2.3.2 and `LEAD_PRE_MISSING` on 2.3.3.
+- An edit losing its claim inside the claim step was not staged; read in the code.
+- Rerun on 2.3.3, same results as before: lead Edit verified, lead Bash cases, every gate decision.
+
 ## [software-workflows 2.3.2] — 2026-10-19
 
 ### Fixed: from the review of 2.3.1
