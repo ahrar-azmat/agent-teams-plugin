@@ -154,18 +154,18 @@ choose one yourself. On Windows set `CODEX_ORACLE_PYTHON=python` (python.org bui
 (`~/.claude/plugins/data/software-workflows-agent-teams/venv/`; about 10 s on a fast network,
 once per change of requirements or interpreter). If Claude Code reports that the server timed
 out on that first start, run `/mcp` → Reconnect: the next start waits for the interrupted
-build to stop, then builds again from pip's cache. Do not add a second, direct `mcpServers` entry for the same server — two
-registrations give two tool sets.
+build to stop, then builds again from pip's cache. Do not add a second, direct `mcpServers`
+entry for the same server — two registrations give two tool sets.
 
-The plugin's PreToolUse **hooks** (live-view nudge, plan gate, git-push gate) run
-`python3` directly — the hook spawn path performs no `${VAR:-default}` expansion (measured
-across Claude Code versions; see CHANGELOG 1.17.2), so `CODEX_ORACLE_PYTHON` cannot reach
-them. They fire ONLY where `python3` resolves on PATH — on every OS (a custom
-`CODEX_ORACLE_PYTHON` can run the MCP server without making the hooks work). On Windows
-create a `python3` alias/shim next to your `python.exe` (or use the Store alias); with only
-`python` on PATH the hooks do not fire (Claude Code treats an unstartable hook as
-non-blocking), while the MCP server itself still runs via `CODEX_ORACLE_PYTHON`. The 1.18
-daemon replaces this with a native launcher.
+The plugin's **hooks** (SessionStart: the git shim; PreToolUse: live-view nudge, plan gate,
+git-push gate; PostToolUse: the gate's notice) run `python3` directly — the hook spawn path
+performs no `${VAR:-default}` expansion (measured across Claude Code versions; see CHANGELOG
+1.17.2), so `CODEX_ORACLE_PYTHON` cannot reach them. They fire ONLY where `python3` resolves
+on PATH — on every OS (a custom `CODEX_ORACLE_PYTHON` can run the MCP server without making
+the hooks work); any `python3` from 3.9 on runs them. On Windows create a `python3`
+alias/shim next to your `python.exe` (or use the Store alias); with only `python` on PATH the
+hooks do not fire (Claude Code treats an unstartable hook as non-blocking), while the MCP
+server itself still runs via `CODEX_ORACLE_PYTHON`.
 
 The **git-push gate** never auto-approves and never blocks silently: every detected
 `git push` / `git commit` is DENIED with the review state in the reason (REVIEW VERIFIED for a
@@ -175,6 +175,17 @@ PENDING, or none otherwise) plus a one-shot acknowledgement token. Re-run the sa
 to proceed under the session's normal permissions; the token is bound to that command and tree,
 lives 10 minutes, and is consumed on first use. "deny" rather than "ask" because a hook "ask"
 is honoured only in some permission modes, while "deny" is authoritative in all of them.
+**In the Bash tool the gate runs where git runs (2.0):** a SessionStart hook puts the plugin's
+`hooks/gitshim` first on the Bash tool's PATH (through `CLAUDE_ENV_FILE`; the main session, its
+subagents and its agent-team teammates share it). There `git commit` and `git push` reach the
+gate with their exact arguments, working directory and environment — an alias, a script or a
+tool that runs git is seen as well — while every other git command runs the real git at once
+(about 3 ms added per call). Once a session's git has gone through the shim, the gate no longer
+reads that session's Bash command text: a grep, `sed` or heredoc that merely mentions push or
+commit is never denied. A denial the command's own output hides (`2>/dev/null`) still reaches
+Claude through the PostToolUse notice hook. PowerShell, and a session whose shim has not run
+yet, keep the text gate. The shim sees a git the shell finds on PATH — the same
+cooperative-guardrail trust model as the rest of the gate.
 The tree digest is one module, `treedigest.py`, shared by the server and the hook. The hook
 itself evaluates in a worker process group under a hard deadline held by its parent
 (`CODEX_PUSH_GATE_EVAL_DEADLINE_S`, default 60 s, under the declared 90 s hook timeout); a

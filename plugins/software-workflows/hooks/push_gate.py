@@ -43,13 +43,26 @@ Command detection is deliberately over-broad (`git … push|commit` anywhere
 in one shell segment): a false positive costs one extra permission prompt,
 a false negative silently skips the gate.
 
+THE GIT SHIM (2.0) ends that trade for the Bash tool. hooks/session_start.py
+puts hooks/gitshim first on the Bash tool's PATH; there `git commit` and
+`git push` reach this file as `--argv <real git> <args…>` — the EXACT argv,
+cwd and environment, at the moment git would run them — and get the same
+decision, the same wording and the same one-shot token as below (`_decide`).
+Every other git command runs the real git at once. Once a session's git has
+gone through the shim (its `.live` marker), the text detection stands down
+for that session's Bash, so read-only text that merely mentions push or
+commit is never denied again; PowerShell, and a session whose shim has not
+run yet, keep the text gate unchanged. A denial the command's own output
+hides (a redirected stderr) reaches Claude through hooks/gate_notice.py.
+
 TRUST MODEL — a guardrail against FORGETTING, not a security boundary.
 This hook protects a cooperative agent from the accident of pushing
 without a review, on a stale review, or on a failed/timed-out one. It
 does NOT defend against a deliberately evasive agent: any Bash-text hook
 is bypassable by construction (write a script and execute it, shell
-functions, aliases), so a keyed signature would add ceremony, not
-security — the header check is honesty-against-accident. Two disclosed
+functions, aliases), and the shim sees only a git the shell finds through
+PATH, so a keyed signature would add ceremony, not security — the header
+check is honesty-against-accident. Two disclosed
 residuals: the digest is taken at DISPATCH time (server `_answer_sig`),
 so edits made while the review runs are NOT in it — the review vouches
 for the dispatched tree, and a push of the edited tree reads STALE; and
@@ -69,6 +82,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import NoReturn
 
 GATE_REASON = (
     "PUSH GATE: no completed Codex review found for the current tree. Run "
@@ -1645,17 +1659,12 @@ def _evaluate(data):
         # UNVERIFIED platform (round 34): deny BEFORE any git or digest work
         return _deny(GATE_REASON + STORE_UNUSABLE_NOTE.format(
             path=_ack_dir(), why=_ack_dir_fd()[1] or "unverified on Windows"))
-    _fault("worker")
-    _stall("worker")
-    insp = _inspect_tree(cwd)
-    current = insp["digest"]
-    notes = ""
     # ONE-SHOT ACKNOWLEDGEMENT (round 30): a token minted by an earlier
     # decision lets the command proceed under the session's normal
     # permissions (no decision emitted). It is bound to the COMPLETE decision
     # (round 37): the command, the content digest, and every input the
-    # decision below is computed from — so it is consumed only AFTER that
-    # decision has been recomputed here for the inner command.
+    # decision is computed from — so it is consumed only AFTER that decision
+    # has been recomputed (`_decide`) for the inner command.
     ack = _ACK_PREFIX_RE.match(command)
     nonce = ""
     if ack:
@@ -1665,7 +1674,7 @@ def _evaluate(data):
     # semantics counterexamples proved static classification of arbitrary
     # shell text cannot be complete, so the DECISION surface is gone — a
     # detected push/commit is always stopped with the review state in the
-    # reason, and parsing only informs the WORDING below. "deny" rather than
+    # reason, and parsing only informs the WORDING. "deny" rather than
     # "ask" (round 30): "ask" is auto-approved in some host permission modes;
     # "deny" holds in all of them. A parsing error can cost a sentence,
     # never a silent auto-open.
@@ -1675,7 +1684,29 @@ def _evaluate(data):
               and not GIT_OTHER_REPO_RE.search(deesc)
               and "\\" not in command and "`" not in command
               and _direct_git_only(command))
-    kind, info = _lone_kind(command, cwd) if direct else ("", {})
+    accepted, reason = _decide(command, cwd, tool_name, data.get("transcript_path") or "", nonce, direct)
+    if accepted:
+        return json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": ACK_ACCEPTED_NOTE,
+        }})
+    return _deny(reason)
+
+
+def _decide(command, cwd, tool_name, transcript, nonce, direct, semantic=None):
+    """The decision for ONE push/commit: (True, "") when `nonce` acknowledges
+    exactly this decision, else (False, reason), the reason ending in a fresh
+    token. `command` is what a token binds; `semantic` (default: `command`)
+    is the plain `git …` text the classifier reads; `direct` says whether that
+    text is all the command runs. Shared by the PreToolUse hook and the git
+    shim (`--argv`)."""
+    semantic = command if semantic is None else semantic
+    _fault("worker")
+    _stall("worker")
+    insp = _inspect_tree(cwd)
+    current = insp["digest"]
+    notes = ""
+    kind, info = _lone_kind(semantic, cwd) if direct else ("", {})
     # ENVIRONMENT ROUTING (round 37): inspection scrubs GIT_DIR-style
     # variables, the shell that runs the command inherits them — with one
     # present, inspection and execution may address different repositories.
@@ -1748,7 +1779,6 @@ def _evaluate(data):
     # it rests on are inputs of the decision the token binds.
     reason = GATE_REASON
     review_evidence = "no-transcript"
-    transcript = data.get("transcript_path") or ""
     dispatched, answered_digests, scan_note = False, set(), ""
     if transcript:
         try:
@@ -1777,10 +1807,7 @@ def _evaluate(data):
         str(consistent), ",".join(routed), review_evidence, reason.split(" — ", 1)[0][:60]])
     if nonce:
         if _consume_ack(nonce, command, current, state):
-            return json.dumps({"hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "additionalContext": ACK_ACCEPTED_NOTE,
-            }})
+            return True, ""
         notes += ACK_INVALID_NOTE
     notes += scan_note
     if transcript:
@@ -1845,15 +1872,7 @@ def _evaluate(data):
         # auto-approved in some host modes — the guardrail would vanish
         # silently on exactly the misconfigured machines that need it.
         notes += STORE_UNUSABLE_NOTE.format(path=_ack_dir(), why=why or "unknown")
-    reason += notes
-    return json.dumps({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-            "additionalContext": reason,
-        }
-    })
+    return False, reason + notes
 
 
 def _deny(reason):
@@ -1863,6 +1882,209 @@ def _deny(reason):
         "permissionDecisionReason": reason,
         "additionalContext": reason,
     }})
+
+
+# THE GIT SHIM (hooks/gitshim/git; hooks/session_start.py puts it first on the
+# Bash tool's PATH). commit and push are decided on their EXACT argv, cwd and
+# environment at the moment git would run them — no shell text is read, so
+# nothing is guessed; every other git command runs the real git at once. Once
+# a session's git has gone through the shim (the `.live` marker it writes),
+# the PreToolUse text gate stands down for that session's Bash. Same trust
+# model as the rest of this hook: a guardrail for a cooperative agent — a git
+# the shell does not find through PATH is not seen.
+_GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env",
+                   "--attr-source", "--shallow-file"}  # git.c handle_options: value in `=…` or the next argument
+_GIT_FLAG_OPTS = {"-p", "--paginate", "-P", "--no-pager", "--no-replace-objects", "--bare",
+                  "--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs",
+                  "--icase-pathspecs", "--no-optional-locks", "--no-lazy-fetch", "--no-advice"}
+_GIT_PRINT_OPTS = {"--exec-path", "--html-path", "--man-path", "--info-path"}  # print and exit
+_GIT_OPT_COMMANDS = {"-h": "help", "--help": "help", "-v": "version", "--version": "version"}
+# git 2.56's builtins (`git --list-cmds=builtins`), as listed in hooks/gitshim/git: an alias
+# cannot hide a builtin, so none of these is ever a push/commit
+_GIT_BUILTINS = frozenset("""
+add am annotate apply archive backfill bisect blame branch bugreport bundle cat-file check-attr
+check-ignore check-mailmap check-ref-format checkout checkout--worker checkout-index cherry
+cherry-pick clean clone column commit-graph commit-tree config count-objects credential
+credential-cache credential-cache--daemon credential-store describe diagnose diff diff-files
+diff-index diff-pairs diff-tree difftool fast-export fast-import fetch fetch-pack fmt-merge-msg
+for-each-ref for-each-repo format-patch format-rev fsck fsck-objects fsmonitor--daemon gc
+get-tar-commit-id grep hash-object help history hook index-pack init init-db interpret-trailers
+last-modified log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base
+merge-file merge-index merge-ours merge-recursive merge-recursive-ours merge-recursive-theirs
+merge-subtree merge-tree mktag mktree multi-pack-index mv name-rev notes pack-objects
+pack-redundant pack-refs patch-id pickaxe prune prune-packed pull range-diff read-tree rebase
+receive-pack reflog refs remote remote-ext remote-fd repack replace replay repo rerere reset
+restore rev-list rev-parse revert rm send-pack shortlog show show-branch show-index show-ref
+sparse-checkout stage stash status stripspace submodule--helper switch symbolic-ref tag
+unpack-file unpack-objects update-index update-ref update-server-info upload-archive
+upload-archive--writer upload-pack url-parse var verify-commit verify-pack verify-tag version
+whatchanged worktree write-tree""".split())
+_SESSION_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+_NOTICE_NONCE_RE = re.compile(ACK_ENV + r"=([0-9a-f]{16})")
+ARGV_HEADER = "[push gate: `{command}` in {cwd} was NOT run]"
+ARGV_ACCEPTED_NOTE = "PUSH GATE: acknowledgement accepted — `{command}` runs under the session's normal permissions."
+
+
+def _shim_state_dir():
+    """Where the shim's `.live` markers and notices live: beside the token
+    store (hooks/session_start.py and hooks/gate_notice.py compute the same)."""
+    return os.environ.get("CODEX_GATE_STATE") or os.path.join(os.path.dirname(_ack_dir()), "gitshim")
+
+
+def _shim_live(session):
+    """Has this session's git gone through the shim (hooks/gitshim/git writes
+    the marker; hooks/session_start.py clears it at every session start)?"""
+    session = str(session or "")
+    return bool(_SESSION_RE.fullmatch(session)) and os.path.isfile(
+        os.path.join(_shim_state_dir(), session + ".live"))
+
+
+def _git_parse(args):
+    """git's own reading of an argv's global options (git.c handle_options):
+    (k, opts) — `args[k]` is the subcommand and opts the (option, value)
+    pairs before it; k is None when git runs no subcommand (nothing left, or
+    an option that prints and exits) and -1 at an option this parser does not
+    know (git refuses it, or reads it in a way not modelled here)."""
+    opts, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if not a.startswith("-") or a in _GIT_OPT_COMMANDS:
+            return i, opts
+        name, eq, val = a.partition("=") if a.startswith("--") else (a, "", "")
+        if name in _GIT_VALUE_OPTS:
+            if eq:
+                opts.append((name, val))
+                i += 1
+            elif i + 1 < len(args):
+                opts.append((name, args[i + 1]))
+                i += 2
+            else:
+                return None, opts  # git: the option's value is missing
+            continue
+        if a in _GIT_FLAG_OPTS:
+            opts.append((a, None))
+            i += 1
+            continue
+        if name == "--exec-path" and eq:
+            opts.append((name, val))
+            i += 1
+            continue
+        if a in _GIT_PRINT_OPTS or a.startswith("--list-cmds="):
+            return None, opts
+        return -1, opts
+    return None, opts
+
+
+def _git_alias(real_git, cwd, prefix, name):
+    """alias.<name> as git would read it under the same global options
+    (`prefix`, the arguments before the subcommand), or None."""
+    prefix = [a for a in prefix if a not in ("-p", "--paginate")]
+    try:
+        proc = subprocess.run([real_git, "--no-pager", *prefix, "config", "-z", "--get-all", "alias." + name],
+                              cwd=cwd, capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    values = [v for v in proc.stdout.split(b"\0") if v] if proc.returncode == 0 else []
+    return values[-1].decode("utf-8", "surrogateescape") if values else None
+
+
+def _same_dir(a, b):
+    try:
+        return os.path.samefile(a or ".", b)
+    except OSError:
+        return False
+
+
+def _write_notice(text):
+    """The denial for hooks/gate_notice.py, which shows it to Claude when the
+    command's own output did not (a redirected stderr)."""
+    session = os.environ.get("CODEX_GATE_SESSION") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
+    if not _SESSION_RE.fullmatch(session):
+        return
+    m = _NOTICE_NONCE_RE.search(text)
+    try:
+        state = _shim_state_dir()
+        os.makedirs(state, mode=0o700, exist_ok=True)
+        with open(os.path.join(state, session + ".notice"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"nonce": m.group(1) if m else "", "ts": time.time(), "text": text}) + "\n")
+    except OSError:
+        pass  # best effort: the denial is on stderr already
+
+
+def _argv_main(real_git, args):
+    """`git <args>` as the shell ran it, handed over by hooks/gitshim/git:
+    run the real git, or decide a commit/push. Returns an exit status only
+    when git is not run."""
+    import shlex
+    shim_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gitshim")
+    path = os.environ.get("PATH", "")
+    # the gate's own git calls (inspection, configuration, aliases) go to the real git
+    os.environ["PATH"] = os.pathsep.join(d for d in path.split(os.pathsep) if not _same_dir(d, shim_dir))
+
+    def run_git() -> NoReturn:
+        os.environ["PATH"] = path
+        os.execv(real_git, [real_git, *args])
+
+    command = shlex.join(["git", *args])
+    try:
+        cwd0 = os.getcwd()
+        cur, k, opts = list(args), None, []
+        for _ in range(16):  # alias chains; git itself reports a loop
+            k, opts = _git_parse(cur)
+            if k is None:
+                run_git()
+            if k == -1:
+                if "commit" not in cur and "push" not in cur:
+                    run_git()  # an option git refuses or reads its own way, and no push/commit word
+                break
+            sub = _GIT_OPT_COMMANDS.get(cur[k], cur[k])
+            if sub in ("commit", "push"):
+                break
+            if sub in _GIT_BUILTINS:
+                run_git()
+            value = _git_alias(real_git, cwd0, cur[:k], sub)
+            if value is None or value.startswith("!"):
+                run_git()  # no alias (an external command), or a shell alias whose gits come back through the shim
+            cur = cur[:k] + shlex.split(value) + cur[k + 1:]
+        else:
+            run_git()
+    except (OSError, ValueError):
+        run_git()  # nothing here could tell a push/commit: git decides (an unclosed alias quote, a vanished cwd)
+    if os.name == "nt":
+        print(GATE_REASON + STORE_UNUSABLE_NOTE.format(path=_ack_dir(), why="unverified on Windows"),
+              file=sys.stderr)
+        return 1
+    # DIRECT: only global options that change presentation or locking, -C (the
+    # inspection moves with it) and inert -c keys; the semantic text the
+    # classifier reads is the subcommand with exactly those options
+    cwd, direct, semantic = cwd0, k != -1, ["git"]
+    for opt, val in opts:
+        if opt == "-C":
+            cwd = os.path.join(cwd, val) if val else cwd
+        elif opt == "-c" and _INERT_CONFIG_RE.match(val or ""):
+            semantic += ["-c", val]
+        elif opt in _GIT_GLOBAL_INERT:
+            semantic.append(opt)
+        else:
+            direct = False
+    if direct:
+        semantic += cur[k:]
+        if any(t.startswith(("--receive-pack", "--upload-pack", "--exec")) for t in cur[k + 1:]):
+            direct = False  # transport overrides run a program
+    try:
+        accepted, reason = _decide(command, cwd, "bash", os.environ.get("CODEX_GATE_TRANSCRIPT", ""),
+                                   os.environ.get(ACK_ENV, "").strip(), direct,
+                                   shlex.join(semantic) if direct else command)
+    except Exception as exc:
+        accepted, reason = False, EVAL_FAILED_REASON.format(why=f"{type(exc).__name__}: {exc}")
+    if accepted:
+        print(ARGV_ACCEPTED_NOTE.format(command=command), file=sys.stderr, flush=True)
+        os.environ.pop(ACK_ENV, None)
+        run_git()
+    text = ARGV_HEADER.format(command=command, cwd=cwd0) + "\n" + reason
+    print(text, file=sys.stderr, flush=True)
+    _write_notice(text)
+    return 1
 
 
 def _read_fd_select(fd, cap, end):
@@ -1947,6 +2169,8 @@ def main() -> int:
         # through silently (round 39): fail closed, say why
         print(_deny(PAYLOAD_REASON.format(why=f"not a JSON object: {type(exc).__name__}")))
         return 0
+    if str(data.get("tool_name") or "").lower() == "bash" and _shim_live(data.get("session_id")):
+        return 0  # this session's git runs through the shim, which decides push/commit on their exact argv
     tool_input = data.get("tool_input") or {}
     command = tool_input.get("command") or ""
     if not isinstance(command, str):
@@ -2011,7 +2235,14 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and sys.argv[1:2] == ["--argv"] and len(sys.argv) > 2:
+    # the git shim: stdout and stdin are git's, so nothing is read or printed there
+    try:
+        sys.exit(_argv_main(sys.argv[2], sys.argv[3:]))
+    except OSError as _exc:  # the real git could not be started
+        print(f"git: {_exc}", file=sys.stderr)
+        sys.exit(126)
+elif __name__ == "__main__":
     # NEVER CRASH (round 37): the host treats a hook that exits non-zero
     # with a traceback as a NON-BLOCKING error and runs the command — so
     # every failure past stdin parsing becomes a structured deny on stdout

@@ -196,6 +196,48 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   - Not measured: Windows (no machine here). Its build lock retries instead of using
     msvcrt's blocking mode, which gives up after 10 s; old generations are not removed there.
 
+### Push gate: decided where git runs, so read-only text is never denied again
+- A SessionStart hook (`hooks/session_start.py`) puts `hooks/gitshim` first on the Bash tool's
+  PATH through `CLAUDE_ENV_FILE`, with the session's id and transcript. The main session, its
+  subagents and its agent-team teammates share that file (measured, Claude Code 2.1.302).
+- `hooks/gitshim/git` runs the real git — the next one on PATH — at once for every git command
+  but commit and push. Those two, and whatever the shim does not recognize (an alias, an
+  external command, an unknown option), go to `push_gate.py --argv` with their exact argv, cwd
+  and environment. There they get the same decision, wording and one-shot token as before
+  (`_decide`, shared with the text hook): aliases are expanded as git expands them, `-C` moves
+  the inspection with it, and a script or tool that runs git is seen as well.
+- Once a session's git has gone through the shim (a `.live` marker; cleared at every session
+  start), the PreToolUse hook stops reading that session's Bash text, which ends the false
+  denials of greps, `sed` and heredocs that merely mention push or commit. PowerShell, and a
+  session whose shim has not run yet, keep the text gate unchanged; Windows does not install
+  the shim (not measured there).
+- A denial the command's own output hides reaches Claude through a PostToolUse hook
+  (`hooks/gate_notice.py`): only denials from that call, and only when the result does not
+  already show their token.
+- Verified 2026-10-18 by real runs against a scratch repository with a bare remote (macOS 26.6,
+  git 2.56.0):
+  - through the shim, `git status` and `git log` run the real git and write the live marker;
+  - five read-only commands from the false-positive corpus: 0 denied in the live session,
+    3 denied in a session whose shim never ran; PowerShell `git push` still denied;
+  - `git commit -m second` is not run and hands out a token; with the token it is recorded;
+    the token works once and only for its own command;
+  - with a signed `code_review` answer for the tree in the session's transcript, the wording
+    reads REVIEW VERIFIED; `git push origin main` is not run until its token, then lands;
+  - a configured alias (`ci` = commit), `sh -c "git …"`, `git -C <repo>` run from `/`, and the
+    shim under dash are all stopped the same way;
+  - with stderr or all output redirected, the notice hook delivers the denial (twice in the
+    run, once per hidden denial) and stays silent when the output showed it;
+  - every hook, `treedigest.py` and `procenv.py` run under Apple's Python 3.9.6, the gate's
+    `--argv` mode included;
+  - cost per git call: 3.8 ms for the real git, 6.7 ms through the shim (builtins, `-C`,
+    `--version`), 50 ms for an alias resolved in Python;
+  - end to end, a headless Claude Code 2.1.302 session with this plugin (the installed
+    agent-teams plugins switched off for the run): the corpus grep ran, the commit was stopped
+    with a token and recorded with it, a fully redirected commit reached the model through
+    the notice hook, and a subagent's commit was stopped; the repository held exactly the one
+    acknowledged commit;
+  - `claude plugin validate --strict` passes for the plugin and the marketplace.
+
 ## [software-workflows 1.8.1] — 2026-10-16
 
 ### No git worktrees: one writer per repository checkout (user ruling 2026-10-16)
