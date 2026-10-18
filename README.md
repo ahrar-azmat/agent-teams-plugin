@@ -1,175 +1,79 @@
 # agent-teams-plugin
 
-A Claude Code plugin marketplace providing **`software-workflows`** — a skill that orchestrates **multi-agent work** using Claude Code [Agent Teams](https://code.claude.com/docs/en/agent-teams) (shared task lists, inter-agent messaging, task dependencies), with **correct, schema-validated tool signatures** so runs don't fail on malformed tool calls.
+A Claude Code plugin marketplace, **`agent-teams`**, with one plugin, **`software-workflows`** (2.0.0).
+It adds three things to Claude Code:
 
-> Marketplace name: `agent-teams` · Plugin name: `software-workflows`
+- **Agent teams that work.** A skill that runs multi-agent work through Claude Code's
+  [Agent Teams](https://code.claude.com/docs/en/agent-teams), with every tool signature pinned so
+  runs don't fail on malformed calls.
+- **Codex as the second model.** The bundled **Codex Oracle** MCP server puts OpenAI Codex, at
+  maximum reasoning effort with live web search, beside Claude. It acts as a blind reviewer,
+  architect and researcher, and, through `abraham`, as a writer that edits your real checkout with
+  full access.
+- **Guards.** Hooks that ask for a Codex architecture review before plan mode, and that stop every
+  `git commit` and `git push` Claude runs until the review state has been read.
 
-## What it does
+Marketplace `agent-teams` · plugin `software-workflows` ·
+[PolyForm Noncommercial 1.0.0](./LICENSE)
 
-When you ask Claude Code to do anything involving 2+ agents, the `agent-teams` skill kicks in and drives the full lifecycle:
+## Quick start
 
-1. Loads the deferred team tools (`TaskCreate`, `TaskUpdate`, `SendMessage`, `TaskGet`, `TaskList`)
-2. Spawns focused teammates (each its own context window) with self-contained prompts — the team is **implicit**, formed by the first `Agent` call
-3. Wires up task dependencies, assigns/claims work, coordinates via direct messages
-4. Shuts teammates down when the work is done (the implicit team cleans up on session exit)
-
-It ships **role templates** (researcher, architect, implementer, reviewer, verifier, …) and **team patterns** (research, implementation, debug, review), plus an optional **cross-model advisory** layer that uses Codex Oracle as an independent senior advisor when its MCP server is present.
-
-The plugin also ships **`/abraham`**: a write-capable mode that runs as two codex phases, both with full access (no sandbox, network, live web, your MCP servers and live infrastructure) — deep analysis (read-only by instruction) producing an implementation brief, then an implementer that edits the target repository, runs the project's real checks and reports their results, under git preconditions, a one-writer lock, and changed-files attribution for the orchestrator to review.
-
-## Why this exists (the v1.1.0 fix)
-
-Agent Teams tools are **deferred** and **schema-validated** (`additionalProperties: false`). The most common way orchestration runs fail is passing parameters the tools don't accept. This skill pins the exact signatures so the model can't improvise:
-
-- `TeamCreate` / `TeamDelete` **no longer exist** (removed in Claude Code v2.1.178) and `team_name` is deprecated and ignored — the team is implicit and the Task tools auto-associate with the session.
-- `TaskCreate` has **no** `blockedBy` — create first, then `TaskUpdate(taskId, addBlockedBy=[…])`.
-- `SendMessage` is `to` + `message` (+ optional `summary`) — **not** `recipient`/`type`/`content`, and there is **no broadcast**. Protocol `type` goes *inside* the `message` object.
-- Deferred tools load **per context** — every teammate prompt loads them first.
-
-The skill includes a Tool-Signatures reference table and troubleshooting entries mapping each error to its fix.
-
-## The Independence Protocol (v1.4.0)
-
-A second opinion is only worth something if it was formed **independently** — and the way that
-guarantee gets destroyed is subtle. You write up your own diagnosis, paste it into the prompt,
-and ask Codex to "review" it. What comes back is a reaction to *your framing*, not an
-independent read of the evidence — your own opinion wearing the advisor's voice.
-
-The MCP enforces independence server-side rather than trusting the caller to ask for it:
-
-- **`caller_hypothesis`** on every advisory tool — the one correct channel for your own view.
-  It is presented as an *unverified claim to refute* and answered with an explicit
-  **CONFIRMED / REFUTED / UNPROVEN** verdict naming the evidence that decided it.
-- **An independence contract** injected into every prompt: reason from primary evidence first,
-  treat caller claims as unverified, investigate what the caller *didn't* ask about, lead with
-  disagreement.
-- **An anchoring lint** on the neutral scoping fields (`context`, `concerns`, `focus`, `topic`).
-  Conclusion language ("the root cause is", "I fixed", "does this look right") triggers a
-  counter-anchoring injection *and* a loud `⚠️ ANCHORING WARNING` on the result telling you your
-  agreement is now weak evidence. It never silently strips your text and never blocks the call.
-- **A mandatory "where I disagree with the caller's framing"** section in every review's output.
-
-Round 1 is blind; round 2 can be adversarial. The rule to remember:
-
-> The advisor agreeing with you is strong evidence **only if it was dispatched blind.**
-> Disagreement is strong evidence either way.
-
-## Live web research (v1.4.0)
-
-The advisor actually researches instead of recalling. Codex runs with `web_search=live` —
-its default is `cached`, an OpenAI-maintained snapshot index, so the previous instruction to
-"search the web and cite URLs" had no mechanism behind it. It requires primary sources with
-URLs, marks unverifiable load-bearing claims `UNVERIFIED`, and ends with a Sources section;
-code reviews additionally check APIs against current upstream docs and touched dependencies
-for known CVEs.
-
-## The channel layer (v1.14.0)
-
-Advisor web search reaches ordinary pages; it can't read YouTube subtitles, RSS feeds, or
-semantic-search indexes. When the [agent-reach](https://github.com/Panniantong/agent-reach)
-CLI is installed, the orchestration skill uses it as a **caller-side fetch layer**: the
-orchestrator or a teammate fetches, curates, and passes content to the advisor as cited
-context data. The advisor is never given a networked sandbox to fetch for itself —
-untrusted web content, full-disk read, and network egress must never share a process
-(measured on codex 0.147.0: no mechanism exists for network without full disk read).
-Entirely optional — without the CLI, nothing changes.
-
-## Reviews continue their own session (2.0)
-
-A follow-up `code_review` or `architect_review` is the next turn of this workspace's latest
-review session — `codex exec resume <thread id>`, Codex's own resume — so the reviewer starts
-from its earlier findings and reads of the code, and says which are fixed, which still stand
-and what is new. The result's second line names the session: its thread id, turn number, this
-call's tokens, the context size and how often Codex compacted it. `session="new"` starts a fresh
-one (an unrelated change, or a deliberately independent opinion); a thread id from that line
-continues a particular session; a session another call is using falls back to a fresh one with
-a note. `research` and `codex_query` start fresh unless you pass `session="continue"` or an id.
-Codex itself replays the history, compacts it near its window and refuses two writers on one
-thread; the plugin only picks the thread and reports it.
-
-## Run operations and survivability (v1.17.0)
-
-A backgrounded oracle call used to be a child of the MCP server: Claude Code's `/mcp`
-reconnect (SIGINT, then SIGTERM ~100 ms later) killed the run and the caller saw
-"Connection closed" — a 25-minute max-effort review lost. Now codex runs on a **file-backed
-spool** (`~/.claude/logs/codex-oracle/runs/<run>/`) that the server tails, a **detached
-watchdog** enforces the runtime deadline with no server alive, the shutdown signal makes the
-cancel-cleanup **detach instead of kill**, and `codex_resume_run` **adopts** the run from
-the next connection — waiting for it if it is still running, returning its answer at no
-model cost. A caller cancel (no shutdown signal) still kills. Write runs are never detached.
-
-Operations tools, so nobody tails log files by hand: `codex_runs()` (status of every run —
-RUNNING / DETACHED / ok / error / cancelled / timeout), `codex_run_log(run, lines)` (the live
-log in-conversation; the MCP task panel is structurally silent once a call is backgrounded),
-`codex_cancel_run(run)`. `CODEX_ORACLE_CODEX_BIN` pins the codex executable (e.g. the
-ChatGPT.app-bundled build). To see detach work: start a long `codex_query`, run `/mcp` →
-Reconnect while it is running, and `codex_runs()` shows the run DETACHED, then ok;
-`codex_resume_run` collects its answer without asking again.
-
-**Run budget.** A run is SIGKILLed at its wall-clock budget by the detached watchdog (no
-server needed). Default **3 hours** (measured: healthy runs take 4–30 min; the old 60-minute
-literal killed legitimate analysis-heavy runs at 62–66 min). Adjust with
-`CODEX_ORACLE_MAX_RUNTIME_S=<seconds>` in the environment Claude Code starts the MCP server
-with (300..12600 — 30 min under the plugin's 4 h MCP call timeout; anything else is rejected
-loudly and the default kept). It is ONE budget per request: retries and abraham's two phases
-share it. `codex_runs()` prints
-the effective budget, the live log warns at 80 %, and a kill message names the knob and
-tells you to `codex_resume_run` the thread instead of re-asking. The plugin's MCP call
-timeout (`.mcp.json`, 4 h) and the host's idle abort sit above it; a detached run survives both.
-
-## Upstream codex source as reference (map vs territory)
-
-The `openai/codex` CLI is Apache-2.0 open source, and its internals are the reference for
-everything these plugins wrap. Two rules keep that reference honest:
-
-1. **Read the ref that matches the installed binary, never main-HEAD.** Releases are cut on
-   branches, so main and the release tags are divergent — either direction of drift has
-   produced wrong conclusions here. `python3 scripts/codex_src.py` keeps one stable path
-   (`~/Documents/codex-installed`, override via `CODEX_SRC_DIR`) pointing at a read-only
-   export of `rust-v<installed version>` — never a git worktree. An export is the commit's
-   blobs written verbatim (`git cat-file`, so no export-ignore, export-subst, eol or filter
-   attribute changes it). Each release gets its own export
-   (`~/Documents/.codex-installed.exports/<tag>-<sha12>/`), checked file by file against the
-   commit before the link moves to it; a `.codex-src.json` stamp names the tag and commit.
-   Reruns re-verify (a damaged export is rebuilt beside it, then swapped in); after a codex
-   update the link moves to the new release and the previous export is kept for sessions still
-   reading it. The script deletes only what git can recreate, with git supplying the bytes:
-   anything else it finds there (an edit, an added file, a write a killed run cut short, a copy
-   whose blob the clone has lost) is moved aside as `.kept-…` and named, never deleted. The base clone
-   (`~/Documents/codex`, override via `CODEX_SRC_CLONE`) is only fetched, never checked out.
-   Anything else at the stable path is refused untouched — a worktree an older version left
-   there included: remove it yourself, then rerun.
-2. **Source is the map; the installed binary is the territory.** Source names the config
-   keys, events, and mechanisms worth probing — but anything load-bearing is confirmed
-   against the running binary (`--strict-config` with a known-bad key first, live probes,
-   the binary's own `models_cache.json`), never asserted from source alone.
-
-## Install
+In Claude Code:
 
 ```text
 /plugin marketplace add ahrar-azmat/agent-teams-plugin
 /plugin install software-workflows@agent-teams
+/software-workflows:setup
 ```
 
-Then run `/software-workflows:setup` once. It checks the Codex CLI, `codex login`, Python 3.11+
-and git, builds the Codex Oracle server's environment, and, after asking you, turns agent teams
-on in your own settings: the one switch a plugin cannot set for you. For anything it cannot do
-itself it prints the exact command to run. A session that starts with something missing says so
-and points to setup.
+Setup checks everything the plugin needs and prints a table of what is ready. It fixes what it can
+and gives you the exact command for the rest:
 
-Then just ask for multi-agent work (e.g. *"Create an agent team to review this PR from security, performance, and correctness angles"*).
+| Item | What setup does |
+|---|---|
+| agent teams | Asks you, then adds the one switch a plugin cannot set: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, in your own settings. Nothing else in the file changes. |
+| Codex CLI | Checks `codex` is installed (`npm i -g @openai/codex`). |
+| codex login | Checks you are logged in; if not, type `! codex login` in the prompt. |
+| Python 3.11+ | Finds one for the Codex Oracle server. |
+| server environment | Builds the server's venv in the plugin's data directory (about 10 s). |
+| codex-oracle registration | Finds a codex-oracle server you once added by hand (the 1.x way) and prints the `claude mcp remove` command for it. Two registrations give two tool sets. |
+| git | Checks git is on PATH. |
 
-### Updating
+Agent teams start in your next Claude Code session. After that, just ask, for example *"Create an
+agent team to review this PR from security, performance and correctness angles"*, or *"Have Codex
+review this diff"*. A session that starts with something missing says so and points you to setup;
+nobody has to edit `settings.json` by hand.
 
-Turn on auto-update once: `/plugin` → **Marketplaces** → `agent-teams` → enable auto-update.
-Claude Code then fetches new versions when it starts. To update by hand, run
-`claude plugin marketplace update agent-teams` and then `claude plugin update
-software-workflows@agent-teams`, and restart Claude Code. After any update, run
-`/software-workflows:setup` once; it says what the new version needs.
+### Requirements
 
-**Coming from 1.x**, where codex-oracle and software-workflows were two plugins: whichever of
-them you had, run these once in a terminal, then restart Claude Code and run
-`/software-workflows:setup`:
+- **A recent Claude Code.** Tested on 2.1.302. The skill needs at least 2.1.178 (agent teams without
+  `TeamCreate`/`TeamDelete`), and moving a 1.x install over needs 2.1.193 or newer (the marketplace's
+  `renames` entry).
+- **Codex CLI, logged in.** Tested with codex-cli 0.163.0. Codex uses the model set in your
+  `~/.codex/config.toml` (gpt-6-astra by default) at reasoning effort `max`. The server pins the
+  effort, so the Codex app's slider cannot lower it.
+- **Python.** The Codex Oracle server needs Python 3.11 or newer, which setup finds for you. The
+  hooks run with whatever `python3` is on PATH, 3.9 or newer (the one macOS ships is fine).
+- **git** with the CVE-2024-32465 fix: 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1, 2.45.1, or
+  anything from 2.46 on. The push gate refuses older gits.
+
+## Updating
+
+**Once:** turn on auto-update. Open `/plugin` → **Marketplaces** → `agent-teams` and enable
+auto-update. Claude Code then fetches new versions when it starts.
+
+**By hand:**
+
+```text
+claude plugin marketplace update agent-teams
+claude plugin update software-workflows@agent-teams
+```
+
+Then **restart Claude Code**: `/reload-plugins` does not restart a running MCP server. Run
+`/software-workflows:setup` once after any update; it says what the new version needs.
+
+**Coming from 1.x**, where codex-oracle and software-workflows were two plugins: whichever of them
+you had, run these once in a terminal, then restart Claude Code and run `/software-workflows:setup`:
 
 ```text
 claude plugin marketplace update agent-teams
@@ -177,165 +81,249 @@ claude plugin install software-workflows@agent-teams
 claude plugin update software-workflows@agent-teams
 ```
 
-The marketplace's `renames` entry retires `codex-oracle` at the next start, but it neither
-installs nor updates `software-workflows` (measured on Claude Code 2.1.302): a machine that had
-only codex-oracle is left with no plugin until `install` runs, and one that had
-software-workflows 1.x stays on 1.x until `update` runs. Each command does nothing where it is
-not needed. If you once registered codex-oracle by hand (the 1.x instructions),
-`/software-workflows:setup` finds that registration and prints the `claude mcp remove` command
-for it: the plugin registers its own server, and two registrations give two tool sets.
+The marketplace's `renames` entry retires `codex-oracle` at the next start, but it neither installs
+nor updates `software-workflows` (measured on Claude Code 2.1.302). A machine that had only
+codex-oracle is left with no plugin until `install` runs. One that had software-workflows 1.x stays
+on 1.x until `update` runs. Each command does nothing where it is not needed. The Codex tools are now
+named `mcp__plugin_software-workflows_codex-oracle__<tool>`.
 
-The plugin registers its MCP server itself (`plugins/software-workflows/.mcp.json`). Its
-launcher, `run_server.py`, runs under any `python3` — 3.9, the one macOS ships, too — and
-picks the interpreter the server needs: Python 3.11 or newer, the newest `python3.N` on PATH
-or in `/opt/homebrew/bin`, `/usr/local/bin` or `~/.local/bin`; set `CODEX_ORACLE_PYTHON` to
-choose one yourself. On Windows set `CODEX_ORACLE_PYTHON=python` (python.org builds ship no
-`python3.exe`). The first start builds the server's venv in the plugin's data directory
-(`~/.claude/plugins/data/software-workflows-agent-teams/venv/`; about 10 s on a fast network,
-once per change of requirements or interpreter). If Claude Code reports that the server timed
-out on that first start, run `/mcp` → Reconnect: the next start waits for the interrupted
-build to stop, then builds again from pip's cache. Do not add a second, direct `mcpServers`
-entry for the same server — two registrations give two tool sets.
+## What's in the plugin
 
-The plugin's **hooks** (SessionStart: the git shim; PreToolUse: live-view nudge, plan gate,
-git-push gate; PostToolUse and PostToolUseFailure: the gate's notice) run `python3` directly — the hook spawn path
-performs no `${VAR:-default}` expansion (measured across Claude Code versions; see CHANGELOG
-1.17.2), so `CODEX_ORACLE_PYTHON` cannot reach them. They fire ONLY where `python3` resolves
-on PATH — on every OS (a custom `CODEX_ORACLE_PYTHON` can run the MCP server without making
-the hooks work); any `python3` from 3.9 on runs them. On Windows create a `python3`
-alias/shim next to your `python.exe` (or use the Store alias); with only `python` on PATH the
-hooks do not fire (Claude Code treats an unstartable hook as non-blocking), while the MCP
-server itself still runs via `CODEX_ORACLE_PYTHON`.
+| Part | What it does |
+|---|---|
+| Skill `agent-teams` | Runs every multi-agent task: spawns named teammates, wires tasks and dependencies, messages, shuts the team down. Includes role templates (researcher, architect, implementer, reviewer, verifier), team patterns (research, implementation, debug, review) and a troubleshooting table that maps each tool error to its fix. |
+| Skill `codex-planning` | Before a feature or non-trivial change: consult Codex independently before building. |
+| Skill `codex-review` | Before committing or pushing: Codex reviews the change independently. |
+| Agent `code-reviewer` | Dispatches a blind Codex review, verifies its findings and writes one report. |
+| `/software-workflows:setup` | The setup above. |
+| `/software-workflows:abraham` | Hands a task to Codex as the writer (see below). |
+| MCP server `codex-oracle` | The Codex tools below. The plugin registers it itself (`.mcp.json`); do not add a second `mcpServers` entry for it. |
+| Hooks | The plan gate, the push gate and its git shim, the session-start check, and a live-view nudge. |
 
-The **git-push gate** never auto-approves and never blocks silently: every detected
-`git push` / `git commit` is DENIED with the review state in the reason (REVIEW VERIFIED for a
-completed, digest-matching Codex review of a lone push/commit of the reviewed HEAD; STALE,
-PENDING, or none otherwise) plus a one-shot acknowledgement token. Re-run the same command as
-`CODEX_PUSH_ACK=<token> git push …` (`$env:CODEX_PUSH_ACK='<token>'; git push …` in PowerShell)
-to proceed under the session's normal permissions; the token is bound to that command and tree,
-lives 10 minutes, and is consumed on first use. "deny" rather than "ask" because a hook "ask"
-is honoured only in some permission modes, while "deny" is authoritative in all of them.
-**In the Bash tool the gate runs where git runs (2.0):** a SessionStart hook puts the plugin's
-`hooks/gitshim` first on the Bash tool's PATH (through `CLAUDE_ENV_FILE`; the main session, its
-subagents and its agent-team teammates share it). There `git commit` and `git push` reach the
-gate with their exact arguments, working directory and environment — an alias, a script or a
-tool that runs git is seen as well — while every other git command runs the real git at once
-(about 3 ms added per call). git runs with a mirror of its own exec-path, whose `git` is the
-shim, so a git that git itself starts (through an alias, an external command or a step of its
-own) comes back through the shim too and is decided like any other: an alias is followed, a
-name git does not know is refused rather than autocorrected. A commit or push that git starts
-as a step of the command that started it (continuing a rebase, a push for each submodule, the
-commit an acknowledged `git ci` runs) runs as that step. The session-start hook builds that
-mirror for the git the session finds on PATH; where none exists for the git that runs and the
-gate's state cannot be written, the shim builds it in a private directory of its temp dir. Where
-it cannot build one at all, it refuses git commands with a message that says so, rather than run
-git unwatched.
-**With Claude Code's Bash sandbox on**, Bash may read the gate's state and token store (under
-`~/.claude`, which the sandbox protects) but never write them. Every git command still runs. The
-text gate stays in charge, since the shim cannot mark the session live: a plain `git commit …` or
-`git push …` is denied with a token as usual, and when the gate accepts the token it leaves the
-shim a pass for exactly that command. A commit or push the shim has to decide there itself (an
-alias, a script, a push a hook starts) is refused with what to do: run it as one plain git
-command in its own Bash call (`git commit -F <file>` for a long message), or outside the
-sandbox. Once a git command of the session has run outside the sandbox (a retry with the
-sandbox off, say), a commit or push inside it can no longer be acknowledged: run that one
-outside the sandbox too. Like the rest of the gate, the pass is a guardrail for Claude's own
-commands, not a barrier against a process that sets out to get around it.
-Once a session's git has gone through the shim with a usable mirror, the gate no longer
-reads that session's Bash command text: a grep, `sed` or heredoc that merely mentions push or
-commit is never denied. A denial the command's own output hides (`2>/dev/null`) still reaches
-Claude through the notice hook, after a call that failed as well as one that did not.
-PowerShell, and a session whose shim has not run yet, keep the text gate. The shim sees a git
-the shell finds on PATH by name, not one run by its full path — the same cooperative-guardrail
-trust model as the rest of the gate.
-The tree digest is one module, `treedigest.py`, shared by the server and the hook. The hook
-itself evaluates in a worker process group under a hard deadline held by its parent
-(`CODEX_PUSH_GATE_EVAL_DEADLINE_S`, default 60 s, under the declared 90 s hook timeout); a
-stalled worker is killed and the command DENIED — a timed-out hook would fail open. An
-unusable token store is likewise a deny that names the fix. Windows: the token store is
-UNVERIFIED and the gate denies there until a native walk passes. The digest reads the
-worktree's bytes itself (no `git diff`, no `git status` — those run configured filters and
-drivers) and every remaining git read forces repository-controlled execution off
-(`core.fsmonitor`, `core.hooksPath`; GIT_DIR-style environment re-aiming is scrubbed) — a
-repository cannot run a helper through the hook. The digest ignores HEAD: committing reviewed
-content keeps the review VERIFIED through the push. Because git commits the INDEX and pushes
-HEAD's TREE — and a push transfers HISTORY — the full VERIFIED wording also needs the recorded
-objects to equal the reviewed worktree under a strict verifier (a push: HEAD ≡ index ≡ worktree,
-nothing untracked, no sparse/unrepresentable entries, at most ONE commit on top of the
-remote-tracking ref, and the push BOUND to that ref's measured object id —
-`git push --force-with-lease=refs/heads/<branch>:<oid> <remote> <branch>`, the lease spelled exactly
-like the destination and first on the command line (git expands even a full destination against the
-remote's refs, and applies the first lease that matches the same way), a compare-and-swap git refuses
-if the remote moved, because a tracking ref is only as fresh as the last fetch; a commit: a form that
-records the complete index whose every blob equals its file, names a message source or `--no-edit`
-so no editor runs, and does not re-add through clean filters with `-a`), judged by the same
-module's filter-free status (the server's write-mode snapshot
-uses it too, so no `git status` runs anywhere in the plugin) with replace refs disabled. A
-GIT_DIR/GIT_CONFIG-style variable in the environment, a reviewed-then-rewritten history, a
-pathspec or `#`-word commit, a forced push (only `--force-with-lease=<ref>:<oid>` with an explicit
-object id is a lease; every other force form is a force; `--no-force-with-lease` cancels the ones
-before it), an unleased push, a push whose destination is mapped by `remote.<r>.push` or, under
-`push.default=upstream` (or its synonym `tracking`, and only when `branch.<b>.remote` is set, as git
-requires), by `branch.<b>.merge`, a command-local
-`VAR=value` assignment, a push-only endpoint (`pushurl`, `pushInsteadOf`, `receivepack`, or an
-effective fetch/push URL that is not a native transport — git runs a `git-remote-<transport>`
-helper for every scheme it does not implement — schemes are case-sensitive to git; ssh, git, file,
-git+ssh and ssh+git are builtin, http(s) run git's bundled remote-curl helper), an explicit
-destination that is not `refs/heads/<name>` (git resolves `<src>:<name>` against the remote's refs at
-push time, so a tag of that name would receive the push; `main`, `HEAD` and a bare push inherit the
-source's full name), an active hook for ANY event the command reaches
-as git itself lists them (configured hooks included; `--no-verify` skips pre-commit and commit-msg
-only — prepare-commit-msg and the post-* hooks always run), a commit form that opens a program (an
-editor when no message source is given, a signer — explicit or via commit.gpgSign/push.gpgSign —
-a trailer command), repository-scoped configuration that names a program or rewrites an endpoint
-(parsed by section and variable, so URL-scoped credential helpers and dotted driver names count),
-or a stale token (the token binds the
-command, the content, HEAD, the index listing, the branch, the configuration, the tracking ref,
-the environment and the review evidence — the whole decision, consumed atomically) all read
-VERIFIED-BUT and say why; the acknowledgement is yours to make. The hook never crashes to a
-non-blocking exit: any failure past detection is a structured deny, and the host's payload itself
-is read from the descriptor under a cap and ONE deadline that also bounds detection (linear, run in
-the worker; the parent only pre-filters) and the evaluation — an over-cap, malformed or stalled
-payload is a deny that names the cause, never a silent exit. Git booleans are read with git's own
-grammar (any non-zero integer is true; an unreadable value is not provably off). Before any read the git on
-PATH is PROBED in a throwaway partial clone (a promisor helper must not run under the safe
-environment; the probe must go red without it) and checked against the CVE-2024-32465
-fixed-version policy; a git that fails either refuses every read.
+### Pinned tool signatures
 
-**Full-access writes (2.0):** every `abraham` run implements with codex's
-`--dangerously-bypass-approvals-and-sandbox` (`--yolo`): no sandbox, no prompts, network on, live
-web search, your MCP servers, your privileges, so the writer runs the project's real gates
-(fresh-database migrations, Temporal suites, browsers) and reports real exit codes. Its analysis
-phase has infra and live web too. The sealed mode is gone (user ruling 2026-10-18): `false` for
-`full_access`, `infra` or `web_search`, or `CODEX_ORACLE_WRITE_FULL_ACCESS` set to a false value,
-is refused. The target may be any git repository on the machine — the run is listed and resumable
-from the dispatching folder and from the target — and a run writes inside that repository. The
-git contract, one-writer lock, changed-files report and request budget still hold, and the report
-ends with the mode codex recorded for each turn, read back from the run's rollout.
+Agent Teams tools are deferred and schema-checked (`additionalProperties: false`), and the usual way
+orchestration fails is a parameter they don't accept. The skill pins them:
 
-**Survivor-containment trust model (1.17.x):** runaway processes left behind by a codex run
-are contained COOPERATIVELY — the process group is swept, and descendants that `setsid()` out
-of it (codex 0.151.0's shell tools do) are found and killed via an inherited per-run
-environment marker. A descendant that deliberately scrubs its environment, descriptors and
-session escapes every userspace channel at once; no in-process mechanism can hold it. For
-read-only runs that residual is bounded by codex's own OS sandbox (which descendants inherit);
-**infra runs and every abraham run are `danger-full-access` by design** — a scrubbed escapee
-retains unrestricted user-level filesystem capability, which is part of what full access
-accepts (the caller already trusts the prompt).
+- `TeamCreate` and `TeamDelete` are gone. The team forms with the first `Agent` call, and
+  `team_name` is ignored.
+- `TaskCreate` has no `blockedBy`. Create the task, then `TaskUpdate(taskId, addBlockedBy=[…])`.
+- `SendMessage` is `to` + `message` (+ optional `summary`). There is no `recipient`, `type` or
+  `content`, and no broadcast.
+- Deferred tools load per context, so every teammate prompt loads them first.
 
-## Requirements
+Optional: with the [agent-reach](https://github.com/Panniantong/agent-reach) CLI installed, the
+skill uses it to fetch what web search can't read, such as subtitles, RSS and semantic-search
+indexes. The fetched content goes to Codex as cited context, never as a network connection of its own.
 
-- **Claude Code v2.1.178+** — the skill drives the implicit-team API introduced when `TeamCreate`/`TeamDelete` were removed in v2.1.178. (v2.1.193+ additionally auto-migrates installs that still have the removed `antigravity` plugin enabled, via the marketplace `renames` mapping.)
-- **Agent Teams enabled** — they're experimental and off by default; `/software-workflows:setup` turns them on in your own settings after asking you.
-- **Optional — cross-model advisory:** the `codex-oracle` MCP server, bundled in this plugin since 2.0.0 (an install that still has the separate `codex-oracle` plugin enabled is moved to `software-workflows` by the marketplace `renames` mapping). If it isn't configured, the skill still runs normally; the cross-model steps are simply skipped.
-  - The server needs a Python ≥3.11 installed; its launcher starts under `${CODEX_ORACLE_PYTHON:-python3}` of any version and finds it (see the note above). The hooks additionally require a resolvable `python3`.
-  - `codex-oracle` needs the Codex CLI (`npm i -g @openai/codex`) logged in (`codex login`); setup checks both. Live web search is forced on per call, so no config change is required.
-  - **Windows (v1.9.0+):** fully supported — no WSL needed. Optional: enable Developer Mode if you want the `latest.log` convenience symlink; without it the merged `stream.log` is the live view.
+## The Codex tools
+
+| Tool | Use it for |
+|---|---|
+| `architect_review` | Judge a design or plan before anything is built. |
+| `code_review` | Review a change before it is committed or pushed. |
+| `research` | Technical research from live sources, with URLs. |
+| `codex_query` | Anything else you want Codex's reasoning on. |
+| `abraham` | Codex implements a task in a git checkout (see below). |
+| `codex_runs`, `codex_run_log`, `codex_cancel_run`, `codex_resume_run` | See, watch, stop and collect runs. |
+
+**Dispatch blind.** A second opinion counts only if it was formed independently. So send Codex the
+evidence and the question, never your diagnosis. Put your own view in `caller_hypothesis`. Codex
+treats it as a claim to refute and answers CONFIRMED, REFUTED or UNPROVEN, naming the evidence that
+decided it. The scoping fields (`context`, `concerns`, `focus`, `topic`) are linted for conclusion
+language such as "the root cause is" or "I fixed". A hit adds a counter-anchoring instruction and a
+loud `⚠️ ANCHORING WARNING` on the answer. Every review also has a "where I disagree with the
+caller's framing" section. The advisor agreeing with you is strong evidence only if it was
+dispatched blind; disagreement is strong evidence either way.
+
+**Live web.** Every call runs Codex with `web_search=live`; Codex's own default is a cached
+snapshot. Answers must cite primary sources with URLs and mark unverifiable load-bearing claims
+`UNVERIFIED`. Code reviews also check APIs against current upstream docs and touched dependencies
+for known CVEs.
+
+**Reviews continue their session.** A follow-up `code_review` or `architect_review` is the next turn
+of the workspace's latest review session (`codex exec resume`). The reviewer starts from its earlier
+findings and says which are fixed, which still stand and what is new. The answer's second line names
+the session: thread id, turn, tokens, context size and compactions. Use `session="new"` for a fresh,
+independent opinion, or a thread id to continue a particular one. `research` and `codex_query` start
+fresh unless you pass `session="continue"` or an id.
+
+**Long runs survive.** Codex runs at max effort, so a call often takes many minutes. Claude Code then
+moves it to the background and it returns as a task notification; that is normal, so wait for it.
+A run lives on a file-backed spool, so `/mcp` → Reconnect or a server restart detaches it instead
+of killing it, and `codex_resume_run` collects the answer at no model cost. `codex_runs` shows every
+run (RUNNING, DETACHED, ok, error, cancelled, timeout), and `codex_run_log` shows its live log in
+the conversation. To watch runs as they happen, ask Claude to "run mcp-live in the background", or
+`tail -F ~/.claude/logs/codex-oracle/stream.log` in a terminal. A hook reminds Claude to start that
+view at a session's first Codex call.
+
+**Run budget.** A run is stopped at its wall-clock budget: 3 hours by default (healthy runs take 4–30
+minutes). Set `CODEX_ORACLE_MAX_RUNTIME_S` (300 to 12600 seconds) in the environment Claude Code
+starts with. Retries and abraham's two phases share one budget. The live log warns at 80 %, and a
+stopped run tells you to `codex_resume_run` its thread instead of asking again.
+
+## Codex as the writer: abraham
+
+`abraham` (or `/software-workflows:abraham <task>`) runs two Codex phases in one call. Both have
+**full access**: no sandbox, network, live web search, your MCP servers and your live
+infrastructure.
+
+1. **Analysis.** Codex studies the code, the live web and your infrastructure (read-only by
+   instruction) and writes an implementation brief.
+2. **Implementation.** Codex implements the brief with
+   `--dangerously-bypass-approvals-and-sandbox`, runs the project's real checks (migrations, test
+   suites, browsers) and reports their real exit codes.
+
+What it guarantees:
+
+- Full access is always on. `full_access`, `infra` or `web_search` set to `false` is refused.
+- The target (`cwd`) may be any git repository on the machine. The run is listed and resumable from
+  the folder you dispatched it from and from the target.
+- A dirty tree is refused unless you pass `allow_dirty=true`. Uncommitted edits Codex touches have no
+  undo.
+- One writer per checkout, held by a lock across both phases.
+- Codex never commits or pushes. Every run ends with a **CHANGED FILES** report, compared by
+  content, inside submodules and across every index stage. The report also gives the mode Codex
+  recorded for each turn. Review the diff, then record it yourself.
+
+How the team works with it:
+
+- Codex writes the code through abraham, in the repository's real checkout, never in a copy or a
+  git worktree.
+- Claude plans, coordinates, reviews and records.
+- Put the access paths you know in `context`: a key-based SSH host, a `docker exec` target, a local
+  test database. Never put credentials there; Codex finds its own way in from the project's docs and
+  your configuration.
+- Run parallel writers in **different** repositories. Several writers sharing one checkout, with
+  claims, messages and attribution, come in the next release.
+
+Full access means full access. Processes a run leaves behind are swept cooperatively, but one that
+deliberately escapes keeps your user's rights. That is part of what full access accepts.
+
+## The guards
+
+### Plan gate
+
+Before Claude enters plan mode, the hook reminds it to get a blind Codex `architect_review`. It
+should send the requirement and constraints, not the design it already picked, with any preferred
+design in `caller_hypothesis`.
+
+### Push gate
+
+Every `git commit` and `git push` Claude runs is **denied once**, with the review state in the
+reason and a one-shot token. Re-run the same command with the token in front to go ahead:
+
+```text
+CODEX_PUSH_ACK=<token> git push …                  # Bash
+$env:CODEX_PUSH_ACK='<token>'; git push …          # PowerShell
+```
+
+The token is bound to that command and tree, lives 10 minutes and works once. The gate denies
+rather than asks, because a hook's "ask" is honoured only in some permission modes, while "deny"
+works in all of them. The review states are:
+
+- **REVIEW VERIFIED.** A completed Codex review in this session whose signed content digest matches
+  the tree, and a command that records exactly what was reviewed:
+  - for a commit, a form that records the whole index, with its message given so no editor runs;
+  - for a push, HEAD, index and worktree equal, nothing untracked, at most one commit on top of the
+    remote-tracking ref, and the push bound to that ref:
+    `git push --force-with-lease=refs/heads/<branch>:<oid> <remote> <branch>`.
+- **VERIFIED-BUT.** A review exists, but something the gate cannot vouch for is present, and the
+  reason names it. Examples: another command form, a hook or signer that would run, configuration
+  that names a program, an environment that re-aims git, or a rewritten history.
+- **STALE.** The tree changed after the review.
+- **PENDING / none.** No completed review covers this change.
+
+The acknowledgement is always yours to make. The token binds the whole decision: command, content,
+HEAD, index, branch, configuration, tracking ref, environment and review evidence.
+
+**Where it runs.** A session-start hook puts the plugin's git shim first on the Bash tool's PATH,
+for the session, its subagents and teammates. `git commit` and `git push` reach the gate with their
+exact arguments, directory and environment. Aliases, scripts and tools that run git are seen too, and
+so is a git that git itself starts (through an alias, an external command or a step of its own).
+Every other git command runs at once, adding about 3 ms. Once the shim is live, a grep, `sed` or
+heredoc that merely mentions push or commit is never denied. A denial that a command's own output
+hides (`2>/dev/null`) still reaches Claude through the notice hook. A git run by its full path is
+not seen. The gate is a guardrail for Claude's own commands, not a barrier against code that sets
+out to get around it.
+
+**It never fails open.** The hook evaluates under a hard deadline (`CODEX_PUSH_GATE_EVAL_DEADLINE_S`,
+60 s by default, under the 90 s hook timeout). A stall, a crash, an unusable token store or a git
+without the CVE fix is a deny that names the cause. Its reads never run repository-controlled
+programs: no `git diff` or `git status`, and fsmonitor and hooks forced off.
+
+**With Claude Code's Bash sandbox on**, Bash can read the gate's state but not write it. Every git
+command still runs. Run a commit or push as one plain git command in its own Bash call (`git commit
+-F <file>` for a long message); it is denied with a token as usual and runs once acknowledged. A
+commit or push the shim must decide inside the sandbox (an alias, a script, a push a hook starts) is
+refused with what to do. Once a git command of the session has run outside the sandbox, a commit or
+push inside it can no longer be acknowledged, so run that one outside the sandbox too.
+
+## Configuration
+
+Set these in the environment Claude Code starts with. Every one is optional.
+
+| Variable | Effect |
+|---|---|
+| `CODEX_ORACLE_PYTHON` | The Python (3.11+) for the Codex Oracle server. Windows: `python`. |
+| `CODEX_ORACLE_CODEX_BIN` | A specific `codex` executable, for example the one bundled with ChatGPT.app. |
+| `CODEX_ORACLE_MAX_RUNTIME_S` | A run's wall-clock budget, 300–12600 s (default 10800). |
+| `CODEX_PUSH_GATE_EVAL_DEADLINE_S` | The push gate's evaluation deadline (default 60 s). |
+| `CODEX_PUSH_ACK_DIR` | Where the push gate keeps its tokens (default `~/.claude/logs/codex-oracle/push-ack`). |
+
+The server's venv lives in the plugin's data directory
+(`~/.claude/plugins/data/software-workflows-agent-teams/venv/`) and survives updates. A new one is
+built when the requirements or the interpreter change.
+
+## Platforms
+
+- **macOS:** everything, measured.
+- **Linux:** the same code. The git shim's Linux-specific paths have not yet been measured end to end
+  for 2.0.
+- **Windows:** no WSL needed for the agent teams and the Codex tools.
+  - Set `CODEX_ORACLE_PYTHON=python`: python.org builds ship no `python3.exe`.
+  - The hooks need `python3` on PATH. Create a `python3` alias next to `python.exe`, or use the
+    Store alias; without one the hooks do not fire.
+  - The git shim is not used on Windows. The push gate refuses every commit and push Claude runs,
+    because its token store is not verified there, so commit and push yourself in a terminal.
+  - Optional: Developer Mode gives the `latest.log` live-view symlink; without it, use `stream.log`.
+
+## Troubleshooting
+
+| Symptom | What to do |
+|---|---|
+| No Codex tools after installing or updating | Restart Claude Code, then check `/mcp`. `/reload-plugins` does not restart MCP servers. |
+| "Server timed out" on the first start | The venv was still building. Run `/mcp` → codex-oracle → Reconnect; the next start finishes the build from pip's cache. |
+| Two sets of Codex tools | A hand-added registration from 1.x. Run `/software-workflows:setup` and use the `claude mcp remove` command it prints. |
+| A commit or push was denied | That is the push gate. Read the review state, then re-run the same command with the token. |
+| A commit inside the sandbox can't be acknowledged | Run it as one plain git command in its own Bash call, or outside the sandbox. |
+| A Codex call seems stuck | `codex_runs` and `codex_run_log`, or the live view. Max-effort runs often take many minutes. |
+| A run shows DETACHED after a reconnect | `codex_resume_run(run=<id>)` collects its answer. |
+| Hooks never fire on Windows | Add a `python3` alias (see Platforms). |
+
+## For maintainers
+
+- **Layout.** The marketplace is `.claude-plugin/marketplace.json`, and the plugin is
+  `plugins/software-workflows/`. In it: `server.py` (the Codex Oracle server), `run_server.py`
+  (its launcher), `hooks/`, `skills/`, `agents/`, `commands/`, and `treedigest.py`, the content
+  digest the server and the push gate share.
+- **The record.** `CHANGELOG.md` holds what changed in each release and how it was verified. There
+  is no test harness, by decision: every change is verified by real runs, with the results recorded
+  there.
+- **Checks before a release:** `claude plugin validate --strict plugins/software-workflows` and
+  `claude plugin validate --strict .`, then a fresh install in an empty `CLAUDE_CONFIG_DIR`. Bump
+  `version` in `plugin.json`, because teammates get a new copy only when it changes. Then tag with
+  `claude plugin tag plugins/software-workflows`.
+- **The Codex source as reference.** `python3 scripts/codex_src.py` keeps
+  `~/Documents/codex-installed` pointing at a read-only export of the release tag that matches
+  `codex --version`, never a git worktree. Read the ref that matches the installed binary, never
+  main. Treat the source as the map and the installed binary as the territory: confirm anything
+  load-bearing against the running binary, starting with a known-bad probe.
 
 ## License
 
 [PolyForm Noncommercial 1.0.0](./LICENSE) © Ahrar Ahmad
 
-**Noncommercial use only.** You may use, modify, and share this plugin for any
-noncommercial purpose (personal, research, education, nonprofits). Commercial
-use is not permitted under this license — contact the author for commercial terms.
+**Noncommercial use only.** You may use, modify and share this plugin for any noncommercial purpose
+(personal, research, education, nonprofits). Commercial use is not permitted under this license.
+Contact the author for commercial terms.
