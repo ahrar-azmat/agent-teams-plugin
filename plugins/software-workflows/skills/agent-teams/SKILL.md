@@ -29,6 +29,7 @@ If arguments were provided: "$ARGUMENTS" — use this as the task description an
 14. **Demand live web research** — the advisor has live web search. Version/API/CVE/best-practice claims must be checked against primary sources with URLs, not recalled from training data. See **Mandatory web research** below.
 15. **"Present" is not "supported"** — a missing method fails at lint time in seconds; a present-but-unsupported one fails in production on a real customer's data. At every call into a swappable backend, verify the *deployed* engine implements it, not that the type stub declares it. See **The Runtime Capability Law** below.
 16. **NO GIT WORKTREES (user ruling 2026-10-16: "make sure we don't use worktrees from now on").** Never pass `isolation: "worktree"` to `Agent`, never use `EnterWorktree`, never run `git worktree add` (and never write a script that does). Teammates who WRITE code work in the repository's own checkout, **one writer per checkout at a time**: parallel writers are allowed only in DIFFERENT repositories (e.g. one backend implementer and one frontend implementer); every other concurrent teammate is read-only (researcher, architect, reviewer). Writers in the same repository run in sequence — a teammate that must pause hands its work back as a patch file and restores its own paths, never `git stash` / `git add -A` in the shared checkout. A pristine copy of a commit (a baseline run, a red-first check on the deployed bytes) is a read-only export (`git archive <sha> | tar -x -C <scratch dir>`), never a worktree.
+17. **No test cases unless the user explicitly asks for them (user ruling 2026-10-18: "we shouldn't have tests until requested explicitly … test it out with results rather than tests").** A change is verified by running the real thing — the app, the command, the endpoint, the install — and recording what was observed (exit codes, outputs, files) in the report and the commit message. No teammate, reviewer or Codex run writes a test, a test harness, a mutation run or a self-test of a checker on its own initiative, and a review finding is never closed with "add a test". If the repository already has more than a few test cases, the lead removes them in a commit of their own (one revert brings them back) unless the user has explicitly asked to keep them. Build the real thing first: time spent on tests is time the product does not get.
 
 ## Tool Signatures — Exact Parameters (do NOT improvise)
 
@@ -70,7 +71,7 @@ Each Claude Code context (the lead AND every teammate) must load these tools bef
 Every teammate prompt and every review must prioritize these three values, in order:
 
 1. **Performance** — speed, efficiency, resource usage, scalability under load
-2. **Quality** — correctness, robustness, security, test coverage, clean abstractions
+2. **Quality** — correctness, robustness, security, clean abstractions — shown by real runs and their results, not by test counts
 3. **Adaptability** — extensibility, modularity, ease of change, future-proofing without over-engineering
 
 These are not guidelines — they are the lens through which ALL work is evaluated. If existing code or patterns conflict with these values, the existing code is what needs to change.
@@ -94,7 +95,7 @@ Create focused, self-contained tasks. Each task should produce a clear deliverab
 ```
 TaskCreate(
     subject="Implement user authentication middleware",
-    description="Create JWT-based auth middleware in src/middleware/auth.py. Must validate tokens, extract user context, and handle expired tokens. Write tests in tests/test_auth_middleware.py.",
+    description="Create JWT-based auth middleware in src/middleware/auth.py. Must validate tokens, extract user context, and handle expired tokens. Verify it with real requests against the running app — a valid, an expired and a malformed token — and report what each returned.",
     activeForm="Implementing auth middleware"
 )
 ```
@@ -241,7 +242,7 @@ Pick roles based on what the work needs. Not every team needs all roles. **All r
 | `architect` | Design, patterns, architecture — uses Codex during design | `general-purpose` | `plan` | `opus` |
 | `implementer` | Write code, make changes | `general-purpose` | — | `opus` |
 | `reviewer` | Code review with Codex cross-model analysis | `general-purpose` | — | `opus` |
-| `tester` | Write and run tests | `general-purpose` | — | `opus` |
+| `verifier` | Run the change for real and report the observed results (no test suites — rule 17) | `general-purpose` | — | `opus` |
 | `db-specialist` | Migrations, schema, queries | `general-purpose` | — | `opus` |
 | `security` | Vulnerability analysis | `general-purpose` | — | `opus` |
 | `perf-analyst` | Performance bottlenecks | `general-purpose` | — | `opus` |
@@ -389,7 +390,7 @@ a rubber stamp.
 
 | Send | Withhold until round 2 |
 |------|------------------------|
-| The diff, the files, the failing test, the logs, the error | Your diagnosis of what's wrong |
+| The diff, the files, the failing run's output, the logs, the error | Your diagnosis of what's wrong |
 | What the system is supposed to do (factual invariants) | Your claim that the fix is correct |
 | The constraints that genuinely bound the answer | The design you already picked |
 | The open question ("why does X fail under Y?") | The leading question ("X fails because Z, right?") |
@@ -548,21 +549,21 @@ Prefer a 3-teammate variant first:
 
 Use the 4+ teammate pattern only when backend, frontend, and validation are genuinely independent.
 
-One writer per repository checkout (rule 16): `implementer-1` and `implementer-2` may write at the same time only because they write DIFFERENT repositories (or, in a single repository, strictly disjoint work run in sequence). Within one repository, writers run one after another; the `tester` starts only after the implementers have finished.
+One writer per repository checkout (rule 16): `implementer-1` and `implementer-2` may write at the same time only because they write DIFFERENT repositories (or, in a single repository, strictly disjoint work run in sequence). Within one repository, writers run one after another; the `verifier` starts only after the implementers have finished.
 
 Tasks:
 - "Design architecture with Codex input, create task breakdown" → `architect` (plan mode)
 - "Implement backend API endpoints" → `implementer-1` (blocked by architect)
 - "Implement frontend components" → `implementer-2` (blocked by architect)
-- "Write integration tests for API + frontend" → `tester` (blocked by both implementers)
-- "Review all changes with Codex, strict analysis" → `reviewer` (blocked by tester)
+- "Run the API and the frontend together for real; report what worked and what did not" → `verifier` (blocked by both implementers)
+- "Review all changes with Codex, strict analysis" → `reviewer` (blocked by verifier)
 
 | Role | Mode | Purpose | model |
 |------|------|---------|-------|
 | `architect` | `plan` | Design with Codex input | `opus` |
 | `implementer-1` | — | Backend changes | `opus` |
 | `implementer-2` | — | Frontend changes | `opus` |
-| `tester` | — | Write tests, validate integration | `opus` |
+| `verifier` | — | Run it end to end for real, report the results | `opus` |
 | `reviewer` | — | Strict Codex cross-model review | `opus` |
 
 ### Debug Team (3 teammates, all Opus)
@@ -585,7 +586,7 @@ All tasks run in parallel. Teammates should message each other to challenge find
 Tasks:
 - "Security review: OWASP top 10, CWE analysis + Codex code_review (focus: security)" → `security-reviewer`
 - "Performance review: N+1 queries, missing indexes, async bottlenecks + Codex code_review (focus: performance)" → `perf-reviewer`
-- "Quality review: test coverage, code patterns, DRY violations + Codex full review" → `quality-reviewer`
+- "Quality review: code patterns, DRY violations, whether each change was seen working in a real run + Codex full review" → `quality-reviewer`
 
 All tasks run in parallel.
 

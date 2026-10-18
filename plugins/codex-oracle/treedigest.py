@@ -82,8 +82,7 @@ agent-teams-plugin 1.0 MB / 38 files, Smartpay_Backend 24.9 MB / 1,108
 files, SmartPay_Frontend 11.8 MB / 1,294 files; largest file 1.3 MB; hashing
 everything ≤ 0.25 s — the budgets below carry ≥ 40× headroom. A tree beyond
 them reads "unknown", which only makes the gate MORE conservative (the gate
-says why) and never opens anything. Pinned at-cap/over-cap by
-tests/test_push_gate.py.
+says why) and never opens anything.
 
 CLI:  python3 treedigest.py [--deadline S] [--status] -- <cwd>
       prints the digest, or (--status) `<digest> <head>` then the status lines
@@ -501,7 +500,7 @@ def _read_bounded_thread(proc, end, cap):
     """Windows reader (no select on pipes): a thread reads chunks, the caller
     waits with timeouts; on the deadline or the cap the child is killed so
     the blocked read ends. Returns (chunks, why) with why "" | "timeout" |
-    "cap". UNMEASURED on Windows; exercised on POSIX by the tests."""
+    "cap". UNMEASURED on Windows."""
     chunks, why = [], ""
     state = {"done": False, "cap": False, "total": 0}
     pipe = proc.stdout

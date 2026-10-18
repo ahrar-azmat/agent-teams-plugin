@@ -54,8 +54,9 @@ $ARGUMENTS
    from pre-existing dirt; HEAD is verified unmoved — if it says HEAD MOVED, audit
    `git log` before anything else).
 2. **Review the actual diff** (`git diff`, plus new untracked files) — the report is a
-   summary, the diff is the truth. Verify the change does what the task asked; run the
-   repo's checks (build/lint/targeted tests) yourself. A `.abraham/tmp/` scratch dir may
+   summary, the diff is the truth. Verify the change does what the task asked by running it
+   for real yourself — the build and linters, and the app, command or endpoint it changes —
+   and look at the results; no test cases unless the user explicitly asked for them. A `.abraham/tmp/` scratch dir may
    appear — that's the sandboxed TMPDIR; safe to delete, never commit it.
 3. Report to the user: what was implemented, what you verified, anything you'd push back on.
    **Commit only when the user says so** — never as part of this command; nothing is pushed.

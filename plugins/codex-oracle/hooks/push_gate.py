@@ -28,7 +28,7 @@ Answer verification is a SIGNATURE, not shape-sniffing: server.py stamps
 every answer header with `tool:<name> | status:<ok|timeout> | tree:<digest>`
 (see `_answer_sig`). The VERIFIED wording appears only for a header
 carrying `tool:code_review | status:ok` whose tree digest matches the
-workspace at push time. Consequences, each pinned by tests/test_push_gate.py:
+workspace at push time. Consequences:
   - another tool's answer (codex_query etc.) carries its own tool name and
     never yields the VERIFIED wording, even if its text mentions code_review;
   - a TIMEOUT partial carries status:timeout and never opens the gate;

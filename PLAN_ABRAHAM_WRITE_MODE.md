@@ -123,7 +123,8 @@ structural (separate tools; resume inherits the axis and force-seals write conti
   inheritance + force-seal + lock.
 - `plugins/codex-oracle/commands/abraham.md` — the `/abraham` command (orchestrator
   instructions).
-- `tests/test_write_mode.py` — 84 dependency-free checks (see CHANGELOG for coverage).
+- `tests/test_write_mode.py` — 84 dependency-free checks (see CHANGELOG for coverage;
+  removed with the test harness in software-workflows 2.0.0).
 - `plugins/codex-oracle/.claude-plugin/plugin.json` → 1.10.0; `marketplace.json`
   description; `CHANGELOG.md` → [1.13.0].
 

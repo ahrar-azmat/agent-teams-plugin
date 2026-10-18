@@ -3,6 +3,33 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.0.0] — unreleased
+
+### No test harness: verify with results (user ruling 2026-10-18)
+- The ruling: no test cases unless the user explicitly asks for them; where a repository
+  already has more than a few, they are removed unless the user asks to keep them; a change
+  is verified by running the real thing and recording what was observed. This release
+  removes the harness: `tests/` (eight files, about 9,350 lines — the detach, push-gate,
+  write-mode, transient-retry and anchor-lint suites, the retry-pin check and their
+  fixtures) and the plugin's `selftest_detach.py` and `selftest_progress.py`. One revert
+  of that commit brings them back.
+- The plugin stops asking for tests. The agent-teams skill's new Critical Rule 17 states
+  the ruling; the `tester` role is now `verifier`, which runs the change for real and
+  reports what it observed; the example task, the implementation-team pattern and the
+  quality review no longer write tests or measure coverage.
+- Codex is told the same. `code_review` asks for the real run that would show a claim,
+  never for new test cases. The planning brief's Verification section and the full-access
+  implementation prompt say no test cases unless the user asked for them. The capability
+  text, the code-reviewer agent and the codex-review skill ask for one real run on the
+  deployed engine instead of coverage. `/abraham` tells the lead to run the change for real.
+- Comments that pointed at removed tests now say how to check by hand: for the
+  ServerOverloaded text, grep the installed release's source. The README says how to see
+  detach work: `/mcp` → Reconnect during a long call, then `codex_runs()`.
+- Verified 2026-10-18: the checkout's server, started over stdio, initializes and lists its
+  nine tools; the checkout's push gate passes `ls -la` and denies a commit with no review;
+  `claude plugin validate --strict` passes for the marketplace and both plugins; every
+  changed Python file compiles.
+
 ## [software-workflows 1.8.1] — 2026-10-16
 
 ### No git worktrees: one writer per repository checkout (user ruling 2026-10-16)

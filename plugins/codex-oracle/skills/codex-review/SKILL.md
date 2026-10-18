@@ -73,7 +73,8 @@ Ask of this diff:
 - Does any `try`/`except` degrade such a call into a no-op, a default, or a skipped write **without
   recording** whether it was a capability miss or a genuine failure?
 - Is any parameter **accepted then ignored, clamped, or silently downgraded**?
-- Does the test coverage run on the **production engine**, or only on the library's default?
+- Has anyone seen it work on the **production engine**, in the mode it runs in — one real run and
+  its result — or only on the library's default? Ask for that run, not for more test cases.
 
 The server injects this hunt into `code_review` automatically — but check it yourself too,
 since it is the finding a fast reviewer most reliably misses.

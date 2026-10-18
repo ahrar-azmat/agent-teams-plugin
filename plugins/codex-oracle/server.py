@@ -183,7 +183,7 @@ STARTUP_PROBE_SECONDS = 90
 # REJECTED loudly — default + a startup warning on stderr — never clamped.
 # Observable: the live log warns at 80 % of the budget, `codex_runs` prints
 # the effective budget, and a deadline kill journals status "timeout" with
-# the budget and the knob in its message. Pinned by tests/test_detach.py.
+# the budget and the knob in its message.
 MAX_RUNTIME_DEFAULT_S = 3 * 3600
 MAX_RUNTIME_MIN_S = 300
 # CHAINED CEILING (round 32): the plugin's MCP call timeout (.mcp.json) is a
@@ -418,8 +418,10 @@ _CAPABILITY_HUNT = (
     "clamped, or silently downgraded; a config key that parses but no longer "
     "exists in the installed version; an instruction with no mechanism behind "
     "it. Accepted-but-ignored is worse than rejected.\n"
-    "- A test that passes on the library's DEFAULT backend proves nothing "
-    "about the deployed one. Flag missing coverage on the real engine.\n"
+    "- A check that passes on the library's DEFAULT backend proves nothing "
+    "about the deployed one. Flag a capability nobody has seen work on the "
+    "real engine, in the real mode; what settles it is one real run there "
+    "and its observed result, not more test cases.\n"
 )
 
 # Conclusion language in a scoping field means the caller anchored the advisor.
@@ -2461,7 +2463,7 @@ def _marked_survivors(run_tag: str) -> list[int]:
     in-process mechanism can hold it (that is kernel custody — the 1.18
     daemon's launchd/cgroup supervision). Until then that residual is
     bounded by codex's own OS sandbox, which descendants inherit, and is
-    pinned by a regression test so it can never be mistaken for covered."""
+    named here so it can never be mistaken for covered."""
     if os.name == "nt" or not run_tag:
         return []
     return list(_procenv.marked_pids(run_tag))  # OSError propagates: fail closed
@@ -2606,8 +2608,9 @@ def _journal_runs() -> dict[str, dict[str, Any]]:
 # stream, reset, 5xx other than 503): resume right away. Neither includes
 # auth (needs a human), usage/quota policy denials, or argument errors —
 # retrying cannot fix those. The first entry is the rendered text of
-# CodexErr::ServerOverloaded — pinned by tests/test_transient_retry.py
-# against the installed codex source when that worktree is present.
+# CodexErr::ServerOverloaded: after a codex update, check it against the
+# installed release's source (`grep -n "at capacity" codex-rs/protocol/src/error.rs`
+# in the export scripts/codex_src.py keeps at ~/Documents/codex-installed).
 _OVERLOAD_SIGNALS = (
     "at capacity",                     # ServerOverloaded (terminal in codex)
     "server_is_overloaded",            # the 503 error codes behind it
@@ -3731,11 +3734,14 @@ async def _run_codex(
             "IMPLEMENTATION MODE — FULL ACCESS: this process runs WITHOUT a "
             "sandbox, with the caller's own privileges, network and tools "
             "(--dangerously-bypass-approvals-and-sandbox). Use that to VERIFY "
-            "your work against the real system before you report: run the "
-            "project's own gates (tests, migrations on a fresh database, "
-            "workflow suites, builds, linters) exactly as the project runs "
-            "them, and report their real exit codes and output — never a "
-            "claim of green without the run.\n"
+            "your work against the real system before you report: run what "
+            "you changed for real (the app, command, endpoint or migration on "
+            "a fresh database) and the project's own existing checks (builds, "
+            "linters, whatever suites it already has) exactly as the project "
+            "runs them, and report their real exit codes and output — never a "
+            "claim of green without the run. Do not write test cases or test "
+            "harnesses unless the user explicitly asked for them: verification "
+            "is the real run and its results.\n"
             "BOUNDARIES: edit files INSIDE this workspace only; never modify "
             "another repository, a dotfile, a credential store or system "
             "configuration; no destructive infrastructure actions (dropping "
@@ -3829,8 +3835,7 @@ async def _run_codex(
 
         The session id is journaled the INSTANT it streams in (not after the
         attempt returns) — a run cancelled mid-flight must still leave a
-        resumable handle behind. Regression-tested by the kill-then-recover
-        case in the verification suite.
+        resumable handle behind.
         """
         nonlocal journaled_tid, journaled_spawn_pid
         _live_write(live_fh, t0, text)
@@ -4663,6 +4668,10 @@ async def code_review(
         "edge cases (empty, null, overflow), error handling gaps,",
         "and violations of clean code principles.",
         "Do NOT compliment the code. Find real problems.",
+        "Do NOT ask for new test cases or a test harness: the user's rule is "
+        "no tests unless they explicitly ask for them. Where a claim needs "
+        "evidence, name the real run that would show it and the result to "
+        "expect.",
         "",
         _INDEPENDENCE_PREAMBLE,
         "Code review specifics: read the code before you read the caller's "
@@ -5122,8 +5131,10 @@ async def abraham(
             "file, including error paths and edge cases; no artificial "
             "caps, no silently deferred scope.",
             "## Risks — what could break, and what to check.",
-            "## Verification — the exact fast checks to run "
-            "(tests/linters/build) and expected outcomes.",
+            "## Verification — how to see it work: the real runs to make "
+            "(the changed command, app or endpoint, plus the existing "
+            "build/linters) and the results to expect. No test cases "
+            "unless the user explicitly asked for them.",
             "",
             "Do NOT modify any file in this phase.",
             "",

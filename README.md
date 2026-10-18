@@ -13,7 +13,7 @@ When you ask Claude Code to do anything involving 2+ agents, the `agent-teams` s
 3. Wires up task dependencies, assigns/claims work, coordinates via direct messages
 4. Shuts teammates down when the work is done (the implicit team cleans up on session exit)
 
-It ships **role templates** (researcher, architect, implementer, reviewer, tester, …) and **team patterns** (research, implementation, debug, review), plus an optional **cross-model advisory** layer that uses Codex Oracle as an independent senior advisor when its MCP server is present.
+It ships **role templates** (researcher, architect, implementer, reviewer, verifier, …) and **team patterns** (research, implementation, debug, review), plus an optional **cross-model advisory** layer that uses Codex Oracle as an independent senior advisor when its MCP server is present.
 
 The codex-oracle plugin also ships **`/abraham`** (v1.13.0): a write-capable mode that runs as two air-gapped codex phases — read-only deep analysis (codebase + live infra + live web) producing an implementation brief, then a sealed implementer (workspace-write file access, no network/web/MCP) that edits the working tree under git preconditions, a one-writer lock, and changed-files attribution for the orchestrator to review.
 
@@ -89,8 +89,9 @@ Operations tools, so nobody tails log files by hand: `codex_runs()` (status of e
 RUNNING / DETACHED / ok / error / cancelled / timeout), `codex_run_log(run, lines)` (the live
 log in-conversation; the MCP task panel is structurally silent once a call is backgrounded),
 `codex_cancel_run(run)`. `CODEX_ORACLE_CODEX_BIN` pins the codex executable (e.g. the
-ChatGPT.app-bundled build). E2E proof: `plugins/codex-oracle/selftest_detach.py [--real]`
-kills the server exactly like Claude Code does mid-call and collects the run afterwards.
+ChatGPT.app-bundled build). To see detach work: start a long `codex_query`, run `/mcp` →
+Reconnect while it is running, and `codex_runs()` shows the run DETACHED, then ok;
+`codex_resume_run` collects its answer without asking again.
 
 **Run budget.** A run is SIGKILLed at its wall-clock budget by the detached watchdog (no
 server needed). Default **3 hours** (measured: healthy runs take 4–30 min; the old 60-minute
@@ -132,7 +133,7 @@ everything these plugins wrap. Two rules keep that reference honest:
 /plugin install software-workflows@agent-teams
 ```
 
-Then just ask for multi-agent work (e.g. *"Create an agent team to review this PR from security, performance, and test-coverage angles"*).
+Then just ask for multi-agent work (e.g. *"Create an agent team to review this PR from security, performance, and correctness angles"*).
 
 The plugin registers its MCP server itself (`plugins/codex-oracle/.mcp.json`, launcher
 `run_server.py` bootstraps its venv). Its interpreter is `${CODEX_ORACLE_PYTHON:-python3}`:
@@ -228,8 +229,8 @@ session escapes every userspace channel at once; no in-process mechanism can hol
 read-only and write runs that residual is bounded by codex's own OS sandbox (which descendants
 inherit); an **infra run is `danger-full-access` by design** — a scrubbed escapee from an infra
 run retains unrestricted user-level filesystem capability, which is part of what opting into
-`infra: true` accepts (the caller already trusts the investigation prompt). Pinned by a
-regression test; durable kernel-side custody is the 1.18 daemon's job.
+`infra: true` accepts (the caller already trusts the investigation prompt). Durable
+kernel-side custody is the 1.18 daemon's job.
 
 ## Requirements
 

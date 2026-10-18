@@ -61,8 +61,8 @@ provider, cloud SDK against a compatible endpoint, container binary): which back
 and is that the one deployed? Treat any engine/driver/provider/version **swap** in the diff as
 making every call into that surface suspect. Flag any `try`/`except` that degrades such a call to a
 silent no-op without recording whether it was a capability miss or a real failure. Flag any
-parameter accepted then ignored, clamped, or downgraded. Flag tests that only exercise the
-library's default backend.
+parameter accepted then ignored, clamped, or downgraded. Flag a capability nobody has seen work
+on the deployed backend: what settles it is one real run there and its result, not new test cases.
 
 ## Output Format
 
