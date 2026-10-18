@@ -99,6 +99,15 @@ def bash_deadline(data, limits):
     return time.time() + min(ms(data.get("timeout"), default), ceiling) / 1000 + 60
 
 
+def others_running(daemon, checkout, ident):
+    """Another lead Bash call in this checkout that the daemon has received and not yet completed,
+    within its host deadline. Synchronous: callers check it with nothing awaited before they act."""
+    now = time.time()
+    return any(other["id"] != ident and other.get("tool") == "Bash" and other.get("state") == "observed"
+               and other.get("checkout") == checkout["id"] and now < other.get("deadline", 0)
+               for other in daemon.store.all("lead_hook"))
+
+
 async def window(daemon, checkout, actor, ident):
     """A fingerprint of what besides this lead's command could change files here, or None while
     something could: another lead Bash command still running (in any session), a writer's turn, a
@@ -109,11 +118,8 @@ async def window(daemon, checkout, actor, ident):
     # The one await comes first: everything after it reads the store without yielding.
     if await asyncio.to_thread(exec_writing, checkout["root"]):
         return None
-    now = time.time()
-    for other in daemon.store.all("lead_hook"):
-        if (other["id"] != ident and other.get("tool") == "Bash" and other.get("state") == "observed"
-                and other.get("checkout") == checkout["id"] and now < other.get("deadline", 0)):
-            return None
+    if others_running(daemon, checkout, ident):
+        return None
     marks = []
     for other in daemon.store.all("actor"):
         if other["checkout"] != checkout["id"] or other["id"] == actor["id"]:
@@ -147,25 +153,32 @@ async def dispatch(daemon, payload):
     session, call = payload.get("session_id"), payload.get("tool_use_id")
     if not isinstance(session, str) or not session or not isinstance(call, str) or not call:
         raise CoordinatorError("LEAD_HOOK_IDENTITY", "Host session_id and tool_use_id are required")
-    from .lead import attach
-    mapping = await attach(daemon, checkout["id"], session)
-    actor = daemon.store.get(mapping["actor"])
     ident = "lead_hook_" + digest([checkout["identity"], session, call])
     data = payload.get("tool_input") or {}
     signature = digest([tool, data])
     record = daemon.store.get(ident, required=False)
     if record and record["input_digest"] != signature:
         raise CoordinatorError("LEAD_HOOK_REWRITTEN", "Host input changed between hook events; prepared intent cannot be reused")
+    fresh = tool == "Bash" and event == "PreToolUse" and record is None
+    if fresh:
+        # Registered before anything that can wait (attaching a new session, the checkout's other
+        # transitions): a hook that gives up waiting (its client's 3 s) lets the command run, so a
+        # call the daemon has received counts as running from here on.
+        daemon.store.put("lead_hook", ident, {"tool": tool, "state": "observed", "input_digest": signature,
+                         "checkout": checkout["id"], "deadline": bash_deadline(data, payload.get("bash_limits")),
+                         "window": None})
+    from .lead import attach
+    mapping = await attach(daemon, checkout["id"], session)
+    actor = daemon.store.get(mapping["actor"])
     if tool == "Bash":
         async with BASH_TRANSITIONS.hold(checkout["id"]):
-            if event == "PreToolUse" and record is None:
+            if fresh:
                 # What changed before this command is not its doing: settle that first, so only changes
                 # made inside the window can become the lead's.
                 await daemon.ledger.reconcile(checkout, reason="before lead Bash: " + ident)
-                daemon.store.put("lead_hook", ident, {"unit": actor["unit"], "actor": actor["id"], "tool": tool,
-                                 "state": "observed", "input_digest": signature, "checkout": checkout["id"],
-                                 "deadline": bash_deadline(data, payload.get("bash_limits")),
-                                 "window": await window(daemon, checkout, actor, ident)}, actor["unit"])
+                record = daemon.store.get(ident)
+                record.update(unit=actor["unit"], actor=actor["id"], window=await window(daemon, checkout, actor, ident))
+                daemon.store.save(record)
             if event != "PreToolUse" and record and record["state"] == "reconciled":
                 # A second completion for the same call (Post and Failure, or a retried hook) names nobody:
                 # its window closed with the first.
@@ -180,12 +193,14 @@ async def dispatch(daemon, payload):
                 if record and record.get("window") is not None and record["window"] == await window(daemon, checkout, actor, ident):
                     attribute = {"attribution": "lead-command", "operation": ident, "unit": actor["unit"],
                                  "excluded": [normalize(checkout, c["path"])["key"] for c in daemon.custody.claims(checkout["id"])
-                                              if c["unit"] != actor["unit"]]}
+                                              if c["unit"] != actor["unit"]],
+                                 # checked again after the scan: a lead call received meanwhile voids it
+                                 "still_quiet": lambda: not others_running(daemon, checkout, ident)}
                 result = await daemon.ledger.reconcile(checkout, reason="possible lead Bash effects: " + ident, attribute=attribute)
                 if record:
                     record["state"] = "reconciled"
                     daemon.store.save(record)
-                return dict(result, attribution="lead-command" if attribute else "UNKNOWN-context-only", executed_again=False)
+                return dict(result, attribution="lead-command" if "attributed" in result else "UNKNOWN-context-only", executed_again=False)
             return {"coordinated": True, "observed": ident, "executed_again": False}
     path = normalize(checkout, target)["path"]
     if event == "PreToolUse":

@@ -861,7 +861,7 @@ def _commit_scope(semantic):
         k += 2 if seg[k] in ("-c", "-C") else 1
     if k >= len(seg) or seg[k].lower() != "commit":
         return None
-    args, specs, every, include, only, reword = seg[k + 1:], [], False, False, False, False
+    args, specs, every, include, only, fixup = seg[k + 1:], [], False, False, False, None
     j = 0
     while j < len(args):
         tok = args[j]
@@ -876,8 +876,13 @@ def _commit_scope(semantic):
         if tok.split("=", 1)[0] in ("--fixup", "--squash", "--reuse-message", "--reedit-message"):
             # these take a value: `--fixup=reword:<commit>` rewords only, no staged change goes in
             value = tok.split("=", 1)[1] if "=" in tok else (args[j + 1] if j + 1 < len(args) else "")
-            reword = reword or (tok.startswith("--fixup") and value.startswith("reword:"))
+            if tok.startswith("--fixup"):
+                fixup = value  # git keeps the last one
             j += 1 if "=" in tok else 2
+            continue
+        if tok == "--no-fixup":
+            fixup = None
+            j += 1
             continue
         if tok in ("--no-all", "--no-include", "--no-only"):  # git's negation: the last one counts
             every = every and tok != "--no-all"
@@ -908,6 +913,7 @@ def _commit_scope(semantic):
     where = (chdirs, flags)
     if specs:
         return ("paths+index" if include else "paths"), specs, where
+    reword = fixup is not None and fixup.startswith("reword:")
     return ("all" if every else "none" if only or reword else "index"), [], where
 
 

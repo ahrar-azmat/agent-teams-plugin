@@ -3,6 +3,34 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.3.1] — 2026-10-19
+
+### Fixed: from the review of 2.3.0's last fixes
+- **A lead Bash call counts as running from the moment the coordinator receives it**, before it
+  waits for anything: attaching a new session, or another session's transition in the same
+  checkout. In 2.3.0, a call that waited longer than its hook's 3 s client timeout let its
+  command run unregistered, and another lead command could then be credited with what it wrote.
+  The quiet check is also made again after the scan, just before anything is recorded.
+- **`git commit --fixup`**: the gate keeps git's last value. `--fixup=reword:X --fixup=Y` and
+  `--fixup=reword:X --no-fixup` take the index again, and are judged on it.
+
+### Measured
+- **The race, as Codex described it**, on a registered checkout of 20,000 files (one full reconcile:
+  8.2 s): two established lead sessions; A's Bash completion scanning; B's Bash call arriving 0.3 s
+  later, its hook giving up after 3.0 s; B's command writing a file that A's scan reads late.
+  - 2.3.0, as calibration: the file was recorded as `lead-command` for **A**'s unit (wrong).
+  - 2.3.1: the file is UNKNOWN.
+- Rerun on 2.3.1, same results as 2.3.0: lead Bash alone (attributed), overlapping (UNKNOWN),
+  duplicate completion (nothing attributed), an outside edit before `pwd` (UNKNOWN); every gate case,
+  plus `--fixup=reword:HEAD --fixup=HEAD` and `--fixup=reword:HEAD --no-fixup` refused with another
+  unit's file staged.
+
+### Noticed, not changed
+- Registering a 30,000-file checkout took over 60 s on this Mac, and one full reconcile of a
+  16,000-file checkout about 3.1–3.6 s. A lead hook gives up after 3 s, so in a large registered
+  checkout lead hooks report the coordinator as unavailable while it scans (the daemon still
+  completes each call). Open for a later release.
+
 ## [software-workflows 2.3.0] — 2026-10-19
 
 ### Added: the writer coordinator — several Codex writers in one checkout

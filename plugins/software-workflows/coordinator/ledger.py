@@ -411,6 +411,9 @@ class Ledger:
                     if operation["checkout"] == checkout["id"] and operation["state"] in ("prepared", "allowed", "running") and operation["kind"] in ("patch", "lead-edit", "restore"):
                         pending.update(operation["paths"])
             context = [r["id"] for r in self.store.all("custody") if r["checkout"] == checkout["id"] and r["state"] != "released"]
+            # The caller's proof is checked again after the scan, with nothing awaited before the writes.
+            if attribute and attribute.get("still_quiet") and not attribute["still_quiet"]():
+                attribute = None
             unknowns, attributed = [], []
             with self.store.transaction():
                 for path in paths:

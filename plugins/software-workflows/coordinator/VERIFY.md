@@ -6715,6 +6715,21 @@ first lets it stop.
 
 The first 23 gate cases gave the same decisions as before this round.
 
+### 2.3.1: the hook-timeout race (review turn 8)
+
+`lead_bash5.py <plugin> <work dir>` with `BULK=20000`: a registered checkout of 20,000 files plus the
+named ones (one full reconcile 8.2–8.5 s). Session B is attached first with one quiet `true`. Then A's
+Bash Pre; A's Post starts; 0.3 s later B's Pre, whose hook gives up after 3.0 s (the daemon still
+processes it); B writes `bulk/019999.txt`; B's Post later. Each run exited 0 and left no daemon.
+
+| Code | `bulk/019999.txt` after the race |
+| --- | --- |
+| 2.3.0 (tag export), calibration | `lead-command`, naming A's actor (the one with a single lead hook): **red** |
+| 2.3.1 | UNKNOWN |
+
+Two earlier attempts did not reproduce the red on 2.3.0 and are not evidence either way: with a new
+session B, attaching it changed A's fingerprint; with 16,000 files, A's scan finished before B wrote.
+
 ### Commands and exit codes for the lead record
 
 The scripts are lead scratch in the session's scratchpad (`…/scratchpad/m3/`), not part of the
