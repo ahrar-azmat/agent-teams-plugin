@@ -72,14 +72,17 @@ cooperative agent, not a secret (the same trust model as the rest of the
 hook). Token store: ~/.claude/logs/codex-oracle/push-ack (override:
 CODEX_PUSH_ACK_DIR), 0600 files, 10-minute TTL, consumed on first read.
 """
+import errno
 import hashlib
 import os
 import stat as stat_mod
 import json
 import re
 import secrets
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import NoReturn
@@ -200,6 +203,18 @@ NOT_DIRECT_NOTE = (
     "acknowledge only if you understand what it does.)"
 )
 
+OPAQUE_NOTE = (
+    " (Note: `git {sub}` runs {what}. git puts its own exec-path first on "
+    "PATH for it, and no mirror of that exec-path could be made for this git, "
+    "so the git commands it runs would not come back through this gate: it is "
+    "asked about like a push, since it may run one.)"
+)
+UNREAD_NOTE = (
+    " (Note: this gate cannot tell what git runs here — {why} — so it is "
+    "asked about like a push, since it may run one.)"
+)
+NOT_A_COMMAND = "git: '{sub}' is not a git command. See 'git --help'."
+
 NOT_LONE_NOTE = (
     " (Note: this command is compound — earlier segments can change the "
     "tree before the push — or pushes refs/tags beyond the reviewed HEAD "
@@ -254,6 +269,15 @@ STORE_UNUSABLE_NOTE = (
     "point CODEX_PUSH_ACK_DIR at one — and re-run; on Windows the store is "
     "UNVERIFIED and the gate denies until it works. A broken store is a "
     "configuration defect the gate reports, never a reason to open — round 32.)"
+)
+READ_ONLY_NOTE = (
+    "\nThis git runs where the gate's state can be read but not written: Claude Code's sandbox "
+    "keeps Bash out of it, so nothing a command runs there can forge an acknowledgement. There the "
+    "gate acknowledges a commit or push that is ONE plain git command in its own Bash call — `git "
+    "commit …` or `git push …` with no `$(…)`, pipe, `&&`, alias or script around it (for a long "
+    "message, write it to a file and use `git commit -F <file>`): run it in that form and the "
+    "gate's PreToolUse hook, which runs outside the sandbox, hands you the token. Any other commit "
+    "or push runs only outside the sandbox."
 )
 
 # The hook's WORKER runs the whole evaluation (transcript scan, git lookups,
@@ -374,8 +398,8 @@ def _ansi_c_quote(command):
     and three of them are not decidable from text at all, because the deciding
     content is an expansion's VALUE. This module already says so — "a denylist
     of launchers recurs forever; a whitelist of one shape ends it" — and the
-    trust model already places execution-boundary enforcement in the 1.18
-    daemon. So the exemption is WITHDRAWN rather than narrowed a sixth time:
+    trust model places execution-boundary enforcement in the exact-argv git
+    shim (`hooks/gitshim`, 2.0). So the exemption is WITHDRAWN rather than narrowed a sixth time:
     a `$'` is detection, the idiom costs one acknowledgement, and a silent push
     costs the acknowledgement itself. Over-detection is the designed failure
     direction; under-detection never was."""
@@ -445,13 +469,23 @@ _ACK_PREFIX_RE = re.compile(
     re.S | re.I)
 
 
-_ACK_NAME_RE = re.compile(r"[0-9a-f]{16}(?:\.claim-\d+-[0-9a-f]{8})?\.json")
+_ACK_NAME_RE = re.compile(r"[0-9a-f]{16}(?:\.claim-\d+-[0-9a-f]{8}|\.pass)?\.json")  # tokens, claims, passes
 _ACK_SWEEP_MAX = 4096  # entries examined per mint — beyond it minting is REFUSED loudly (round 33)
 
 
 def _ack_dir():
     return os.environ.get("CODEX_PUSH_ACK_DIR") or os.path.join(
         os.path.expanduser("~"), ".claude", "logs", "codex-oracle", "push-ack")
+
+
+READ_ONLY_WHY = "this process may read it but not write it"
+
+
+def _read_only_error(exc):
+    """A write the operating system refused in a directory that is ours: Claude Code's sandbox
+    (EPERM under macOS Seatbelt, measured 2026-10-18; a read-only mount, EROFS, under Linux),
+    or permissions that keep this process out."""
+    return isinstance(exc, PermissionError) or (isinstance(exc, OSError) and exc.errno == errno.EROFS)
 
 
 def _ack_dir_fd():
@@ -467,6 +501,8 @@ def _ack_dir_fd():
     try:
         os.makedirs(d, mode=0o700, exist_ok=True)
     except Exception as exc:
+        if _read_only_error(exc):
+            return None, f"{READ_ONLY_WHY} ({exc.__class__.__name__}: {exc})"
         return None, f"cannot create it ({exc.__class__.__name__}: {exc})"
     if os.name == "nt":
         # UNVERIFIED on Windows (round 33): no directory handle, no reparse-
@@ -572,6 +608,8 @@ def _mint_ack(command, tree, state=""):
             json.dump({"binding": _ack_binding(command, tree, state), "ts": now}, fh)
         return nonce, ""
     except Exception as exc:
+        if _read_only_error(exc):
+            return "", f"{READ_ONLY_WHY} ({exc.__class__.__name__}: {exc})"
         return "", f"cannot write a token ({exc.__class__.__name__}: {exc})"
     finally:
         _close_store(fd)
@@ -628,6 +666,89 @@ def _consume_ack(nonce, command, tree, state=""):
                     os.unlink(os.path.join(d, claim))
             except OSError:
                 pass
+    finally:
+        _close_store(fd)
+
+
+# A PASS (review of 2026-10-18, turn 9): what the PreToolUse gate leaves for the git shim when it
+# has consumed a token for a command that is exactly ONE plain git invocation. The shim decides that
+# commit or push again on its exact argv, and the token is gone by then (the hook took it); the pass
+# lets that one argv run in that directory, on that tree and index. It is what makes an
+# acknowledgement work in Claude Code's sandbox, where Bash may read the token store but never write
+# it (measured 2026-10-18) — so a pass is also nothing a sandboxed command can forge. The shim
+# removes the pass it uses; where it cannot (the sandbox), hooks/gate_notice.py removes it once the
+# Bash call is over, and PASS_TTL_S bounds it either way.
+PASS_TTL_S = 120  # the hook's decision → the git it allowed deciding again: 9.5 s from the pass to the
+#                   commit's post-commit hook in a real sandboxed session (measured 2026-10-18) — the
+#                   sandbox and the shell start, then the shim inspects the tree as the hook did, which
+#                   the hook's 60 s deadline bounds; ×2
+
+
+def _pass_binding(argv_text, cwd, tree, index_binding):
+    return hashlib.sha256("\0".join([argv_text, os.path.realpath(cwd), tree, index_binding])
+                          .encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def _issue_pass(nonce, binding):
+    """The hook's side, best effort: without a pass the shim asks for a token of its own."""
+    fd, _ = _ack_dir_fd()
+    if fd is None:
+        return
+    name = nonce + ".pass.json"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        if _USE_DIR_FD and fd >= 0:
+            pfd = os.open(name, flags, 0o600, dir_fd=fd)
+        else:
+            pfd = os.open(os.path.join(_ack_dir(), name), flags, 0o600)
+        with os.fdopen(pfd, "w", encoding="utf-8") as fh:
+            json.dump({"binding": binding, "ts": time.time()}, fh)
+    except OSError:
+        pass
+    finally:
+        _close_store(fd)
+
+
+def _take_pass(nonce, binding):
+    """The shim's side: True when the hook left a pass for exactly this git (`binding`), unexpired,
+    and this process removed it — or could not, the store being read-only here (the sandbox). A pass
+    for another git is left alone."""
+    if not re.fullmatch(r"[0-9a-f]{16}", nonce or ""):
+        return False
+    fd, _ = _ack_dir_fd()
+    if fd is None:
+        return False
+    by_fd = _USE_DIR_FD and fd >= 0
+    name = nonce + ".pass.json"
+    path = name if by_fd else os.path.join(_ack_dir(), name)
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        try:
+            pfd = os.open(path, flags, dir_fd=fd) if by_fd else os.open(path, flags)
+        except OSError:
+            return False
+        try:
+            st = os.fstat(pfd)
+            if not stat_mod.S_ISREG(st.st_mode) or (hasattr(os, "geteuid") and st.st_uid != os.geteuid()):
+                return False
+            rec = json.loads(os.read(pfd, 4096).decode("utf-8"))
+            if not (time.time() - float(rec.get("ts") or 0) <= PASS_TTL_S and rec.get("binding") == binding):
+                return False
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
+        finally:
+            os.close(pfd)
+        try:
+            if by_fd:
+                os.unlink(name, dir_fd=fd)
+            else:
+                os.unlink(path)
+        except FileNotFoundError:
+            return False  # another git took it first
+        except OSError as exc:
+            if not _read_only_error(exc):
+                return False
+        return True
     finally:
         _close_store(fd)
 
@@ -773,7 +894,7 @@ def _deescaped(command):
     each time, because normalizing text discards the quote structure that says
     which word is the COMMAND, and a full shell lexer is what five earlier
     rounds showed cannot be written soundly here. They were WITHDRAWN in
-    round 58; the shapes they caught are recorded for the 1.18 daemon."""
+    round 58; the exact-argv git shim (2.0) decides those shapes at execution."""
     joined = re.sub(r"\\\r?\n", "", command)       # POSIX continuation: pair removed
     joined = re.sub(r"`\r?\n", "", joined)          # PowerShell continuation
     joined = re.sub(r"\\(.)", r"\1", joined)         # POSIX escape
@@ -865,7 +986,7 @@ def _detected(command):
         # no reason to hex-assemble a command; the rare legitimate use costs
         # one prompt. Full evasion-proofing is impossible for a text hook
         # (documented trust model); execution-boundary enforcement is the
-        # 1.18 daemon's job.
+        # exact-argv git shim's (2.0).
         return True
     toks = _tokenize(command)
     if toks is None:
@@ -1161,6 +1282,25 @@ def _commit_form(args):
     if not has_message and not no_edit:
         return "no -m/-F message source and no --no-edit: git opens the editor (a program)", False
     return "", no_verify
+
+
+def _lone_git_argv(command):
+    """The argv of a command that is exactly ONE plain git invocation — `git` first, no assignment
+    or wrapper before it, nothing after it — as the shell hands it to git, quoted back into one
+    string the way the git shim quotes the argv it receives; "" for anything else. Called only for
+    a command `_direct_git_only` accepted (no `$`, backslash or backtick). A reading the shell
+    would not share (a glob, a `~`, a comment) gives an argv the shim never sees, so its pass goes
+    unused: the shim then asks for a token of its own."""
+    import shlex
+    toks = _tokenize(command)
+    segs = _segments(toks) if toks is not None else None
+    if not segs or len(segs) != 1 or segs[0][0] != "git":
+        return ""
+    try:
+        words = shlex.split(command, comments=False, posix=True)  # a quoted newline stays in its word
+    except ValueError:
+        return ""
+    return shlex.join(words) if words and words[0] == "git" else ""
 
 
 def _lone_kind(command, cwd):
@@ -1684,7 +1824,8 @@ def _evaluate(data):
               and not GIT_OTHER_REPO_RE.search(deesc)
               and "\\" not in command and "`" not in command
               and _direct_git_only(command))
-    accepted, reason = _decide(command, cwd, tool_name, data.get("transcript_path") or "", nonce, direct)
+    accepted, reason = _decide(command, cwd, tool_name, data.get("transcript_path") or "", nonce, direct,
+                               hook_argv=_lone_git_argv(command) if (direct and nonce) else "")
     if accepted:
         return json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -1693,13 +1834,15 @@ def _evaluate(data):
     return _deny(reason)
 
 
-def _decide(command, cwd, tool_name, transcript, nonce, direct, semantic=None):
+def _decide(command, cwd, tool_name, transcript, nonce, direct, semantic=None, hook_argv="", shim=False):
     """The decision for ONE push/commit: (True, "") when `nonce` acknowledges
     exactly this decision, else (False, reason), the reason ending in a fresh
     token. `command` is what a token binds; `semantic` (default: `command`)
     is the plain `git …` text the classifier reads; `direct` says whether that
     text is all the command runs. Shared by the PreToolUse hook and the git
-    shim (`--argv`)."""
+    shim (`--argv`, `shim`); `hook_argv` is the hook's reading of a command
+    that is one plain git invocation, which an accepted token leaves a pass
+    for."""
     semantic = command if semantic is None else semantic
     _fault("worker")
     _stall("worker")
@@ -1807,6 +1950,10 @@ def _decide(command, cwd, tool_name, transcript, nonce, direct, semantic=None):
         str(consistent), ",".join(routed), review_evidence, reason.split(" — ", 1)[0][:60]])
     if nonce:
         if _consume_ack(nonce, command, current, state):
+            if hook_argv:
+                _issue_pass(nonce, _pass_binding(hook_argv, cwd, current, insp.get("binding") or ""))
+            return True, ""
+        if shim and _take_pass(nonce, _pass_binding(command, cwd, current, insp.get("binding") or "")):
             return True, ""
         notes += ACK_INVALID_NOTE
     notes += scan_note
@@ -1872,6 +2019,8 @@ def _decide(command, cwd, tool_name, transcript, nonce, direct, semantic=None):
         # auto-approved in some host modes — the guardrail would vanish
         # silently on exactly the misconfigured machines that need it.
         notes += STORE_UNUSABLE_NOTE.format(path=_ack_dir(), why=why or "unknown")
+        if shim and why.startswith(READ_ONLY_WHY):
+            notes += READ_ONLY_NOTE
     return False, reason + notes
 
 
@@ -1893,36 +2042,40 @@ def _deny(reason):
 # model as the rest of this hook: a guardrail for a cooperative agent — a git
 # the shell does not find through PATH is not seen.
 _GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env",
-                   "--attr-source", "--shallow-file"}  # git.c handle_options: value in `=…` or the next argument
+                   "--attr-source", "--shallow-file", "--super-prefix"}  # git.c handle_options: value in `=…` or the next argument
+# --super-prefix: git ≤ 2.45 passes it to the submodule--helper it starts for a recursive submodule
+# op, so a recursive `git submodule status` through the shim would otherwise be met as unreadable
 _GIT_FLAG_OPTS = {"-p", "--paginate", "-P", "--no-pager", "--no-replace-objects", "--bare",
                   "--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs",
                   "--icase-pathspecs", "--no-optional-locks", "--no-lazy-fetch", "--no-advice"}
 _GIT_PRINT_OPTS = {"--exec-path", "--html-path", "--man-path", "--info-path"}  # print and exit
 _GIT_OPT_COMMANDS = {"-h": "help", "--help": "help", "-v": "version", "--version": "version"}
-# git 2.56's builtins (`git --list-cmds=builtins`), as listed in hooks/gitshim/git: an alias
-# cannot hide a builtin, so none of these is ever a push/commit
-_GIT_BUILTINS = frozenset("""
-add am annotate apply archive backfill bisect blame branch bugreport bundle cat-file check-attr
-check-ignore check-mailmap check-ref-format checkout checkout--worker checkout-index cherry
-cherry-pick clean clone column commit-graph commit-tree config count-objects credential
-credential-cache credential-cache--daemon credential-store describe diagnose diff diff-files
-diff-index diff-pairs diff-tree difftool fast-export fast-import fetch fetch-pack fmt-merge-msg
-for-each-ref for-each-repo format-patch format-rev fsck fsck-objects fsmonitor--daemon gc
-get-tar-commit-id grep hash-object help history hook index-pack init init-db interpret-trailers
-last-modified log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base
-merge-file merge-index merge-ours merge-recursive merge-recursive-ours merge-recursive-theirs
-merge-subtree merge-tree mktag mktree multi-pack-index mv name-rev notes pack-objects
-pack-redundant pack-refs patch-id pickaxe prune prune-packed pull range-diff read-tree rebase
-receive-pack reflog refs remote remote-ext remote-fd repack replace replay repo rerere reset
-restore rev-list rev-parse revert rm send-pack shortlog show show-branch show-index show-ref
-sparse-checkout stage stash status stripspace submodule--helper switch symbolic-ref tag
-unpack-file unpack-objects update-index update-ref update-server-info upload-archive
-upload-archive--writer upload-pack url-parse var verify-commit verify-pack verify-tag version
-whatchanged worktree write-tree""".split())
+# Builtins every supported git has (≥ 2.39.4, the CVE-2024-32465 floor; checked against the
+# commands[] table of v2.39.4's git.c, where bisect is still a script), as the shim's fast path
+# lists them in hooks/gitshim/git. A list from one git is wrong for another (Apple's 2.50.1 lacks
+# `history`, `repo` and three more that 2.56 has, and there they are free names for an alias), so
+# the gate asks the git that will run (_git_builtins) and falls back to this.
+_GIT_PORTABLE_BUILTINS = frozenset("""
+add am apply archive blame branch bundle cat-file check-attr check-ignore check-mailmap
+check-ref-format checkout checkout-index cherry cherry-pick clean clone column commit-graph
+commit-tree config count-objects credential describe diff diff-files diff-index diff-tree difftool
+fetch fetch-pack fmt-merge-msg for-each-ref format-patch fsck gc grep hash-object help index-pack
+init interpret-trailers log ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge
+merge-base merge-file merge-tree mktag mktree multi-pack-index mv name-rev notes pack-objects
+pack-refs patch-id prune pull range-diff read-tree rebase reflog remote repack replace rerere reset
+restore rev-list rev-parse revert rm shortlog show show-branch show-ref sparse-checkout stash
+status stripspace switch symbolic-ref tag unpack-objects update-index update-ref var verify-commit
+verify-tag version whatchanged worktree write-tree""".split())
 _SESSION_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _NOTICE_NONCE_RE = re.compile(ACK_ENV + r"=([0-9a-f]{16})")
 ARGV_HEADER = "[push gate: `{command}` in {cwd} was NOT run]"
 ARGV_ACCEPTED_NOTE = "PUSH GATE: acknowledgement accepted — `{command}` runs under the session's normal permissions."
+NO_MIRROR_NOTE = ("\nThe push gate could not build or inherit a mirror of git's exec-path — not in its "
+                  "state directory, nor in a private directory of this process's temp dir (neither "
+                  "writable, or an exec-path it cannot mirror) — so it cannot intercept the gits this "
+                  "git would start: a push for each submodule, or a push a hook or an alias runs. It "
+                  "refuses rather than run git without that interception (and never silently lets it "
+                  "through). Fix the state directory, then rerun.")
 
 
 def _shim_state_dir():
@@ -1931,12 +2084,52 @@ def _shim_state_dir():
     return os.environ.get("CODEX_GATE_STATE") or os.path.join(os.path.dirname(_ack_dir()), "gitshim")
 
 
+def _fallback_state():
+    """A directory of this process's temp dir, private to this user, for exec-path mirrors when the
+    state cannot be written here; "" when there is none to be had."""
+    if not hasattr(os, "geteuid"):
+        return ""
+    base = os.path.join(tempfile.gettempdir(), f"software-workflows-gitshim-{os.geteuid()}")
+    try:
+        os.mkdir(base, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return ""
+    try:
+        st = os.lstat(base)
+    except OSError:
+        return ""
+    if not stat_mod.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+        return ""  # not a private directory of ours
+    return base
+
+
+def _any_farm_usable():
+    """Has the gate managed to build at least one exec-path mirror in this state (a line of
+    farms.tsv whose mirror still carries its mark)? If not — an unwritable state directory, a git
+    whose exec-path cannot be mirrored — the shim cannot intercept the gits that git itself starts,
+    so it is NOT trusted as the execution gate (review of 2026-10-18, turn 7)."""
+    try:
+        with open(os.path.join(_shim_state_dir(), "farms.tsv"), encoding="utf-8", errors="surrogateescape") as fh:
+            for line in fh:
+                f = line.rstrip("\n").split("\t")
+                if len(f) == 5 and _is_farm(f[2]):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
 def _shim_live(session):
-    """Has this session's git gone through the shim (hooks/gitshim/git writes
-    the marker; hooks/session_start.py clears it at every session start)?"""
+    """Is this session's git going through the shim AND is the shim actually able to intercept the
+    gits git starts? The shim writes the .live marker (hooks/session_start.py clears it at every
+    session start); a usable exec-path mirror must also exist, or the PreToolUse text gate stays in
+    charge rather than trusting a shim that cannot mirror (review of 2026-10-18, turn 7)."""
     session = str(session or "")
-    return bool(_SESSION_RE.fullmatch(session)) and os.path.isfile(
-        os.path.join(_shim_state_dir(), session + ".live"))
+    return (bool(_SESSION_RE.fullmatch(session))
+            and os.path.isfile(os.path.join(_shim_state_dir(), session + ".live"))
+            and _any_farm_usable())
 
 
 def _git_parse(args):
@@ -1975,6 +2168,245 @@ def _git_parse(args):
     return None, opts
 
 
+def _git_builtins(real_git):
+    """The builtins of the git that will run (`git --list-cmds=builtins`, git ≥ 2.18): git runs a
+    builtin before any alias of the same name, so none is ever a push/commit in disguise. When
+    that git cannot say, _GIT_PORTABLE_BUILTINS."""
+    try:
+        proc = subprocess.run([real_git, "--list-cmds=builtins"], capture_output=True, timeout=10,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return _GIT_PORTABLE_BUILTINS
+    names = proc.stdout.decode("utf-8", "replace").split() if proc.returncode == 0 else []
+    return frozenset(names) or _GIT_PORTABLE_BUILTINS
+
+
+def _git_external(name, opts, cwd0, path, exec_path):
+    """Would git run a dashed external `git-<name>`? git.c run_argv tries one after the builtins
+    and before the aliases: `git-<name>` in its exec-path, then on PATH, from the directory the -C
+    options lead to, which is where a relative or an empty PATH entry points (review of
+    2026-10-18). With no exec-path known, True: it is decided rather than run."""
+    if not name or name.startswith("-") or "/" in name or "\\" in name or "\0" in name:
+        return False
+    if not exec_path:
+        return True
+    cwd = cwd0
+    for opt, val in opts:
+        if opt == "-C" and val:
+            cwd = os.path.join(cwd, val)
+    for d in [exec_path, *path.split(os.pathsep)]:
+        cand = os.path.join(cwd, d or ".", "git-" + name)  # an empty PATH entry is the current directory
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return True
+    return False
+
+
+FARM_MARK = ".codex-gate-farm"  # in a mirror of git's exec-path; hooks/gitshim/git skips such a directory
+# A git that runs `git commit` or `git push` itself, as part of its own work, starts it directly:
+# a commit while it continues a rebase, cherry-pick, revert or merge, a push for each submodule of
+# a push. Such a child is part of the command that started it and is not decided again.
+_FARM_INTERNAL = {"commit": frozenset({"rebase", "cherry-pick", "revert", "merge"}),
+                  "push": frozenset({"push"})}
+
+
+def _is_farm(d):
+    return bool(d) and os.path.isfile(os.path.join(d, FARM_MARK))
+
+
+def _farm_index_put(real_bin, xp, farm, foreign, shim, fast):
+    """hooks/gitshim/git's fast path reads <state>/farms.tsv, newest line first: the git binary,
+    its exec-path, the mirror, the shim its `git` leads to — one per plugin version, and sessions
+    of two versions can run side by side — and the GIT_EXEC_PATH it mirrors ("" for git's own;
+    last, since the shell's `read` merges a run of tabs, so an empty field can only end a line). A
+    git that lacks a builtin of the fast path is not listed, so all its commands come through the
+    gate."""
+    fields = [real_bin, xp, farm, shim, foreign]
+    if any("\t" in f or "\n" in f for f in fields):
+        return
+    line = "\t".join(fields) + "\n"
+    idx = os.path.join(_shim_state_dir(), "farms.tsv")
+    try:
+        with open(idx, encoding="utf-8", errors="surrogateescape") as fh:
+            old = fh.readlines()
+    except OSError:
+        old = []
+
+    def keeps(ln):
+        f = ln.rstrip("\n").split("\t")
+        return len(f) == 5 and (f[0], f[3], f[4]) != (real_bin, shim, foreign) and _is_farm(f[2])
+
+    new = ([line] if fast else []) + [ln for ln in old if keeps(ln)]
+    if new != old:
+        tmp = f"{idx}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            fh.writelines(new)
+        os.replace(tmp, idx)  # a line lost to a concurrent rewrite comes back on the next call
+
+
+def _git_exec_farm(real_git, builtins, foreign=None):
+    """(GIT_EXEC_PATH for real_git, the exec-path it mirrors). git puts its exec-path first on PATH
+    for everything it starts (exec-cmd.c setup_path), so a git that anything git starts runs would
+    come from there and never reach the shim. The mirror holds a symlink to each entry of that
+    exec-path, a `git` that leads back to the shim, and for each dashed builtin a script running
+    `git <name>` through it; it is built once per git binary, exec-path and shim. ("", exec-path)
+    when it cannot be built: git then runs as it would."""
+    import shlex
+    env = {k: v for k, v in os.environ.items() if k != "GIT_EXEC_PATH"}
+    if foreign:
+        env["GIT_EXEC_PATH"] = foreign
+    try:
+        proc = subprocess.run([real_git, "--exec-path"], capture_output=True, timeout=10,
+                              stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    xp = proc.stdout.decode("utf-8", "surrogateescape").strip() if proc.returncode == 0 else ""
+    try:
+        real_xp = os.path.realpath(xp) if xp else ""
+        if not real_xp or not os.path.isdir(real_xp) or _is_farm(real_xp):
+            return "", xp
+        real_bin = os.path.realpath(real_git)
+        shim = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "gitshim", "git"))
+        state = _shim_state_dir()
+        ident = "\0".join([real_bin, real_xp, str(os.stat(real_xp).st_mtime_ns), shim, state])
+        root = os.path.join(state, "exec")
+        farm = os.path.join(root, hashlib.sha256(ident.encode("utf-8", "surrogateescape")).hexdigest()[:16])
+        if not _is_farm(farm):
+            os.makedirs(root, mode=0o700, exist_ok=True)
+            tmp = f"{farm}.build-{os.getpid()}"
+            shutil.rmtree(tmp, ignore_errors=True)
+            os.mkdir(tmp, 0o700)
+            q = shlex.quote
+            scripts = {"git": "#!/bin/sh\n# git as git finds it in its exec-path: the push gate's shim\n"
+                              f"CODEX_GATE_STATE={q(state)}; export CODEX_GATE_STATE\nexec {q(shim)} \"$@\"\n"}
+            for name in os.listdir(real_xp):
+                if name.startswith(".") or name == "git":
+                    continue
+                if name.startswith("git-") and name[4:] in builtins:
+                    scripts[name] = f"#!/bin/sh\nexec \"${{0%/*}}/git\" {q(name[4:])} \"$@\"\n"
+                else:
+                    os.symlink(os.path.join(real_xp, name), os.path.join(tmp, name))
+            for name, text in scripts.items():
+                with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                os.chmod(os.path.join(tmp, name), 0o755)
+            # what it mirrors, for _farm_passed_down and for hooks/session_start.py, which removes
+            # a mirror once any of the three is gone
+            with open(os.path.join(tmp, FARM_MARK), "w", encoding="utf-8", errors="surrogateescape") as fh:
+                fh.write(real_bin + "\n" + real_xp + "\n" + shim + "\n")
+            try:
+                os.rename(tmp, farm)
+            except OSError:  # another git built it meanwhile
+                shutil.rmtree(tmp, ignore_errors=True)
+            if not _is_farm(farm):
+                return "", xp
+        try:
+            _farm_index_put(real_bin, xp, farm, foreign or "", shim, _GIT_PORTABLE_BUILTINS <= builtins)
+        except OSError:
+            pass  # the index only speeds up the shell's fast path; the mirror itself is usable
+        return farm, xp
+    except OSError:
+        return "", xp
+
+
+def _farm_passed_down(farm, real_git):
+    """(farm, the exec-path it mirrors) when the mirror a git passed down is the one for real_git."""
+    try:
+        with open(os.path.join(farm, FARM_MARK), encoding="utf-8", errors="surrogateescape") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return "", ""
+    if len(lines) >= 2 and lines[0] == os.path.realpath(real_git) and os.path.isdir(lines[1]):
+        return farm, lines[1]
+    return "", ""
+
+
+def _proc_argv(pid):
+    """Process `pid`'s exact argv — /proc on Linux, sysctl KERN_PROCARGS2 on macOS — or None. Never
+    `ps -o args`: it joins the arguments with spaces, and `-c alias.x=!git push …` would read as a
+    parent `git push` (measured 2026-10-18)."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            data = fh.read()
+        return [a.decode("utf-8", "surrogateescape") for a in data.split(b"\0")[:-1]] if data.endswith(b"\0") else None
+    except OSError:
+        pass
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value < 4:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+            return None
+    except (OSError, AttributeError, ValueError):
+        return None
+    raw = buf.raw[:size.value]
+    argc, i = int.from_bytes(raw[:4], sys.byteorder), raw.find(b"\0", 4)  # argc, then the exec path
+    if i < 0:
+        return None
+    while i < len(raw) and raw[i] == 0:  # its padding
+        i += 1
+    argv = []
+    for _ in range(argc):
+        j = raw.find(b"\0", i)
+        if j < 0:
+            return None
+        argv.append(raw[i:j].decode("utf-8", "surrogateescape"))
+        i = j + 1
+    return argv
+
+
+def _parent_git_sub(real_git=None, cwd=None, builtins=frozenset()):
+    """The effective subcommand of this process's parent when the parent is a git (one that started
+    this git itself, no shell between), else None — also when its argv cannot be read exactly. A
+    builtin alias is resolved to the command it names (`ci` = commit → "commit"), so a child
+    `git commit` that git spawns for an acknowledged `git ci` is recognised as that same commit
+    (review of 2026-10-18, turn 7); a shell alias (`!…`) resolves to None (the shell, not git, runs
+    what it spawns)."""
+    import shlex
+    argv = _proc_argv(os.getppid())
+    if not argv or os.path.basename(argv[0]) not in ("git", "git.exe"):
+        return None
+    cur = argv[1:]
+    for _ in range(16):
+        k, _opts = _git_parse(cur)
+        if k is None or k == -1:
+            return None
+        sub = _GIT_OPT_COMMANDS.get(cur[k], cur[k])
+        if real_git is None or sub in ("commit", "push") or sub in builtins:
+            return sub  # git runs a builtin before any alias of its name
+        # this git already runs where the parent's -C options led (git changes directory before it
+        # starts a child), so a relative -C replayed from here resolves twice and misses the alias
+        # (review of 2026-10-18, turn 8); every other option of the parent is kept as given
+        pre, j = [], 0
+        while j < k:
+            a = cur[j]
+            takes = (a.partition("=")[0] if a.startswith("--") else a) in _GIT_VALUE_OPTS and not (
+                a.startswith("--") and "=" in a)
+            if a == "-C":
+                j += 2
+                continue
+            pre.append(a)
+            if takes and j + 1 < k:
+                pre.append(cur[j + 1])
+                j += 2
+            else:
+                j += 1
+        value = _git_alias(real_git, cwd or os.getcwd(), pre, sub)
+        if value is None or value.startswith("!"):
+            return sub  # a real subcommand, or a shell alias we do not follow
+        try:
+            cur = cur[:k] + shlex.split(value) + cur[k + 1:]
+        except ValueError:
+            return sub
+    return None
+
+
 def _git_alias(real_git, cwd, prefix, name):
     """alias.<name> as git would read it under the same global options
     (`prefix`, the arguments before the subcommand), or None."""
@@ -1995,19 +2427,34 @@ def _same_dir(a, b):
         return False
 
 
+NOTICE_LOCK = "notices.lock"  # hooks/gate_notice.py NOTICE_LOCK; hooks/session_start.py never removes it
+
+
 def _write_notice(text):
     """The denial for hooks/gate_notice.py, which shows it to Claude when the
-    command's own output did not (a redirected stderr)."""
+    command's own output did not (a redirected stderr). Appended under the
+    lock file gate_notice.py replaces the notice under: Bash calls run side by
+    side."""
     session = os.environ.get("CODEX_GATE_SESSION") or os.environ.get("CLAUDE_CODE_SESSION_ID") or ""
     if not _SESSION_RE.fullmatch(session):
         return
     m = _NOTICE_NONCE_RE.search(text)
     try:
+        import fcntl
         state = _shim_state_dir()
         os.makedirs(state, mode=0o700, exist_ok=True)
-        with open(os.path.join(state, session + ".notice"), "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"nonce": m.group(1) if m else "", "ts": time.time(), "text": text}) + "\n")
-    except OSError:
+        lock = os.open(os.path.join(state, NOTICE_LOCK), os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with open(os.path.join(state, session + ".notice"), "a+b") as fh:
+                end = fh.seek(0, os.SEEK_END)
+                fh.seek(max(end - 1, 0))
+                lead = b"\n" if end and fh.read(1) != b"\n" else b""  # a line a failed write left unfinished
+                record = {"nonce": m.group(1) if m else "", "ts": time.time(), "text": text}
+                fh.write(lead + json.dumps(record).encode() + b"\n")
+        finally:
+            os.close(lock)
+    except (OSError, ImportError):
         pass  # best effort: the denial is on stderr already
 
 
@@ -2018,14 +2465,47 @@ def _argv_main(real_git, args):
     import shlex
     shim_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gitshim")
     path = os.environ.get("PATH", "")
+    inherited = os.environ.pop("GIT_EXEC_PATH", None)
+    nested = _is_farm(inherited or "")  # started by a git this shim ran (its exec-path is a mirror)
     # the gate's own git calls (inspection, configuration, aliases) go to the real git
-    os.environ["PATH"] = os.pathsep.join(d for d in path.split(os.pathsep) if not _same_dir(d, shim_dir))
+    os.environ["PATH"] = os.pathsep.join(d for d in path.split(os.pathsep)
+                                         if not _same_dir(d, shim_dir) and not _is_farm(d))
+    builtins = _git_builtins(real_git)
+    farm, exec_path = _farm_passed_down(inherited, real_git) if nested else ("", "")
+    if not farm:
+        farm, exec_path = _git_exec_farm(real_git, builtins, None if nested else inherited)
+        alt = "" if farm else _fallback_state()
+        if alt and alt != _shim_state_dir():
+            # The state is the hooks' to write. Where this process cannot (Claude Code's sandbox
+            # lets Bash read it, never write it — measured 2026-10-18) and no hook built a mirror
+            # for this git, it is built in a private directory this process may write, and the
+            # gits it starts look there (CODEX_GATE_STATE is inherited).
+            os.environ["CODEX_GATE_STATE"] = alt
+            farm, exec_path = _git_exec_farm(real_git, builtins, None if nested else inherited)
+    if not farm:
+        # No mirror for THIS git: the gits it would start (a push for each submodule, a push a hook
+        # or an alias runs) cannot come back through the shim, and another git's cached mirror does
+        # not change that. Any command can start one through a hook, so none runs blind; the text
+        # gate's `_shim_live` alone is no guarantee (review of 2026-10-18, turn 8).
+        try:
+            cwd_now = os.getcwd()
+        except OSError:
+            cwd_now = ""
+        text = ARGV_HEADER.format(command=shlex.join(["git", *args]), cwd=cwd_now) + NO_MIRROR_NOTE
+        print(text, file=sys.stderr, flush=True)
+        _write_notice(text)
+        return 1
 
     def run_git() -> NoReturn:
         os.environ["PATH"] = path
+        if farm:
+            os.environ["GIT_EXEC_PATH"] = farm  # what git starts finds this shim as its `git`
+        elif inherited is not None:
+            os.environ["GIT_EXEC_PATH"] = inherited
         os.execv(real_git, [real_git, *args])
 
     command = shlex.join(["git", *args])
+    opaque = ""
     try:
         cwd0 = os.getcwd()
         cur, k, opts = list(args), None, []
@@ -2034,22 +2514,57 @@ def _argv_main(real_git, args):
             if k is None:
                 run_git()
             if k == -1:
-                if "commit" not in cur and "push" not in cur:
-                    run_git()  # an option git refuses or reads its own way, and no push/commit word
+                opaque = UNREAD_NOTE.format(why="a global option it does not read")
+                break
+            if any(o == "--exec-path" for o, _v in opts):
+                opaque = UNREAD_NOTE.format(why="git is given an exec-path of its own, where the gits "
+                                                "it starts would come from")
                 break
             sub = _GIT_OPT_COMMANDS.get(cur[k], cur[k])
             if sub in ("commit", "push"):
+                if nested:
+                    psub = _parent_git_sub(real_git, cwd0, builtins)
+                    # git itself is executing this very commit/push: its own verb or an alias to it
+                    # (`git ci` → commit), or a rebase/cherry-pick/revert/merge/push step of it. A
+                    # child whose parent is a shell (submodule foreach, a `!` alias) gives psub None.
+                    if psub == sub or psub in _FARM_INTERNAL[sub]:
+                        run_git()
                 break
-            if sub in _GIT_BUILTINS:
-                run_git()
+            if sub in builtins:
+                run_git()  # also git's own helpers it starts: `submodule--helper` is a builtin
+            # A git that git started is classified like any other: its dashed helpers
+            # (git-submodule, git-submodule--helper) run at the external branch below, while an
+            # alias is followed and an unknown name refused — so a nested alias to push, or a
+            # nested misspelling git would autocorrect, never skips the gate (review of
+            # 2026-10-18, turn 8).
+            # git's order is builtin, dashed external, alias. What an external or a shell alias
+            # runs comes back through the shim when git's exec-path is the mirror; without one it
+            # is decided here, since it may run a push.
+            if _git_external(sub, opts, cwd0, path, exec_path):
+                if farm:
+                    run_git()
+                opaque = OPAQUE_NOTE.format(sub=sub, what=f"the external command git-{sub}")
+                break
             value = _git_alias(real_git, cwd0, cur[:k], sub)
-            if value is None or value.startswith("!"):
-                run_git()  # no alias (an external command), or a shell alias whose gits come back through the shim
-            cur = cur[:k] + shlex.split(value) + cur[k + 1:]
+            if value is None:
+                # not a git command: said here and never handed to git, whose autocorrection
+                # (help.autocorrect) could run another command in its place (review of 2026-10-18)
+                print(NOT_A_COMMAND.format(sub=sub), file=sys.stderr)
+                return 1
+            if value.startswith("!"):
+                if farm:
+                    run_git()
+                opaque = OPAQUE_NOTE.format(sub=sub, what="a shell alias")
+                break
+            try:
+                cur = cur[:k] + shlex.split(value) + cur[k + 1:]
+            except ValueError:
+                opaque = UNREAD_NOTE.format(why=f"the alias {sub} does not parse")
+                break
         else:
-            run_git()
-    except (OSError, ValueError):
-        run_git()  # nothing here could tell a push/commit: git decides (an unclosed alias quote, a vanished cwd)
+            opaque = UNREAD_NOTE.format(why="more than 16 aliases deep")
+    except OSError:
+        run_git()  # a vanished cwd: git says so
     if os.name == "nt":
         print(GATE_REASON + STORE_UNUSABLE_NOTE.format(path=_ack_dir(), why="unverified on Windows"),
               file=sys.stderr)
@@ -2067,6 +2582,8 @@ def _argv_main(real_git, args):
             semantic.append(opt)
         else:
             direct = False
+    if opaque:
+        direct = False  # what it runs is not this argv
     if direct:
         semantic += cur[k:]
         if any(t.startswith(("--receive-pack", "--upload-pack", "--exec")) for t in cur[k + 1:]):
@@ -2074,14 +2591,14 @@ def _argv_main(real_git, args):
     try:
         accepted, reason = _decide(command, cwd, "bash", os.environ.get("CODEX_GATE_TRANSCRIPT", ""),
                                    os.environ.get(ACK_ENV, "").strip(), direct,
-                                   shlex.join(semantic) if direct else command)
+                                   shlex.join(semantic) if direct else command, shim=True)
     except Exception as exc:
         accepted, reason = False, EVAL_FAILED_REASON.format(why=f"{type(exc).__name__}: {exc}")
     if accepted:
         print(ARGV_ACCEPTED_NOTE.format(command=command), file=sys.stderr, flush=True)
         os.environ.pop(ACK_ENV, None)
         run_git()
-    text = ARGV_HEADER.format(command=command, cwd=cwd0) + "\n" + reason
+    text = ARGV_HEADER.format(command=command, cwd=cwd0) + opaque + "\n" + reason
     print(text, file=sys.stderr, flush=True)
     _write_notice(text)
     return 1

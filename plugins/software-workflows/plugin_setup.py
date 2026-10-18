@@ -10,14 +10,18 @@ SessionStart hook runs the quick checks and points to setup when one fails.
 
 It runs under any python3 from 3.9 on (what macOS ships). Nothing changes without `apply` or
 `prepare`; `apply` adds one key to one file and leaves everything else in it as it was."""
+import ctypes
+import errno
 import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -123,6 +127,29 @@ def checks(data_dir=None, quick=False):
                             "setup builds it now (about 10 s); otherwise the server builds it on its next start",
                             "prepare"))
 
+    # A codex-oracle server registered by hand (1.x instructions) next to this plugin's own gives
+    # two tool sets; only server NAMES are read, never their settings.
+    try:
+        conf = json.loads((Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home()) / ".claude.json")
+                          .read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        conf = {}
+    dupes = [("user", name) for name in (conf.get("mcpServers") or {}) if "codex" in name.lower()
+             and "oracle" in name.lower()] if isinstance(conf, dict) else []
+    for project, entry in ((conf.get("projects") or {}).items() if isinstance(conf, dict) else ()):
+        if isinstance(entry, dict) and isinstance(entry.get("mcpServers"), dict):
+            dupes += [(f"local, in {project}", name) for name in entry["mcpServers"]
+                      if "codex" in name.lower() and "oracle" in name.lower()]
+    if dupes:
+        scope, name = dupes[0]
+        out.append(("codex-oracle registration", False,
+                    f"also registered by hand: {', '.join(f'{n} ({s})' for s, n in dupes)}; this plugin "
+                    "registers its own, and two registrations give two tool sets",
+                    f"claude mcp remove {shlex.quote(name)} -s {scope.split(',')[0]}"
+                    + (f"   (run it in {scope.split('in ', 1)[1]})" if scope.startswith("local") else ""), ""))
+    else:
+        out.append(("codex-oracle registration", True, "only the plugin's own", "", ""))
+
     # the real git: in the Bash tool the push gate's shim comes first on PATH
     shim = os.path.realpath(ROOT / "hooks" / "gitshim")
     git = shutil.which("git", path=os.pathsep.join(
@@ -136,14 +163,25 @@ def checks(data_dir=None, quick=False):
     return out
 
 
+def _sh(path):
+    """A path as commands/setup.md quotes it — in double quotes, the form its allowed-tools rule
+    matches (measured on Claude Code 2.1.302 with a space in the plugin root: an unquoted ! step
+    breaks, and a quoted step runs only under the quoted rule) — or shell-quoted when double
+    quotes would not keep it as it is."""
+    if re.search(r'["$`\n]|\\(?=["$`\\])', path):
+        return shlex.quote(path)
+    return f'"{path}"'
+
+
 def _check(data_dir):
     items = checks(data_dir)
-    me = sys.argv[0]
+    me = _sh(sys.argv[0])
+    data = f" --data {_sh(data_dir)}" if data_dir else ""
     print(f"software-workflows setup check ({sum(1 for i in items if i[1])} of {len(items)} ready)")
     for item, ready, detail, fix, action in items:
-        print(f"  {'OK     ' if ready else 'MISSING'}  {item:<19} {detail}")
+        print(f"  {'OK     ' if ready else 'MISSING'}  {item:<25} {detail}")
         if fix:
-            print(f"  {'':<7}  {'':<19} fix: {fix}")
+            print(f"  {'':<7}  {'':<25} fix: {fix}")
     actions = [i[4] for i in items if i[4] and not i[1]]
     if actions:
         print("Setup can do these itself:")
@@ -151,55 +189,183 @@ def _check(data_dir):
             if action == "agent-teams":
                 print(f"  agent-teams (ask the person first): python3 {me} apply agent-teams")
             elif action == "prepare":
-                print(f"  prepare (writes only in the plugin's data directory): "
-                      f"python3 {me} prepare --data {data_dir or ''}".rstrip())
-    print(f"Check again: python3 {me} check --data {data_dir or ''}".rstrip())
+                print(f"  prepare (writes only in the plugin's data directory): python3 {me} prepare{data}")
+    print(f"Check again: python3 {me} check{data}")
     return 0
+
+
+def _read_bytes(path):
+    try:
+        return path.read_bytes()
+    except FileNotFoundError:
+        return None
+
+
+def _flag_rename():
+    """The C rename that takes flags, with its (exchange, never-replace) flags: macOS renameatx_np
+    (RENAME_SWAP, RENAME_EXCL), Linux renameat2 (RENAME_EXCHANGE, RENAME_NOREPLACE); None where
+    there is none (Windows, an older C library). As scripts/codex_src.py `_exclusive_rename`."""
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except (OSError, TypeError):
+        return None
+    for name, flags in (("renameatx_np", (0x2, 0x4)), ("renameat2", (0x2, 0x1))):
+        fn = getattr(libc, name, None)
+        if fn is not None:
+            fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            fn.restype = ctypes.c_int
+            return fn, flags
+    return None
+
+
+def _with_agent_teams(raw, target):
+    """(the settings bytes with agent teams on, or None when they need no change; a refusal, or
+    "")."""
+    try:
+        text = raw.decode("utf-8") if raw is not None else ""
+        data = json.loads(text) if text.strip() else {}
+    except ValueError as exc:
+        return None, f"not changed: {target} is not valid JSON ({exc}); fix the file, then run setup again"
+    env = data.get("env", {}) if isinstance(data, dict) else None
+    if not isinstance(env, dict):
+        return None, f"not changed: {target} does not hold a JSON object with an \"env\" object"
+    if env.get(TEAMS) == "1":
+        return None, ""
+    data["env"] = env
+    env[TEAMS] = "1"
+    return (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"), ""
+
+
+def _finish(dir_fd, code):
+    if dir_fd >= 0:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+    return code
+
+
+def _exclusive(target, prefix, suffix=""):
+    """A new, empty file beside `target` under a name nothing held before (created exclusively), so
+    a temp or recovery file an earlier run left — even under a reused PID — is never truncated or
+    overwritten (review of 2026-10-18, turn 8)."""
+    fd, name = tempfile.mkstemp(dir=target.parent, prefix=prefix, suffix=suffix)
+    os.close(fd)
+    return Path(name)
 
 
 def apply_agent_teams():
     """Add env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = "1" to the person's own settings.json, in
     place: every other key stays as it was, the write is atomic, and a symlinked file is written
-    through its link. A file that is not a JSON object is refused, never rewritten."""
+    through its link. A file that is not a JSON object is refused, never rewritten.
+
+    Claude Code writes this file too (review of 2026-10-18). The merged file is EXCHANGED with the
+    one in place, atomically, and when what that displaced is not the text the merge was made from,
+    a write landed meanwhile: setup moves the displaced text out to a durable recovery file BEFORE
+    anything else, merges it in turn, and exchanges again, until a swap displaces only setup's own
+    text — so a concurrent write is always either in the live file or in that recovery file, never
+    only in memory, and a crash at any point loses nothing. The invariant holds the HIGH finding of
+    the turn-7 review closed. A file that did not exist is created only if it still does not. Where
+    the system has no exchange (Windows; a filesystem that refuses it), the file is read again just
+    before an ordinary replace instead, and a write landing in that last instant is the one setup
+    cannot see (documented, not claimed closed)."""
     path = settings_path()
     target = path.resolve() if path.is_symlink() else path
+    tmp = None   # setup's own merge, in a file made for it at each write
+    keep = None  # durable home for a concurrent write, made the first time one is displaced
+    flagged = _flag_rename()
+    done = f'set env.{TEAMS} = "1" in {target}. Agent teams start in your next Claude Code session.'
     try:
-        text = target.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        text = ""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        expect = _read_bytes(target)  # the text in place, as far as setup knows
+        dir_fd = os.open(target.parent, os.O_RDONLY) if flagged else -1
     except OSError as exc:
         print(f"not changed: cannot read {target} ({exc})")
         return 1
+    base, saved = expect, False  # base: the newest text to merge onto; saved: `keep` holds a concurrent write
+    tmp_holds_displaced = False  # tmp holds a concurrent write not yet moved to `keep` (one syscall wide)
     try:
-        data = json.loads(text) if text.strip() else {}
-    except ValueError as exc:
-        print(f"not changed: {target} is not valid JSON ({exc}); fix the file, then run setup again")
-        return 1
-    env = data.get("env", {}) if isinstance(data, dict) else None
-    if not isinstance(env, dict):
-        print(f"not changed: {target} does not hold a JSON object with an \"env\" object")
-        return 1
-    if env.get(TEAMS) == "1":
-        print(f'already on: env.{TEAMS} is "1" in {target}')
-        return 0
-    data["env"] = env
-    env[TEAMS] = "1"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-        if target.exists():
-            os.chmod(tmp, stat.S_IMODE(target.stat().st_mode))
-        os.replace(tmp, target)
+        for _ in range(5):
+            merged, refusal = _with_agent_teams(base, target)
+            if merged is None and base == expect:
+                print(refusal or f'already on: env.{TEAMS} is "1" in {target}')
+                return _finish(dir_fd, 1 if refusal else 0)
+            new = merged if merged is not None else base  # else: a displaced write, merged, going back in
+            assert new is not None  # base is None only when expect is None, where _with_agent_teams merges {} to bytes
+            tmp = _exclusive(target, f".{target.name}.", ".tmp")
+            tmp.write_bytes(new)
+            if expect is not None:
+                os.chmod(tmp, stat.S_IMODE(target.stat().st_mode))
+            else:  # a file setup creates gets the mode a plain write would give it
+                um = os.umask(0)
+                os.umask(um)
+                os.chmod(tmp, 0o666 & ~um)
+            if flagged:
+                fn, (exchange, exclusive) = flagged
+                rc = fn(dir_fd, os.fsencode(tmp.name), dir_fd, os.fsencode(target.name),
+                        exclusive if expect is None else exchange)
+                err = ctypes.get_errno() if rc != 0 else 0
+                if expect is None and err == errno.EEXIST:  # created meanwhile: merge onto that
+                    tmp.unlink()
+                    base = expect = _read_bytes(target)
+                    continue
+                if err and err not in (errno.EINVAL, errno.ENOTSUP, errno.ENOSYS):
+                    raise OSError(err, os.strerror(err), str(target))
+                if not err:
+                    if expect is None:  # created where nothing was: the rename moved tmp to target
+                        print(refusal or done)
+                        return _finish(dir_fd, 1 if refusal else 0)
+                    # the swap put the displaced text in tmp; move it to `keep` at once, durably,
+                    # before reading or merging it — on disk throughout, in tmp for a few syscalls
+                    tmp_holds_displaced = True
+                    if keep is None:
+                        keep = _exclusive(target, f"{target.name}.displaced-by-setup-")
+                    os.replace(tmp, keep)
+                    tmp_holds_displaced, saved = False, True
+                    displaced = _read_bytes(keep)
+                    if displaced == expect:  # setup displaced its own earlier write: all merges are in
+                        keep.unlink()
+                        print(refusal or done)
+                        return _finish(dir_fd, 1 if refusal else 0)
+                    base, expect = displaced, new
+                    continue
+            # no exchange here: read again just before an ordinary replace
+            now = _read_bytes(target)
+            if now != expect:
+                tmp.unlink()
+                base = expect = now
+                continue
+            os.replace(tmp, target)
+            print(refusal or done)
+            return _finish(dir_fd, 1 if refusal else 0)
     except OSError as exc:
-        print(f"not changed: cannot write {target} ({exc})")
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        return 1
-    print(f'set env.{TEAMS} = "1" in {target}. Agent teams start in your next Claude Code session.')
-    return 0
+        if tmp_holds_displaced and tmp is not None:  # preserve the concurrent write only in tmp now
+            try:
+                if keep is None:
+                    keep = _exclusive(target, f"{target.name}.displaced-by-setup-")
+                os.replace(tmp, keep)
+                tmp_holds_displaced, saved = False, True
+            except OSError:
+                pass  # tmp keeps the bytes on disk under its own name
+        elif tmp is not None:
+            try:
+                tmp.unlink()  # tmp holds only setup's own merge, if it is still there
+            except OSError:
+                pass
+        where = (f"; a concurrent write is preserved in {tmp}" if tmp_holds_displaced
+                 else f"; a concurrent write is preserved in {keep}" if saved else "")
+        print(f"stopped: cannot write {target} ({exc}){where}")
+        return _finish(dir_fd, 1)
+    if keep is None:  # every round met a newer file before setup wrote anything
+        print(f"stopped: {target} kept changing while setup merged it; setup left it as it is. "
+              "Run setup again.")
+        return _finish(dir_fd, 1)
+    # five swaps, each displacing a newer write: the live file holds setup's merge of an earlier
+    # version; `keep` holds the last write it displaced, already merged into nothing live yet
+    print(f"stopped: {target} kept changing while setup merged it. It holds setup's merge of an "
+          f"earlier version; the newer text it displaced last is in {keep}. Compare the two, then "
+          "run setup again.")
+    return _finish(dir_fd, 1)
 
 
 def main(argv):

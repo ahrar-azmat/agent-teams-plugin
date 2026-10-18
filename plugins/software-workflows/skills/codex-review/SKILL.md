@@ -20,6 +20,13 @@ diff is large, also read the changed files so you can answer follow-ups without 
 
 - **Codex Oracle**: `code_review` with the diff
 
+**One review, then follow-ups in the same session (2.0).** `code_review` continues this
+workspace's latest completed review session by default (`session="continue"`): it is the next
+turn of the same Codex thread, so the reviewer starts from its earlier findings and its reads of
+the code. After you fix its findings, send a short follow-up naming what changed. It says which
+findings are fixed, which still stand and what is new. Do not restate the context. Pass
+`session="new"` for an unrelated change. The result's second line names the session.
+
 > **The review is NOT complete until CODEX has answered.** Codex runs at max effort and often
 > takes many minutes; long calls are backgrounded and return later as a task notification —
 > that is normal. Never ship, commit, or declare the review done while the call is pending.

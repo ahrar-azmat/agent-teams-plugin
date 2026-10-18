@@ -776,11 +776,59 @@ def _git(args: list[str], cwd: str) -> tuple[int, str]:
 _GIT_STATE_REASON = ""  # why the last _git_state refused (for the messages that follow it)
 
 
+def _tree_snapshot(cwd: str) -> dict:
+    """ONE walk of the tree (treedigest.inspect) → {"ok", "lines", "head",
+    "paths", "index", "reason"}: _git_state's status lines and HEAD, plus a
+    digest of each path's content, tracked and untracked (ignored files are
+    not part of a change), a submodule's covering what is inside it, and each
+    tracked path's staged (index) identity — so a further edit to a file that
+    was dirty already, or a staged blob swapped under an unchanged status,
+    both show, which status lines cannot (review of 2026-10-18). ok is False
+    when any of it could not be read, and `reason` says why."""
+    try:
+        r = _treedigest.inspect(cwd, want_status=True, inner_paths=True)
+    except Exception as exc:  # the module never raises; belt and braces
+        r = {"repo": False, "lines": None, "head": "", "paths": None, "index": None,
+             "reason": f"{type(exc).__name__}: {exc}"}
+    if not (r["repo"] and r["lines"] is not None and r.get("paths") is not None
+            and r.get("index") is not None):
+        return {"ok": False, "lines": set(), "head": "", "paths": {}, "index": {},
+                "reason": r["reason"] or "unknown"}
+    return {"ok": True, "lines": set(r["lines"]), "head": r["head"],
+            "paths": r["paths"], "index": r["index"], "reason": ""}
+
+
+def _lines_by_path(lines: set[str]) -> dict[str, str]:
+    """Status lines by path. Two byte paths that display alike (bytes that are
+    not UTF-8) keep both lines, in a stable order (review of 2026-10-18)."""
+    out: dict[str, str] = {}
+    for ln in sorted(lines):
+        out[ln[3:]] = f"{out[ln[3:]]}; {ln}" if ln[3:] in out else ln
+    return out
+
+
+def _tree_changes(before: dict, after: dict) -> list[tuple[str, str]]:
+    """(path, line) for each path two _tree_snapshot results disagree on, by
+    content or by status: the line is the path's status line now, `   path`
+    when it is clean now, `(gone) path` when it is no longer there; marked
+    `(dirty before)` when it already differed from HEAD before."""
+    bl, al = _lines_by_path(before["lines"]), _lines_by_path(after["lines"])
+    bp, ap = before["paths"], after["paths"]
+    bi, ai = before.get("index") or {}, after.get("index") or {}
+    out = []
+    for path in sorted(set(bp) | set(ap) | set(bl) | set(al) | set(bi) | set(ai)):
+        if bp.get(path) == ap.get(path) and bl.get(path) == al.get(path) and bi.get(path) == ai.get(path):
+            continue
+        line = al.get(path) or (f"   {path}" if path in ap else f"(gone) {path}")
+        out.append((path, line + (" (dirty before)" if path in bl else "")))
+    return out
+
+
 def _git_state(cwd: str) -> tuple[bool, set[str], str]:
     """(is_work_tree, porcelain-shaped dirty lines, HEAD sha — '' on a repo
     with no commits yet, which is still a valid write target).
 
-    Round 36: computed by treedigest.worktree_status — the index and HEAD
+    Round 36: computed by treedigest (_tree_snapshot) — the index and HEAD
     listings plus this process's OWN byte reads — so no `git status` runs
     here: status refreshes the index and runs a configured clean filter for
     any file whose stat data changed (measured on 2.55.0), a helper command
@@ -792,55 +840,39 @@ def _git_state(cwd: str) -> tuple[bool, set[str], str]:
     write target (fail closed, round 34), and the reason is kept for the
     refusal message."""
     global _GIT_STATE_REASON
-    try:
-        ok, lines, head, reason = _treedigest.worktree_status(cwd)
-    except Exception as exc:  # the module never raises; belt and braces
-        ok, lines, head, reason = False, set(), "", f"{type(exc).__name__}: {exc}"
-    _GIT_STATE_REASON = "" if ok else (reason or "unknown")
-    if not ok:
-        return False, set(), ""
-    return True, set(lines), head
+    snap = _tree_snapshot(cwd)
+    _GIT_STATE_REASON = snap["reason"]
+    return snap["ok"], snap["lines"], snap["head"]
 
 
 _WRITE_REPORT_MAX_CHARS = 3500  # the report is a summary; the DIFF is the review surface
 
 
-def _write_changes_report(before: set[str], head_before: str, cwd: str) -> str:
-    """Attribution block appended to every write-run result.
-
-    Porcelain-line set math cannot see codex piling FURTHER changes onto a
-    file that was already dirty (same 'M path' line before and after) — the
-    report says so instead of pretending; the caller's diff review covers
-    those paths.
+def _write_changes_report(before: dict, cwd: str) -> str:
+    """Attribution block appended to every write-run result, from the
+    _tree_snapshot taken before the run and one taken now. By content: a
+    further change to a file that was dirty already is named, and a dirty
+    file the run left alone is not (review of 2026-10-18; porcelain-line set
+    math could not tell them apart). What another writer changed in the same
+    tree meanwhile is in it too, and the header says so.
     """
-    ok, after, head_after = _git_state(cwd)
-    if not ok:
+    after = _tree_snapshot(cwd)
+    if not after["ok"]:
         return (
             "\n\n[CHANGED FILES: git state unreadable after the run "
-            f"({_GIT_STATE_REASON}) — inspect the tree manually]"
+            f"({after['reason']}) — inspect the tree manually]"
         )
-    new_lines = sorted(after - before)
-    gone_lines = sorted(before - after)
-    pre_dirty = sorted(before & after)
-    parts = ["\n\n[CHANGED FILES — this write run]"]
-    if new_lines:
-        parts += [f"  {ln}" for ln in new_lines]
+    head_before, head_after = before["head"], after["head"]
+    changed = _tree_changes(before, after)
+    left_alone = {ln[3:] for ln in before["lines"]} - {p for p, _ in changed}
+    parts = ["\n\n[CHANGED FILES — in this tree while this write run ran "
+             "(another writer's changes meanwhile count too)]"]
+    if changed:
+        parts += [f"  {ln}" for _, ln in changed]
     else:
-        parts.append("  (no new working-tree changes attributable to this run)")
-    if gone_lines:
-        parts.append(
-            "  pre-existing dirty entries that DISAPPEARED "
-            "(deleted, reverted, or renamed by the run):"
-        )
-        parts += [f"    {ln}" for ln in gone_lines]
-    if pre_dirty:
-        parts.append(
-            f"  dirty before dispatch ({len(pre_dirty)} path(s)) — further "
-            "changes to these are NOT separable here; review them in the diff:"
-        )
-        parts += [f"    {ln}" for ln in pre_dirty[:20]]
-        if len(pre_dirty) > 20:
-            parts.append(f"    … +{len(pre_dirty) - 20} more")
+        parts.append("  (no working-tree changes during this run)")
+    if left_alone:
+        parts.append(f"  dirty before dispatch and left as they were: {len(left_alone)} path(s)")
     if head_after != head_before:
         parts.append(
             f"  ⚠ HEAD MOVED {head_before[:9] or '(none)'} → "
@@ -852,7 +884,7 @@ def _write_changes_report(before: set[str], head_before: str, cwd: str) -> str:
             f"  HEAD unchanged ({head_before[:9] or 'no commits yet'}) — "
             "nothing was committed"
         )
-    if any(len(ln) > 1 and ln[1] == "~" for ln in (before | after)):
+    if any(len(ln) > 1 and ln[1] == "~" for ln in (before["lines"] | after["lines"])):
         parts.append(
             "  legend: ` ~` = bytes differ from the index but a conversion "
             "attribute (filter/eol/ident/encoding) applies, so the comparison "
@@ -2290,10 +2322,11 @@ def _marked_survivors(run_tag: str) -> list[int]:
     leaks and its setsid() shell tools, which inherit the environment. A
     descendant that deliberately SCRUBS its environment (env={} +
     close_fds + new session) escapes every userspace channel at once; no
-    in-process mechanism can hold it (that is kernel custody — the 1.18
-    daemon's launchd/cgroup supervision). Until then that residual is
-    bounded by codex's own OS sandbox, which descendants inherit, and is
-    named here so it can never be mistaken for covered."""
+    in-process mechanism can hold it (that would take kernel custody:
+    launchd or cgroup supervision). For read runs that residual is bounded
+    by codex's own OS sandbox, which descendants inherit; infra and abraham
+    runs have no sandbox, so there it is not bounded. It is named here so
+    it can never be mistaken for covered."""
     if os.name == "nt" or not run_tag:
         return []
     return list(_procenv.marked_pids(run_tag))  # OSError propagates: fail closed
@@ -2304,8 +2337,8 @@ def _kill_marked(run_tag: str, pids: list[int]) -> None:
     (round 17): a pid from an older snapshot whose process exited (and was
     reused) is never signalled. This NARROWS the reuse window to the
     scan→signal gap — it does not close it (round 18): pid-based signalling
-    has no atomic identity on POSIX; handle-based kills belong to the 1.18
-    daemon's supervisor.
+    has no atomic identity on POSIX; only a supervisor holding process
+    handles could close it.
     """
     if not pids:
         return
@@ -3494,8 +3527,7 @@ async def _run_codex(
     # Refuse outside a work tree, and snapshot the dirty state so the final
     # report can attribute changes honestly (see _write_changes_report).
     eff_cwd = workdir or _get_cwd()
-    write_before: set[str] = set()
-    write_head = ""
+    write_before: dict = {}
     mode_since = 0
     extra_env: dict[str, str] = {}
     holds_tree_lock = bool(write or custody_cwd)
@@ -3513,11 +3545,11 @@ async def _run_codex(
             "@openai/codex.]"
         )
     if write:
-        ok, write_before, write_head = _git_state(eff_cwd)
-        if not ok:
+        write_before = _tree_snapshot(eff_cwd)
+        if not write_before["ok"]:
             return (
                 f"[write run refused: {eff_cwd} is not inside a git work "
-                f"tree, or its state could not be read ({_GIT_STATE_REASON}). "
+                f"tree, or its state could not be read ({write_before['reason']}). "
                 "Autonomous writes without version control have no "
                 "undo. Run from a git checkout (or `git init` first), or use "
                 "the read-only tools instead.]"
@@ -4082,7 +4114,7 @@ async def _run_codex(
                 with contextlib.suppress(Exception):
                     _fh.close()
         survivors_report = (
-            _write_changes_report(write_before, write_head, eff_cwd)
+            _write_changes_report(write_before, eff_cwd)
             if write else ""
         )
         return (
@@ -4157,7 +4189,7 @@ async def _run_codex(
     # changed on disk: a timed-out run may still have written files, and the
     # caller's next step is reviewing exactly that.
     write_report = (
-        _write_changes_report(write_before, write_head, eff_cwd) + _modes_line(modes)
+        _write_changes_report(write_before, eff_cwd) + _modes_line(modes)
         if write else ""
     )
 
@@ -4999,6 +5031,33 @@ async def codex_query(
     return banner + _verdict_missing_notice(caller_hypothesis, result) + result
 
 
+def _analysis_note(before: dict, after: dict, phase2: bool) -> str:
+    """What abraham's ANALYSIS phase — full access, read-only only by
+    instruction — left changed in the tree, on every way out of it, by
+    content (architect review and code review of 2026-10-18): "" when
+    nothing changed and phase 2 follows."""
+    if not before["ok"] or not after["ok"]:
+        side, why = ("before", before["reason"]) if not before["ok"] else ("after", after["reason"])
+        return (
+            "⚠ whether the ANALYSIS phase changed the tree is UNKNOWN: the tree "
+            f"could not be read {side} it ({why}) — review the whole diff.\n\n"
+        )
+    changed = [ln for _, ln in _tree_changes(before, after)]
+    if before["head"] != after["head"]:
+        changed.append(f"HEAD MOVED {before['head'][:9] or '(none)'} → {after['head'][:9] or '(none)'}")
+    if not changed:
+        return "" if phase2 else "The tree is as it was before the run.\n\n"
+    where = ("the changed-files report below counts them as there before phase 2"
+             if phase2 else "phase 2 never ran, and they are on disk now")
+    return (
+        "⚠ the tree changed during the ANALYSIS phase, which was told not to "
+        f"modify files (or another writer changed it meanwhile); {where} — "
+        "review them in the diff:\n" + "\n".join(f"  {ln}" for ln in changed[:20])
+        + (f"\n  … +{len(changed) - 20} more" if len(changed) > 20 else "")
+        + "\n\n"
+    )
+
+
 @mcp.tool()
 async def abraham(
     task: str,
@@ -5091,11 +5150,11 @@ async def abraham(
         # Fail closed BEFORE any precondition: the one-writer lock cannot
         # follow the codex child on Windows (a byte-range lock's ownership
         # does not transfer with an inherited handle), so a write run could
-        # outlive its server unlocked. Write mode returns with the 1.18 daemon.
+        # outlive its server unlocked.
         return (
-            "[abraham is unavailable on Windows in 1.17.x: the one-writer lock "
-            "cannot follow the codex child there. Write mode returns with the "
-            "1.18 daemon.]"
+            "[abraham is not available on Windows: the one-writer lock cannot "
+            "follow the codex child there, so a write run could outlive its "
+            "server unlocked. Run abraham from macOS or Linux.]"
         )
 
     # Anchor the heartbeat deadline to the REQUEST, not to each codex run:
@@ -5166,6 +5225,10 @@ async def abraham(
             f"({holder}). One writer per tree.]"
         )
     try:
+        # Phase 1 has full access and is read-only only by instruction: its
+        # changes must not be filed as pre-existing dirt by phase 2's report
+        # (architect review, 2026-10-18), so the tree is read on both sides.
+        before0 = _tree_snapshot(cwd)
         # ---- Phase 1: read-only analysis → implementation brief ----
         analysis_parts = [
             "PHASE 1 of 2 — ANALYSIS ONLY. You are a senior engineer "
@@ -5226,9 +5289,12 @@ async def abraham(
         brief_body = rest.strip()
         if not ok_header or not brief_body:
             return (
-                "[abraham: ANALYSIS phase failed — nothing was "
-                f"written. Phase-1 result follows.]\n\n{brief}"
+                "[abraham: ANALYSIS phase failed — phase 2 never ran. "
+                "Phase-1 result follows.]\n\n"
+                + _analysis_note(before0, _tree_snapshot(cwd), phase2=False)
+                + brief
             )
+        phase1_note = _analysis_note(before0, _tree_snapshot(cwd), phase2=True)
 
         # ---- Phase 2: implementation, full access ----
         impl_parts = [
@@ -5266,7 +5332,7 @@ async def abraham(
             "live web, MCP servers); phase 2 implemented (FULL ACCESS: no "
             "sandbox, network, live web and MCP servers — "
             "--dangerously-bypass-approvals-and-sandbox)]\n\n"
-            + result
+            + phase1_note + result
         )
     finally:
         _release_write_lock(cwd)
@@ -5359,15 +5425,13 @@ async def codex_resume_run(
         # a run claim there cannot be transferred to or survive its owning
         # process (byte-range locks are not inherited, and a parent's exit
         # does not end its children), so a second continuation of the same
-        # thread cannot be excluded. Refuse them all until the 1.18 daemon
-        # owns runs natively on Windows.
+        # thread cannot be excluded. Refuse them all.
         return (
             "[continuations (resume/collect/adopt) are not available on "
-            "Windows in 1.17.x: the run claim cannot outlive or be handed "
-            "off from the owning process there, so a second continuation of "
-            "the same thread cannot be excluded. Inspect with codex_runs / "
-            "codex_run_log and re-dispatch the question; the 1.18 daemon "
-            "brings native Windows run ownership.]"
+            "Windows: the run claim cannot outlive or be handed off from the "
+            "owning process there, so a second continuation of the same "
+            "thread cannot be excluded. Inspect with codex_runs / "
+            "codex_run_log and re-dispatch the question.]"
         )
 
     if run:
@@ -6429,8 +6493,7 @@ async def codex_cancel_run(run: str = "") -> str:
                     # Residual: custody is in-memory, so only the OWNING
                     # server can release it — a cross-server cancel leaves
                     # the owner's lock held (fail-closed over-hold) until
-                    # that server exits; the 1.18 daemon owns custody
-                    # durably.
+                    # that server exits.
                     _LOCK_CUSTODY.discard(str(lp))
                     _release_write_lock(custody_tree)
     finally:

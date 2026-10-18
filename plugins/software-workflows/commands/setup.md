@@ -1,11 +1,11 @@
 ---
 description: "Set up software-workflows on this machine: turn agent teams on in your own settings (asks first), check the Codex CLI, codex login, Python 3.11+ and git, and build the Codex Oracle server's environment"
-allowed-tools: Bash(python3 ${CLAUDE_PLUGIN_ROOT}/plugin_setup.py:*), AskUserQuestion
+allowed-tools: Bash(python3 "${CLAUDE_PLUGIN_ROOT}/plugin_setup.py":*), AskUserQuestion
 ---
 
 The setup check ran on this machine:
 
-!`python3 ${CLAUDE_PLUGIN_ROOT}/plugin_setup.py check --data ${CLAUDE_PLUGIN_DATA}`
+!`python3 "${CLAUDE_PLUGIN_ROOT}/plugin_setup.py" check --data "${CLAUDE_PLUGIN_DATA}"`
 
 Take the person through it:
 

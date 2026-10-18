@@ -205,15 +205,17 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   external command, an unknown option), go to `push_gate.py --argv` with their exact argv, cwd
   and environment. There they get the same decision, wording and one-shot token as before
   (`_decide`, shared with the text hook): aliases are expanded as git expands them, `-C` moves
-  the inspection with it, and a script or tool that runs git is seen as well.
+  the inspection with it, and a script or tool that runs git is seen as well. git runs with a
+  mirror of its exec-path, so the gits git itself starts come back through the shim (see
+  Review fixes).
 - Once a session's git has gone through the shim (a `.live` marker; cleared at every session
   start), the PreToolUse hook stops reading that session's Bash text, which ends the false
   denials of greps, `sed` and heredocs that merely mention push or commit. PowerShell, and a
   session whose shim has not run yet, keep the text gate unchanged; Windows does not install
   the shim (not measured there).
-- A denial the command's own output hides reaches Claude through a PostToolUse hook
-  (`hooks/gate_notice.py`): only denials from that call, and only when the result does not
-  already show their token.
+- A denial the command's own output hides reaches Claude through the PostToolUse and
+  PostToolUseFailure hooks (`hooks/gate_notice.py`): only denials from that call, and only when
+  the result does not already show their token.
 - Verified 2026-10-18 by real runs against a scratch repository with a bare remote (macOS 26.6,
   git 2.56.0):
   - through the shim, `git status` and `git log` run the real git and write the live marker;
@@ -351,6 +353,272 @@ This project adheres to [Semantic Versioning](https://semver.org/).
     `infra=false` was refused;
   - the read-back, calibrated: a read-only `code_review` thread gave `read-only/never` and the
     ⚠ line; the write run gave `danger-full-access/never`, journaled the same.
+
+### abraham reports what changed during its analysis phase, and every write report is by content
+- The analysis phase has full access and is read-only only by instruction. Until now, anything
+  that changed during it was filed as pre-existing dirt by the implementation phase's report.
+  abraham now reads the tree before and after the analysis phase, on every way out of it. When
+  they differ, the result starts with a ⚠ note naming the paths: changed by the analysis phase
+  or by another writer meanwhile. When phase 1 fails, the failure no longer says "nothing was
+  written": it says phase 2 never ran, and either names what changed or says the tree is as it
+  was. A tree that cannot be read before or after makes the note say the answer is UNKNOWN.
+  Found by the architect review of 2026-10-18; the code review the same day found that status
+  lines could not see a further edit to a file that was already dirty.
+- The comparison is by content. treedigest's one walk of the tree now also returns a digest of
+  each path (content, exec bit, symlink target, gitlink head), so a further edit to an
+  already-dirty or untracked file shows. The CHANGED FILES block of every write run uses the
+  same snapshots: it names each changed path with its status line, marks the ones that were
+  dirty before as `(dirty before)`, and counts the dirty paths the run left as they were. Its
+  header says that another writer's changes in the same tree meanwhile count too.
+- Verified 2026-10-18:
+  - in-process, on real files in a scratch repository: status lines alone missed a further
+    edit to a dirty `b.txt` and to an untracked `u.txt`; the snapshots named both, a staged
+    change, a new file and a clean file made dirty, counted the dirty `c.txt` left alone, and
+    reported UNKNOWN for a tree that could not be read;
+  - by a real run (codex-cli 0.163.0, gpt-6-astra at max), with `b.txt` dirty and `u.txt`
+    untracked before dispatch and both appended to while phase 1 ran. The note named
+    ` M b.txt (dirty before)` and `?? u.txt (dirty before)`, CHANGED FILES named ` M a.py` and
+    "dirty before dispatch and left as they were: 3 path(s)", HEAD was unchanged, and the
+    effective mode read full access;
+  - by a real run whose phase 1 was cancelled (`codex_cancel_run` from a second server) right
+    after another process appended to the already-dirty `b.txt`: abraham answered "ANALYSIS
+    phase failed — phase 2 never ran", with the note naming ` M b.txt (dirty before)`.
+
+### Review fixes (code review of 2026-10-18)
+- **The git shim sees every git that git starts.** git puts its own exec-path first on PATH
+  for everything it starts (`setup_path` in exec-cmd.c), so a git that git itself started,
+  through an alias, an external command or a step of its own command, never came back through
+  a shim on PATH. The gate now gives git a mirror of that exec-path as `GIT_EXEC_PATH`
+  (`push_gate.py` `_git_exec_farm`). In the mirror, `git` leads back to the shim, each dashed
+  builtin runs `git <name>` through it, and every other entry links to the real one. It is
+  built once per git binary, exec-path and plugin version, so sessions of two versions can run
+  side by side, and the shim's fast path finds it through an index. External commands and shell
+  aliases therefore run, and only the git commands they start are decided. Also:
+  - The fast path lists only the builtins every supported git has (≥ 2.39.4, checked against
+    that version's own command table), except commit and push, because a name that is a builtin
+    in a newer git can be an alias in an older one. Anything else goes to the gate. The gate
+    asks the real git for its builtins, then looks for an external command (from the directory
+    `-C` leads to, as git does), then for an alias.
+  - A command git does not know is answered by the gate and never handed to git, whose
+    autocorrection could run a different command in its place.
+  - A global option the gate does not read, an exec-path of the command's own, and an alias
+    chain it cannot follow are each decided like a push.
+  - A commit or push that git starts as a step of the command that started it runs as that
+    step: a commit while a rebase, cherry-pick, revert or merge continues, a push for each
+    submodule of a push, or the commit an acknowledged alias to commit runs (`git ci`). The
+    parent's exact argv is read from the kernel (sysctl on macOS, /proc on Linux), never from
+    `ps`, which joins arguments with spaces. Its verb is read the way git dispatches it (a
+    builtin before an alias of its name), in the directory the parent's `-C` already led to.
+  - A git that git started is decided like any other: its builtins and its dashed helpers run,
+    an alias is followed, and a name git does not know is refused. An alias chain that ends in
+    a push, or a misspelling git would autocorrect into one, cannot skip the gate.
+  - Where no mirror can be built or passed down for the git that runs (an unwritable state
+    directory, an exec-path that cannot be mirrored), the gate refuses the command and says
+    why, rather than run git where what it starts would not come back. A mirror cached for
+    another git does not count. The text gate stays in charge until a usable mirror exists.
+  - The command's stdin stays its own on the fast path.
+  - A session start removes a mirror nothing can use any more: its git binary, exec-path or
+    shim is gone, or its exec-path changed more than a day ago. It also removes a build that
+    died.
+  - The boundary is stated in the gate: a git that the shell does not find through PATH by
+    name (one run by its full path) is not seen, and a commit started inside an allowed parent
+    runs as that parent's step.
+  Verified 2026-10-18 by real runs in scratch repositories with no remote, under Apple git
+  2.50.1 and Homebrew git 2.56.0, comparing HEAD's shim and gate (a read-only `git archive`
+  export) with the checkout's:
+  - Six ways for a git command to start a push ran it through HEAD's shim; the new one decided
+    all six, under both gits.
+  - A plain commit and an alias to commit are denied by both.
+  - An acknowledged alias to commit completes as one commit. `git submodule status
+    --recursive`, which enters a submodule, runs. A git that git starts under a custom
+    exec-path still finds that exec-path's commands.
+  - Each later fix was run against a copy with only that fix taken out, under both gits. An
+    alias chain to push and a misspelling, each started by git, pushed through the copy and
+    were denied or refused by the checkout. With one git's mirror cached and none buildable
+    for the other, a builtin whose step runs a push pushed through the copy while the text
+    gate would have stood down, and was refused by the checkout, in both directions. An
+    acknowledged alias to commit run with a relative `-C` needed a second acknowledgement
+    through the copy and committed once through the checkout.
+  - The four `--continue` flows finish through the new shim. In the traced flows,
+    `cherry-pick` and `revert` each start one nested commit, and `rebase` and `merge` commit
+    in-process. With the step rule taken out, the nested commit of `cherry-pick --continue` is
+    denied.
+  - A git child sees the mirror as its exec-path, and `git-sh-setup` sources through it. stdin
+    is intact on both paths, and a `file://` clone works.
+  - With two copies of the hooks sharing one state directory, each version's gits reach its own
+    shim, through the fast path alone too. The cleanup kept and removed exactly the seven kinds
+    of mirror and five kinds of file set up for it.
+  - Cost per git call on the fast path, on the final code: 6.1 ms against 3.4 ms for the real
+    git under Homebrew git (HEAD's shim: 6.7 ms), and 14.2 ms against 10.6 ms under Apple git
+    (HEAD's: 14.2 ms).
+  - The Linux branch of the argv read (/proc) was not measured.
+- **The denial notices: failed calls too, and crash-safe.** A denial exits 1, and a Bash call
+  that exits non-zero fires PostToolUseFailure, never PostToolUse. Measured on Claude Code
+  2.1.302: that payload carries the call's output in `error`, plus `duration_ms`, and its
+  `additionalContext` reaches the model. The notice hook now runs on both events and answers
+  with the one it ran for.
+  Bash calls run side by side. Readers and writers take one lock file, which is never removed.
+  A reader writes what it keeps to a new file and renames it over the notice, so a reader that
+  dies midway leaves the notice whole. It states its denials before it lets go of them.
+  A denial from before this call started stays for the call that made it. Once no foreground
+  call can still be running (the Bash tool's longest timeout: 600 s, or `BASH_MAX_TIMEOUT_MS`),
+  the next call shows it as an earlier command's, which also covers a background command's
+  denial. A denial counts as shown only by its token: a header without its token cannot be
+  acted on. The window rests on the payload's `duration_ms` (3074 for a `sleep 3` call).
+  Verified 2026-10-18 by real runs of the hooks, comparing the version the review read with the
+  checkout's:
+  - After a failed call, the old hook repeated a denial the output already showed, under the
+    wrong event; the new one showed only what was hidden, under PostToolUseFailure.
+  - Killed at the moment it rewrites the notice, the old hook lost a running call's denial; the
+    new one lost nothing.
+  - With 12 writers and 4 readers side by side, three rounds of 720 denials: each shown once,
+    none lost.
+  - A writer that does not take the lock file loses its record whenever a reader is inside its
+    rewrite (calibrated by holding the reader there for 1 s). The new writer waited 0.6 s and
+    its record was kept.
+  - End to end, in a headless Claude Code 2.1.302 session with each plugin: a failed call's
+    fully redirected denial reached the model with the checkout's hooks and not with HEAD's.
+- **Setup quotes its paths.** Measured on Claude Code 2.1.302 with a space in the plugin root:
+  an unquoted `!` step breaks, and a double-quoted step runs only under a double-quoted
+  allowed-tools rule (not under the unquoted one, nor under an unrelated one). The command's
+  step, its rule and every command `plugin_setup.py` prints now use that form. Verified at a
+  path holding a space: the real `/software-workflows:setup` ran its step and reported all 7
+  items, and the model ran a printed quoted command under the rule with no permission denial.
+- **Setup never loses a settings write made meanwhile.** Claude Code writes `settings.json` too.
+  `apply agent-teams` now exchanges its merged file with the one in place in one atomic step
+  (macOS `renameatx_np` RENAME_SWAP, Linux `renameat2` RENAME_EXCHANGE). If the exchange
+  displaced something other than the text the merge was made from, a write landed meanwhile.
+  That text is merged and exchanged in turn, until a swap displaces only setup's own text. A
+  file that did not exist is created only if it still does not. A displaced text that is not
+  JSON goes back as it was. After five such swaps setup stops, keeps the newest displaced text
+  beside the file and says where. Where the system has no exchange (Windows, or a filesystem
+  that refuses it), the file is read again just before an ordinary replace, and a write landing
+  in that last instant is the one setup cannot see. A file that is not valid UTF-8 is refused
+  like invalid JSON. What an exchange displaces goes to a recovery file before setup reads it,
+  so a crash at any moment leaves a concurrent write on disk. The temporary and the recovery
+  file get names no file held before, created exclusively: what an earlier run left, even
+  under a reused process id, is never truncated or overwritten.
+  Verified 2026-10-18 under Apple's Python 3.9.6, with another writer's change injected inside
+  the call that puts setup's file in place:
+  - The version the review read lost the change in every case: once, every time, and a file
+    created meanwhile.
+  - The new one kept the change in each case. It restored a half-written file byte for byte and
+    refused it. After five swaps, every foreign change was in the file or in the kept text.
+  - With the exchange taken away, it loses the injected change, as stated above.
+  - Killed with no cleanup right after the exchange, right after the recovery name exists, and
+    right after the recovery file is written: the concurrent write was on disk each time.
+  - With files present beforehand under the names the previous version would use for this
+    process, and under the first names the exclusive allocation tries: the previous version
+    lost the first two; the new one left all four as they were and wrote under other names.
+  - The ordinary paths are unchanged: create, merge, already on, through a symlink, and not
+    JSON.
+  - The Linux branch was not measured.
+- **Change reports see inside submodules, and paths that display alike.** The snapshots behind
+  the CHANGED FILES block and abraham's analysis note now cover what is inside a checked-out
+  submodule: its paths and its status, recursively. Before, a further change inside an
+  already-dirty submodule was invisible to them. Two byte paths that display alike (bytes that
+  are not UTF-8) share one entry made of both and keep both status lines, so a change to either
+  shows. They also carry each tracked path's staged identity, at the top level, inside
+  submodules, and for every conflict stage, so a change to the index alone shows. The digest
+  the push gate binds reviews to is unchanged and still takes a submodule as its HEAD.
+  Verified 2026-10-18 on real files in scratch repositories, comparing the code before this fix
+  with the checkout's:
+  - Five changes were missed before and are named now: a file edited again in a dirty
+    submodule, a file edited in a submodule whose HEAD moved, a change staged inside a
+    submodule, a new file in a dirty submodule, and an edit to one of two paths that display
+    alike.
+  - A staged blob swapped under unchanged worktree bytes and status letters, at the top level
+    and inside a dirty submodule, and a change to one conflict stage alone: each missed before
+    and named now.
+  - A tree where nothing changed still reads as unchanged.
+  - One tree held a dirty submodule, a dirty file, an untracked file and the colliding pair.
+    HEAD's treedigest, the earlier one and the checkout's gave the same digest and the same
+    status lines on it.
+- **`scripts/codex_src.py`**: an entry whose extended attributes cannot be listed, for any
+  reason (ENOTSUP included: CIFS returns it when attributes are only switched off), is kept,
+  never deleted. Verified by injecting ENOTSUP into the listing call.
+- **Claude Code's Bash sandbox.** With the sandbox on, Bash may read the gate's state and token
+  store but never write them: they live under `~/.claude`, which the sandbox protects (measured
+  on Claude Code 2.1.302: EPERM under macOS Seatbelt). HEAD's shim failed every git command
+  there, because it wrote its live marker by a redirection on `:`. That is a special built-in,
+  and a failed redirection on one exits a non-interactive shell (measured under sh, dash and
+  bash --posix). Now:
+  - The marker is written by `true` with stderr redirected first, and the shim's reads of the
+    mirror index say nothing when a file is gone, so git runs whether or not the state can be
+    written. The mirror index and the denial notices are best effort.
+  - The session-start hook, which runs outside the sandbox, builds the exec-path mirror for the
+    git the session finds on PATH, so the shim has one without writing. Where none exists for
+    the git that runs (another git first on PATH, an upgrade during the session), the shim
+    builds it in a private directory of its temp dir, and the gits it starts look there.
+  - The shim cannot mark the session live, so the PreToolUse gate stays in charge of the text
+    and hands out the token as before. When it accepts a token for a command that is exactly
+    one plain `git commit …` or `git push …`, it leaves a pass in the token store. The shim
+    decides that commit or push again on its exact argv, finds the token gone and the pass
+    there, and lets that one argv run in that directory, on that tree and index, within 120 s.
+    Nothing inside the sandbox can write a pass. The shim removes the pass it uses; where it
+    cannot, the PostToolUse hook removes it after the call. The same pass spares an
+    unsandboxed session a second token when its first git command is a commit or push.
+  - A commit or push the shim must decide inside the sandbox (an alias, a script, a push a hook
+    starts) is refused, with what to do: run it as one plain git command in its own Bash call
+    (`git commit -F <file>` for a long message), or run it outside the sandbox.
+  Verified 2026-10-18:
+  - Real headless Claude Code 2.1.302 sessions with the sandbox on, the gate's state where the
+    sandbox lets Bash read but not write (under `~/.cache`, then under `~/.claude/logs`). HEAD's
+    plugin failed `git status`; the checkout's ran it. Before the pass, an acknowledged commit
+    was refused again by the shim, which could not mint a token, so it was a dead end (both
+    locations). With the pass, under `~/.claude/logs`, a plain commit and a plain push were each
+    denied with a token, then recorded once acknowledged: one commit, and the remote's `main` at
+    it. An alias commit was refused with the guidance. No pass was left afterwards.
+  - The pass was 9.5 s old when the commit's post-commit hook ran in that session. That is the
+    sandbox and shell starting plus the shim's own inspection, which the hook's 60 s deadline
+    bounds; the 120 s lifetime is that bound twice.
+  - A real headless session: the session-start hook built the mirror before the first git
+    command.
+  - 22 checks under Apple git 2.50.1 and Homebrew git 2.56.0, with macOS `sandbox-exec` (the
+    mechanism Claude Code's sandbox uses on macOS) denying writes to the gate's state:
+    - The pass runs exactly its own argv, once. Unsandboxed, the shim removes it. Sandboxed, it
+      stays until the PostToolUse hook removes it.
+    - A pass for another argv, an expired pass, and a push that the acknowledged commit's
+      pre-commit hook starts each ran nothing.
+    - The alias commit was refused with the guidance, and the acknowledged push landed.
+    - With no mirror for its git, `git status` ran on a mirror in a private temp directory and
+      wrote nothing into the state.
+    - With the pass taken out of a copy, 7 checks failed: the acknowledged commit, the commit
+      with a hook and the push were refused. With the fallback taken out, 3 failed: `git
+      status` was refused.
+  - Not reproduced in a real session: a git that the pre-build did not cover. Claude Code's
+    Bash kept the launching PATH (both found Apple's git), and the auto-mode classifier refused
+    a command that put another git first.
+
+### Setup finds a codex-oracle server registered by hand
+- A `codex-oracle` server added with `claude mcp add` (the 1.x way), next to the one this
+  plugin registers, gives two tool sets. `/software-workflows:setup` and the session-start
+  check now look for one, user or local scope, in `.claude.json`. Only server names are read,
+  never their settings. The check prints the exact `claude mcp remove <name> -s <scope>`.
+- Verified 2026-10-18: on this machine the check reports OK, and reading the file takes 1 ms.
+  Against a config directory holding `codex-oracle` (user) and `codex_oracle_dev` (local) it
+  reports MISSING, names both, and gives `claude mcp remove codex-oracle -s user`. It runs under
+  Python 3.9.6 and 3.15. The README's "Coming from 1.x" paragraph points to this check instead
+  of asking the person to find the entry themselves.
+
+### Docs: Codex writes, reviews continue their session, how to update
+- The agent-teams skill has a new rule 18 (Codex writes the code; Claude reads, coordinates
+  and reviews; the lead may write on paths no running writer holds) and a "Codex writers
+  (abraham)" section. The section covers: charter, dispatch, the run tools, the CHANGED FILES
+  block, the effective-mode line, the analysis-phase note, verification and recording by path.
+  The `implementer` role now charters and dispatches a Codex writer instead of writing.
+- The skill and the codex-review and codex-planning skills explain that reviews continue
+  their session: one review, then short follow-ups in the same session; `session="new"` for
+  unrelated work. They also point to `/software-workflows:setup`.
+- The README gains an "Updating" section: turn on auto-update once under `/plugin` →
+  Marketplaces, or run `claude plugin marketplace update agent-teams` and `claude plugin
+  update software-workflows@agent-teams`. It covers the 1.x `renames` move and runs setup
+  after updating.
+- The staged "1.18 daemon" is gone from the README, the code comments and two refusals.
+  abraham and the continuations on Windows now say they are unavailable there and why,
+  without promising a release. The push gate's comments name the exact-argv git shim (2.0) as
+  the execution boundary. The README no longer says write runs are bounded by codex's sandbox:
+  infra and abraham runs have none.
 
 ## [software-workflows 1.8.1] — 2026-10-16
 

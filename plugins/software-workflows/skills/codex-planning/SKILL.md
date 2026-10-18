@@ -35,6 +35,11 @@ presented as an unverified claim to refute and returns an explicit
 If a result carries a **⚠️ ANCHORING WARNING** banner, that dispatch was contaminated — re-run it
 blind before treating agreement as validation.
 
+**Design rounds continue one session (2.0).** `architect_review` continues this workspace's latest
+completed architecture session by default (`session="continue"`), so the second round starts
+from the first round's concerns instead of a fresh read. Send the revised design with a short
+note on what changed. Pass `session="new"` for an unrelated design.
+
 ## Step 2: Expect prior art, not opinion
 Codex runs with live web search (`web_search=live`). A design opinion with no reference to how
 this has been solved before is speculation:

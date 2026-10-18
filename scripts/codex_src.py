@@ -224,15 +224,15 @@ def foreign_attributes(names: list[str]) -> list[str]:
 
 
 def attributes(fd: int) -> list[str]:
-    """foreign_attributes() of the open descriptor; a filesystem without them has none.
-    When they cannot all be read — this process cannot list some namespace, or the
-    listing fails — the answer is UNSEEN, which keeps the entry like an attribute does."""
+    """foreign_attributes() of the open descriptor. When they cannot all be read — this
+    process cannot list some namespace, or the listing fails — the answer is UNSEEN, which
+    keeps the entry like an attribute does. That includes ENOTSUP: it can mean attributes
+    are switched off rather than absent (a CIFS mount returns it without asking the server,
+    which may hold some), so an entry is deleted only once its attributes are known."""
     assert _LIST_ATTRIBUTES is not None  # require_platform() refused its absence
     try:
         names = foreign_attributes(_LIST_ATTRIBUTES(fd))
-    except OSError as e:
-        if e.errno in (errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)):
-            return []  # a filesystem without extended attributes hides none
+    except OSError:
         return [UNSEEN]
     return names if _SEES_EVERY_ATTRIBUTE else [*names, UNSEEN]
 
@@ -253,10 +253,8 @@ def link_attributes(dir_fd: int, name: str) -> list[str]:
         return [UNSEEN]
     try:
         names = foreign_attributes(_OS_LISTXATTR(f"/proc/self/fd/{dir_fd}/{name}", follow_symlinks=False))
-    except OSError as e:
-        if e.errno in (errno.ENOTSUP, getattr(errno, "EOPNOTSUPP", errno.ENOTSUP)):
-            return []
-        return [UNSEEN]
+    except OSError:
+        return [UNSEEN]  # ENOTSUP included, as in attributes()
     return names if _SEES_EVERY_ATTRIBUTE else [*names, UNSEEN]
 
 

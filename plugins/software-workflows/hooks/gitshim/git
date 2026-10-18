@@ -1,16 +1,19 @@
 #!/bin/sh
 # git, as Claude's Bash tool finds it: the plugin's SessionStart hook puts this directory first on
-# PATH (hooks/session_start.py). Every git command but commit and push runs the real git — the
-# next git on PATH — at once. commit and push, and whatever this script does not recognize (an
+# PATH (hooks/session_start.py). commit and push, and whatever this script does not recognize (an
 # alias, an external command, an option it does not know), go to the push gate with their exact
 # arguments (hooks/push_gate.py --argv), which decides them at the moment git would run them.
+# Every other git command runs the real git — the next git on PATH — at once, with GIT_EXEC_PATH
+# set to a mirror of git's exec-path whose `git` is this script (push_gate.py _git_exec_farm):
+# git puts its exec-path first on PATH for everything it starts, so their gits come back here.
 real=
 set -f
 old_ifs=$IFS
 IFS=:
 for d in $PATH; do
   [ -n "$d" ] || d=.
-  if [ -f "$d/git" ] && [ -x "$d/git" ] && ! [ "$d/git" -ef "$0" ]; then
+  # a mirror of git's exec-path is not the real git: its `git` leads back to this script
+  if [ -f "$d/git" ] && [ -x "$d/git" ] && ! [ "$d/git" -ef "$0" ] && ! [ -f "$d/.codex-gate-farm" ]; then
     real=$d/git
     break
   fi
@@ -21,9 +24,12 @@ if [ -z "$real" ]; then
   echo "git: no git on PATH after the push gate's shim ($0)" >&2
   exit 127
 fi
-# this session's proof that its git goes through the shim, read by the PreToolUse hook
+# this session's proof that its git goes through the shim, read by the PreToolUse hook. Best effort:
+# `true`, a regular built-in, with stderr redirected first. A redirection that fails on `:`, a
+# special built-in, exits the shell, so a state this shell cannot write (a sandbox) failed every git
+# command here (measured under sh, dash and bash --posix, review of 2026-10-18, turn 9).
 if [ -n "${CODEX_GATE_LIVE:-}" ] && ! [ -e "$CODEX_GATE_LIVE" ]; then
-  : > "$CODEX_GATE_LIVE" 2>/dev/null
+  true 2>/dev/null >"$CODEX_GATE_LIVE"
 fi
 # the subcommand, after the global options git reads before it (git.c handle_options)
 sub=
@@ -38,26 +44,52 @@ for a do
     *) sub=$a; break ;;
   esac
 done
-# git 2.56's builtins but commit and push (`git --list-cmds=builtins`); an alias cannot hide one
+# builtins every supported git has (≥ 2.39.4, checked against its git.c table), but commit and
+# push; an alias cannot hide a builtin. Anything else goes to the gate, which asks the real git for
+# ITS builtins: a newer git's builtin is a free alias name in an older one (`history` in 2.50.1).
 case $sub in
   commit|push) ;;
-  ''|add|am|annotate|apply|archive|backfill|bisect|blame|branch|bugreport|bundle|cat-file|check-attr|\
-check-ignore|check-mailmap|check-ref-format|checkout|checkout--worker|checkout-index|cherry|cherry-pick|\
-clean|clone|column|commit-graph|commit-tree|config|count-objects|credential|credential-cache|\
-credential-cache--daemon|credential-store|describe|diagnose|diff|diff-files|diff-index|diff-pairs|\
-diff-tree|difftool|fast-export|fast-import|fetch|fetch-pack|fmt-merge-msg|for-each-ref|for-each-repo|\
-format-patch|format-rev|fsck|fsck-objects|fsmonitor--daemon|gc|get-tar-commit-id|grep|hash-object|help|\
-history|hook|index-pack|init|init-db|interpret-trailers|last-modified|log|ls-files|ls-remote|ls-tree|\
-mailinfo|mailsplit|maintenance|merge|merge-base|merge-file|merge-index|merge-ours|merge-recursive|\
-merge-recursive-ours|merge-recursive-theirs|merge-subtree|merge-tree|mktag|mktree|multi-pack-index|mv|\
-name-rev|notes|pack-objects|pack-redundant|pack-refs|patch-id|pickaxe|prune|prune-packed|pull|\
-range-diff|read-tree|rebase|receive-pack|reflog|refs|remote|remote-ext|remote-fd|repack|replace|replay|\
-repo|rerere|reset|restore|rev-list|rev-parse|revert|rm|send-pack|shortlog|show|show-branch|show-index|\
-show-ref|sparse-checkout|stage|stash|status|stripspace|submodule--helper|switch|symbolic-ref|tag|\
-unpack-file|unpack-objects|update-index|update-ref|update-server-info|upload-archive|\
-upload-archive--writer|upload-pack|url-parse|var|verify-commit|verify-pack|verify-tag|version|\
-whatchanged|worktree|write-tree)
-    exec "$real" "$@" ;;
+  ''|add|am|apply|archive|blame|branch|bundle|cat-file|check-attr|check-ignore|check-mailmap|\
+check-ref-format|checkout|checkout-index|cherry|cherry-pick|clean|clone|column|commit-graph|\
+commit-tree|config|count-objects|credential|describe|diff|diff-files|diff-index|diff-tree|difftool|\
+fetch|fetch-pack|fmt-merge-msg|for-each-ref|format-patch|fsck|gc|grep|hash-object|help|index-pack|\
+init|interpret-trailers|log|ls-files|ls-remote|ls-tree|mailinfo|mailsplit|maintenance|merge|\
+merge-base|merge-file|merge-tree|mktag|mktree|multi-pack-index|mv|name-rev|notes|pack-objects|\
+pack-refs|patch-id|prune|pull|range-diff|read-tree|rebase|reflog|remote|repack|replace|rerere|reset|\
+restore|rev-list|rev-parse|revert|rm|shortlog|show|show-branch|show-ref|sparse-checkout|stash|\
+status|stripspace|switch|symbolic-ref|tag|unpack-objects|update-index|update-ref|var|verify-commit|\
+verify-tag|version|whatchanged|worktree|write-tree)
+    # the mirror the gate built for this git and this shim (its index: binary, exec-path, mirror,
+    # the shim its `git` leads to, and the GIT_EXEC_PATH it mirrors — empty for git's own, so last:
+    # read merges a run of tabs); none yet, or a stale one: the gate builds it
+    # (read on fd 3, and git started after the loop: the command's stdin stays its own)
+    want=${GIT_EXEC_PATH:-}
+    if [ -n "$want" ] && [ -f "$want/.codex-gate-farm" ]; then
+      # git already runs inside a mirror. If it is OUR mirror for THIS git and shim, reuse it as
+      # it is — it already mirrors the right exec-path (a custom GIT_EXEC_PATH too); resetting want
+      # here would pick the default mirror and drop that exec-path (review of 2026-10-18, turn 7).
+      mbin= ; mshim=
+      { IFS= read -r mbin; IFS= read -r _mxp; IFS= read -r mshim; } 2>/dev/null < "$want/.codex-gate-farm"
+      if [ -n "$mbin" ] && [ "$mbin" -ef "$real" ] && [ -n "$mshim" ] && [ "$mshim" -ef "$0" ]; then
+        exec "$real" "$@"
+      fi
+      want=
+    fi
+    found=
+    if [ -n "${CODEX_GATE_STATE:-}" ] && [ -f "$CODEX_GATE_STATE/farms.tsv" ]; then
+      while IFS='	' read -r bin xp farm shim built <&3; do
+        if [ "$built" = "$want" ] && [ "$real" -ef "$bin" ] && [ "$shim" -ef "$0" ] \
+            && [ -f "$farm/.codex-gate-farm" ] && ! [ "$xp" -nt "$farm/.codex-gate-farm" ]; then
+          found=$farm
+          break
+        fi
+      done 2>/dev/null 3< "$CODEX_GATE_STATE/farms.tsv"  # stderr first: a file gone meanwhile says nothing
+    fi
+    if [ -n "$found" ]; then
+      GIT_EXEC_PATH=$found
+      export GIT_EXEC_PATH
+      exec "$real" "$@"
+    fi ;;
 esac
 py=$(command -v python3 2>/dev/null) || exec "$real" "$@"  # no python3: no hook of this plugin runs either
 exec "$py" "${0%/*}/../push_gate.py" --argv "$real" "$@"
