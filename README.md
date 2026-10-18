@@ -116,11 +116,21 @@ everything these plugins wrap. Two rules keep that reference honest:
 
 1. **Read the ref that matches the installed binary, never main-HEAD.** Releases are cut on
    branches, so main and the release tags are divergent — either direction of drift has
-   produced wrong conclusions here. `python3 scripts/codex_src.py` keeps a stable worktree
-   (`~/Documents/codex-installed`, override via `CODEX_SRC_WORKTREE`) checked out at
-   `rust-v<installed version>`, re-aligning itself after every codex update. It never touches
-   the base clone (`~/Documents/codex`, override via `CODEX_SRC_CLONE`) and refuses to run
-   over local modifications.
+   produced wrong conclusions here. `python3 scripts/codex_src.py` keeps one stable path
+   (`~/Documents/codex-installed`, override via `CODEX_SRC_DIR`) pointing at a read-only
+   export of `rust-v<installed version>` — never a git worktree. An export is the commit's
+   blobs written verbatim (`git cat-file`, so no export-ignore, export-subst, eol or filter
+   attribute changes it). Each release gets its own export
+   (`~/Documents/.codex-installed.exports/<tag>-<sha12>/`), checked file by file against the
+   commit before the link moves to it; a `.codex-src.json` stamp names the tag and commit.
+   Reruns re-verify (a damaged export is rebuilt beside it, then swapped in); after a codex
+   update the link moves to the new release and the previous export is kept for sessions still
+   reading it. The script deletes only what git can recreate, with git supplying the bytes:
+   anything else it finds there (an edit, an added file, a write a killed run cut short, a copy
+   whose blob the clone has lost) is moved aside as `.kept-…` and named, never deleted. The base clone
+   (`~/Documents/codex`, override via `CODEX_SRC_CLONE`) is only fetched, never checked out.
+   Anything else at the stable path is refused untouched — a worktree an older version left
+   there included: remove it yourself, then rerun.
 2. **Source is the map; the installed binary is the territory.** Source names the config
    keys, events, and mechanisms worth probing — but anything load-bearing is confirmed
    against the running binary (`--strict-config` with a known-bad key first, live probes,

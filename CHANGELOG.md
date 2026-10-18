@@ -5,6 +5,110 @@ This project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [software-workflows 2.0.0] — unreleased
 
+### `scripts/codex_src.py`: the codex source as read-only per-release exports, never a worktree
+- `~/Documents/codex-installed` is now a symlink to
+  `~/Documents/.codex-installed.exports/<tag>-<sha12>/`, a read-only export of the release
+  tag that matches `codex --version`. An export is the commit's blobs written verbatim from
+  `git cat-file --batch`. Neither alternative is the release byte for byte: `git archive`
+  drops export-ignore paths and rewrites export-subst files, and a checkout applies eol and
+  filter attributes. Before the link moves, the export on disk is checked against the
+  commit: every blob's content, type and mode, and no extra path except the
+  `.codex-src.json` stamp.
+- Everything is written through directory descriptors with O_NOFOLLOW and O_EXCL, anchored
+  to an exports directory checked to be a real one owned by this user, so nothing is
+  written through a symlink. Any of these fails the export, with nothing written outside
+  it: a path the filesystem folds onto another (case, Unicode), a `.git` path, a path
+  taking the stamp's name, or a symlink that is absolute or resolves outside the export. A
+  platform without these primitives is refused up front.
+- Nothing is deleted because of its name. A tree is deleted only entry by entry. Each entry
+  is first moved to a name only this run knows, then checked against the commit its name
+  records, and deleted only if it is still the very entry checked. A file is judged by the
+  descriptor it is read through, and only if it did not change while being read. So the
+  script deletes only what git can recreate, and a file saved at an entry's old name
+  meanwhile is never touched. Modes are not data. Git must supply each entry's bytes
+  itself, read to the end and checked against the object id: when the clone has lost a
+  blob, the export's copy may be the only one, so it is kept. The one file that need not
+  be whole is the one a build of this run was writing when it failed, while it holds
+  exactly the bytes that reached it; its identity, length and digest are tracked as it is
+  written. A file a killed run cut short cannot be told from an edit afterwards, so it is
+  kept like one. The stamp goes only when it is, byte for byte, a stamp this script writes
+  for that export's commit (the git-archive version's included): an edited, added or
+  reordered field keeps it. Git records bytes, a mode and a type and nothing else, so an
+  entry carrying an extended attribute (a resource fork, a user's tag or note) is kept too;
+  `com.apple.provenance`, which macOS sets on every entry and no process can, is not data,
+  and neither are Linux's `security.*` and `system.*` namespaces (labels, capabilities,
+  ACLs: permissions, like modes) — `user.*`, `trusted.*` and any newer namespace are. An
+  entry whose attributes cannot be read is kept the same way. On Linux, where `trusted.*`
+  is listed only to a process privileged in the initial user namespace, the script
+  deletes nothing and says so. A link the script made that carries one is kept aside beside the stable path as
+  `.<dir name>.kept-<time>` and named on every run, never deleted.
+  Anything git cannot recreate is moved aside as `.<export>.kept-<time>` and listed on every
+  run, an aligned one included, never deleted: an edit, an added file, a file at a
+  leftover's name, a write a killed run cut short, an extended attribute, or a tree whose
+  commit or blobs the clone no longer has.
+  Anything else in the exports directory is left alone and listed. A link a killed run
+  left beside the stable path goes only if it is one this script writes: a symlink naming
+  an export.
+- No rename replaces anything: every one uses `renameatx_np` with `RENAME_EXCL` on macOS,
+  or `renameat2` with `RENAME_NOREPLACE` on Linux, and a platform without either is
+  refused. An entry that cannot go back to its name, because something was created there
+  meanwhile, stays beside it, and the refusal names both.
+- Reruns re-verify the current export. A damaged one is rebuilt beside it and swapped in
+  with two renames, so a failed rebuild leaves it published. A version switch keeps the
+  export it replaces, since a session may still be reading it.
+- The stable symlink is created exclusively. An existing one is first moved aside and
+  checked to be the very link this run inspected, so something created at the path, or put
+  in place of the link, while a run is under way is never replaced. Exports are kept by
+  identity as well as by name: a name the filesystem folds onto a kept export (case) is
+  that very directory, never swept. The link, a new one or the one an aligned run found,
+  stays only if what a reader following it reaches, checked after the cleanup, is the
+  export this run verified; otherwise it is withdrawn and the run fails. Anything at the stable path that this script did not create
+  is refused untouched, including a worktree an older version kept there: this script never
+  deletes a worktree. A stamp that is not a regular file (a FIFO, a directory) is read
+  without blocking and repaired.
+- `GIT_DIR` and the other repository-local git variables (`git rev-parse --local-env-vars`)
+  are cleared first, so an inherited one can no longer point the export or the fetch at
+  another repository. This was so before the rewrite too.
+- What it cannot promise: a process of the same user racing on purpose can still swap an
+  entry in the instant between the last check and the delete, or replace the exports
+  after the link is checked. POSIX has no unlink-if-unchanged. A stamp edited into exactly
+  the form this script writes (another well-formed time) cannot be told from one it wrote.
+- Measured on the maintainer's machine 2026-10-18 (macOS 26.6.2, APFS):
+  - Replacing a symlink is not atomic for concurrent lookups: 2,988 EINVAL failures in
+    349,736 lookups over 20,000 swaps. Moving directories instead failed 887,379 of
+    1,213,821.
+  - `openat()` with O_CREAT fails with ENOENT when another process is creating the same
+    name: 1,180 of 1,600 racing opens. The lock file is therefore opened with O_EXCL first,
+    then plainly (0 of 1,600 failed).
+- Verified by real runs on the maintainer's machine, 2026-10-18 (codex-cli 0.163.0, the
+  real `~/Documents/codex` clone, a scratch stable path; every exit code is the script's
+  own):
+  - A fresh export, 9,176 files: exit 0. A rerun: `already aligned`, exit 0.
+  - One file's mode changed and another file given a resource fork in the published
+    export: the next run rebuilt it, kept the replaced export aside with the fork intact,
+    and named it (exit 0); the new export carries no fork. The aligned run after it named
+    the kept export again (exit 0).
+  - The stable link given an attribute, then a repair that replaces it: the old link was
+    kept beside the stable path, its attribute intact, and named (exit 0); the new link
+    carries only `com.apple.provenance`; the aligned run after it named the kept link again.
+  - The stable link's attributes made unreadable (an ACL denying `readextattr`), then a
+    repair that replaces it: the old link was kept aside and named, exit 0.
+  - The real `~/Documents/codex-installed`: `already aligned`, exit 0.
+  - Linux was not run: its rules follow xattr(7), unmeasured.
+- Six blind reviews shaped it: 3 HIGH and 7 MEDIUM, then 2 HIGH and 4 MEDIUM, then 4 HIGH
+  and 4 MEDIUM, then 3 HIGH, then 2 HIGH and 1 MEDIUM, then 1 HIGH and 1 LOW (an extended
+  attribute deleted with its entry; an aligned run that named nothing kept). Follow-ups in
+  the sixth review's own Codex session then found 2 HIGH and 1 LOW (a replaced link's
+  attribute deleted with it; Linux's `trusted.*` and newer namespaces counted as not data;
+  stale references to the removed tests), then 1 HIGH and 1 MEDIUM (`trusted.*` invisible
+  to an unprivileged process; an unreadable link attribute raised instead of keeping it),
+  then 1 HIGH (a capability held in a child user namespace taken for one that lists
+  `trusted.*`). Linux now deletes nothing, the fix that last answer named.
+- The README and both Codex skills describe the export.
+- Migrated on the maintainer's machine 2026-10-18: the rust-v0.153.4 worktree was replaced
+  by the rust-v0.163.0 export. A full export (9,176 files, 91 MB) builds in about 2.4 s,
+  and a rerun's content check takes about 0.25 s.
+
 ### No test harness: verify with results (user ruling 2026-10-18)
 - The ruling: no test cases unless the user explicitly asks for them; where a repository
   already has more than a few, they are removed unless the user asks to keep them; a change

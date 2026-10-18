@@ -74,8 +74,8 @@ advisory synthesis.
 
 ## When upstream vendor source informs the plan
 Source is the MAP; the installed binary is the TERRITORY. Read vendor source at the ref
-matching the INSTALLED version (for codex: `python3 scripts/codex_src.py` aligns
-`~/Documents/codex-installed` to the installed CLI's release tag), state which ref was read,
+matching the INSTALLED version (for codex: `python3 scripts/codex_src.py` keeps a read-only
+export of the installed CLI's release tag at `~/Documents/codex-installed`), state which ref was read,
 and confirm anything load-bearing against the running binary — main-HEAD and release tags
 are divergent, and either direction of drift has produced wrong conclusions here before.
 
