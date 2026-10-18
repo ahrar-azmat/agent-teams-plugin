@@ -158,6 +158,44 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   this checkout and `plugin install software-workflows@agent-teams` succeed, `plugin list`
   shows 2.0.0 enabled, and `claude mcp list` connects `plugin:software-workflows:codex-oracle`.
 
+### Launcher: any python3 starts the server; its venv lives in the plugin's data directory
+- `run_server.py` runs under any Python 3, including the 3.9 macOS ships as `python3`, and
+  picks the interpreter the server needs (3.11+): `CODEX_ORACLE_PYTHON` when set (used as
+  given, or refused with the reason), else the newest `python3.N` on PATH, `/opt/homebrew/bin`,
+  `/usr/local/bin` or `~/.local/bin`, else itself.
+- The venv moves to `${CLAUDE_PLUGIN_DATA}/venv/<key>` (`.venvs/` beside the launcher when
+  Claude Code sets no data directory), so a plugin update no longer rebuilds it. The key is the
+  requirements, the interpreter the venv links to and its version, and the platform; a change
+  to any of them builds a new generation.
+- Builds are serialized by a lock, and a generation counts only once `.ready` is written,
+  after the server's imports load in it. The build's own processes hold that lock as well:
+  Claude Code kills a server slow to start (`MCP_TIMEOUT`) but not the pip it started, so the
+  next start waits for that pip to stop instead of building over it.
+- A running server holds a shared lock on its generation and hands it to each detached
+  watchdog, which runs that venv's python after the server may be gone. An old generation is
+  deleted only when no process holds it.
+- Verified 2026-10-18 by real runs (macOS 26.6, Homebrew Python 3.15.0, Apple Python 3.9.6):
+  - under `/usr/bin/python3` with an empty data directory: python3.15 found, venv built in
+    4 s (10 s with no pip cache), nine tools listed; the next start reused it in under a second;
+  - two first starts at once: both list nine tools, one build;
+  - an old generation that a process holds stays and one nobody holds is removed; a
+    half-built one (no `.ready`) is removed and rebuilt;
+  - `CODEX_ORACLE_PYTHON=/usr/bin/python3` is refused ("is 3.9; the server needs >= 3.11"), a
+    missing path is refused ("not runnable"), `python3.15` is used; with no
+    `CLAUDE_PLUGIN_DATA` the venv is built in `.venvs/`;
+  - during a `codex_query`, `lsof` shows the server, its watchdog (`/bin/sh`) and the
+    watchdog's `sleep` holding the generation, and an exclusive lock on it is refused; after
+    the call nothing holds it;
+  - `claude mcp list` in a fresh config connects; the venv is in
+    `plugins/data/software-workflows-agent-teams/venv/`, and the generation an earlier key had
+    built there was removed;
+  - with `MCP_TIMEOUT=4000` and no pip cache, Claude Code reports the timeout and its pip runs
+    on as an orphan holding the build lock; the next start waits for it, rebuilds and connects
+    in 6 s, never two pips at once. Calibrated on a copy without the handoff: there the lock is
+    free right after the kill, and the next start deletes the venv under the running pip.
+  - Not measured: Windows (no machine here). Its build lock retries instead of using
+    msvcrt's blocking mode, which gives up after 10 s; old generations are not removed there.
+
 ## [software-workflows 1.8.1] — 2026-10-16
 
 ### No git worktrees: one writer per repository checkout (user ruling 2026-10-16)

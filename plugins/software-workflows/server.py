@@ -2075,6 +2075,22 @@ _WATCHDOG_SH = (
 )
 
 
+def _venv_lock() -> tuple[int, ...]:
+    """run_server.py's shared lock on this server's venv, as pass_fds for a detached watchdog: the
+    watchdog runs procenv.py with this venv's python after the server may be gone, and the
+    launcher deletes an old venv only when no process holds that lock. () when this server was
+    not started that way (the descriptor must be the lock on this very venv's .in-use)."""
+    fd = os.environ.pop("CODEX_ORACLE_VENV_LOCK", "")
+    try:
+        held, ours = os.fstat(int(fd)), os.stat(Path(sys.prefix) / ".in-use")
+    except (ValueError, OSError):
+        return ()
+    return (int(fd),) if os.path.samestat(held, ours) else ()
+
+
+_VENV_LOCK_FDS = _venv_lock()
+
+
 def _spawn_watchdog(pid: int, pgid: int, deadline_ts: float,
                     run_tag: str = "", pid_start: str = "",
                     max_unknown: int = 60, ps_bin: str = "/bin/ps",
@@ -2094,6 +2110,7 @@ def _spawn_watchdog(pid: int, pgid: int, deadline_ts: float,
              python_bin or sys.executable, procenv or str(PROCENV_PATH), str(max_ticks)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+            pass_fds=_VENV_LOCK_FDS,
         )
         return wd
     except OSError:

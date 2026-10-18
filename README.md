@@ -145,11 +145,17 @@ everything these plugins wrap. Two rules keep that reference honest:
 
 Then just ask for multi-agent work (e.g. *"Create an agent team to review this PR from security, performance, and correctness angles"*).
 
-The plugin registers its MCP server itself (`plugins/software-workflows/.mcp.json`, launcher
-`run_server.py` bootstraps its venv). Its interpreter is `${CODEX_ORACLE_PYTHON:-python3}`:
-macOS/Linux need nothing; on Windows set `CODEX_ORACLE_PYTHON=python` (python.org builds
-ship no `python3.exe`). Do not add a second, direct `mcpServers` entry for the same server —
-two registrations give two tool sets.
+The plugin registers its MCP server itself (`plugins/software-workflows/.mcp.json`). Its
+launcher, `run_server.py`, runs under any `python3` — 3.9, the one macOS ships, too — and
+picks the interpreter the server needs: Python 3.11 or newer, the newest `python3.N` on PATH
+or in `/opt/homebrew/bin`, `/usr/local/bin` or `~/.local/bin`; set `CODEX_ORACLE_PYTHON` to
+choose one yourself. On Windows set `CODEX_ORACLE_PYTHON=python` (python.org builds ship no
+`python3.exe`). The first start builds the server's venv in the plugin's data directory
+(`~/.claude/plugins/data/software-workflows-agent-teams/venv/`; about 10 s on a fast network,
+once per change of requirements or interpreter). If Claude Code reports that the server timed
+out on that first start, run `/mcp` → Reconnect: the next start waits for the interrupted
+build to stop, then builds again from pip's cache. Do not add a second, direct `mcpServers` entry for the same server — two
+registrations give two tool sets.
 
 The plugin's PreToolUse **hooks** (live-view nudge, plan gate, git-push gate) run
 `python3` directly — the hook spawn path performs no `${VAR:-default}` expansion (measured
@@ -250,7 +256,7 @@ kernel-side custody is the 1.18 daemon's job.
   { "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" } }
   ```
 - **Optional — cross-model advisory:** the `codex-oracle` MCP server, bundled in this plugin since 2.0.0 (an install that still has the separate `codex-oracle` plugin enabled is moved to `software-workflows` by the marketplace `renames` mapping). If it isn't configured, the skill still runs normally; the cross-model steps are simply skipped.
-  - The server is Python (≥3.11) and launches via `${CODEX_ORACLE_PYTHON:-python3}` (see the note above); the hooks additionally require a resolvable `python3`.
+  - The server needs a Python ≥3.11 installed; its launcher starts under `${CODEX_ORACLE_PYTHON:-python3}` of any version and finds it (see the note above). The hooks additionally require a resolvable `python3`.
   - `codex-oracle` needs the Codex CLI (`npm i -g @openai/codex`) authenticated (`codex`); live web search is forced on per call, so no config change is required.
   - **Windows (v1.9.0+):** fully supported — no WSL needed. Optional: enable Developer Mode if you want the `latest.log` convenience symlink; without it the merged `stream.log` is the live view.
 

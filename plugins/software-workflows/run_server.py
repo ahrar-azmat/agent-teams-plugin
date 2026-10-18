@@ -1,116 +1,217 @@
 #!/usr/bin/env python3
-"""Cross-platform MCP server launcher with venv bootstrap (Windows + POSIX).
+"""Cross-platform MCP server launcher: finds a Python >= 3.11, keeps the server's venv in the
+plugin's data directory, builds it once under a lock, and runs the server from it.
 
-Replaces run-server.sh, which was POSIX-only twice over: Windows cannot exec
-a .sh file at all, and a Windows venv keeps its interpreter at
-.venv/Scripts/python.exe, not .venv/bin/python.
+It runs under any Python 3 — 3.9 is what macOS ships as python3 — because it only looks for the
+interpreter the server needs (3.11+, for tomllib): CODEX_ORACLE_PYTHON when set, else the newest
+python3.N on PATH or in the usual install directories, else this interpreter if it is new enough.
 
-Claude Code materializes plugins into a versioned CACHE copy
-(~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/) and resolves
-${CLAUDE_PLUGIN_ROOT} there — but .venv is gitignored, so it never exists in
-a fresh copy. This launcher makes any copy self-sufficient.
+The venv lives in ${CLAUDE_PLUGIN_DATA} (Claude Code keeps that directory across plugin updates;
+without it, beside this file as before), at venv/<key>: the key is the requirements, the
+interpreter the venv links to and its version, and the platform, so a change to any of them builds
+a new generation instead of running against a stale one. Builds are serialized by an exclusive
+lock, and a generation counts only once it holds `.ready`, written after the server's own imports
+load in it — so two sessions starting at once build once, and a build killed half-way is rebuilt,
+never used. A running server holds a shared lock on its generation's `.in-use` file for its whole
+life (the descriptor survives the exec) and hands it to each detached watchdog it starts, which
+runs this venv's python after the server may be gone; an old generation is deleted only when no
+process holds it.
 
 stdout is the MCP JSON-RPC channel — ALL bootstrap output goes to stderr.
 """
+import hashlib
 import os
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 NAME = ROOT.name
 IS_WINDOWS = os.name == "nt"
+MIN = (3, 11)
+IMPORT_CHECK = "import mcp.server.fastmcp, tomllib"
+
+try:
+    import fcntl
+except ImportError:  # Windows: builds lock through msvcrt below
+    fcntl = None
 
 
-def _venv_python(venv: Path) -> Path:
-    if IS_WINDOWS:
-        return venv / "Scripts" / "python.exe"
-    return venv / "bin" / "python"
-
-
-def _requirements_hash() -> str:
-    import hashlib
-
-    try:
-        req = hashlib.sha256((ROOT / "requirements.txt").read_bytes()).hexdigest()
-    except OSError:
-        return ""
-    # The interpreter is part of the venv's identity: a venv built by an
-    # older/other python is stale even when requirements did not change.
-    return f"{req}:py{sys.version_info.major}.{sys.version_info.minor}:{sys.platform}"
-
-
-def _venv_current(venv: Path, expected: str) -> bool:
-    """A venv is usable only if it exists AND was installed from the same
-    requirements.txt — otherwise a dependency change in the plugin would
-    silently keep running against the old environment forever."""
-    if not _venv_python(venv).exists():
-        return False
-    try:
-        return (venv / ".requirements.sha256").read_text().strip() == expected
-    except OSError:
-        return False
-
-
-def _err(msg: str) -> None:
+def _err(msg):
     print(f"[{NAME}] {msg}", file=sys.stderr, flush=True)
 
 
-def _run(python: Path) -> int:
-    argv = [str(python), str(ROOT / "server.py")]
-    if IS_WINDOWS:
-        # No true exec() on Windows — run the server as a child. stdio handles
-        # are inherited, so the JSON-RPC channel passes straight through, and
-        # the server exits on stdin EOF when the host closes the pipe.
-        return subprocess.run(argv).returncode
-    os.execv(str(python), argv)
-    return 0  # unreachable
+def _probe(python):
+    """((major, minor), sys.executable) of an interpreter, or None when it does not run."""
+    try:
+        out = subprocess.run([python, "-c", "import sys; print(*sys.version_info[:2], sys.executable)"],
+                             capture_output=True, text=True, timeout=20).stdout.split(None, 2)
+        return (int(out[0]), int(out[1])), out[2].strip()
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
 
 
-def main() -> int:
-    # server.py needs 3.11+ (tomllib); the venv inherits this interpreter.
-    if sys.version_info < (3, 11):
-        _err(
-            "bootstrap failed: python >= 3.11 required, launcher ran under "
-            f"{sys.version.split()[0]}"
-        )
-        return 1
+def _find_python():
+    """The interpreter for the server's venv as (path, ((major, minor), sys.executable)), or (None, why)."""
+    chosen = os.environ.get("CODEX_ORACLE_PYTHON", "")
+    if chosen:  # the user's explicit choice is used as it is, or refused
+        found = shutil.which(chosen) or chosen
+        info = _probe(found)
+        if info is None or info[0] < MIN:
+            got = "%d.%d" % info[0] if info else "not runnable"
+            return None, f"CODEX_ORACLE_PYTHON={chosen} is {got}; the server needs >= 3.11"
+        return found, info
+    seen, best = set(), (None, None)
+    suffix = ".exe" if IS_WINDOWS else ""
+    dirs = os.environ.get("PATH", "").split(os.pathsep) + [
+        "/opt/homebrew/bin", "/usr/local/bin", str(Path.home() / ".local" / "bin")]
+    for d in dirs:
+        for minor in range(30, MIN[1] - 1, -1):
+            if best[1] is not None and (3, minor) <= best[1][0]:
+                break  # newest first: nothing newer is left in this directory
+            p = Path(d) / f"python3.{minor}{suffix}"
+            try:
+                real = str(p.resolve()) if p.is_file() else ""
+            except OSError:
+                real = ""
+            if not real or real in seen:
+                continue
+            seen.add(real)
+            info = _probe(str(p))
+            if info is not None and info[0] >= MIN:
+                best = (str(p), info)
+    here = sys.version_info[:2]
+    if here >= MIN and (best[1] is None or here > best[1][0]):
+        best = (sys.executable, (here, sys.executable))
+    if best[0] is None:
+        return None, (f"no Python >= 3.11 found (this launcher runs under {sys.version.split()[0]}; looked "
+                      f"for python3.11 … python3.30 on PATH, /opt/homebrew/bin, /usr/local/bin); install one, "
+                      f"or set CODEX_ORACLE_PYTHON to its path")
+    return best
 
-    expected = _requirements_hash()
 
-    # Fast path: this machine's maintained marketplace checkout already carries
-    # a working venv — reuse its interpreter (deps only; the code that runs is
-    # still THIS copy's server.py). Only when its installed dependencies match
-    # THIS copy's requirements.txt: a stale sibling venv must not mask a
-    # dependency change shipped with the plugin.
-    mk = Path.home() / ".claude" / "plugins" / "marketplaces" / "agent-teams" / "plugins" / NAME
-    if ROOT != mk and _venv_current(mk / ".venv", expected):
-        return _run(_venv_python(mk / ".venv"))
+def _venv_python(venv):
+    return venv / ("Scripts/python.exe" if IS_WINDOWS else "bin/python")
 
-    venv = ROOT / ".venv"
+
+def _lock(path, shared=False, wait=True):
+    """An open descriptor holding a lock on `path`, or None when wait=False and it is taken."""
+    fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if fcntl is not None:
+            mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+            fcntl.flock(fd, mode if wait else mode | fcntl.LOCK_NB)
+            return fd
+        import msvcrt
+        while True:  # msvcrt's own blocking mode gives up after 10 s, and a build takes longer
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return fd
+            except OSError:
+                if not wait:
+                    raise
+                time.sleep(1)
+    except OSError:
+        os.close(fd)
+        if wait:
+            raise
+        return None
+
+
+def _ready(venv):
+    return (venv / ".ready").is_file() and _venv_python(venv).exists()
+
+
+def _build(venv, python, build_lock):
+    """Build the venv at its own path (a venv's scripts name the path they were made at)."""
+    if venv.exists():
+        _err(f"removing an unfinished venv at {venv}")
+        shutil.rmtree(venv)
+    _err(f"building the server venv at {venv} with {python}")
     py = _venv_python(venv)
-    if not _venv_current(venv, expected):
-        _err(f"(re)installing venv deps at {venv} with {sys.executable}")
-        cmds = []
-        if not py.exists():
-            cmds.append([sys.executable, "-m", "venv", str(venv)])
-        # --upgrade so a re-install actually moves within the declared
-        # constraint range instead of keeping whatever satisfied it years ago.
-        cmds.append([str(py), "-m", "pip", "install", "--quiet", "--upgrade",
-                     "-r", str(ROOT / "requirements.txt")])
-        for cmd in cmds:
-            proc = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr)
-            if proc.returncode != 0:
-                _err(f"bootstrap failed: {' '.join(cmd)} -> exit {proc.returncode}")
-                return 1
+    # Claude Code kills a server slow to start (MCP_TIMEOUT) but not its children: a pip cut off
+    # that way runs on, so it holds the build lock too, and the next start waits for it to stop
+    # instead of building over it.
+    hold = () if IS_WINDOWS else (build_lock,)
+    for cmd in ([python, "-m", "venv", str(venv)],
+                [str(py), "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
+                 "-r", str(ROOT / "requirements.txt")],
+                [str(py), "-c", IMPORT_CHECK]):
+        proc = subprocess.run(cmd, stdout=sys.stderr, stderr=sys.stderr, pass_fds=hold)
+        if proc.returncode != 0:
+            return f"{' '.join(cmd)} -> exit {proc.returncode}"
+    (venv / ".ready").write_text(f"{python}\n")
+    return ""
+
+
+def _prune(generations, keep):
+    """Delete other generations no running process holds."""
+    if fcntl is None:
+        return
+    for old in generations.iterdir():
+        if old.name == keep or not old.is_dir() or old.name.startswith("."):
+            continue
+        fd = _lock(old / ".in-use", wait=False) if (old / ".in-use").exists() else None
+        if (old / ".in-use").exists() and fd is None:
+            continue  # a server or its watchdog still runs from it
         try:
-            marker = venv / ".requirements.sha256"
-            tmp = marker.with_suffix(".tmp")
-            tmp.write_text(expected)
-            tmp.replace(marker)  # atomic: never a torn marker
+            shutil.rmtree(old)
+            _err(f"removed an old server venv: {old}")
         except OSError as exc:
-            _err(f"could not record requirements hash: {exc}")
-    return _run(py)
+            _err(f"could not remove an old server venv {old}: {exc}")
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+def main():
+    python, info = _find_python()
+    if python is None:
+        _err(f"bootstrap failed: {info}")
+        return 1
+    (major, minor), exe = info
+    try:
+        requirements = (ROOT / "requirements.txt").read_bytes()
+    except OSError as exc:
+        _err(f"bootstrap failed: cannot read requirements.txt ({exc})")
+        return 1
+    # the venv links to the interpreter's own sys.executable (Homebrew's stays put across patch
+    # releases), so that path, not the symlink's target, is what a generation depends on
+    key = hashlib.sha256(requirements + f"\0{exe}\0{major}.{minor}\0{sys.platform}".encode()).hexdigest()[:16]
+    data = os.environ.get("CLAUDE_PLUGIN_DATA")
+    # without a data directory (older Claude Code): beside this file, never in the .venv an older
+    # launcher may still be serving from
+    generations = Path(data) / "venv" if data else ROOT / ".venvs"
+    generations.mkdir(parents=True, exist_ok=True)
+    venv = generations / key
+
+    build_lock = _lock(generations / ".lock")
+    in_use = None
+    try:
+        if not _ready(venv):
+            failed = _build(venv, python, build_lock)
+            if failed:
+                _err(f"bootstrap failed: {failed}")
+                return 1
+        if fcntl is not None:
+            in_use = _lock(venv / ".in-use", shared=True)  # held by the server until it exits
+            _prune(generations, keep=key)
+    finally:
+        os.close(build_lock)
+
+    py = _venv_python(venv)
+    argv = [str(py), str(ROOT / "server.py")]
+    if IS_WINDOWS:
+        # No true exec() on Windows — run the server as a child; stdio handles are inherited, so the
+        # JSON-RPC channel passes straight through (old generations are not pruned there).
+        return subprocess.run(argv).returncode
+    if in_use is not None:
+        os.set_inheritable(in_use, True)
+        os.environ["CODEX_ORACLE_VENV_LOCK"] = str(in_use)  # server.py passes it to its watchdogs
+    os.execv(str(py), argv)
+    return 0  # unreachable
 
 
 if __name__ == "__main__":
