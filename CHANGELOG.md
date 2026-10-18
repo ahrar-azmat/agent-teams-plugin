@@ -109,6 +109,14 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   by the rust-v0.163.0 export. A full export (9,176 files, 91 MB) builds in about 2.4 s,
   and a rerun's content check takes about 0.25 s.
 
+### Spike U0: what codex-cli 0.163.0 offers parallel writers in one checkout
+- `plugins/codex-oracle/spike/u0/`: four probes, each run red first against a deliberately
+  bad configuration before it measures — apply_patch mediation, mutator hooks, instruction
+  loading, file-change events. `FEASIBILITY.md` records what each measured (its generated
+  section) and the multi-repository target model it led to. Measurement only: no plugin
+  behavior changes, and the probes' `evidence/` directories are regenerated and
+  git-ignored.
+
 ### No test harness: verify with results (user ruling 2026-10-18)
 - The ruling: no test cases unless the user explicitly asks for them; where a repository
   already has more than a few, they are removed unless the user asks to keep them; a change
