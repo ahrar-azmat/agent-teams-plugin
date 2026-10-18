@@ -99,25 +99,24 @@ def bash_deadline(data, limits):
     return time.time() + min(ms(data.get("timeout"), default), ceiling) / 1000 + 60
 
 
+# A lead file edit's own deadline: the daemon's 120 s pre/post gap for prepared edits, plus 60 s.
+FILE_HOOK_S = 180
+
+
 def others_running(daemon, checkout, ident):
-    """Another lead Bash call in this checkout that the daemon has received and not yet completed,
-    within its host deadline. Synchronous: callers check it with nothing awaited before they act."""
+    """Another lead call in this checkout that the daemon has received and that may still write
+    outside any prepared operation, within its deadline: a Bash call not yet completed, or a file
+    edit not yet prepared (a prepared one is a pending operation, which reconciliation skips).
+    Synchronous: callers check it with nothing awaited before they act."""
     now = time.time()
-    return any(other["id"] != ident and other.get("tool") == "Bash" and other.get("state") == "observed"
-               and other.get("checkout") == checkout["id"] and now < other.get("deadline", 0)
+    return any(other["id"] != ident and other.get("checkout") == checkout["id"] and now < other.get("deadline", 0)
+               and (other.get("tool") == "Bash" and other.get("state") == "observed"
+                    or other.get("tool") in FILES and other.get("state") == "received")
                for other in daemon.store.all("lead_hook"))
 
 
-async def window(daemon, checkout, actor, ident):
-    """A fingerprint of what besides this lead's command could change files here, or None while
-    something could: another lead Bash command still running (in any session), a writer's turn, a
-    pending patch or edit, command custody (a command or its held survivors), or an exec write
-    holding the tree. A turn that starts and ends inside the window still rewrites its actor's
-    record, so the fingerprint changes; a lead command that does so reconciles its own effects
-    as UNKNOWN before this one ends, since its window was not quiet."""
-    # The one await comes first: everything after it reads the store without yielding.
-    if await asyncio.to_thread(exec_writing, checkout["root"]):
-        return None
+def quiet(daemon, checkout, actor, ident):
+    """The synchronous part of `window`: the fingerprint, or None."""
     if others_running(daemon, checkout, ident):
         return None
     marks = []
@@ -132,6 +131,19 @@ async def window(daemon, checkout, actor, ident):
     if any(o["checkout"] == checkout["id"] and o["state"] in ("prepared", "allowed", "running") for o in daemon.store.all("operation")):
         return None
     return digest(sorted(marks))
+
+
+async def window(daemon, checkout, actor, ident):
+    """A fingerprint of what besides this lead's command could change files here, or None while
+    something could: another lead Bash command still running (in any session), a writer's turn, a
+    pending patch or edit, command custody (a command or its held survivors), or an exec write
+    holding the tree. A turn that starts and ends inside the window still rewrites its actor's
+    record, so the fingerprint changes; a lead command that does so reconciles its own effects
+    as UNKNOWN before this one ends, since its window was not quiet."""
+    # The one await comes first: everything after it reads the store without yielding.
+    if await asyncio.to_thread(exec_writing, checkout["root"]):
+        return None
+    return quiet(daemon, checkout, actor, ident)
 
 
 async def dispatch(daemon, payload):
@@ -159,14 +171,15 @@ async def dispatch(daemon, payload):
     record = daemon.store.get(ident, required=False)
     if record and record["input_digest"] != signature:
         raise CoordinatorError("LEAD_HOOK_REWRITTEN", "Host input changed between hook events; prepared intent cannot be reused")
-    fresh = tool == "Bash" and event == "PreToolUse" and record is None
+    fresh = event == "PreToolUse" and record is None
     if fresh:
         # Registered before anything that can wait (attaching a new session, the checkout's other
-        # transitions): a hook that gives up waiting (its client's 3 s) lets the command run, so a
-        # call the daemon has received counts as running from here on.
-        daemon.store.put("lead_hook", ident, {"tool": tool, "state": "observed", "input_digest": signature,
-                         "checkout": checkout["id"], "deadline": bash_deadline(data, payload.get("bash_limits")),
-                         "window": None})
+        # transitions, the ledger): a hook that gives up waiting (its client's 3 s) lets the command
+        # or the edit go ahead, so a call the daemon has received counts as possibly writing from here.
+        daemon.store.put("lead_hook", ident, {"tool": tool, "state": "observed" if tool == "Bash" else "received",
+                         "input_digest": signature, "checkout": checkout["id"], "window": None,
+                         "deadline": bash_deadline(data, payload.get("bash_limits")) if tool == "Bash" else time.time() + FILE_HOOK_S})
+        record = None
     from .lead import attach
     mapping = await attach(daemon, checkout["id"], session)
     actor = daemon.store.get(mapping["actor"])
@@ -194,8 +207,8 @@ async def dispatch(daemon, payload):
                     attribute = {"attribution": "lead-command", "operation": ident, "unit": actor["unit"],
                                  "excluded": [normalize(checkout, c["path"])["key"] for c in daemon.custody.claims(checkout["id"])
                                               if c["unit"] != actor["unit"]],
-                                 # checked again after the scan: a lead call received meanwhile voids it
-                                 "still_quiet": lambda: not others_running(daemon, checkout, ident)}
+                                 # checked again after the scan: anything that started meanwhile voids it
+                                 "still_quiet": lambda: quiet(daemon, checkout, actor, ident) == record["window"]}
                 result = await daemon.ledger.reconcile(checkout, reason="possible lead Bash effects: " + ident, attribute=attribute)
                 if record:
                     record["state"] = "reconciled"
@@ -212,6 +225,8 @@ async def dispatch(daemon, payload):
         # (an uncalibrated adapter, an encoding), so that refusal must never hide the claim.
         conflicts = daemon.custody.conflicts(checkout["id"], actor["unit"], [normalize(checkout, path)])
         if conflicts:
+            daemon.store.put("lead_hook", ident, {"tool": tool, "state": "refused", "input_digest": signature,
+                             "checkout": checkout["id"]})  # denied: it writes nothing
             raise CoordinatorError("CLAIM_CONFLICT", "Scope held by " + conflicts[0]["holder"] +
                                    "; send a message to that holder or the lead, then request lead-authorized handback",
                                    {"conflicts": conflicts})
@@ -230,7 +245,12 @@ async def dispatch(daemon, payload):
         daemon.store.put("lead_hook", ident, {"unit": actor["unit"], "actor": actor["id"], "tool": tool,
                          "state": "prepared", "input_digest": signature, "operation": operation["id"]}, actor["unit"])
         return {"coordinated": True, "operation": operation["id"]}
-    if not record:
+    if not record or record["state"] in ("received", "refused"):
+        # no prepared intent: its Pre was refused (an uncalibrated adapter, an encoding) or never
+        # finished, and the host went ahead
+        if record:
+            record["state"] = "unrecorded"
+            daemon.store.save(record)
         await daemon.ledger.reconcile(checkout, [path], reason="lead post hook without prepared intent")
         raise CoordinatorError("LEAD_PRE_MISSING", "No matching prepared host intent; matching bytes cannot acquire authorship")
     operation = daemon.store.get(record["operation"])

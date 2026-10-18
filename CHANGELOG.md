@@ -3,6 +3,32 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.3.2] — 2026-10-19
+
+### Fixed: from the review of 2.3.1
+- **A lead Edit or Write counts as possibly writing from the moment the coordinator receives it**,
+  until it is prepared (a prepared edit is a pending operation, which reconciliation skips). In
+  2.3.1 only Bash calls counted: an Edit whose hook gave up waiting (3 s) could write while another
+  session's Bash completion scanned, and that session could be credited with the edit.
+  - A denied edit (another unit's claim) counts as nothing. One whose Pre never prepared (an
+    uncalibrated adapter, an encoding) counts until its Post, which records what it wrote as
+    UNKNOWN, or for 180 s: the daemon's 120 s pre/post gap for prepared edits, plus 60 s.
+- **The quiet check after the scan compares the whole fingerprint again**: another lead call, a
+  writer's turn, command custody or a pending operation that began during the scan voids the
+  attribution.
+
+### Measured
+- **Codex's variant**, on the same 20,000-file schedule as 2.3.1 (one full reconcile: 7.6–8.5 s),
+  with session B using Write instead of Bash: its hook gives up after 3 s, and the host writes the
+  file that A's Bash completion reads late in its scan.
+  - 2.3.1, as calibration: the file was recorded as `lead-command` for A, and B's own edit was
+    quarantined ("pre-image changed").
+  - 2.3.2: the file is UNKNOWN. B's edit is still quarantined, since the host wrote before it was
+    prepared, and its Post records the edit as unrecorded.
+- Rerun on 2.3.2, same results as before: lead Edit verified, lead Bash alone attributed,
+  overlapping and duplicate cases UNKNOWN, an outside edit before `pwd` UNKNOWN; every gate decision
+  unchanged, the lead edits of its setup verified.
+
 ## [software-workflows 2.3.1] — 2026-10-19
 
 ### Fixed: from the review of 2.3.0's last fixes

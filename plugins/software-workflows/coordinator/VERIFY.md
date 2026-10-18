@@ -6730,6 +6730,18 @@ processes it); B writes `bulk/019999.txt`; B's Post later. Each run exited 0 and
 Two earlier attempts did not reproduce the red on 2.3.0 and are not evidence either way: with a new
 session B, attaching it changed A's fingerprint; with 16,000 files, A's scan finished before B wrote.
 
+### 2.3.2: the same race with a lead Write (review turn 9)
+
+`lead_bash6.py`: `lead_bash5.py`'s schedule (`BULK=20000`), with session B's call a Write of
+`bulk/019999.txt` through the real hook (Pre gives up after 3 s, the host writes, Post).
+
+| Code | `bulk/019999.txt` after the race | B's Write |
+| --- | --- | --- |
+| 2.3.1 (tag export), calibration | `lead-command`, from A's Bash completion: **red** | operation quarantined, "pre-image changed during host intent preparation" |
+| 2.3.2 | UNKNOWN | the same quarantine; its hook record ends `unrecorded` |
+
+Both runs exited 0 and left no daemon.
+
 ### Commands and exit codes for the lead record
 
 The scripts are lead scratch in the session's scratchpad (`…/scratchpad/m3/`), not part of the
