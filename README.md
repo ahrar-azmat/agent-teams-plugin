@@ -126,7 +126,7 @@ indexes. The fetched content goes to Codex as cited context, never as a network 
 | `research` | Technical research from live sources, with URLs. |
 | `codex_query` | Anything else you want Codex's reasoning on. |
 | `abraham` | Codex implements a task in a git checkout (see below). |
-| `codex_runs`, `codex_run_log`, `codex_cancel_run`, `codex_resume_run` | See, watch, stop and collect runs. |
+| `codex_runs`, `codex_run_log`, `codex_cancel_run`, `codex_resume_run` | See, watch, stop and collect runs. `codex_resume_run` continues a run's thread with a nudge, and with `images` too. |
 
 **Dispatch blind.** A second opinion counts only if it was formed independently. So send Codex the
 evidence and the question, never your diagnosis. Put your own view in `caller_hypothesis`. Codex
@@ -265,11 +265,11 @@ calls them. An action's outcome comes from the journal, not from the reply alone
   note.
 - An attachment or `@`-file that's gone by the time you send is refused by name, and your draft stays.
 
-Before sending images, the office asks the server whether `codex_resume_run` takes an `images`
-argument:
-- If it does, the images are attached to the continuation.
-- If it doesn't, the note gives their paths and asks Codex to open each with its `view_image` tool.
-  Codex's look at an image doesn't show in the stream, because `codex exec` reports no event for it.
+Images are attached to the continuation itself: from 2.2.0, `codex_resume_run` takes `images`, and
+Codex sees them as part of the turn. The office asks the server whether it takes them rather than
+going by the version. Against an older server, the note gives the images' paths and asks Codex to
+open each with its `view_image` tool. Codex's look at an image that way doesn't show in the stream,
+because `codex exec` reports no event for it.
 
 A note to a live worker interrupts it. Steering a live run without stopping it comes with the
 writer coordinator.

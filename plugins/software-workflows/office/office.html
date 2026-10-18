@@ -1455,14 +1455,26 @@ const Composer = (() => {
     attBox.replaceChildren(...atts.map((a, i) => h('span', { class: 'att' + (a.path ? '' : ' up'), title: a.path || 'uploading…' }, a.url ? h('img', { src: a.url, alt: '' }) : h('span', { class: 'fi' }, '📄'), h('span', { class: 'n' }, a.name), h('button', { type: 'button', title: 'Remove', onclick: () => { atts.splice(i, 1); drawAtts(); } }, '✕'))),
       ...files.map((f, i) => h('span', { class: 'att', title: f }, h('span', { class: 'fi' }, '@'), h('span', { class: 'n' }, f.startsWith(w.cwd + '/') ? f.slice(w.cwd.length + 1) : home(f)), h('button', { type: 'button', title: 'Remove', onclick: () => { files.splice(i, 1); drawAtts(); } }, '✕'))));
   }
+  // Everything a draft would send, for telling whether it still reads as what was sent.
+  const revision = (text, as, fs) => JSON.stringify([text, as.map(a => a.path || a.name), fs]);
+  const storedRevision = id => { const d = store('draft.' + id) || {}; return revision(d.text || '', d.atts || [], d.files || []); };
   async function upload(list) {
+    // An upload belongs to the worker it was started for, wherever the person is when it lands.
+    const owner = w; if (!owner) return;
+    const here = () => w && w.id === owner.id;
     for (const file of list) {
       const a = { name: file.name || 'pasted.png', url: /^image\//.test(file.type) ? URL.createObjectURL(file) : '', path: '', image: /^image\//.test(file.type) };
-      atts.push(a); drawAtts();
+      if (here()) { atts.push(a); drawAtts(); }
       try {
         const r = await api(`/api/upload?name=${enc(a.name)}`, { method: 'POST', body: file });
-        a.path = r.path; a.image = a.image || r.image; drawAtts();
-      } catch (e) { atts.splice(atts.indexOf(a), 1); drawAtts(); toast(`Upload failed: ${e.message}`, 'bad'); }
+        a.path = r.path; a.image = a.image || r.image;
+        if (here()) { if (!atts.includes(a)) atts.push(a); drawAtts(); }
+        else {
+          const d = store('draft.' + owner.id) || { text: '', atts: [], files: [] };
+          d.atts = (d.atts || []).filter(x => x.path !== a.path).concat([{ name: a.name, path: a.path, image: !!a.image }]);
+          store('draft.' + owner.id, d);
+        }
+      } catch (e) { const k = atts.indexOf(a); if (k >= 0) { atts.splice(k, 1); drawAtts(); } toast(`Upload failed: ${e.message}`, 'bad'); }
     }
   }
   $('#b-attach').onclick = () => $('#file').click();
@@ -1515,48 +1527,50 @@ const Composer = (() => {
   msg.addEventListener('blur', () => setTimeout(hideMention, 150));
 
   /* sending */
-  function warnings(kind) {
+  function warnings(kind, who) {
     const out = [];
-    if (w.tool === 'abraham' && !w.write) out.push(`<p><b>${esc(w.name)} is in abraham's analysis phase.</b> Stopping it ends this dispatch: continuing later resumes the analysis thread only, and the write phase will not start by itself. “Send when done” is the safe choice here.</p>`);
-    if (w.write) out.push(`<p><b>${esc(w.name)} is writing in ${esc(home(w.cwd))}.</b> A file it was in the middle of may be left half-written; continue it with instructions to finish, and read the diff before anything is committed.</p>`);
+    if (who.tool === 'abraham' && !who.write) out.push(`<p><b>${esc(who.name)} is in abraham's analysis phase.</b> Stopping it ends this dispatch: continuing later resumes the analysis thread only, and the write phase will not start by itself. “Send when done” is the safe choice here.</p>`);
+    if (who.write) out.push(`<p><b>${esc(who.name)} is writing in ${esc(home(who.cwd))}.</b> A file it was in the middle of may be left half-written; continue it with instructions to finish, and read the diff before anything is committed.</p>`);
     return out.join('');
   }
-  async function send(kind) {
-    if (!w) return;
-    if (atts.some(a => !a.path)) { toast('Wait for the uploads to finish', 'bad'); return; }
-    const text = msg.value.trim();
-    if (kind !== 'cancel' && !text && !atts.length && !files.length) { toast('Write the instructions first', 'bad'); msg.focus(); return; }
+  async function send(kind, target) {
+    // The request is fixed before any dialog opens: its worker, run, text and attachments. Whatever the person
+    // does while the dialog is up, or while the reply is on its way, changes none of it.
+    const to = target || w; if (!to) return;
+    const onTo = () => w && w.id === to.id;
+    const raw = kind === 'cancel' || !onTo() ? '' : msg.value, text = raw.trim();
+    const sAtts = kind === 'cancel' || !onTo() ? [] : atts.slice(), sFiles = kind === 'cancel' || !onTo() ? [] : files.slice();
+    if (kind !== 'cancel') {
+      if (sAtts.some(a => !a.path)) { toast('Wait for the uploads to finish', 'bad'); return; }
+      if (!text && !sAtts.length && !sFiles.length) { toast('Write the instructions first', 'bad'); msg.focus(); return; }
+    }
+    const infra = $('#o-infra').checked, web = $('#o-web').checked, sent = revision(raw, sAtts, sFiles);
     if (kind === 'interrupt') {
-      const ok = await confirmBox(`Interrupt ${w.name}?`, `<p>The current run stops now (its Codex process is killed); the thread stays on disk, and ${esc(w.name)} continues it right away with your note.</p>${warnings(kind)}`, 'Interrupt & send', kind);
+      const ok = await confirmBox(`Interrupt ${to.name}?`, `<p>The current run stops now (its Codex process is killed); the thread stays on disk, and ${esc(to.name)} continues it right away with your note.</p>${warnings(kind, to)}`, 'Interrupt & send', kind);
       if (!ok) return;
     }
-    const body = kind === 'cancel' ? { kind, run: w.run, worker: w.id }
-      : { kind, run: w.run, worker: w.id, text, images: atts.filter(a => a.image).map(a => a.path), files: [...files, ...atts.filter(a => !a.image).map(a => a.path)] };
-    if (!w.write && kind !== 'cancel') {
-      if ($('#o-infra').checked !== !!w.infra) body.infra = $('#o-infra').checked;
-      if ($('#o-web').checked !== !!w.web) body.web_search = $('#o-web').checked;
+    const body = kind === 'cancel' ? { kind, run: to.run, worker: to.id }
+      : { kind, run: to.run, worker: to.id, text, images: sAtts.filter(a => a.image).map(a => a.path), files: [...sFiles, ...sAtts.filter(a => !a.image).map(a => a.path)] };
+    if (!to.write && kind !== 'cancel') {
+      if (infra !== !!to.infra) body.infra = infra;
+      if (web !== !!to.web) body.web_search = web;
     }
-    // The reply can arrive after the person moved to another worker or kept typing: it settles only the
-    // draft that was sent, and only that worker's panel shows the action.
-    const to = w, sentText = msg.value, sentAtts = atts.slice(), sentFiles = files.slice();
     try {
       const r = await api('/api/action', { method: 'POST', body: JSON.stringify(body) });
       if (Panel.worker && Panel.worker.id === to.id) Panel.localAction(r.action);
       if (kind !== 'cancel') {
-        const same = w === to && msg.value === sentText && atts.length === sentAtts.length && atts.every((a, i) => a === sentAtts[i])
-          && files.length === sentFiles.length && files.every((f, i) => f === sentFiles[i]);
-        if (same) { msg.value = ''; atts = []; files = []; drawAtts(); autosize(); }
-        else if (w !== to) { const d = store('draft.' + to.id); if (!d || d.text === sentText) store('draft.' + to.id, null); }
+        // Settle the draft only while it still reads as what was sent; a later edit or attachment stays.
+        if (onTo()) { if (revision(msg.value, atts, files) === sent) { msg.value = ''; atts = []; files = []; drawAtts(); autosize(); } }
+        else if (storedRevision(to.id) === sent) store('draft.' + to.id, null);
       }
       toast(kind === 'cancel' ? `Pausing ${to.name}…` : kind === 'after' ? `Queued for ${to.name} — delivered when this run finishes` : `Sent to ${to.name}`, 'good');
     } catch (e) { toast(e.message, 'bad'); }
   }
   async function pause(worker) {
-    w = worker;
     const ok = worker.cancel_stuck
       ? await confirmBox(`Retry ${worker.name}'s cancel?`, `<p>This run was told to stop, but nothing finished the cancel: its server and its Codex process are gone. Retrying asks the plugin to make sure nothing of it is left and to record it as cancelled. The thread stays on disk.</p>`, '⏸ Retry cancel', 'cancel')
-      : await confirmBox(`Pause ${worker.name}?`, `<p>Codex stops now (its process group is killed). The thread stays on disk: continue it with instructions any time from here.</p>${warnings('cancel')}`, '⏸ Pause', 'cancel');
-    if (ok) send('cancel');
+      : await confirmBox(`Pause ${worker.name}?`, `<p>Codex stops now (its process group is killed). The thread stays on disk: continue it with instructions any time from here.</p>${warnings('cancel', worker)}`, '⏸ Pause', 'cancel');
+    if (ok) send('cancel', worker);
   }
   form.addEventListener('submit', e => { e.preventDefault(); send(!w || !w.live ? 'resume' : w.status === 'HANDOFF' ? 'after' : 'interrupt'); });
   $('#b-after').onclick = () => send('after');
@@ -1602,6 +1616,7 @@ function confirmBox(title, html, label, kind) {
     toast(S.notify ? 'You will be notified when a worker finishes' : 'Notifications off');
   };
   document.addEventListener('keydown', e => {
+    if ($('#modal').classList.contains('open')) return;  // a dialog's keys are its own; nothing moves under it
     const typing = /INPUT|TEXTAREA|SELECT/.test((document.activeElement || {}).tagName || '');
     if (e.key === 'Escape') {
       if ($('#roster').classList.contains('open')) Roster.open(false); else if (!typing) Panel.close(); else document.activeElement.blur();

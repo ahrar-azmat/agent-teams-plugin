@@ -3,6 +3,39 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.2.0] — 2026-10-18
+
+### Added: images on `codex_resume_run`
+- **`images`** attaches local image files to a continuation's turn, as the other Codex tools already
+  could for a new call. Codex sees them natively, through `codex exec resume -i`.
+  - Missing paths are refused before anything is sent. Measured: refused in 0.0 s, and no run started.
+- **Images without a nudge** continue the thread with a default note. Before, an empty nudge on a
+  finished run replayed its stored answer, and the images would have gone nowhere. Measured: a
+  continuation started with that note.
+- **Continuing a failed or interrupted run re-attaches its images.** The journal records the images
+  the interrupted turn was given, and Codex may never have received them. One that no longer exists
+  is named in the reply.
+  - Measured: an image question was killed after its session started (server, watchdog and Codex
+    process). A resume with no images re-attached the image, and the answer was "7".
+- **Measured through the Codex Office**, on a scratch conversation:
+  - The office found `images` in the server's tool list and attached the image.
+  - Its note named no path, so Codex could only see the image through the attachment. It read
+    "Zebra, 7." off it.
+
+### Fixed
+- **A resume never accepts instructions and drops them silently.**
+  - When the call handles a detached run instead (it collects the run, or says why it can't), the
+    reply now says the nudge and images were not delivered.
+  - `run="list"` says the same, instead of only listing.
+- **The Codex Office**, from its review:
+  - A pause or interrupt dialog keeps the worker it was opened for. The `[` and `]` keys no longer
+    move the selection under an open dialog.
+  - A note whose write to the server stalls is ended with the server, so it can't arrive later.
+  - The reply to a send clears the draft only if the draft still holds exactly what was sent.
+  - Uploads land in the draft of the worker they were started for.
+  - Continuing a detached run that failed collects its output, then delivers the note, as it already
+    did for one that finished.
+
 ## [software-workflows 2.1.0] — 2026-10-18
 
 ### Added: the Codex Office (`/software-workflows:office`)
@@ -24,8 +57,6 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   - Interrupt & send cancelled the live run, and the same thread answered the new note 16 s after the
     click.
   - Pause cancelled a run in about 2 s.
-  - `$ARGUMENTS` reaching a command's `!` step, which `stop` and `status` rely on, was measured on
-    Claude Code 2.1.302.
 - **Roles.** Besides the six roles that follow the Codex tool, a worker can be one of eleven more:
   CEO, CTO, Project Manager, Product Manager, Business Analyst, QA Engineer, Security Engineer,
   DevOps Engineer, Designer, Data Analyst or Tech Writer. Each has its own sprite and gear.

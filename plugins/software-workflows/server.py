@@ -2412,6 +2412,11 @@ RESUME_NUDGE = (
     "The previous process was interrupted before your answer arrived. "
     "Continue from where you left off and provide the complete final answer."
 )
+# A resume given images and no nudge: images are an instruction in themselves.
+IMAGES_NUDGE = (
+    "Images are attached to this turn. Look at each one, then continue from "
+    "where you left off with them in mind."
+)
 
 
 _journal_lock = threading.Lock()
@@ -2586,8 +2591,9 @@ def _build_exec_argv(
     live on 0.144.1), on a resume as well: 0.163.0 chains the parent's ``-i``
     list into the resumed turn's input (exec/src/lib.rs:937-941), which is how
     a follow-up turn in a continued advisory session sees a new screenshot. A
-    recovery resume (codex_resume_run) passes none — its images are already in
-    the thread. ``--image`` is VARIADIC
+    recovery resume (codex_resume_run) re-attaches the images the journal
+    recorded for the interrupted turn (codex may never have received them) and
+    adds the caller's new ones. ``--image`` is VARIADIC
     (``<FILE>...``) — measured live: if the ``-i`` list sits immediately
     before the positional prompt, clap swallows the prompt as another image
     path and codex reports "No prompt provided via stdin". So images go RIGHT
@@ -5344,6 +5350,7 @@ async def codex_resume_run(
     nudge: str = "",
     infra: bool | None = None,
     web_search: bool | None = None,
+    images: list[str] = [],
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -5397,6 +5404,13 @@ async def codex_resume_run(
             shell/network + your MCP servers; False takes it away.
         web_search: Change live web search for the continuation. None
             inherits the original run's setting.
+        images: Local image file paths to attach to the continuation's turn
+            (screenshots, diagrams). Codex views them natively. Missing paths
+            are rejected loudly before any spend. Images without a nudge
+            continue the thread with a default one: they never ride the
+            stored-answer replay or the cancelled-run refusal. Continuing a
+            failed or interrupted run also re-attaches the images its
+            interrupted turn was given.
     """
     # WORKSPACE SCOPING (security): the journal is global across every project
     # on this machine. Listing or auto-resuming must not surface another
@@ -5407,6 +5421,14 @@ async def codex_resume_run(
     # Anchor the heartbeat deadline to THIS request's start: a fresh per-run
     # clock would resurrect dead-token sends (round-2 review, 2026-08-21).
     request_t0 = time.monotonic()
+    # Images are an explicit instruction: with no nudge they bring their own,
+    # so no short-circuit below (stored answer, cancelled refusal) drops them.
+    if isinstance(images, str):
+        images = [images]
+    images = list(images or [])
+    instructed = bool(nudge) or bool(images)
+    if images and not nudge:
+        nudge = IMAGES_NUDGE
 
     cwd = _get_cwd()
     all_runs = _journal_runs()
@@ -5418,7 +5440,11 @@ async def codex_resume_run(
             if _run_belongs(v, cwd) and v.get("has_start")}
 
     if run == "list":
-        return await codex_runs()
+        listing = await codex_runs()
+        if instructed:
+            listing += ("\n\n[Not delivered: run=\"list\" only lists runs; "
+                        "the nudge and images were not sent.]")
+        return listing
 
     if _IS_WINDOWS:
         # Round 6: read-mode continuations lacked durable claims on Windows —
@@ -5469,6 +5495,16 @@ async def codex_resume_run(
     if _is_detached(rec):
         collected = await _collect_detached(rec, run, ctx, request_t0, nudge)
         if collected is not None:
+            if instructed:
+                # Never accept-and-ignore: this call handled the detached run
+                # (collected it, or reported why it could not); the caller's
+                # instructions were not delivered.
+                collected += (
+                    "\n\n[Not delivered with this call: the nudge"
+                    + (" and images" if images else "")
+                    + " went nowhere, as this call handled the detached run "
+                    "above. Once that run has ended, call codex_resume_run on "
+                    "it again to continue with them.]")
             return collected
         rec = _journal_runs().get(run, rec)
     if (rec.get("has_end") and str(rec.get("status") or "") == "cancelled"
@@ -5587,6 +5623,20 @@ async def codex_resume_run(
     continuation = nudge or RESUME_NUDGE
     original_prompt = str(rec.get("prompt") or "")
     completed = bool(rec.get("has_end")) and str(rec.get("status") or "") == "ok"
+    restored_missing: list[str] = []
+    if not completed:
+        # The interrupted turn's images go back too: codex may never have
+        # received them. One that is gone is said, not silently skipped.
+        for img in rec.get("images") or []:
+            if not isinstance(img, str) or img in images:
+                continue
+            if Path(img).is_file():
+                images.append(img)
+            else:
+                restored_missing.append(img)
+        if restored_missing:
+            note += ("[The interrupted turn's image(s) no longer exist and were "
+                     f"not re-attached: {', '.join(restored_missing)}]\n\n")
     if original_prompt and not completed:
         continuation = (
             "[RECOVERY CONTEXT — this thread's interrupted turn may not have "
@@ -5648,6 +5698,7 @@ async def codex_resume_run(
             workdir=run_cwd,
             request_started=request_t0,
             claim_key=_thread_claim_key(tid),
+            images=images,
         )
     finally:
         _release_run_claim(_thread_claim_key(tid))

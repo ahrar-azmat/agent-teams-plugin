@@ -927,6 +927,9 @@ class McpClient:
         t.start()
         t.join(None if deadline is None else max(0.0, deadline - time.monotonic()))
         if t.is_alive():
+            # A timed join does not stop the write: end the server, so the request can never arrive later.
+            self.abort()
+            t.join(10)
             raise NoAnswer(f"the plugin's MCP server stopped reading ({len(data):,} bytes not taken in time)")
         if failed:
             raise failed[0]
@@ -971,6 +974,14 @@ class McpClient:
         res = self.request("tools/call", {"name": tool, "arguments": args}, timeout)
         text = "\n".join(c.get("text", "") for c in res.get("content") or [] if c.get("type") == "text")
         return text.strip(), bool(res.get("isError"))
+
+    def abort(self):
+        """End the server now: nothing sent so far may still be acted on after this returns."""
+        try:
+            self.p.kill()
+            self.p.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
     def close(self):
         """End of input lets the server exit; one that does not within 20 s is killed. Closing stdin waits
@@ -1158,15 +1169,18 @@ def run_action(aid):
             sent, budget = time.time(), call_timeout()
             try:
                 res, err = client.call("codex_resume_run", args, budget)
-                if (not err and before in ("DETACHED", "DETACHED-ENDED")
-                        and continuation_of(journal.refresh(), run, client.p.pid, sent) is None
-                        and run_status(journal.refresh().get(run, {}), processes()) == "ok"):
-                    # A detached run that had finished is collected first and the note is not delivered
-                    # (HEAD's _collect_detached returns its answer); with the run ended, send it again.
+                after = journal.refresh().get(run, {})
+                if (not err and before in ("DETACHED", "DETACHED-ENDED") and after.get("has_end")
+                        and str(after.get("status")) != "cancelled"
+                        and continuation_of(journal.refresh(), run, client.p.pid, sent) is None):
+                    # The server collected what the detached run left (its answer, or its partial output when
+                    # it failed) and did not deliver the note; with the run ended, send it again. A cancel
+                    # reached meanwhile is someone's decision, and stands.
                     save(collect_result=res)
                     sent = time.time()
                     res, err = client.call("codex_resume_run", args, budget)
             except NoAnswer as e:
+                client.abort()  # settle the transport before reading the outcome: no late delivery after it
                 cont = continuation_of(journal.refresh(), run, client.p.pid, sent)
                 save(status="failed", ended=time.time(), continuation=cont["run"] if cont else "",
                      run_status=run_status(cont, processes()) if cont else "",
