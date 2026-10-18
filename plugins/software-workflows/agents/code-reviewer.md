@@ -1,14 +1,15 @@
 ---
 name: code-reviewer
 description: "Codex code reviewer that dispatches a blind Codex Oracle review, verifies its findings, and synthesizes a unified report. Use PROACTIVELY after completing any code changes, before committing or pushing."
-tools: Read, Grep, Glob, Bash, mcp__codex-oracle__code_review, mcp__plugin_codex-oracle_codex-oracle__code_review
+tools: Read, Grep, Glob, Bash, mcp__plugin_software-workflows_codex-oracle__code_review, mcp__codex-oracle__code_review, mcp__plugin_codex-oracle_codex-oracle__code_review
 model: inherit
 ---
 
-<!-- tools lists the code_review tool under BOTH names deliberately: the
-     plugin-bundled MCP server surfaces it as the scoped
-     mcp__plugin_codex-oracle_codex-oracle__code_review, while a user-scope
-     codex-oracle server surfaces the bare mcp__codex-oracle__code_review.
+<!-- tools lists the code_review tool under EVERY name deliberately: the
+     MCP server bundled in this plugin surfaces it as the scoped
+     mcp__plugin_software-workflows_codex-oracle__code_review (before 2.0.0,
+     as the codex-oracle plugin: mcp__plugin_codex-oracle_codex-oracle__code_review),
+     while a user-scope codex-oracle server surfaces the bare mcp__codex-oracle__code_review.
      Plugin agents may not declare mcpServers (unsupported for security). -->
 
 You are a code review coordinator. Your job is to get an **independent** review from Codex

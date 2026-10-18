@@ -15,7 +15,7 @@ When you ask Claude Code to do anything involving 2+ agents, the `agent-teams` s
 
 It ships **role templates** (researcher, architect, implementer, reviewer, verifier, …) and **team patterns** (research, implementation, debug, review), plus an optional **cross-model advisory** layer that uses Codex Oracle as an independent senior advisor when its MCP server is present.
 
-The codex-oracle plugin also ships **`/abraham`** (v1.13.0): a write-capable mode that runs as two air-gapped codex phases — read-only deep analysis (codebase + live infra + live web) producing an implementation brief, then a sealed implementer (workspace-write file access, no network/web/MCP) that edits the working tree under git preconditions, a one-writer lock, and changed-files attribution for the orchestrator to review.
+The plugin also ships **`/abraham`** (v1.13.0): a write-capable mode that runs as two air-gapped codex phases — read-only deep analysis (codebase + live infra + live web) producing an implementation brief, then a sealed implementer (workspace-write file access, no network/web/MCP) that edits the working tree under git preconditions, a one-writer lock, and changed-files attribution for the orchestrator to review.
 
 ## Why this exists (the v1.1.0 fix)
 
@@ -107,7 +107,7 @@ timeout (`.mcp.json`, 4 h) and the host's idle abort sit above it; a detached ru
 **Next (1.18, staged):** a per-user *oracle daemon* that owns the codex processes (exit codes,
 deadlines, journal) with a CLI follower run through Claude Code's background Bash and a thin MCP
 façade — first on `codex exec`, then `codex app-server` read runs once the pin/isolation/recovery
-probes pass. Plan: `PLAN_1.18_ORACLE_DAEMON.md`; measured spike: `plugins/codex-oracle/spike/`.
+probes pass. Plan: `PLAN_1.18_ORACLE_DAEMON.md`; measured spike: `plugins/software-workflows/spike/`.
 
 ## Upstream codex source as reference (map vs territory)
 
@@ -145,7 +145,7 @@ everything these plugins wrap. Two rules keep that reference honest:
 
 Then just ask for multi-agent work (e.g. *"Create an agent team to review this PR from security, performance, and correctness angles"*).
 
-The plugin registers its MCP server itself (`plugins/codex-oracle/.mcp.json`, launcher
+The plugin registers its MCP server itself (`plugins/software-workflows/.mcp.json`, launcher
 `run_server.py` bootstraps its venv). Its interpreter is `${CODEX_ORACLE_PYTHON:-python3}`:
 macOS/Linux need nothing; on Windows set `CODEX_ORACLE_PYTHON=python` (python.org builds
 ship no `python3.exe`). Do not add a second, direct `mcpServers` entry for the same server —
@@ -249,7 +249,7 @@ kernel-side custody is the 1.18 daemon's job.
   ```json
   { "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" } }
   ```
-- **Optional — cross-model advisory:** the `codex-oracle` MCP server (ships in this marketplace). If it isn't configured, the skill still runs normally; the cross-model steps are simply skipped.
+- **Optional — cross-model advisory:** the `codex-oracle` MCP server, bundled in this plugin since 2.0.0 (an install that still has the separate `codex-oracle` plugin enabled is moved to `software-workflows` by the marketplace `renames` mapping). If it isn't configured, the skill still runs normally; the cross-model steps are simply skipped.
   - The server is Python (≥3.11) and launches via `${CODEX_ORACLE_PYTHON:-python3}` (see the note above); the hooks additionally require a resolvable `python3`.
   - `codex-oracle` needs the Codex CLI (`npm i -g @openai/codex`) authenticated (`codex`); live web search is forced on per call, so no config change is required.
   - **Windows (v1.9.0+):** fully supported — no WSL needed. Optional: enable Developer Mode if you want the `latest.log` convenience symlink; without it the merged `stream.log` is the live view.

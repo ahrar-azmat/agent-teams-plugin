@@ -1350,7 +1350,7 @@ def _pre_1172_server_running() -> str:
         low = cmd.lower()
         if "run_server.py" not in low and "server.py" not in low:
             continue
-        if "codex-oracle" not in low and "agent-teams" not in low:
+        if not any(name in low for name in ("codex-oracle", "software-workflows", "agent-teams")):
             continue
         try:
             comm = _proc_comm(pid)

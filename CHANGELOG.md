@@ -142,6 +142,22 @@ This project adheres to [Semantic Versioning](https://semver.org/).
   `claude plugin validate --strict` passes for the marketplace and both plugins; every
   changed Python file compiles.
 
+### One plugin: codex-oracle is part of software-workflows
+- The Codex Oracle MCP server, its hooks (plan gate, push gate, live-view nudge), `/abraham`,
+  the code-reviewer agent and the two Codex skills now ship inside `software-workflows`
+  (`plugins/software-workflows/`), with their history (`git mv`). The separate `codex-oracle`
+  plugin is gone; the marketplace's `renames` maps `codex-oracle` to `software-workflows`, so
+  an install that still has the old plugin enabled moves to this one, as `antigravity` was
+  handled (Claude Code v2.1.193+).
+- Codex tools now surface as `mcp__plugin_software-workflows_codex-oracle__<tool>`. The push
+  gate already recognizes a review under any `mcp__…__code_review` name; the server
+  recognizes its own processes under either layout; the code-reviewer agent lists every
+  name; the agent-teams skill and `/abraham` say which name to expect.
+- Verified 2026-10-18 by real runs: `claude plugin validate --strict` passes for the
+  marketplace and the plugin; in an empty `CLAUDE_CONFIG_DIR`, `plugin marketplace add` of
+  this checkout and `plugin install software-workflows@agent-teams` succeed, `plugin list`
+  shows 2.0.0 enabled, and `claude mcp list` connects `plugin:software-workflows:codex-oracle`.
+
 ## [software-workflows 1.8.1] — 2026-10-16
 
 ### No git worktrees: one writer per repository checkout (user ruling 2026-10-16)

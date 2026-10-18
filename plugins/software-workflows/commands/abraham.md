@@ -3,7 +3,8 @@ description: "Abraham: Codex analyzes deeply (codebase + live infra + live web),
 argument-hint: <task — what to build/fix/change, with the desired outcome>
 ---
 
-Dispatch the following task to the **`abraham`** tool (`mcp__codex-oracle__abraham`) — the
+Dispatch the following task to the **`abraham`** tool (`mcp__plugin_software-workflows_codex-oracle__abraham`;
+`mcp__codex-oracle__abraham` from a user-scope server) — the
 write-capable Codex mode — and orchestrate it exactly as you do the read tools: dispatch,
 monitor, review. You remain the orchestrator; Codex does the implementation.
 
