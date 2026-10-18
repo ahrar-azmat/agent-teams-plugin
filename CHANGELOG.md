@@ -275,6 +275,44 @@ This project adheres to [Semantic Versioning](https://semver.org/).
     answered from the thread's context;
   - the push gate's parser read the signed first line of both continued answers.
 
+### `/software-workflows:setup`, and a session-start check that points to it
+- `/software-workflows:setup` runs `plugin_setup.py check` and takes the person through the
+  result. What a plugin cannot switch on, agent teams, it turns on in the person's own
+  settings after asking: one key, `env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = "1"`, added in
+  place (every other key kept, file mode kept, written atomically and through a symlink; a
+  file that is not a JSON object is refused unchanged). It builds the Codex Oracle server's
+  environment if it is missing (`run_server.py --prepare`). For the Codex CLI, `codex login`,
+  Python 3.11+ and git it prints the exact fix. Nothing asks anyone to edit settings.json by
+  hand any more; the README's settings snippet is gone.
+- The command is allowed to run only its own script (`Bash(python3
+  ${CLAUDE_PLUGIN_ROOT}/plugin_setup.py:*)`), so it works in the default permission mode
+  without opening `python3` in general.
+- The SessionStart hook runs the quick checks when a session starts or resumes, about 120 ms.
+  When one fails it shows the person a line naming what is missing and tells the model to
+  point to setup; when everything is ready it says nothing.
+- Measured on Claude Code 2.1.302 before building it: `${CLAUDE_PLUGIN_ROOT}` and
+  `${CLAUDE_PLUGIN_DATA}` expand in a command's body, its `!` steps and its `allowed-tools`,
+  but the step's process does not get them as variables; a SessionStart `additionalContext`
+  reaches the model and a `systemMessage` does not; a settings `env` value reaches the hook.
+  In the default permission mode a `!` step without a matching `allowed-tools` rule is
+  refused, and with the narrow rule it runs.
+- Verified 2026-10-18 by real runs:
+  - on this machine the check reports 6 of 6 ready under Python 3.9.6 and 3.15;
+  - each item goes red when its cause is present (agent teams off, Codex logged out, no codex
+    or git on PATH, `CODEX_ORACLE_PYTHON` forced to 3.9, no server venv), with its fix;
+  - `prepare` built the server venv in an empty data directory in 4 s and it imports the
+    server's modules;
+  - `apply` created a settings file, merged into one with other keys (mode 600 kept),
+    reported "already on" the second time, refused invalid JSON byte for byte and an `env`
+    that is not an object (exit 1), and wrote through a symlinked file, leaving the link;
+  - the hook said nothing on a ready machine, named agent teams and codex login when both
+    were missing, and said nothing on compact;
+  - headless Claude Code sessions with this plugin in the default permission mode: on a
+    ready machine setup reported 6 of 6 and changed nothing; with Codex logged out the
+    session-start notice reached the model and setup told the person to type
+    `! codex login`; with the server venv missing setup built it without a question, checked
+    again and reported 6 of 6.
+
 ## [software-workflows 1.8.1] — 2026-10-16
 
 ### No git worktrees: one writer per repository checkout (user ruling 2026-10-16)

@@ -156,6 +156,12 @@ everything these plugins wrap. Two rules keep that reference honest:
 /plugin install software-workflows@agent-teams
 ```
 
+Then run `/software-workflows:setup` once. It checks the Codex CLI, `codex login`, Python 3.11+
+and git, builds the Codex Oracle server's environment, and, after asking you, turns agent teams
+on in your own settings: the one switch a plugin cannot set for you. For anything it cannot do
+itself it prints the exact command to run. A session that starts with something missing says so
+and points to setup.
+
 Then just ask for multi-agent work (e.g. *"Create an agent team to review this PR from security, performance, and correctness angles"*).
 
 The plugin registers its MCP server itself (`plugins/software-workflows/.mcp.json`). Its
@@ -275,13 +281,10 @@ kernel-side custody is the 1.18 daemon's job.
 ## Requirements
 
 - **Claude Code v2.1.178+** — the skill drives the implicit-team API introduced when `TeamCreate`/`TeamDelete` were removed in v2.1.178. (v2.1.193+ additionally auto-migrates installs that still have the removed `antigravity` plugin enabled, via the marketplace `renames` mapping.)
-- **Agent Teams enabled** — they're experimental and off by default. Enable in `settings.json`:
-  ```json
-  { "env": { "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1" } }
-  ```
+- **Agent Teams enabled** — they're experimental and off by default; `/software-workflows:setup` turns them on in your own settings after asking you.
 - **Optional — cross-model advisory:** the `codex-oracle` MCP server, bundled in this plugin since 2.0.0 (an install that still has the separate `codex-oracle` plugin enabled is moved to `software-workflows` by the marketplace `renames` mapping). If it isn't configured, the skill still runs normally; the cross-model steps are simply skipped.
   - The server needs a Python ≥3.11 installed; its launcher starts under `${CODEX_ORACLE_PYTHON:-python3}` of any version and finds it (see the note above). The hooks additionally require a resolvable `python3`.
-  - `codex-oracle` needs the Codex CLI (`npm i -g @openai/codex`) authenticated (`codex`); live web search is forced on per call, so no config change is required.
+  - `codex-oracle` needs the Codex CLI (`npm i -g @openai/codex`) logged in (`codex login`); setup checks both. Live web search is forced on per call, so no config change is required.
   - **Windows (v1.9.0+):** fully supported — no WSL needed. Optional: enable Developer Mode if you want the `latest.log` convenience symlink; without it the merged `stream.log` is the live view.
 
 ## License

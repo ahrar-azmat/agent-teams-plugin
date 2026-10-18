@@ -17,6 +17,9 @@ life (the descriptor survives the exec) and hands it to each detached watchdog i
 runs this venv's python after the server may be gone; an old generation is deleted only when no
 process holds it.
 
+`--prepare` makes the venv ready and exits without starting the server (/software-workflows:setup
+runs it, through plugin_setup.py).
+
 stdout is the MCP JSON-RPC channel — ALL bootstrap output goes to stderr.
 """
 import hashlib
@@ -166,26 +169,31 @@ def _prune(generations, keep):
                 os.close(fd)
 
 
-def main():
+def _generation(info, data):
+    """The venv directory for the interpreter `info` describes (raises OSError without requirements)."""
+    (major, minor), exe = info
+    requirements = (ROOT / "requirements.txt").read_bytes()
+    # the venv links to the interpreter's own sys.executable (Homebrew's stays put across patch
+    # releases), so that path, not the symlink's target, is what a generation depends on
+    key = hashlib.sha256(requirements + f"\0{exe}\0{major}.{minor}\0{sys.platform}".encode()).hexdigest()[:16]
+    # without a data directory (older Claude Code): beside this file, never in the .venv an older
+    # launcher may still be serving from
+    return (Path(data) / "venv" if data else ROOT / ".venvs") / key
+
+
+def main(prepare=False):
+    """Run the server; with prepare=True only make its venv ready (setup does this) and exit."""
     python, info = _find_python()
     if python is None:
         _err(f"bootstrap failed: {info}")
         return 1
-    (major, minor), exe = info
     try:
-        requirements = (ROOT / "requirements.txt").read_bytes()
+        venv = _generation(info, os.environ.get("CLAUDE_PLUGIN_DATA"))
     except OSError as exc:
         _err(f"bootstrap failed: cannot read requirements.txt ({exc})")
         return 1
-    # the venv links to the interpreter's own sys.executable (Homebrew's stays put across patch
-    # releases), so that path, not the symlink's target, is what a generation depends on
-    key = hashlib.sha256(requirements + f"\0{exe}\0{major}.{minor}\0{sys.platform}".encode()).hexdigest()[:16]
-    data = os.environ.get("CLAUDE_PLUGIN_DATA")
-    # without a data directory (older Claude Code): beside this file, never in the .venv an older
-    # launcher may still be serving from
-    generations = Path(data) / "venv" if data else ROOT / ".venvs"
+    generations, key = venv.parent, venv.name
     generations.mkdir(parents=True, exist_ok=True)
-    venv = generations / key
 
     build_lock = _lock(generations / ".lock")
     in_use = None
@@ -195,11 +203,14 @@ def main():
             if failed:
                 _err(f"bootstrap failed: {failed}")
                 return 1
-        if fcntl is not None:
+        if fcntl is not None and not prepare:
             in_use = _lock(venv / ".in-use", shared=True)  # held by the server until it exits
             _prune(generations, keep=key)
     finally:
         os.close(build_lock)
+    if prepare:
+        _err(f"the server venv is ready: {venv}")
+        return 0
 
     py = _venv_python(venv)
     argv = [str(py), str(ROOT / "server.py")]
@@ -215,4 +226,4 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(prepare="--prepare" in sys.argv[1:]))
