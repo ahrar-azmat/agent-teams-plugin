@@ -3,7 +3,10 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
-## [software-workflows 2.0.0] — unreleased
+## [software-workflows 2.0.0] — 2026-10-18
+
+Not in 2.0.0: parallel Codex writers in one checkout. abraham still runs one writer per
+checkout; the coordinator that lets several share one follows in the next release.
 
 ### `scripts/codex_src.py`: the codex source as read-only per-release exports, never a worktree
 - `~/Documents/codex-installed` is now a symlink to
@@ -555,9 +558,15 @@ This project adheres to [Semantic Versioning](https://semver.org/).
     one plain `git commit …` or `git push …`, it leaves a pass in the token store. The shim
     decides that commit or push again on its exact argv, finds the token gone and the pass
     there, and lets that one argv run in that directory, on that tree and index, within 120 s.
-    Nothing inside the sandbox can write a pass. The shim removes the pass it uses; where it
-    cannot, the PostToolUse hook removes it after the call. The same pass spares an
-    unsandboxed session a second token when its first git command is a commit or push.
+    The shim removes the pass it uses; where it cannot, the PostToolUse hook removes it after
+    the call. The same pass spares an unsandboxed session a second token when its first git
+    command is a commit or push. Like the rest of the gate, the pass is a guardrail for
+    Claude's own commands, not a barrier against a process set on getting around it. Known
+    from the code review of 2026-10-18 (turn 9), not fixed in 2.0.0: once a git command of
+    the session has run outside the sandbox, a commit or push inside it can no longer be
+    acknowledged (run it outside the sandbox); the pass does not bind an alternate index or
+    git directory named in the environment, and inside the sandbox it is not single-use
+    until the PostToolUse hook removes it.
   - A commit or push the shim must decide inside the sandbox (an alias, a script, a push a hook
     starts) is refused, with what to do: run it as one plain git command in its own Bash call
     (`git commit -F <file>` for a long message), or run it outside the sandbox.

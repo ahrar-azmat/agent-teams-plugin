@@ -167,11 +167,23 @@ Claude Code then fetches new versions when it starts. To update by hand, run
 software-workflows@agent-teams`, and restart Claude Code. After any update, run
 `/software-workflows:setup` once; it says what the new version needs.
 
-Coming from 1.x: an install that had the separate `codex-oracle` plugin is moved to
-`software-workflows` by the marketplace's `renames` entry when the marketplace updates. If you
-once registered codex-oracle by hand (the 1.x instructions), `/software-workflows:setup` finds
-that registration and prints the `claude mcp remove` command for it: the plugin registers its
-own server, and two registrations give two tool sets.
+**Coming from 1.x**, where codex-oracle and software-workflows were two plugins: whichever of
+them you had, run these once in a terminal, then restart Claude Code and run
+`/software-workflows:setup`:
+
+```text
+claude plugin marketplace update agent-teams
+claude plugin install software-workflows@agent-teams
+claude plugin update software-workflows@agent-teams
+```
+
+The marketplace's `renames` entry retires `codex-oracle` at the next start, but it neither
+installs nor updates `software-workflows` (measured on Claude Code 2.1.302): a machine that had
+only codex-oracle is left with no plugin until `install` runs, and one that had
+software-workflows 1.x stays on 1.x until `update` runs. Each command does nothing where it is
+not needed. If you once registered codex-oracle by hand (the 1.x instructions),
+`/software-workflows:setup` finds that registration and prints the `claude mcp remove` command
+for it: the plugin registers its own server, and two registrations give two tool sets.
 
 The plugin registers its MCP server itself (`plugins/software-workflows/.mcp.json`). Its
 launcher, `run_server.py`, runs under any `python3` — 3.9, the one macOS ships, too — and
@@ -222,10 +234,13 @@ git unwatched.
 `~/.claude`, which the sandbox protects) but never write them. Every git command still runs. The
 text gate stays in charge, since the shim cannot mark the session live: a plain `git commit …` or
 `git push …` is denied with a token as usual, and when the gate accepts the token it leaves the
-shim a pass for exactly that command, which nothing inside the sandbox can forge. A commit or push
-the shim has to decide there itself (an alias, a script, a push a hook starts) is refused with
-what to do: run it as one plain git command in its own Bash call (`git commit -F <file>` for a
-long message), or outside the sandbox.
+shim a pass for exactly that command. A commit or push the shim has to decide there itself (an
+alias, a script, a push a hook starts) is refused with what to do: run it as one plain git
+command in its own Bash call (`git commit -F <file>` for a long message), or outside the
+sandbox. Once a git command of the session has run outside the sandbox (a retry with the
+sandbox off, say), a commit or push inside it can no longer be acknowledged: run that one
+outside the sandbox too. Like the rest of the gate, the pass is a guardrail for Claude's own
+commands, not a barrier against a process that sets out to get around it.
 Once a session's git has gone through the shim with a usable mirror, the gate no longer
 reads that session's Bash command text: a grep, `sed` or heredoc that merely mentions push or
 commit is never denied. A denial the command's own output hides (`2>/dev/null`) still reaches

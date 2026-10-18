@@ -272,8 +272,7 @@ STORE_UNUSABLE_NOTE = (
 )
 READ_ONLY_NOTE = (
     "\nThis git runs where the gate's state can be read but not written: Claude Code's sandbox "
-    "keeps Bash out of it, so nothing a command runs there can forge an acknowledgement. There the "
-    "gate acknowledges a commit or push that is ONE plain git command in its own Bash call — `git "
+    "keeps Bash out of it. There the gate acknowledges a commit or push that is ONE plain git command in its own Bash call — `git "
     "commit …` or `git push …` with no `$(…)`, pipe, `&&`, alias or script around it (for a long "
     "message, write it to a file and use `git commit -F <file>`): run it in that form and the "
     "gate's PreToolUse hook, which runs outside the sandbox, hands you the token. Any other commit "
@@ -675,7 +674,8 @@ def _consume_ack(nonce, command, tree, state=""):
 # commit or push again on its exact argv, and the token is gone by then (the hook took it); the pass
 # lets that one argv run in that directory, on that tree and index. It is what makes an
 # acknowledgement work in Claude Code's sandbox, where Bash may read the token store but never write
-# it (measured 2026-10-18) — so a pass is also nothing a sandboxed command can forge. The shim
+# it (measured 2026-10-18). Like the rest of the gate it is a guardrail for Claude's own commands,
+# not a barrier against a process set on getting around it (code review of 2026-10-18, turn 9). The shim
 # removes the pass it uses; where it cannot (the sandbox), hooks/gate_notice.py removes it once the
 # Bash call is over, and PASS_TTL_S bounds it either way.
 PASS_TTL_S = 120  # the hook's decision → the git it allowed deciding again: 9.5 s from the pass to the
