@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 
 from .client import CoordinatorError
-from .ledger import normalize, read_path
+from .ledger import hidden, normalize, read_path
 from .locks import KeyedLocks
 from .observations import checkout_at
 from .store import digest
@@ -19,6 +19,8 @@ FILES = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 # One lead Bash transition (Pre: reconcile, fingerprint, record; Post: fingerprint, reconcile) at a
 # time per checkout, so no other lead command can start between a quiet check and its use.
 BASH_TRANSITIONS = KeyedLocks()
+# What was outside git's view when each lead Bash command began: {hook id: (deadline, entries)}.
+HIDDEN = {}
 
 
 def decode(raw):
@@ -176,10 +178,17 @@ async def dispatch(daemon, payload):
         # Registered before anything that can wait (attaching a new session, the checkout's other
         # transitions, the ledger): a hook that gives up waiting (its client's 3 s) lets the command
         # or the edit go ahead, so a call the daemon has received counts as possibly writing from here.
+        deadline = bash_deadline(data, payload.get("bash_limits")) if tool == "Bash" else time.time() + FILE_HOOK_S
         daemon.store.put("lead_hook", ident, {"tool": tool, "state": "observed" if tool == "Bash" else "received",
-                         "input_digest": signature, "checkout": checkout["id"], "window": None,
-                         "deadline": bash_deadline(data, payload.get("bash_limits")) if tool == "Bash" else time.time() + FILE_HOOK_S})
+                         "input_digest": signature, "checkout": checkout["id"], "window": None, "deadline": deadline})
         record = None
+        if tool == "Bash":
+            # What exists outside git's view, listed next, before anything here can wait: the command may
+            # already be running, and what it makes visible from there must not pass for its own. What
+            # becomes visible before the reconcile below is settled there as not its doing.
+            for key in [key for key, (until, _) in HIDDEN.items() if until < time.time()]:
+                del HIDDEN[key]
+            HIDDEN[ident] = (deadline, await asyncio.to_thread(hidden, checkout))
     from .lead import attach
     mapping = await attach(daemon, checkout["id"], session)
     actor = daemon.store.get(mapping["actor"])
@@ -205,11 +214,13 @@ async def dispatch(daemon, payload):
                 attribute = None
                 if record and record.get("window") is not None and record["window"] == await window(daemon, checkout, actor, ident):
                     attribute = {"attribution": "lead-command", "operation": ident, "unit": actor["unit"],
+                                 "hidden": HIDDEN.get(ident, (None, None))[1],
                                  "excluded": [normalize(checkout, c["path"])["key"] for c in daemon.custody.claims(checkout["id"])
                                               if c["unit"] != actor["unit"]],
                                  # checked again after the scan: anything that started meanwhile voids it
                                  "still_quiet": lambda: quiet(daemon, checkout, actor, ident) == record["window"]}
                 result = await daemon.ledger.reconcile(checkout, reason="possible lead Bash effects: " + ident, attribute=attribute)
+                HIDDEN.pop(ident, None)
                 if record:
                     record["state"] = "reconciled"
                     daemon.store.save(record)

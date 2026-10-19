@@ -54,7 +54,7 @@ def normalize(checkout, value):
         current = current / component
         try:
             info = current.lstat()
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
             continue
         if stat.S_ISLNK(info.st_mode):
             raise CoordinatorError("PATH_SYMLINK", "Mutation traverses a symlink", {"path": str(relative)})
@@ -63,10 +63,62 @@ def normalize(checkout, value):
         if not stat.S_ISREG(info.st_mode) and not stat.S_ISDIR(info.st_mode):
             raise CoordinatorError("PATH_TYPE", "Unsupported filesystem node", {"path": str(relative)})
     name = relative.as_posix()
+    return {"path": name, "key": key(checkout, name)}
+
+
+def key(checkout, name):
+    """A path as the volume tells names apart: Unicode-normalized, case-folded where case is ignored."""
     alias = unicodedata.normalize("NFD", name)
-    if not checkout["case_sensitive"]:
-        alias = alias.casefold()
-    return {"path": name, "key": alias}
+    return alias if checkout["case_sensitive"] else alias.casefold()
+
+
+def hidden(checkout):
+    """Keys of what exists outside git's view right now: ignored files, ignored folders (once, as
+    "name/") and embedded repositories ("name/"). Together with git's view this covers the whole
+    checkout. Git also lists as "name/" a folder that is not ignored but holds only ignored content;
+    such a folder is opened, so a new file made there later is not taken for an old one."""
+    root, found, folders = checkout["root"], set(), []
+    for name in gitio.git(root, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"]).stdout.split(b"\0"):
+        if name:
+            (folders.append if name.endswith(b"/") else found.add)(os.fsdecode(name))
+    for name in gitio.git(root, ["ls-files", "-z", "--others", "--exclude-standard"]).stdout.split(b"\0"):
+        if name.endswith(b"/"):
+            found.add(os.fsdecode(name))
+    while folders:
+        ignored = _ignored(root, [folder[:-1] for folder in folders])
+        deeper = []
+        for folder in folders:
+            if folder[:-1] in ignored or os.path.lexists(os.path.join(root, folder, ".git")):
+                found.add(folder)
+                continue
+            try:
+                with os.scandir(os.path.join(root, folder)) as entries:
+                    for entry in entries:
+                        if entry.is_dir(follow_symlinks=False):
+                            deeper.append(folder + entry.name + "/")
+                        else:
+                            found.add(folder + entry.name)
+            except (FileNotFoundError, NotADirectoryError):
+                pass  # gone since git listed it
+        folders = deeper
+    return {key(checkout, name) for name in found}
+
+
+def _ignored(root, names):
+    """Which of these untracked folders an exclude rule itself names."""
+    if not names:
+        return set()
+    result = gitio.git(root, ["check-ignore", "-z", "--stdin"], data=b"".join(os.fsencode(n) + b"\0" for n in names), check=False)
+    if result.returncode not in (0, 1):
+        raise CoordinatorError("GIT_FAILED", "Git could not classify ignored folders", {"returncode": result.returncode})
+    return {os.fsdecode(name) for name in result.stdout.split(b"\0") if name}
+
+
+def covered(checkout, entries, path):
+    """Whether `path` is, or lies inside, one of `hidden()`'s entries, compared as the volume names paths."""
+    name = key(checkout, path)
+    parts = name.split("/")
+    return name in entries or any("/".join(parts[:i]) + "/" in entries for i in range(1, len(parts) + 1))
 
 
 def overlaps(left, right):
@@ -86,6 +138,9 @@ def read_path(store, checkout, name):
                 descriptor = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
                 descriptors.append(descriptor)
             fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                os.close(fd)  # a tracked file that became a folder is absent; its files are paths of their own
+                return {"blob": None, "mode": None}
             with os.fdopen(fd, "rb") as stream:
                 before = os.fstat(stream.fileno())
                 if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -96,7 +151,8 @@ def read_path(store, checkout, name):
                 fields = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode, s.st_nlink)
                 if fields(before) == fields(after) == fields(current):
                     return {"blob": blob, "mode": "100755" if before.st_mode & 0o111 else "100644"}
-        except FileNotFoundError:
+        except (FileNotFoundError, NotADirectoryError):
+            # A tracked path whose parent is now a file is absent like a deleted one.
             return {"blob": None, "mode": None}
         finally:
             for descriptor in reversed(descriptors):
@@ -104,37 +160,78 @@ def read_path(store, checkout, name):
     raise CoordinatorError("UNSTABLE_READ", "File changed while reading", {"path": name})
 
 
-def _snapshot_once(store, checkout):
-    found, directories = {}, []
-    def failed(error):
-        raise error
-    for directory, dirs, files in os.walk(checkout["root"], followlinks=False, onerror=failed):
-        dirs[:] = [name for name in dirs if name != ".git"]
-        info = os.stat(directory, follow_symlinks=False)
-        directories.append((directory, info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns))
-        for name in dirs:
-            if (Path(directory) / name).is_symlink():
-                raise CoordinatorError("PATH_SYMLINK", "Full reconciliation encountered a directory symlink")
-        for name in files:
-            if name == ".git":
-                continue
-            path = (Path(directory) / name).relative_to(checkout["root"]).as_posix()
-            found[path] = read_path(store, checkout, path)
-    for directory, device, inode, modified, changed in directories:
-        info = os.stat(directory, follow_symlinks=False)
-        if (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns) != (device, inode, modified, changed):
-            raise CoordinatorError("UNSTABLE_SNAPSHOT", "Directory entries changed during the full snapshot")
+def _decoded(name):
+    try:
+        return name.decode("utf-8", "strict")
+    except UnicodeError as exc:
+        raise CoordinatorError("PATH_ENCODING", "Path must be valid UTF-8", {"path": os.fsdecode(name)}) from exc
+
+
+def visible(checkout):
+    """Git's own view of the checkout, the set Codex itself diffs: tracked paths, including
+    deleted ones, plus untracked paths no ignore rule covers. Ignored trees (node_modules,
+    virtualenvs, build output) are never commit material and are never read."""
+    root, paths = checkout["root"], set()
+    for entry in gitio.git(root, ["ls-files", "-z", "--stage"]).stdout.split(b"\0"):
+        if not entry:
+            continue
+        meta, name = entry.split(b"\t", 1)
+        if meta.split()[0] == b"160000":
+            raise CoordinatorError("PATH_TYPE", "Git's view of the checkout includes a submodule; the coordinator records "
+                                   "ordinary files only", {"path": _decoded(name)})
+        paths.add(_decoded(name))
+    for name in gitio.git(root, ["ls-files", "-z", "--others", "--exclude-standard"]).stdout.split(b"\0"):
+        # An embedded repository is listed once, as "name/": its files belong to that checkout.
+        if name and not name.endswith(b"/"):
+            paths.add(_decoded(name))
+    return paths
+
+
+def _folders(root, paths):
+    """Each folder holding a scanned path, with the identity and times that change when an entry
+    in it is created, removed or replaced; None for a folder that does not exist."""
+    names = {""}
+    for path in paths:
+        parts = path.split("/")[:-1]
+        names.update("/".join(parts[:i]) for i in range(1, len(parts) + 1))
+    found = {}
+    for name in names:
+        try:
+            info = os.lstat(os.path.join(root, name) if name else root)
+            found[name] = (info.st_dev, info.st_ino, info.st_mode, info.st_mtime_ns, info.st_ctime_ns)
+        except (FileNotFoundError, NotADirectoryError):
+            found[name] = None
     return found
 
 
-def full_snapshot(store, checkout):
+def _snapshot_once(store, checkout, known):
+    listed = visible(checkout)
+    # Paths the ledger already holds stay in scope after an ignore rule starts covering them.
+    scope = sorted(listed | known)
+    folders = _folders(checkout["root"], scope)
+    found = {}
+    for path in scope:
+        try:
+            found[path] = read_path(store, checkout, path)
+        except CoordinatorError as exc:
+            if exc.code in ("PATH_SYMLINK", "PATH_HARDLINK", "PATH_TYPE"):
+                raise CoordinatorError(exc.code, "Git's view of the checkout includes a path that is not an ordinary file; "
+                                       "ignore it in .gitignore or remove it", {"path": path}) from exc
+            raise
+    # Equal listings alone miss a tracked file deleted or replaced after it was read: it stays listed.
+    if visible(checkout) != listed or _folders(checkout["root"], scope) != folders:
+        raise CoordinatorError("UNSTABLE_SNAPSHOT", "Git's view of the checkout changed during the full snapshot")
+    return found
+
+
+def full_snapshot(store, checkout, known=()):
     for _ in range(3):
         try:
-            return _snapshot_once(store, checkout)
+            return _snapshot_once(store, checkout, set(known))
         except CoordinatorError as exc:
             if exc.code != "UNSTABLE_SNAPSHOT":
                 raise
-    raise CoordinatorError("UNSTABLE_SNAPSHOT", "Directory entries did not stabilize for reconciliation")
+    raise CoordinatorError("UNSTABLE_SNAPSHOT", "Git's view of the checkout did not stabilize for reconciliation")
 
 
 def patch_scope(patch):
@@ -243,33 +340,37 @@ class Ledger:
         identity = metadata["identity"]
         self.own(identity)
         existing = self.store.db.execute("SELECT * FROM checkout_identities WHERE identity=?", (identity,)).fetchone()
-        if existing:
+        record = self.store.get(existing["checkout"], required=False) if existing else None
+        # A first registration that failed (marked) or was killed mid-scan (unmarked) never became ready,
+        # wrote no history and admitted nothing: take it again under the same id.
+        retry = (bool(record) and not record.get("ready") and existing["state"] in ("incomplete", "initializing")
+                 and record.get("quarantine") in (None, "baseline incomplete") and self._untouched(record["id"]))
+        if existing and not retry:
             if existing["state"] != "ready":
                 raise CoordinatorError("CHECKOUT_QUARANTINED", "Canonical checkout registration needs reconciliation",
                                        {"identity": identity, "state": existing["state"], "members": existing["members"]})
             record = self.store.get(existing["checkout"])
             self.require_owned(record)
             return record
-        ident = uid("checkout")
+        ident = record["id"] if retry else uid("checkout")
         metadata.update(root=root, case_sensitive=await asyncio.to_thread(case_sensitive, root))
         with self.store.transaction():
             self.store.put("checkout", ident, metadata)
-            self.store.db.execute("INSERT INTO checkout_identities VALUES(?,?,?,?)", (identity, ident, "initializing", '[]'))
+            self.store.db.execute("INSERT INTO checkout_identities VALUES(?,?,?,?) ON CONFLICT(identity) DO UPDATE SET state=excluded.state",
+                                  (identity, ident, "initializing", '[]'))
         checkout = self.store.get(ident)
         try:
-            snapshot = await asyncio.to_thread(full_snapshot, self.store, checkout)
             base_entries = await asyncio.to_thread(gitio.entries, root, metadata["base"])
-            baseline, blobs_by_oid = {}, {}
-            for path in set(snapshot) | set(base_entries):
-                entry = base_entries.get(path, [])
-                if entry and (len(entry) != 1 or entry[0]["mode"] not in ("100644", "100755")):
+            for path, entry in base_entries.items():
+                if len(entry) != 1 or entry[0]["mode"] not in ("100644", "100755"):
                     raise CoordinatorError("BASE_TYPE", "Unsupported base tree entry", {"path": path})
-                oid = entry[0]["oid"] if entry else None
-                if oid and oid not in blobs_by_oid:
-                    data = await asyncio.to_thread(gitio.git, root, ["cat-file", "blob", oid])
-                    blobs_by_oid[oid] = await asyncio.to_thread(self.store.blob, data.stdout)
-                baseline[path] = {"blob": blobs_by_oid.get(oid),
-                                  "mode": entry[0]["mode"] if entry else None}
+            # The base tree's paths are read too: a file removed from the index but kept on disk is not deleted.
+            snapshot = await asyncio.to_thread(full_snapshot, self.store, checkout, set(base_entries))
+            blobs_by_oid = await asyncio.to_thread(self._base_blobs, root, {entry[0]["oid"] for entry in base_entries.values()})
+            baseline = {}
+            for path in set(snapshot) | set(base_entries):
+                entry = base_entries.get(path)
+                baseline[path] = {"blob": blobs_by_oid[entry[0]["oid"]], "mode": entry[0]["mode"]} if entry else {"blob": None, "mode": None}
             with self.store.transaction():
                 for path, known in baseline.items():
                     rev = self.store.revision(ident, path, known["blob"], known["mode"], "baseline")
@@ -368,6 +469,17 @@ class Ledger:
                     paths.add(entry["move"])
         return sorted({normalize(checkout, path)["path"] for path in paths})
 
+    def _untouched(self, ident):
+        db = self.store.db
+        return not (db.execute("SELECT 1 FROM revisions WHERE checkout=? LIMIT 1", (ident,)).fetchone()
+                    or db.execute("SELECT 1 FROM unknowns WHERE checkout=? LIMIT 1", (ident,)).fetchone()
+                    or db.execute("SELECT 1 FROM records WHERE kind != 'checkout' AND json_extract(data, '$.checkout')=? LIMIT 1",
+                                  (ident,)).fetchone())
+
+    def _base_blobs(self, root, oids):
+        with gitio.blobs(root) as read:
+            return {oid: self.store.blob(read(oid)) for oid in sorted(oids)}
+
     def _metadata(self, root):
         top = gitio.text(root, ["rev-parse", "--show-toplevel"])
         if Path(top).resolve() != Path(root):
@@ -389,8 +501,9 @@ class Ledger:
         async with self.lock(checkout["id"]):
             try:
                 if paths is None:
-                    actual = await asyncio.to_thread(full_snapshot, self.store, checkout)
-                    paths = set(actual) | {r[0] for r in self.store.db.execute("SELECT path FROM heads WHERE checkout=?", (checkout["id"],))}
+                    known = {r[0] for r in self.store.db.execute("SELECT path FROM heads WHERE checkout=?", (checkout["id"],))}
+                    actual = await asyncio.to_thread(full_snapshot, self.store, checkout, known)
+                    paths = set(actual)
                 else:
                     actual = {path: await asyncio.to_thread(read_path, self.store, checkout, path) for path in paths}
             except CoordinatorError as exc:
@@ -423,14 +536,19 @@ class Ledger:
                     head = self.store.head(checkout["id"], path)
                     known = {"blob": head["blob"], "mode": head["mode"]} if head else {"blob": None, "mode": None}
                     if current != known:
+                        why = reason
                         # A caller that proved nothing else could have changed the tree names the author.
                         if attribute and not any(overlaps(normalize(checkout, path)["key"], key) for key in attribute["excluded"]):
-                            self.store.revision(checkout["id"], path, current["blob"], current["mode"], attribute["attribution"],
-                                                attribute["operation"], attribute["unit"])
-                            attributed.append(path)
-                            continue
+                            # A path new to the ledger is the caller's only if nothing existed there when it began:
+                            # content that was outside git's view then (`git add -f`, an ignore rule removed) is older.
+                            if head or (attribute.get("hidden") is not None and not covered(checkout, attribute["hidden"], path)):
+                                self.store.revision(checkout["id"], path, current["blob"], current["mode"], attribute["attribution"],
+                                                    attribute["operation"], attribute["unit"])
+                                attributed.append(path)
+                                continue
+                            why = "older content became visible: " + reason
                         revision = self.store.revision(checkout["id"], path, current["blob"], current["mode"], "UNKNOWN")
-                        unknowns.append(self.store.unknown(checkout["id"], path, reason,
+                        unknowns.append(self.store.unknown(checkout["id"], path, why,
                                                           {"custody": context, "label": "custody" if context else "UNKNOWN"}, revision))
             result = {"unknowns": unknowns, "paths_scanned": len(paths)}
             if attribute:

@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.3.0
+# Writer coordinator — software-workflows 2.3.4
 
 C1 runs several native Codex app-server writers in one original checkout. C2
 connects Abraham, the run tools and Claude lead operations to that durable
@@ -169,6 +169,32 @@ Legacy duplicate records keep their history and claims but are quarantined with
 baseline. Each new unit captures the actual branch and tip after pending
 publication reconciliation. Registration's original baseline remains available
 for UNKNOWN restoration.
+
+A checkout's content is git's view of it, the set Codex itself diffs: tracked
+paths, deleted ones included, plus untracked paths no ignore rule covers
+(`git ls-files --cached --others --exclude-standard`). Ignored folders such as
+`node_modules`, virtualenvs and build output are never read or stored. A path
+the ledger already holds stays in a full scan after an ignore rule covers it, and
+registration also reads every path of the base tree. An embedded repository is
+its own checkout; a submodule in the index is refused with its path. A path in
+git's view that is not an ordinary single-link file is refused with that path;
+ignore it or remove it. A tracked file that became a folder reads as deleted,
+in every scan and at sealing. A
+scan whose folders gained, lost or replaced an entry while it read them is taken
+again (three attempts). A first registration that failed or was killed, wrote no
+history and admitted nothing is taken again on the next attempt.
+
+As a lead Bash call arrives, before anything can wait, the coordinator lists what
+exists outside git's view (`ls-files --others --ignored --exclude-standard
+--directory`, plus embedded repositories). An ignored folder or an embedded
+repository is one entry; a folder git lists only because everything in it is
+ignored is opened, file by file. A path new to the ledger at the command's end
+is credited to a quiet command only when no entry of that list covers it,
+compared as the volume tells names apart (Unicode normalization, and case where
+the volume ignores it); otherwise it may have existed before the command,
+unseen, and is UNKNOWN. What becomes visible between the listing and the
+command is settled as not its doing by the reconcile that follows the listing,
+so a hook that gives up waiting (3 s) cannot make old content the command's.
 
 ## Dynamic tools, hooks and custody
 

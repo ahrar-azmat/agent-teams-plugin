@@ -3,6 +3,75 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.3.4] — 2026-10-19
+
+### Fixed: the coordinator refused real repositories
+- **A checkout's content is git's view of it**, the same set Codex itself diffs: tracked paths
+  (deleted ones too) plus untracked paths no ignore rule covers (`git ls-files --cached --others
+  --exclude-standard`). 2.3.3 walked every file on disk, so the first symlink anywhere —
+  `node_modules/.bin`, an ignored `.venv` link — refused registration with `PATH_SYMLINK`, after
+  copying ignored files into the coordinator state. On SmartPay_Frontend that was 178,768 files
+  on disk against the 1,495 git sees; one failed registration left 1.1 GB of copies.
+  - Paths the ledger already holds stay in scope after an ignore rule starts covering them.
+  - An embedded repository is skipped; its files belong to that checkout.
+  - A path in git's view that is not an ordinary file (an untracked symlink) is refused with the
+    path named and the remedy: ignore it or remove it.
+  - A tracked path whose folder became a file reads as deleted instead of failing the scan.
+- **A failed first registration can be retried.** It wrote no revisions and allowed no effects,
+  but every later attempt answered `CHECKOUT_QUARANTINED`, so the repository could never be
+  registered again with that state.
+- **Registration reads the base tree's blobs through one `git cat-file --batch`** instead of one
+  git process per file.
+
+### Fixed: from the review of the first 2.3.4 draft (session 01a14eac, turn 11)
+- **Old content that becomes visible is not credited to a quiet lead command.** A `git add -f` of
+  an ignored file, or an ignore rule removed, shows bytes the coordinator never saw written. As a
+  lead Bash call arrives, before anything can wait, the coordinator now lists what exists outside
+  git's view: ignored files, ignored folders and embedded repositories once each, and file by file
+  a folder git lists only because everything in it is ignored. A path new to the ledger at the
+  command's end is the command's only if none of those covers it, compared as the volume tells
+  names apart (Unicode, and case on a case-insensitive volume), and UNKNOWN otherwise, even after a
+  `touch` or an unchanged rewrite. Files the command creates are still the lead's, also in a folder
+  of ignored files. (Turn 12 refuted the first fix, a file-timestamp rule: `touch` moves the
+  timestamp without writing the bytes. Turn 13 found the listing taken after Pre's reconcile, where
+  a hook that gave up at 3 s lets the command run first; compared by spelling, so a case-only
+  rename passed; and too coarse in folders of ignored files, where new files became UNKNOWN.)
+- **A scan notices a tracked file deleted or replaced after it was read.** Equal listings miss it
+  (the path stays listed), so the scan also compares its folders' identity and times, and is
+  taken again when an entry changed.
+- **A tracked file that became a folder reads as deleted**, in full scans, scoped reconciliation
+  and sealing alike; the folder's files are paths of their own. Each crashed with
+  `IsADirectoryError`.
+- **Registration reads the base tree's paths too**, so a file removed from the index but kept on
+  disk (`git rm --cached` plus an ignore rule) is not recorded as deleted, then as restored.
+- **The batch blob reader has a deadline**: no progress for 120 s fails with `GIT_TIMEOUT`, and the
+  git child is killed and reaped. A stopped child held registration forever.
+- **A registration killed in the middle of its scan is taken again**, like one that failed: never
+  ready, no history, nothing admitted. It stayed `CHECKOUT_QUARANTINED`.
+- **A submodule in the index is refused with its path**, instead of crashing the scan.
+
+### Changed: the agent-teams skill loads a quarter of the tokens
+- `skills/agent-teams/SKILL.md` is a core of 11,472 bytes (was 57,898, about 14k tokens each time
+  the skill loads). The detailed workflow, prompt templates, advisory doctrine, Runtime Capability
+  Law, writer guide and troubleshooting moved unchanged into `skills/agent-teams/references/`, which
+  the core names with when to read each.
+- The start checklist no longer says one writer per checkout: writers in one checkout hold
+  disjoint claims.
+
+### Measured (2.3.3 as calibration, then 2.3.4), on clones of SmartPay_Frontend (with its real
+node_modules, 82,843 files on disk) and Smartpay_Backend (with its `.venv` link)
+- 2.3.3: `PATH_SYMLINK` on both; a second attempt `CHECKOUT_QUARANTINED`.
+- 2.3.4 on that same stuck state: ready. Frontend 1,494 revisions, registration 1.5 s (13.5 s with
+  one git process per file, identical revisions), full reconcile 0.42–0.46 s. Backend 1,289
+  revisions, 1.3 s, 0.31–0.33 s. No UNKNOWN.
+- Edge repository: an untracked symlink refused with its path; once ignored, the retried baseline
+  is ready and records nothing from ignored folders, the embedded repository or the link; a
+  ledger path that becomes ignored is still read (unchanged: nothing new; changed: UNKNOWN); a
+  tracked folder replaced by a file records the deletion (without the new handling: a
+  `NotADirectoryError` crash).
+- The three real SmartPay checkouts, read only: 57, 1,291 and 1,495 paths in git's view, listed in
+  0.01–0.02 s, all ordinary files.
+
 ## [software-workflows 2.3.3] — 2026-10-19
 
 ### Fixed: from the review of 2.3.2

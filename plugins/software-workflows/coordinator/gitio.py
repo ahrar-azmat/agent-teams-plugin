@@ -92,6 +92,60 @@ def text(root, args, **kwargs):
     return git(root, args, **kwargs).stdout.decode("utf-8").strip()
 
 
+# A batch read that makes no progress for this long fails, as one `cat-file blob` call did (git()).
+BLOB_IDLE_S = 120
+
+
+@contextmanager
+def blobs(root):
+    """One `cat-file --batch` process for many blob reads; git flushes after each object."""
+    process = subprocess.Popen(git_argv(str(root), ["cat-file", "--batch"]), stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=git_env(),
+                               close_fds=True, bufsize=0)
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    pending = bytearray()
+    def take(size=None):
+        while (size is None and b"\n" not in pending) or (size is not None and len(pending) < size):
+            if not selector.select(BLOB_IDLE_S):
+                raise CoordinatorError("GIT_TIMEOUT", "Git blob reads stopped making progress", {"seconds": BLOB_IDLE_S}, True)
+            chunk = os.read(process.stdout.fileno(), 1 << 20)
+            if not chunk:
+                raise CoordinatorError("GIT_FAILED", "Git blob reader ended early", operational=True)
+            pending.extend(chunk)
+        end = pending.index(b"\n") + 1 if size is None else size
+        data = bytes(pending[:end])
+        del pending[:end]
+        return data
+    def read(oid):
+        process.stdin.write(oid.encode() + b"\n")
+        header = take().split()
+        if len(header) != 3 or header[1] != b"blob":
+            raise CoordinatorError("GIT_FAILED", "Git did not return the blob", {"oid": oid}, True)
+        data = take(int(header[2]) + 1)
+        if data[-1:] != b"\n":
+            raise CoordinatorError("GIT_FAILED", "Git blob read was truncated", {"oid": oid}, True)
+        return data[:-1]
+    finished = False
+    try:
+        yield read
+        finished = True
+    finally:
+        selector.close()
+        if not finished:
+            process.kill()  # a stalled or misreading child never outlives the failure
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+
+
 def entries(root, tree=None, index=None):
     args = ["ls-tree", "-rz", "--full-tree", tree] if tree else ["ls-files", "--stage", "-z"]
     result = {}

@@ -6752,6 +6752,105 @@ Both runs exited 0 and left no daemon.
 
 Every run exited 0 and left no daemon. A claim lost inside `custody.acquire` was not staged.
 
+### 2.3.4: a checkout is git's view (the SmartPay refusal)
+
+The SmartPay lead's `coordinator_claims` refused Smartpay_Backend and SmartPay_Frontend with
+`PATH_SYMLINK` ("Full reconciliation encountered a directory symlink"). Read only, the real
+coordinator state then held 87,034 blob files (1.1 GB) and both identities `incomplete`.
+`snapcheck.py` registers one checkout in-process on a scratch state and runtime root, then runs one
+full reconcile. Clones: SmartPay_Frontend with its real `node_modules` (`cp -c`, 82,843 files on
+disk, 1,494 in git's view); Smartpay_Backend with `.venv` linked to the real virtualenv.
+
+| Check | 2.3.3 (HEAD export), calibration | 2.3.4 |
+| --- | --- | --- |
+| Frontend, first registration | `PATH_SYMLINK`, 0.7 s, 37 blob files: **red** | ready, 1,494 revisions, 0 UNKNOWN |
+| Frontend, again on the same state | `CHECKOUT_QUARANTINED`: **red** | (2.3.4 on that stuck state) ready |
+| Backend, first registration | `PATH_SYMLINK`: **red** | ready, 1,289 revisions, 0 UNKNOWN |
+| Backend, again on the same state | `CHECKOUT_QUARANTINED`: **red** | (2.3.4 on that stuck state) ready |
+| Registration time, Frontend / Backend | — | 13.5 s / 11.7 s with one `cat-file blob` per file; 1.5 s / 1.3 s with `cat-file --batch`, revisions identical |
+| Full reconcile, Frontend / Backend | — | 0.42–0.46 s / 0.31–0.33 s |
+
+`edgecheck.py`, a scratch repository with a deleted tracked file, an embedded repository, an
+ignored folder, an untracked folder link and an untracked file:
+
+| Step | 2.3.4 |
+| --- | --- |
+| Register with the link unignored | `PATH_SYMLINK`, "Git's view of the checkout includes a path that is not an ordinary file; ignore it in .gitignore or remove it", `{"path": "linkdir"}` |
+| Ignore the link, register again | ready (the failed baseline retried; 2.3.3 here: `CHECKOUT_QUARANTINED`); revisions for `.gitignore`, `a.txt` (deleted, UNKNOWN), `d/e.txt`, `t/x.txt`; nothing from `ign/`, `inner/` or the link |
+| Ignore `d/`, reconcile | new UNKNOWN only `.gitignore`; 4 paths scanned, `d/e.txt` among them |
+| Change `d/e.txt` while ignored, reconcile | UNKNOWN `d/e.txt` |
+| Replace tracked folder `t/` by a file `t`, reconcile | UNKNOWN `t` and `t/x.txt`, `t/x.txt` deleted. With the not-a-directory handling removed: `NotADirectoryError`: **red** |
+
+Read only, the real checkouts: Smartpay_POC 57, Smartpay_Backend 1,291 and SmartPay_Frontend 1,495
+paths in git's view, listed in 0.01–0.02 s, none deleted, all ordinary single-link files.
+
+### 2.3.4: the review of its first draft (turn 11)
+
+Calibration is a copy of the reviewed draft (`prefix11`); every case is a real run.
+`r11_ledger.py` drives the ledger in-process on scratch repositories; `r11_promote.py` drives the
+real `coordinator_lead.py` hook against a scratch daemon.
+
+| Finding | Reviewed draft, calibration | Fixed |
+| --- | --- | --- |
+| HIGH: ignored `generated.txt` written before registration, then a quiet lead Bash `git add -f generated.txt` | `lead-command` for the lead: **red** | UNKNOWN with the first fix (a file-timestamp rule, refuted in turn 12, below); control `echo made > made.txt` still `lead-command` |
+| Tracked `aaa.txt` deleted 1.0 s into a 20,001-file reconcile, after it was read | new UNKNOWN none, head still `baseline` (4.2 s): **red** | UNKNOWN deletion in the same reconcile (7.6 s, one retry) |
+| Tracked file `x` replaced by a folder holding `x/y.txt` | `IsADirectoryError`: **red** | UNKNOWN `x` (deleted) and `x/y.txt` |
+| `git rm --cached keep.txt` plus an ignore rule, file kept, then register and reconcile | UNKNOWN deletion at registration, UNKNOWN again at the next reconcile: **red** | `keep.txt` stays `baseline`; only the untracked `.gitignore` is UNKNOWN |
+| `cat-file --batch` child stopped (SIGSTOP) before its first answer | registration still blocked after 25 s, child left stopped: **red** | `GIT_TIMEOUT` after 3.7 s (deadline lowered to 3 s for the run), child gone |
+| Registration of 20,000 files SIGKILLed after 2.5 s, recovery, register again | `CHECKOUT_QUARANTINED`: **red** | ready |
+| A gitlink added to the index after registration | `IsADirectoryError`: **red** | `PATH_TYPE`, `{"path": "sub"}` |
+
+On the SmartPay clones after the fixes: the 2.3.3 stuck states register (1.8 s and 1.6 s), fresh
+registrations take 1.5 s and 1.3 s, full reconciles 0.48–0.49 s and 0.36–0.38 s, no UNKNOWN.
+
+Rerun on the fixed tree, same results as before the fixes: `edgecheck.py` (all five steps), `lead_bash.py`,
+`lead_bash3.py`, `lead_hooks_edge.py`, `lead_bash2.py` and `settle_check.py` (MARKED held 10.2 s, ESCAPE 2.1 s);
+every run exited 0 and left no daemon.
+
+### 2.3.4: the review of the fixes (turn 12)
+
+Codex refuted the timestamp rule: `touch` changes a file's ctime without writing its bytes. The
+rule is now git's own listing of what was outside its view when the command began. Calibration is a
+copy of the tree turn 12 reviewed (`prefix12`); `r12_checks.py` drives the real hook and a scratch
+daemon.
+
+| Case | Turn-12 tree, calibration | Fixed |
+| --- | --- | --- |
+| `touch touched.txt && git add -f touched.txt` (ignored, older bytes) | `lead-command`: **red** | UNKNOWN |
+| `sed -i '' s/zzz/zzz/ sedded.txt && git add -f sedded.txt` (rewritten unchanged) | `lead-command`: **red** | UNKNOWN |
+| `sed -i '' /dist/d .gitignore` (un-ignores `dist/bundle.js`) | `dist/bundle.js` UNKNOWN, `.gitignore` `lead-command` | the same |
+| Control: `echo made > made.txt` | `lead-command` | `lead-command` |
+| Two verified lead edits delete `x` and add `x/y.txt`, then `unit/seal` | `OPERATIONAL_FAILURE` `IsADirectoryError`: **red** | sealed, candidate `c48fbf88…` |
+| Scoped `checkout/reconcile` of `x` once it is a folder | `IsADirectoryError`: **red** | UNKNOWN deletion of `x` |
+
+### 2.3.4: the review of the fixes (turn 13)
+
+Codex found the listing taken too late, compared by spelling, and too coarse. Calibration is a copy
+of the tree turn 13 reviewed (`prefix13`); `prefix13p` and the fixed tree's copy `fixed13p` add a
+6 s pause in the daemon's Pre, for calibration only, so the real hook gives up at 3 s and the
+command runs while Pre is still working. `r13_checks.py` drives the real hook and a scratch daemon.
+
+| Finding | Turn-13 tree, calibration | Fixed |
+| --- | --- | --- |
+| HIGH: pause after Pre's reconcile; meanwhile the command force-adds the old ignored `generated.txt` | `lead-command`: **red** | UNKNOWN; with the pause before the listing instead, UNKNOWN from Pre's reconcile |
+| HIGH: ignored `Generated.txt` renamed through `tmp.txt` to `generated.txt`, then force-added (this volume ignores case) | `lead-command`: **red** | UNKNOWN |
+| MEDIUM: `*.log` ignored and only `work/old.log` in `work/`; `echo made > work/new.py` | UNKNOWN: **red** | `lead-command` |
+| The same beside `work2/inner/a.log` (`work2/inner/new.py`) and an ignored `work3/node_modules/` (`work3/new.py`) | UNKNOWN: **red** | `lead-command` |
+| Controls: `git add -f` of `work/old.log`, `work3/node_modules/y.js`, `node_modules/x.js` | UNKNOWN | UNKNOWN |
+
+Apple Git 2.50.1 lists `work/`, `work2/`, `work2/inner/` and `work3/` in `ls-files --others
+--ignored --exclude-standard --directory`, next to the files inside them, although no rule names
+those folders: `git check-ignore -z --stdin` names `dist` (`dist/`), `out` (`/out`), `node_modules`
+and `work3/node_modules`, not `work`. The listing keeps an ignored folder or an embedded repository
+as one entry and opens every other folder git lists.
+
+Rerun on the fixed tree with the turn-12 results: the six `r11_ledger.py` cases, `r11_promote.py`,
+`r12_checks.py` (seal candidate `c48fbf88…` again), `snapcheck.py` on both clones (1.8 s and 1.6 s
+to register, 0.51 s and 0.37 s to reconcile, no UNKNOWN), `edgecheck.py`, `lead_bash.py`,
+`lead_bash3.py`, `lead_hooks_edge.py`, `lead_bash2.py` and `settle_check.py` (MARKED 10.2 s, ESCAPE
+2.1 s). Every run exited 0 and stopped its daemon. The first attempt at the three red runs failed in
+the harness (a relative work path) and left two scratch daemons, stopped afterwards.
+
 ### Commands and exit codes for the lead record
 
 The scripts are lead scratch in the session's scratchpad (`…/scratchpad/m3/`), not part of the

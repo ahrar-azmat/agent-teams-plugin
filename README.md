@@ -246,6 +246,16 @@ Known limits, measured on macOS:
 - The push gate checks the content in your working tree. When a commit takes a path whose staged
   content differs from its working file (`git add`, then an edit), the staged bytes are not
   checked; the gate says so in a note.
+- The coordinator records ordinary files only. It reads a checkout as git sees it, so ignored
+  folders (`node_modules`, `.venv`, build output) never matter. A checkout whose committed tree
+  holds a symlink or a submodule is refused at registration (`BASE_TYPE`), and a submodule added
+  to its index later is refused with its path. An untracked symlink that no ignore rule covers is
+  refused with its path: ignore it or remove it.
+- Content that was outside git's view when one of your Bash commands began (an ignored file,
+  anything in an ignored folder) and is visible when it ends (`git add -f`, an ignore rule removed)
+  is UNKNOWN, even if the command rewrote it, and so is a new file the command creates inside an
+  ignored folder and force-adds: the coordinator never saw who wrote it. To publish such a file,
+  make the change with Edit or Write.
 
 ## The Codex Office
 
