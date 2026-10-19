@@ -12,7 +12,7 @@ from .client import CoordinatorError
 from .ledger import hidden, normalize, read_path
 from .locks import KeyedLocks
 from .observations import checkout_at
-from .store import digest
+from .store import digest, uid
 
 
 FILES = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
@@ -117,17 +117,22 @@ def others_running(daemon, checkout, ident):
                for other in daemon.store.all("lead_hook"))
 
 
-def quiet(daemon, checkout, actor, ident):
-    """The synchronous part of `window`: the fingerprint, or None."""
+def quiet(daemon, checkout, mine, ident):
+    """The synchronous part of `window`: the fingerprint, or None. `mine` are this session's actors."""
     if others_running(daemon, checkout, ident):
         return None
     marks = []
     for other in daemon.store.all("actor"):
-        if other["checkout"] != checkout["id"] or other["id"] == actor["id"]:
+        if other["checkout"] != checkout["id"] or other["id"] in mine:
             continue
         if other.get("active_turn") or other.get("state") == "running":
             return None
         marks.append([other["id"], other["_revision"]])
+    # Every other lead call here, finished ones too: one that starts or ends while this window is
+    # open changes it after it has left the active set (what it wrote outside git's view, its own
+    # reconcile never saw).
+    marks += [[other["id"], other["_revision"]] for other in daemon.store.all("lead_hook")
+              if other["id"] != ident and other.get("checkout") == checkout["id"]]
     if daemon.custody.active(checkout["id"]):
         return None
     if any(o["checkout"] == checkout["id"] and o["state"] in ("prepared", "allowed", "running") for o in daemon.store.all("operation")):
@@ -135,17 +140,30 @@ def quiet(daemon, checkout, actor, ident):
     return digest(sorted(marks))
 
 
-async def window(daemon, checkout, actor, ident):
+async def window(daemon, checkout, mine, ident):
     """A fingerprint of what besides this lead's command could change files here, or None while
     something could: another lead Bash command still running (in any session), a writer's turn, a
     pending patch or edit, command custody (a command or its held survivors), or an exec write
     holding the tree. A turn that starts and ends inside the window still rewrites its actor's
-    record, so the fingerprint changes; a lead command that does so reconciles its own effects
-    as UNKNOWN before this one ends, since its window was not quiet."""
+    record, and another lead call its own record, so the fingerprint changes."""
     # The one await comes first: everything after it reads the store without yielding.
     if await asyncio.to_thread(exec_writing, checkout["root"]):
         return None
-    return quiet(daemon, checkout, actor, ident)
+    return quiet(daemon, checkout, mine, ident)
+
+
+async def arm(daemon, params):
+    """The hook got the answer to a lead Bash call's Pre before the host ran the command: only then
+    is what Pre recorded a state from before the command, so only an armed window names the lead.
+    A hook that gave up waiting (3 s) never arms it, and the call's effects stay UNKNOWN."""
+    ident, token = params.get("observed"), params.get("arm")
+    record = daemon.store.get(ident, required=False) if isinstance(ident, str) and ident.startswith("lead_hook_") else None
+    if (not record or record.get("tool") != "Bash" or record.get("state") != "observed" or not token
+            or record.get("arm") != token or record.get("armed")):
+        return {"armed": False}
+    record["armed"] = True
+    daemon.store.save(record)
+    return {"armed": True}
 
 
 async def dispatch(daemon, payload):
@@ -179,8 +197,15 @@ async def dispatch(daemon, payload):
         # transitions, the ledger): a hook that gives up waiting (its client's 3 s) lets the command
         # or the edit go ahead, so a call the daemon has received counts as possibly writing from here.
         deadline = bash_deadline(data, payload.get("bash_limits")) if tool == "Bash" else time.time() + FILE_HOOK_S
-        daemon.store.put("lead_hook", ident, {"tool": tool, "state": "observed" if tool == "Bash" else "received",
-                         "input_digest": signature, "checkout": checkout["id"], "window": None, "deadline": deadline})
+        mapping = daemon.store.get("lead_session_" + digest([checkout["identity"], session]), required=False)
+        fields = {"tool": tool, "state": "observed" if tool == "Bash" else "received", "input_digest": signature,
+                  "checkout": checkout["id"], "window": None, "deadline": deadline,
+                  "session_actors": [mapping["actor"]] if mapping else []}
+        if tool == "Bash":
+            # Quiet as the call arrives? The window taken at the end of Pre must equal this, so a call
+            # that started and ended in between (another lead's, a writer's turn) leaves none.
+            fields["arrival"] = quiet(daemon, checkout, set(fields["session_actors"]), ident)
+        daemon.store.put("lead_hook", ident, fields)
         record = None
         if tool == "Bash":
             # What exists outside git's view, listed next, before anything here can wait: the command may
@@ -199,7 +224,12 @@ async def dispatch(daemon, payload):
                 # made inside the window can become the lead's.
                 await daemon.ledger.reconcile(checkout, reason="before lead Bash: " + ident)
                 record = daemon.store.get(ident)
-                record.update(unit=actor["unit"], actor=actor["id"], window=await window(daemon, checkout, actor, ident))
+                mine = set(record.get("session_actors") or []) | {actor["id"]}
+                now = await window(daemon, checkout, mine, ident)
+                held = now is not None and now == record.get("arrival")
+                # The window counts only once the hook has the answer before the command runs (`arm`).
+                record.update(unit=actor["unit"], actor=actor["id"], session_actors=sorted(mine),
+                              window=now if held else None, arm=uid("arm") if held else None)
                 daemon.store.save(record)
             if event != "PreToolUse" and record and record["state"] == "reconciled":
                 # A second completion for the same call (Post and Failure, or a retried hook) names nobody:
@@ -212,20 +242,25 @@ async def dispatch(daemon, payload):
                 # every `sed -i`, formatter or lockfile update by the lead left content that no commit
                 # or native resume could take (measured, 2.3.0). Another unit's claimed paths stay UNKNOWN.
                 attribute = None
-                if record and record.get("window") is not None and record["window"] == await window(daemon, checkout, actor, ident):
+                mine = set(record.get("session_actors") or []) | {actor["id"]} if record else {actor["id"]}
+                if (record and record.get("window") is not None and record.get("armed")
+                        and record["window"] == await window(daemon, checkout, mine, ident)):
                     attribute = {"attribution": "lead-command", "operation": ident, "unit": actor["unit"],
                                  "hidden": HIDDEN.get(ident, (None, None))[1],
                                  "excluded": [normalize(checkout, c["path"])["key"] for c in daemon.custody.claims(checkout["id"])
                                               if c["unit"] != actor["unit"]],
                                  # checked again after the scan: anything that started meanwhile voids it
-                                 "still_quiet": lambda: quiet(daemon, checkout, actor, ident) == record["window"]}
+                                 "still_quiet": lambda: quiet(daemon, checkout, mine, ident) == record["window"]}
                 result = await daemon.ledger.reconcile(checkout, reason="possible lead Bash effects: " + ident, attribute=attribute)
                 HIDDEN.pop(ident, None)
                 if record:
                     record["state"] = "reconciled"
                     daemon.store.save(record)
                 return dict(result, attribution="lead-command" if "attributed" in result else "UNKNOWN-context-only", executed_again=False)
-            return {"coordinated": True, "observed": ident, "executed_again": False}
+            answer = {"coordinated": True, "observed": ident, "executed_again": False}
+            if fresh and record.get("arm"):
+                answer["arm"] = record["arm"]
+            return answer
     path = normalize(checkout, target)["path"]
     if event == "PreToolUse":
         def refused():  # denied: it writes nothing

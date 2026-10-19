@@ -256,6 +256,10 @@ Known limits, measured on macOS:
   is UNKNOWN, even if the command rewrote it, and so is a new file the command creates inside an
   ignored folder and force-adds: the coordinator never saw who wrote it. To publish such a file,
   make the change with Edit or Write.
+- What one of your Bash commands changes is credited to you only when the coordinator answered
+  before the command ran (within the hook's 3 s) and nothing else ran in that checkout meanwhile,
+  another session's command included. On a very large checkout, where that answer takes longer,
+  the changes are UNKNOWN; make them with Edit or Write.
 
 ## The Codex Office
 

@@ -104,6 +104,15 @@ def main():
         result = Client(state, timeout=3).call("lead-hook/dispatch", {"payload": data})
         if not isinstance(result, dict):
             return unavailable(session, state)
+        token = result.pop("arm", None) if tool == "Bash" and event == "PreToolUse" else None
+        if token:
+            # The answer came before the host runs the command: only that makes the coordinator's
+            # record of what was there a state from before it, so tell it (a lost reply leaves UNKNOWN).
+            try:
+                armed = Client(state, timeout=3).call("lead-hook/armed", {"observed": result.get("observed"), "arm": token})
+                result["armed"] = bool(isinstance(armed, dict) and armed.get("armed"))
+            except Exception:
+                result["armed"] = False
         if not result.get("coordinated", True):
             return None
         return {"hookSpecificOutput": {"hookEventName": event,

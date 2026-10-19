@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.3.4
+# Writer coordinator — software-workflows 2.3.5
 
 C1 runs several native Codex app-server writers in one original checkout. C2
 connects Abraham, the run tools and Claude lead operations to that durable
@@ -192,9 +192,8 @@ ignored is opened, file by file. A path new to the ledger at the command's end
 is credited to a quiet command only when no entry of that list covers it,
 compared as the volume tells names apart (Unicode normalization, and case where
 the volume ignores it); otherwise it may have existed before the command,
-unseen, and is UNKNOWN. What becomes visible between the listing and the
-command is settled as not its doing by the reconcile that follows the listing,
-so a hook that gives up waiting (3 s) cannot make old content the command's.
+unseen, and is UNKNOWN. These listings are a state from before the command only
+because the host has not run it yet: see the armed window below.
 
 ## Dynamic tools, hooks and custody
 
@@ -571,11 +570,20 @@ Bash hooks never run the command again. PreToolUse reconciles the checkout, so
 what changed before the command is not its doing, and records a quiet-window
 fingerprint: None while another lead Bash command in this checkout is still
 running (until its host deadline), a writer's turn is active, a patch or edit is
-pending, command custody is active, or an exec write holds the tree. Post (or
-Failure) reconciles again: when the window was quiet at both ends and unchanged,
-what changed outside other units' claims is recorded as `lead-command` for the
-lead's unit; otherwise it is UNKNOWN. A second completion for the same call
-attributes nothing. When the coordinator is down, lead edits are allowed with one
+pending, command custody is active, or an exec write holds the tree. The
+fingerprint covers every writer actor's record and every other lead call's
+record in the checkout, finished ones included, and is taken twice: as the call
+arrives and at the end of Pre. A call that started or ended in between (another
+session's command that wrote an ignored file, a writer's turn) changes it, and
+the window is not opened. The window is **armed** only when the hook received
+Pre's answer before the host ran the command: the answer carries a one-time
+token and the hook confirms it (`lead-hook/armed`); a hook that gave up waiting
+(its client's 3 s) never confirms, and the command's effects are UNKNOWN. Post
+(or Failure) reconciles again: when the window was armed and unchanged at both
+ends, what changed outside other units' claims is recorded as `lead-command` for
+the lead's unit; otherwise it is UNKNOWN. A second completion for the same call
+attributes nothing. On a checkout whose Pre takes longer than 3 s (a reconcile
+of tens of thousands of files), no lead command is credited. When the coordinator is down, lead edits are allowed with one
 warning per session in private external warning state. Later reconciliation must
 expose unexplained effects. No supplied transcript path is read.
 

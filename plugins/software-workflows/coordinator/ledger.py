@@ -105,13 +105,14 @@ def hidden(checkout):
 
 
 def _ignored(root, names):
-    """Which of these untracked folders an exclude rule itself names."""
+    """Which of these untracked folders an exclude rule itself names. check-ignore reads its input
+    as pathspecs: "./" keeps a folder named like `:(glob)cache` literal (it echoes the input)."""
     if not names:
         return set()
-    result = gitio.git(root, ["check-ignore", "-z", "--stdin"], data=b"".join(os.fsencode(n) + b"\0" for n in names), check=False)
+    result = gitio.git(root, ["check-ignore", "-z", "--stdin"], data=b"".join(b"./" + os.fsencode(n) + b"\0" for n in names), check=False)
     if result.returncode not in (0, 1):
         raise CoordinatorError("GIT_FAILED", "Git could not classify ignored folders", {"returncode": result.returncode})
-    return {os.fsdecode(name) for name in result.stdout.split(b"\0") if name}
+    return {os.fsdecode(name[2:] if name.startswith(b"./") else name) for name in result.stdout.split(b"\0") if name}
 
 
 def covered(checkout, entries, path):

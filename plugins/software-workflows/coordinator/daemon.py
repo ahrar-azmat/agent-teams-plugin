@@ -1041,6 +1041,9 @@ class Daemon:
             payload = params["payload"]
             async with self.actor_locks.hold("host:" + digest([payload.get("session_id"), payload.get("tool_use_id")])):
                 return await dispatch(self, payload)
+        if method == "lead-hook/armed":
+            from .intents import arm
+            return await arm(self, params)
         if method == "claim/acquire":
             self.ledger.require_owned(self.store.get(self.store.get(params["actor"])["checkout"]))
             return await self.custody.acquire(self.store.get(params["actor"]), params["paths"])

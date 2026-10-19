@@ -3,6 +3,31 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.3.5] — 2026-10-19
+
+### Fixed: from the review of 2.3.4's lead-Bash rule (session 01a14eac, turn 14)
+- **A lead Bash command is credited only when the hook had the coordinator's answer before the
+  command ran.** The answer to Pre carries a one-time token and the hook confirms it
+  (`lead-hook/armed`); only a confirmed window can name the lead. A hook that gave up waiting (3 s)
+  let the command run while Pre was still taking its listings, so content the command moved into an
+  ignored folder and back, then force-added, was credited as the lead's. It is UNKNOWN now.
+- **Quiet from the call's arrival to the end of Pre, not only at its end.** The fingerprint is
+  taken twice and also covers every other lead call's record in the checkout, finished ones
+  included. Another session's command that wrote an ignored file while this one's Pre waited to
+  attach, then ended, left this window quiet, and the force-added file became this lead's.
+- **A folder named like pathspec magic (`:(glob)cache`) no longer fails every lead Bash Pre.**
+  `git check-ignore` reads its input as pathspecs; names are passed as `./name`.
+
+### Measured (2.3.4 as calibration, then 2.3.5)
+- Pre paused 6 s before its listing, the command `mv work saved; sleep 8; mv saved work; git add -f
+  work/old.log`: 2.3.4 `lead-command`, 2.3.5 UNKNOWN.
+- Session B's Pre paused 2 s before attaching while session A wrote an ignored `gen.txt`; B then
+  force-added it: 2.3.4 B's `lead-command`, 2.3.5 UNKNOWN (B's hook answered in 2.2 s).
+- `:(glob)cache/old.log` with `*.log` ignored, then `echo made > made.txt`: 2.3.4 the hook reported
+  the coordinator unavailable and `made.txt` was UNKNOWN; 2.3.5 `lead-command`.
+- A plain quiet command is still `lead-command`, with the hook under Homebrew 3.15 and Apple 3.9.6;
+  Pre still answers in 0.2 s. Every 2.3.4 run repeated with the same results.
+
 ## [software-workflows 2.3.4] — 2026-10-19
 
 ### Fixed: the coordinator refused real repositories

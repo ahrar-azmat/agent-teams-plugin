@@ -6851,6 +6851,29 @@ to register, 0.51 s and 0.37 s to reconcile, no UNKNOWN), `edgecheck.py`, `lead_
 2.1 s). Every run exited 0 and stopped its daemon. The first attempt at the three red runs failed in
 the harness (a relative work path) and left two scratch daemons, stopped afterwards.
 
+### 2.3.5: the review of 2.3.4's rule (turn 14)
+
+Codex showed that no ordering of Pre's listings makes them a state from before the command once the
+hook has given up, and that taking the listing before the session attaches let another session's
+finished call pass. Calibration is a copy of the released 2.3.4 tree (`prefix14p`, with 6 s and 2 s
+pauses in Pre for calibration only); `fixed14p` is the fixed tree with the same pauses.
+`r14_checks.py` drives the real hook and a scratch daemon.
+
+| Finding | 2.3.4, calibration | Fixed |
+| --- | --- | --- |
+| HIGH: Pre paused 6 s before its listing (the hook gives up at 3 s); the command `mv work saved; sleep 8; mv saved work; git add -f work/old.log` (`*.log` and `/saved/` ignored) | `lead-command`: **red** | UNKNOWN (never armed) |
+| HIGH: B's Pre paused 2 s before attaching; meanwhile A's whole Bash call writes the ignored `gen.txt`; B then force-adds it | B's `lead-command`: **red** | UNKNOWN (fingerprint changed between arrival and the end of Pre; B's hook answered in 2.2 s) |
+| LOW: `:(glob)cache/old.log` with `*.log` ignored, then `echo made > made.txt` | hook reports the coordinator unavailable (check-ignore exit 128), `made.txt` UNKNOWN: **red** | `lead-command` |
+| Control: `echo made > made.txt` | `lead-command` | `lead-command`, Pre answer `"armed": true`, 0.2 s |
+
+The control and the overlap case also ran with the hook under Apple's Python 3.9.6: `lead-command`
+and UNKNOWN. Rerun on the fixed tree with the earlier results: the six `r11_ledger.py` cases,
+`r11_promote.py`, `r12_checks.py`, the four `r13_checks.py` cases (the pause cases through
+`fixed14p`, now UNKNOWN because the hook never armed), `snapcheck.py` on both clones (1.8 s and
+1.6 s to register, 0.51 s and 0.40 s to reconcile, no UNKNOWN), `edgecheck.py`, `lead_bash.py`,
+`lead_bash3.py`, `lead_hooks_edge.py`, `lead_bash2.py` and `settle_check.py` (MARKED 10.2 s, ESCAPE
+2.1 s). Every run exited 0 and stopped its daemon.
+
 ### Commands and exit codes for the lead record
 
 The scripts are lead scratch in the session's scratchpad (`…/scratchpad/m3/`), not part of the
