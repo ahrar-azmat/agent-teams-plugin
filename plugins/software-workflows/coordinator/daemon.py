@@ -19,8 +19,19 @@ from .client import CoordinatorError, validate_state, venv_fds, launch_environme
 from .store import Store, uid, digest, encoded
 from .ledger import Ledger, normalize, patch_scope, read_path
 from .custody import Custody
-from . import native, tools, processes, runtime
+from . import native, tools, processes, runtime, participants, routing
 from .locks import KeyedLocks
+
+VERSION = runtime.plugin_version()  # in daemon/status, so that a newer client can retire this release
+
+# A hook has 15 s: three 3 s calls (dispatch, retry, Bash arm), the measured
+# 3.5 s replacement start, and 1 s draining leave 1.5 s for polling/transport.
+# This bounds waiting for RPC settlement; occupied mutations refuse immediately.
+STOP_DRAIN_S = 1.0
+READ_RPC = {"daemon/status", "checkout/query", "checkout/revisions", "project/status",
+            "run/status", "run/list", "run/result", "run/events", "run/terminals",
+            "claim/list", "unknown/list", "message/inbox", "unit/status", "unit/diff", "records/list"}
+COMPLETION_RPC = {"operation/complete", "custody/reconcile", "run/interrupt", "run/terminate-terminal", "review/complete"}
 
 
 class Daemon:
@@ -33,6 +44,10 @@ class Daemon:
         self.request_locks, self.actor_locks, self.unit_locks = KeyedLocks(), KeyedLocks(), KeyedLocks()
         self.lease_locks = KeyedLocks()
         self.ready = False
+        self.recovery_barrier = True
+        self.boot = uid("boot")
+        self.draining = self.closing = False
+        self.inflight, self.rpc_tasks = {}, set()
         self.stop = asyncio.Event()
         from .messages import Messages
         self.messages = Messages(self)
@@ -42,6 +57,8 @@ class Daemon:
         self.leases = Leases(self.store.root)
         from .runs import Runs
         self.runs = Runs(self)
+        from .projects import Projects
+        self.projects = Projects(self)
 
     async def ensure_lease(self, checkoutid):
         async with self.lease_locks.hold(checkoutid):
@@ -59,17 +76,17 @@ class Daemon:
         checkout = self.store.get(checkoutid)
         if not checkout.get("compatibility_lease"):
             return
-        runs = [r for r in self.store.all("run") if r["checkout"] == checkoutid and r["mode"] == "native"]
+        runs = [r for r in self.store.all("run") if participants.contains(self.store, r["unit"], checkoutid) and r["mode"] == "native"]
         from .writer import TERMINAL
         if not stopping and any(r["state"] not in TERMINAL | {"idle"} for r in runs):
             return
-        if any(a.get("active_turn") for a in self.store.all("actor") if a["checkout"] == checkoutid) or self.custody.active(checkoutid):
+        if any(a.get("active_turn") for a in self.store.all("actor") if participants.contains(self.store, a["unit"], checkoutid)) or self.custody.active(checkoutid):
             return
         for message in self.store.all("message"):
-            if message["recipient"] == "lead" or message["state"] in ("entered_context", "acknowledged"):
+            if message["recipient"] == "lead" or message["recipient"].startswith("lead_mailbox_") or message["state"] in ("entered_context", "acknowledged"):
                 continue
             recipient = self.store.get(message["recipient"])
-            if recipient["checkout"] == checkoutid and (message["delivery"] in ("submitting", "submitted", "uncertain")
+            if participants.contains(self.store, recipient["unit"], checkoutid) and (message["delivery"] in ("submitting", "submitted", "uncertain")
                     or message["delivery"] == "pending" and message["wake"] != "none"):
                 return  # A queued or uncertain native turn can start without another RPC.
         await self.leases.call("release", checkout["root"])
@@ -91,43 +108,64 @@ class Daemon:
     def status(self, checkout=None):
         writers = []
         for run in self.store.all("run"):
-            if checkout and run["checkout"] != checkout:
+            if checkout and not participants.contains(self.store, run["unit"], checkout):
                 continue
             unit = self.store.get(run["unit"])
             writers.append({"run": run["id"], "unit": unit["id"], "task": run["task"], "state": run["state"],
                             "actors": [a for a in self.store.all("actor", unit["id"])],
                             "claims": [c for c in self.custody.claims(run["checkout"]) if c["unit"] == unit["id"]],
-                            "custody": [c for c in self.custody.active(run["checkout"]) if c["unit"] == unit["id"]],
+                            "custody": self.custody.unit_active(unit["id"]),
+                            **participants.surface(self, unit),
                             "pending_requests": [r for kind in ("claim_request", "release_request", "custody_request")
                                                  for r in self.store.all(kind, unit["id"]) if r["state"] in ("pending", "pending_lead", "waiting")],
                             "messages": [m for m in self.store.all("message") if m.get("unit") == unit["id"] and m["state"] != "acknowledged"]})
         return {"ready": self.ready, "generation": self.store.generation, "pid": os.getpid(),
+                "boot": self.boot, "capabilities": ["draining-stop"], "draining": self.draining,
                 "birth": processes.identity(os.getpid())["birth"], "state_root": str(self.store.root),
                 "endpoint": getattr(self, "endpoint", None),
                 "locks": {"rpc": len(self.request_locks), "actor": len(self.actor_locks),
                           "message": len(self.messages.locks), "unit": len(self.unit_locks),
                           "checkout": len(self.ledger.lifecycle)},
-                "sqlite": sqlite3.sqlite_version, "writers": writers}
+                "sqlite": sqlite3.sqlite_version, "version": VERSION, "writers": writers}
 
-    async def create_run(self, params):
-        if set(params) - {"checkout", "mode", "task", "paths", "model", "fixture", "workflow"} or params.get("mode", "native") not in ("lead", "native"):
-            raise CoordinatorError("RUN_FIELDS", "run/start accepts checkout, mode (lead or native), task, paths, model and fixture")
+    async def create_run(self, params, revision=None):
+        if set(params) - {"checkout", "project", "cwd", "dispatch_cwd", "mode", "task", "paths", "model", "fixture", "workflow"} or params.get("mode", "native") not in ("lead", "native"):
+            raise CoordinatorError("RUN_FIELDS", "run/start accepts checkout or project, cwd, dispatch_cwd, mode (lead or native), task, paths, model, fixture and workflow")
         if params.get("workflow") is not None:
             from .writer import descriptor
             params = dict(params, workflow=descriptor(params["workflow"]))
             if params.get("mode", "native") != "native":
                 raise CoordinatorError("WORKFLOW_MODE", "Abraham uses native writers")
-        if params.get("paths") is not None and (not isinstance(params["paths"], list) or any(not isinstance(p, str) for p in params["paths"])):
+        if params.get("paths") is not None and (not isinstance(params["paths"], list) or any(not isinstance(p, (str, dict)) for p in params["paths"])):
             raise CoordinatorError("CLAIM_PATHS", "Claims must be a list of paths or omitted")
-        async with self.ledger.lifecycle.hold(params["checkout"]):
-            return await self.create_run_locked(params)
+        params = dict(params)
+        if params.get("project"):
+            revision = revision or await self.projects.register(params)
+            from .projects import containing
+            cwd = params.get("cwd")
+            candidates = [b for b in revision["bindings"] if cwd and containing(b["root"], cwd)]
+            if not candidates:
+                raise CoordinatorError("PROJECT_SCOPE", "Project run requires cwd inside a native root", {"roots": revision["roots"]})
+            selected = max(candidates, key=lambda b: len(Path(b["root"]).parts))
+            params.update(checkout=selected["checkout"], _revision=revision, _thread_cwd=selected["root"])
+            ids = list(dict.fromkeys(b["checkout"] for b in revision["bindings"]))
+        else:
+            ids = [params["checkout"]]
+        async with self.ledger.lifecycle.hold_many(ids):
+            snapshots = {}
+            for checkoutid in ids:
+                checkout = self.store.get(checkoutid)
+                try:
+                    snapshots[checkoutid] = await self.admit_checkout(checkout, params)
+                except CoordinatorError as exc:
+                    raise CoordinatorError(exc.code, str(exc), dict(exc.details, root=checkout["root"]), exc.operational) from exc
+            return await self.create_run_locked(params, snapshots)
 
-    async def create_run_locked(self, params):
-        checkout = self.store.get(params["checkout"])
+    async def admit_checkout(self, checkout, params):
         self.ledger.require_owned(checkout)
         from .publish import Publisher
         for publication in list(self.store.all("publication")):
-            if self.store.get(publication["unit"])["checkout"] == checkout["id"] and publication["phase"] not in ("complete", "abandoned"):
+            if not publication.get("group") and self.store.get(publication["unit"])["checkout"] == checkout["id"] and publication["phase"] not in ("complete", "abandoned"):
                 async with self.unit_locks.hold(publication["unit"]):
                     try:
                         await Publisher(self).reconcile(publication)
@@ -152,6 +190,14 @@ class Daemon:
             unexplained += [p for p in set(index) | set(base_index) if index.get(p) != base_index.get(p) and not explained(p)]
             if unexplained:
                 raise CoordinatorError("DIRTY_UNEXPLAINED", "Unexplained dirt requires allow_dirty=true; this grants no receipts", {"paths": sorted(set(unexplained))})
+        return snapshot
+
+    async def create_run_locked(self, params, snapshots):
+        checkout = self.store.get(params["checkout"])
+        snapshot = snapshots[checkout["id"]]
+        workflow, revision = params.get("workflow"), params.get("_revision")
+        thread_cwd = params.get("_thread_cwd", checkout["root"])
+        project_fields = {"project": revision["project"], "project_revision": revision["id"], "generation": 1} if revision else {}
         ident, unitid, attemptid, actorid = uid("run"), uid("unit"), uid("attempt"), uid("actor")
         if workflow:
             ident = workflow["request_id"]
@@ -160,15 +206,25 @@ class Daemon:
         lead = params.get("mode") == "lead"
         with self.store.transaction():
             self.store.put("unit", unitid, {"checkout": checkout["id"], "run": ident, "base": snapshot["base"],
-                           "branch": snapshot["branch"], "state": "open"}, checkout["id"])
+                           "branch": snapshot["branch"], "state": "open", **project_fields}, checkout["id"])
+            for position, (checkoutid, captured) in enumerate(snapshots.items()):
+                bindings = [b for b in revision["bindings"] if b["checkout"] == checkoutid] if revision else []
+                participants.capture(self.store, unitid, self.store.get(checkoutid), captured, bindings, position)
             self.store.put("run", ident, {"checkout": checkout["id"], "unit": unitid, "attempt": attemptid,
                            "root_actor": actorid, "task": params.get("task", ""), "state": "admitting", "mode": "lead" if lead else "native",
                            "created": time.time(), "workflow": workflow, "production_started": False,
-                           "dispatch_cwd": workflow["dispatch_cwd"] if workflow else checkout["root"], "target_cwd": checkout["root"]}, unitid)
+                           "dispatch_cwd": params.get("dispatch_cwd") or (workflow["dispatch_cwd"] if workflow else checkout["root"]),
+                           "target_cwd": params.get("cwd", checkout["root"]), "thread_cwd": thread_cwd,
+                           "runtime_workspace_roots": revision["roots"] if revision else [checkout["root"]], **project_fields}, unitid)
             self.store.put("attempt", attemptid, {"run": ident, "unit": unitid, "generation": 1,
                            "daemon_generation": self.store.generation, "state": "starting"}, ident)
             self.store.put("actor", actorid, {"unit": unitid, "checkout": checkout["id"], "attempt": attemptid,
-                           "run": ident, "kind": "lead" if lead else "root", "active_turn": None, "state": "idle"}, unitid)
+                           "run": ident, "kind": "lead" if lead else "root", "active_turn": None, "state": "idle", "cwd": thread_cwd}, unitid)
+        if workflow and workflow.get("session_id"):
+            from .lead import mailbox
+            unit = self.store.get(unitid)
+            unit["lead_mailbox"] = mailbox(self.store, workflow["session_id"], unitid)
+            self.store.save(unit)
         actor = self.store.get(actorid)
         try:
             await self.custody.acquire(actor, params.get("paths") or [])
@@ -179,7 +235,7 @@ class Daemon:
                 run["state"] = "running" if not lead and params.get("task") else "idle"
             self.store.save(run)
             return {"run": ident, "unit": unitid, "attempt": attemptid, "actor": actorid,
-                    "policy": self.store.get(actorid).get("policy")}
+                    "policy": self.store.get(actorid).get("policy"), **participants.surface(self, unitid)}
         except BaseException as exc:
             run = self.store.get(ident)
             if run.get("production_started"):
@@ -189,15 +245,16 @@ class Daemon:
             self.store.save(run)
             for listener in list(self.store.all("listener", ident)):
                 await self.stop_listener(listener)
-            for claim in self.custody.claims(checkout["id"]):
-                if claim["unit"] == unitid:
-                    claim["state"] = "released"
-                    self.store.save(claim)
-            await self.release_lease(checkout["id"])
+            for checkoutid in snapshots:
+                for claim in self.custody.claims(checkoutid):
+                    if claim["unit"] == unitid:
+                        claim["state"] = "released"
+                        self.store.save(claim)
+                await self.release_lease(checkoutid)
             if isinstance(exc, CoordinatorError):
-                raise CoordinatorError(exc.code, str(exc), dict(exc.details, safe_to_fallback=True, run=ident), exc.operational) from exc
+                raise CoordinatorError(exc.code, str(exc), dict(exc.details, safe_to_fallback=not bool(revision), run=ident), exc.operational) from exc
             raise CoordinatorError("NATIVE_START_" + type(exc).__name__, "Native startup failed before production execution; resources were released",
-                                   {"safe_to_fallback": True, "run": ident}, True) from exc
+                                   {"safe_to_fallback": not bool(revision), "run": ident}, True) from exc
 
     def hook_config(self):
         command = shlex.join([sys.executable, "-B", str(Path(__file__).with_name("hooks.py")), "--state", str(self.store.root)])
@@ -217,7 +274,7 @@ class Daemon:
         if home:
             environment["CODEX_HOME"] = str(home)
         process = await asyncio.create_subprocess_exec(binary, "app-server", "--listen", "unix://" + str(socket),
-                                                       *native.override_args(config), cwd=self.store.get(actor["checkout"])["root"],
+                                                       *native.override_args(config), cwd=actor.get("cwd", self.store.get(actor["checkout"])["root"]),
                                                        env=environment, stdin=asyncio.subprocess.DEVNULL,
                                                        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
                                                        start_new_session=True, close_fds=True)
@@ -321,7 +378,11 @@ class Daemon:
         self.queues.pop(ident, None)
 
     async def launch_writer(self, actor, params):
-        await self.ensure_lease(actor["checkout"])
+        for checkoutid in participants.checkout_ids(self.store, actor["unit"]):
+            await self.ensure_lease(checkoutid)
+        roots = participants.roots(self.store, actor["unit"])
+        unit = self.store.get(actor["unit"])
+        cwd = self.store.get(actor["run"]).get("thread_cwd", self.store.get(actor["checkout"])["root"])
         from .admission import Admission
         admission = Admission(self.store)
         fixture = params.get("fixture")
@@ -340,7 +401,7 @@ class Daemon:
             config["model_auto_compact_token_limit"] = workflow["compact_limit"]
         listener = await self.spawn_listener(actor, config, home)
         connection = self.connections[listener["id"]]
-        listed = await connection.call("hooks/list", {"cwds": [self.store.get(actor["checkout"])["root"]]})
+        listed = await connection.call("hooks/list", {"cwds": roots})
         trust = {}
         for entry in listed["data"]:
             if entry.get("errors"):
@@ -352,7 +413,7 @@ class Daemon:
             raise CoordinatorError("HOOK_DEFINITIONS", "Cannot identify exactly the coordinator's pre/post hook definitions")
         # Restart only the idle, threadless discovery listener. Unrelated hook state is
         # merged from the native config API, never read from CODEX_HOME files.
-        effective = await connection.call("config/read", {"cwd": self.store.get(actor["checkout"])["root"], "includeLayers": False})
+        effective = await connection.call("config/read", {"cwd": cwd, "includeLayers": False})
         from .roles import overlay, apply
         config = apply(config, overlay(effective.get("config", {})))
         prior_trust = effective.get("config", {}).get("hooks", {}).get("state", {})
@@ -360,21 +421,26 @@ class Daemon:
         await self.stop_listener(listener)
         listener = await self.spawn_listener(actor, config, home)
         connection = self.connections[listener["id"]]
-        listed = await connection.call("hooks/list", {"cwds": [self.store.get(actor["checkout"])["root"]]})
-        own = [h for e in listed["data"] for h in e["hooks"] if h.get("command") == command and h.get("source") == "sessionFlags"]
+        listed = await connection.call("hooks/list", {"cwds": roots})
+        own = native.coordinator_hooks(listed, roots, command=command)
         if len(own) != 2 or any(h["trustStatus"] != "trusted" or not h["enabled"] for h in own):
             raise CoordinatorError("HOOK_TRUST", "Precise native hook trust was not honored")
         listener.update(hooks=own, config_digest=digest(effective))
         self.store.save(listener)
         actor["listener"] = listener["id"]
         self.store.save(actor)
-        response = await connection.call("thread/start", {"cwd": self.store.get(actor["checkout"])["root"],
+        response = await connection.call("thread/start", {"cwd": cwd,
+                                          **({"projectId": unit["project"], "runtimeWorkspaceRoots": roots} if unit.get("project_revision") else {}),
                                           "model": workflow["model"] if workflow else params.get("model", "gpt-6-astra"), "approvalPolicy": "never",
                                           "sandbox": "danger-full-access", "dynamicTools": tools.specifications(),
                                           "developerInstructions": "Coordinate through claim, declare, send, inbox, ack and status. "
                                           "Use apply_patch for attributable edits. Commands have opaque effects. "
                                           "Never publish or rewrite Git state: the lead records. "
-                                          "Messages require ack from the named recipient. Child fallback ack format: C1_ACK <message-id>."})
+                                          "Messages require ack from the named recipient. Child fallback ack format: C1_ACK <message-id>. "
+                                          + "Workspace roots in order: " + json.dumps(roots) + ". Paths are absolute or relative to the actual tool cwd. "
+                                          "Qualified coordinator paths use {root_id: checkout-id, path: repository-relative-path}."})
+        from .projects import verify_thread
+        verify_thread(response, unit, cwd, roots)
         actor.update(thread=response["thread"]["id"], session=response["thread"]["id"], policy=native.policy_echo(response))
         self.store.save(actor)
         listener = self.store.get(listener["id"])
@@ -460,11 +526,15 @@ class Daemon:
             raise CoordinatorError("ACTOR_SESSION", "Hook session does not match native root")
         parent = await self.resolve_actor(listener, info["parentThreadId"])
         root_actor = self.store.get(listener["actor"])
+        unit = self.store.get(root_actor["unit"])
+        if unit.get("project_revision") and info.get("projectId") not in (None, unit["project"]):
+            raise CoordinatorError("PROJECT_THREAD_MISMATCH", "Native child belongs to another project")
         actorid = uid("actor")
         self.store.put("actor", actorid, {"unit": root_actor["unit"], "checkout": root_actor["checkout"],
                        "attempt": root_actor["attempt"], "run": root_actor["run"], "kind": "child",
                        "parent_actor": parent["id"], "listener": listener["id"], "thread": thread, "session": root,
-                       "active_turn": None, "state": "unknown"}, root_actor["unit"])
+                       "active_turn": None, "state": "unknown", "cwd": info.get("cwd", root_actor.get("cwd")),
+                       "native_project": info.get("projectId")}, root_actor["unit"])
         return self.store.get(actorid)
 
     def find_operation(self, listener, thread, turn, call, history=False):
@@ -543,15 +613,23 @@ class Daemon:
             if run.get("workflow") and run.get("phase") == "analysis":
                 self.store.event("workflow/analysis_patch_denied", run["id"], {"actor": actor["id"], "native": identity})
                 raise CoordinatorError("ANALYSIS_READ_ONLY", "Analysis cannot apply patches. Finish the implementation brief; the coordinator starts the writing turn after settlement.")
-            checkout = self.store.get(actor["checkout"])
-            scope = patch_scope(command)
-            for entry in scope:
-                entry["path"] = normalize(checkout, entry["path"])["path"]
-                if "move" in entry:
-                    entry["move"] = normalize(checkout, entry["move"])["path"]
-            paths = [p for s in scope for p in (s["path"], s.get("move")) if p]
-            await self.custody.acquire(actor, paths)
-            operation = await self.ledger.prepare(actor, "patch", {"patch": command, "scope": scope}, paths, identity)
+            cwd = payload.get("cwd") or actor.get("cwd") or self.store.get(actor["checkout"])["root"]
+            if self.store.get(actor["unit"]).get("project_revision"):
+                from .operations import prepare_patch
+                # Completion notifications can still be settling a previous
+                # command when the next native hook arrives. Prove the whole
+                # command group settled before attempting any path claims.
+                await self.settle_actor(actor)
+                operation = await prepare_patch(self, actor, command, identity, cwd)
+            else:
+                scope = patch_scope(command)
+                for entry in scope:
+                    entry["path"] = routing.route(self.store, actor, entry["path"], cwd)["path"]
+                    if "move" in entry:
+                        entry["move"] = routing.route(self.store, actor, entry["move"], cwd)["path"]
+                paths = [p for entry in scope for p in (entry["path"], entry.get("move")) if p]
+                await self.custody.acquire(actor, [routing.qualified(actor["checkout"], p) for p in paths])
+                operation = await self.ledger.prepare(actor, "patch", {"patch": command, "scope": scope}, paths, identity)
         elif tool in ("Bash", "exec_command") or str(tool).startswith("mcp"):
             # A hook's command omits workdir and tty. Never infer them. Full-checkout
             # reconciliation and process identity supply the conservative context.
@@ -601,8 +679,9 @@ class Daemon:
                     await self.notification(listener, message["method"], message.get("params", {}))
             except Exception as exc:
                 self.store.event("native/reconcile_failure", listener["id"], {"code": getattr(exc, "code", type(exc).__name__)})
-                self.store.unknown(self.store.get(listener["actor"])["checkout"], "*", "native evidence processing failed",
-                                   {"listener": listener["id"], "code": getattr(exc, "code", type(exc).__name__)})
+                for key in participants.checkout_ids(self.store, listener["unit"]):
+                    self.store.unknown(key, "*", "native evidence processing failed",
+                                       {"listener": listener["id"], "code": getattr(exc, "code", type(exc).__name__)})
             finally:
                 queue.task_done()
 
@@ -614,7 +693,8 @@ class Daemon:
         if method != "item/tool/call":
             await connection.send({"id": message["id"], "error": {"code": -32601,
                                     "message": "Unexpected server request under never/full access; coordinator refuses"}})
-            self.store.unknown(self.store.get(listener["actor"])["checkout"], "*", "unexpected native server request", {"method": method})
+            for key in participants.checkout_ids(self.store, listener["unit"]):
+                self.store.unknown(key, "*", "unexpected native server request", {"method": method})
             return
         ident = "dynamic:" + listener["id"] + ":" + params["threadId"] + ":" + params["callId"]
         existing = self.store.get(ident, required=False)
@@ -643,9 +723,10 @@ class Daemon:
     async def notification(self, listener, method, params):
         if method == "coordinator/transportGap":
             if listener["state"] not in ("stopping", "stopped"):
-                listener["state"] = "disconnected"
+                listener.update(state="disconnected", recovery_state="reconciling")
                 self.store.save(listener)
-                self.store.unknown(self.store.get(listener["actor"])["checkout"], "*", "native notification gap", {"listener": listener["id"]})
+                for key in participants.checkout_ids(self.store, listener["unit"]):
+                    self.store.unknown(key, "*", "native notification gap", {"listener": listener["id"]})
                 from .recovery import reconcile_listener
                 self.background(reconcile_listener(self, listener))
             return
@@ -672,7 +753,7 @@ class Daemon:
                     if self.store.get(operation["id"])["state"] in ("prepared", "allowed", "running"):
                         await self.ledger.quarantine(self.store.get(operation["id"]), "turn ended without complete patch lifecycle evidence")
             await self.settle_actor(actor)
-            await self.ledger.reconcile(self.store.get(actor["checkout"]))
+            await asyncio.gather(*(self.ledger.reconcile(self.store.get(key)) for key in participants.checkout_ids(self.store, actor["unit"])))
             if run.get("workflow"):
                 self.background(self.writer.advance(run["id"]))
         elif method == "hook/completed":
@@ -696,7 +777,8 @@ class Daemon:
             elif kind in ("fileChange", "commandExecution", "mcpToolCall"):
                 operation = self.find_operation(listener, thread, turn, item["id"])
                 if not operation or not operation.get("hook_valid"):
-                    self.store.unknown(actor["checkout"], "*", "UNMEDIATED effect-capable native item", {"listener": listener["id"], "thread": thread, "item": item["id"]})
+                    for key in participants.checkout_ids(self.store, actor["unit"]):
+                        self.store.unknown(key, "*", "UNMEDIATED effect-capable native item", {"listener": listener["id"], "thread": thread, "item": item["id"]})
                     if not operation:
                         # A failed-open hook still opens an opaque effect window.
                         # Record it even if a conflicting reservation already exists:
@@ -712,10 +794,18 @@ class Daemon:
                         custodyid = uid("custody")
                         operation.update(custody=custodyid, unmediated=True)
                         self.store.save(operation)
-                        self.store.put("custody", custodyid, {"checkout": actor["checkout"], "unit": actor["unit"],
-                            "actor": actor["id"], "operation": operation["id"], "command": "UNMEDIATED " + kind,
-                            "level": "exclusive", "excludes": [], "state": "held", "created": time.time(),
-                            "terminals": [], "processes": [], "generation": self.store.generation}, actor["unit"])
+                        members = []
+                        with self.store.transaction():
+                            for index, key in enumerate(participants.checkout_ids(self.store, actor["unit"])):
+                                ident = uid("custody") if index else custodyid
+                                members.append(ident)
+                                self.store.put("custody", ident, {"checkout": key, "unit": actor["unit"],
+                                    "actor": actor["id"], "operation": operation["id"], "command": "UNMEDIATED " + kind,
+                                    "level": "exclusive", "excludes": [], "state": "held", "created": time.time(), "group": custodyid,
+                                    "terminals": [], "processes": [], "generation": self.store.generation}, actor["unit"])
+                            reservation = self.store.get(custodyid)
+                            reservation["members"] = members
+                            self.store.save(reservation)
                 operation["started_item" if method == "item/started" else "completed_item"] = item
                 if operation["state"] not in ("verified", "quarantined", "resolved"):
                     operation["state"] = "running"
@@ -731,7 +821,8 @@ class Daemon:
             if operation and operation.get("custody"):
                 self.store.event("command/stdin", operation["id"], {"processId": params["processId"], "stdin": params["stdin"]})
             else:
-                self.store.unknown(actor["checkout"], "*", "UNMEDIATED nonempty write_stdin", {"listener": listener["id"]})
+                for key in participants.checkout_ids(self.store, actor["unit"]):
+                    self.store.unknown(key, "*", "UNMEDIATED nonempty write_stdin", {"listener": listener["id"]})
 
     def record_hook_evidence(self, listener, params, history=False):
         run = params["run"]
@@ -773,7 +864,7 @@ class Daemon:
                 terminals = response["data"]
             # Bind every sibling terminal before inventory: a markerless native
             # child (including macOS system binaries) still has an exact osPid.
-            for other in self.custody.active(actor["checkout"]):
+            for other in self.custody.unit_active(actor["unit"]):
                 if other["actor"] != actor["id"] or not other.get("operation"):
                     continue
                 intent = self.store.get(other["operation"])
@@ -798,8 +889,8 @@ class Daemon:
                 separate.append(self.leases.controller)
             for service_listener in self.store.all("listener"):
                 separate += service_listener.get("services", []) + service_listener.get("helpers", [])
-            for other in self.custody.active(actor["checkout"]):
-                if other["id"] != reservation["id"] and self.store.get(other["actor"]).get("listener") == listener["id"]:
+            for other in self.custody.unit_active(actor["unit"]):
+                if other["id"] != reservation["id"] and other.get("group", other["id"]) != reservation.get("group", reservation["id"]) and self.store.get(other["actor"]).get("listener") == listener["id"]:
                     separate += [p for p in other.get("observed_processes", []) if p.get("ownership") != "listener-domain"]
             found = await asyncio.to_thread(processes.inventory, listener, actor["session"],
                                             reservation.get("observed_processes", reservation.get("processes", [])),
@@ -845,6 +936,10 @@ class Daemon:
             self.store.save(reservation)
 
     async def settle_actor(self, actor, resolve_quarantine=False):
+        async with self.actor_locks.hold("settle:" + actor["id"]):
+            await self._settle_actor(actor, resolve_quarantine)
+
+    async def _settle_actor(self, actor, resolve_quarantine):
         if not actor.get("listener"):
             return
         listener = self.store.get(actor["listener"])
@@ -854,9 +949,16 @@ class Daemon:
         terminals = await connection.call("thread/backgroundTerminals/list", {"threadId": actor["thread"]})
         if terminals.get("nextCursor"):
             raise CoordinatorError("TERMINAL_PAGINATION", "Native terminal inventory is incomplete")
-        for reservation in self.custody.active(actor["checkout"]):
+        settled_groups = set()
+        for reservation in self.custody.unit_active(actor["unit"]):
             if reservation["actor"] != actor["id"]:
                 continue
+            group = reservation.get("group", reservation["id"])
+            if group in settled_groups:
+                continue
+            settled_groups.add(group)
+            reservation = self.store.get(group)
+            members = reservation.get("members", [reservation["id"]])
             await self.observe_processes(actor, reservation, resolve_quarantine=resolve_quarantine, terminals=terminals["data"])
             reservation = self.store.get(reservation["id"])
             operation = self.store.get(reservation.get("operation"), required=False)
@@ -869,27 +971,43 @@ class Daemon:
                 if metadata["thread"].get("status", {}).get("type") in ("idle", "notLoaded") and not actor.get("active_turn"):
                     operation["completed_item"] = {"exitCode": None, "observedGone": True, "missingNativeCompletion": True}
                     self.store.save(operation)
-                    self.store.unknown(actor["checkout"], "*", "lead reconciled absence of survivors without native completion", {"custody": reservation["id"]})
+                    for key in members:
+                        self.store.unknown(self.store.get(key)["checkout"], "*", "lead reconciled absence of survivors without native completion", {"custody": key})
             if reservation["state"] == "quarantined" or reservation["processes"] or own_terminals or not operation.get("completed_item"):
                 continue
-            await self.ledger.reconcile(self.store.get(actor["checkout"]), reason="opaque command effects")
+            await asyncio.gather(*(self.ledger.reconcile(self.store.get(self.store.get(key)["checkout"]),
+                                                        reason="opaque command effects") for key in members))
             operation["state"] = "reconciled"
             operation["attribution"] = "UNKNOWN-context-only"
             self.store.save(operation)
-            await self.custody.relinquish(reservation)
+            for key in members:
+                await self.custody.relinquish(self.store.get(key))
 
     async def lead_edit(self, params, restore=False):
         actor = self.store.get(params["actor"])
         if actor["kind"] != "lead":
             raise CoordinatorError("LEAD_ONLY", "A lead actor is required")
-        checkout = self.store.get(actor["checkout"])
-        expected = await self.expected_images(checkout, params["changes"])
-        await self.custody.acquire(actor, list(expected))
-        operation = await self.ledger.prepare(actor, "restore" if restore else "lead-edit", {"expected": expected}, list(expected))
+        changes = params["changes"]
+        entries = changes.items() if isinstance(changes, dict) else ((c["path"], c["image"]) for c in changes)
+        grouped = {}
+        for path, image in entries:
+            routed = routing.route(self.store, actor, path, params.get("cwd"))
+            grouped.setdefault(routed["checkout"], {})[routed["path"]] = image
+        expected = {key: await self.expected_images(self.store.get(key), values) for key, values in grouped.items()}
+        await self.custody.acquire(actor, [routing.qualified(key, p) for key, values in expected.items() for p in values])
+        kind = "restore" if restore else "lead-edit"
+        if len(expected) == 1:
+            checkoutid, images = next(iter(expected.items()))
+            operation = await self.ledger.prepare(dict(actor, checkout=checkoutid), kind, {"expected": images}, list(images))
+        else:
+            from .operations import prepare
+            operation = await prepare(self.ledger, actor, kind, {"expected": expected}, expected)
         try:
-            # Intent is durable before the coordinator itself changes any file.
-            await asyncio.to_thread(self.install_images, checkout, expected)
-            return await self.ledger.verify(operation, expected, "restore" if restore else "exact", {"executor": "coordinator"})
+            await asyncio.gather(*(asyncio.to_thread(self.install_images, self.store.get(key), values) for key, values in expected.items()))
+            if operation.get("parts"):
+                from .operations import verify
+                return await verify(self.ledger, operation, expected, "restore" if restore else "exact", {"executor": "coordinator"})
+            return await self.ledger.verify(operation, images, "restore" if restore else "exact", {"executor": "coordinator"})
         except BaseException as exc:
             await self.ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__))
             raise
@@ -945,14 +1063,113 @@ class Daemon:
                 for descriptor in reversed(descriptors):
                     os.close(descriptor)
 
+    def admit_rpc(self, method, params):
+        if method == "daemon/stop" and "expect" in params and params["expect"] != {"pid": os.getpid(), "boot": self.boot}:
+            raise CoordinatorError("DAEMON_REPLACED", "Stop belongs to a different daemon process",
+                                   {"pid": os.getpid(), "boot": self.boot, "version": VERSION})
+        completion = method in COMPLETION_RPC or (method in ("lead-hook/dispatch", "hook/dispatch")
+            and params.get("payload", {}).get("hook_event_name") in ("PostToolUse", "PostToolUseFailure"))
+        if method != "daemon/stop" and (self.closing or self.draining and method not in READ_RPC and not completion):
+            raise CoordinatorError("DAEMON_DRAINING", "Coordinator is draining; retry on the serving daemon",
+                                   {"retryable": True, "pid": os.getpid(), "boot": self.boot}, True)
+
+    def stop_pending(self):
+        from .writer import TERMINAL
+        from .intents import FILE_HOOK_S
+        now = time.time()
+        hooks = []
+        for record in self.store.all("lead_hook"):
+            if record["state"] not in ("received", "prepared", "observed"):
+                continue
+            operation = self.store.get(record.get("operation"), required=False)
+            deadline = record.get("deadline", (operation or {}).get("created", now) + FILE_HOOK_S)
+            if now <= deadline:
+                hooks.append(record)
+        operations = [o for o in self.store.all("operation") if o["state"] in ("prepared", "allowed", "running")]
+        lead_operations = [o for o in operations if o["kind"] in ("lead-edit", "restore", "lead-command")]
+        methods = [method for task, method in self.inflight.items() if task is not asyncio.current_task()]
+        counts = {
+            "recovery": int(not self.ready),
+            "workflows": sum(r["state"] not in TERMINAL | {"idle"} for r in self.store.all("run")
+                             if r.get("workflow") or r["state"] == "admitting"),
+            "writers": sum(bool(a.get("active_turn")) for a in self.store.all("actor")),
+            "custody": sum(c["state"] != "released" for c in self.store.all("custody")),
+            "deliveries": sum(m["recipient"] != "lead" and not m["recipient"].startswith("lead_mailbox_")
+                and m["state"] not in ("entered_context", "acknowledged")
+                and (m["delivery"] in ("submitting", "submitted", "uncertain") or
+                     m["delivery"] == "pending" and m["wake"] != "none") for m in self.store.all("message")),
+            "lead_hooks": len(hooks), "lead_operations": len(lead_operations),
+            "other_operations": len(operations) - len(lead_operations),
+            "publication_rpcs": sum(m in ("unit/publish", "unit/recover") for m in methods),
+            "mutating_rpcs": sum(m not in READ_RPC and m != "daemon/stop" for m in methods),
+        }
+        return {key: value for key, value in counts.items() if value}
+
+    async def drain(self, params):
+        current = {"pid": os.getpid(), "boot": self.boot, "version": VERSION}
+        if "expect" in params and params["expect"] != {"pid": current["pid"], "boot": self.boot}:
+            raise CoordinatorError("DAEMON_REPLACED", "Stop belongs to a different daemon process", current)
+        if self.draining:
+            raise CoordinatorError("DAEMON_DRAINING", "Another stop is draining this daemon", {"retryable": True}, True)
+        pending = self.stop_pending()
+        if pending:
+            raise CoordinatorError("NOT_QUIESCENT", "Settle pending work before stopping", {"pending": pending})
+        self.draining = True
+        try:
+            deadline = time.monotonic() + STOP_DRAIN_S
+            while True:
+                pending = self.stop_pending()
+                tasks = (self.rpc_tasks | set(self.inflight)) - {asyncio.current_task()}
+                if not pending and not tasks:
+                    break
+                if time.monotonic() >= deadline:
+                    raise CoordinatorError("NOT_QUIESCENT", "RPC drain did not settle; admission resumed",
+                                           {"pending": dict(pending, inflight_rpcs=len(tasks)), "wait_seconds": STOP_DRAIN_S})
+                await asyncio.sleep(0.01)
+            # No pending completion remains. Fence even new observational RPCs
+            # before detaching listeners or releasing leases/closing SQLite.
+            self.closing = True
+            for listener in list(self.store.all("listener")):
+                if listener["state"] not in ("stopped", "dead"):
+                    await self.stop_listener(listener)
+            for checkout in list(self.store.all("checkout")):
+                await self.release_lease(checkout["id"], stopping=True)
+            self.stop.set()
+            return {"stopping": True}
+        finally:
+            if not self.stop.is_set():
+                self.draining = self.closing = False
+
     async def dispatch(self, method, params):
+        self.admit_rpc(method, params)
+        task = asyncio.current_task()
+        owned = task not in self.inflight
+        if owned:
+            self.inflight[task] = method
+        try:
+            return await self.dispatch_admitted(method, params)
+        finally:
+            if owned:
+                self.inflight.pop(task, None)
+
+    async def dispatch_admitted(self, method, params):
         if method == "daemon/status":
             return self.status(params.get("checkout"))
         if method == "checkout/query":
             from .observations import query
-            return query(self, params["cwd"], params.get("session_id", ""))
+            return query(self, params["cwd"], params.get("session_id", ""), params.get("git_common"))
+        if method == "daemon/stop":
+            return await self.drain(params)
         if not self.ready:
             raise CoordinatorError("RECOVERING", "Coordinator is reconciling durable state before admitting work")
+        if method == "project/list":
+            return await self.projects.listing(params)
+        if method == "project/resolve":
+            return await self.projects.resolve(params)
+        if method == "project/register":
+            return await self.projects.register(params)
+        if method == "project/status":
+            return self.projects.status(params)
         if method == "checkout/register":
             return await self.ledger.register(params["path"])
         if method == "checkout/reconcile":
@@ -993,16 +1210,19 @@ class Daemon:
                                   (not params.get("run") or j["run"] == params["run"])]}
         if method == "lead/session":
             from .lead import attach
-            return await attach(self, params["checkout"], params["session_id"])
+            return await attach(self, params["checkout"], params["session_id"], params.get("project"), params.get("cwd"), params.get("dispatch_cwd"), params.get("fixture"))
         if method == "lead/attach":
             unit = self.store.get(params["unit"])
             run = self.store.get(unit["run"])
+            cwd = params.get("cwd") or run.get("target_cwd") or self.store.get(unit["checkout"])["root"]
+            routed = routing.route(self.store, dict(unit=unit["id"], checkout=unit["checkout"]), ".", cwd, directory=True)
             ident = uid("actor")
-            self.store.put("actor", ident, {"kind": "lead", "unit": unit["id"], "checkout": unit["checkout"],
-                           "run": run["id"], "attempt": run["attempt"], "state": "idle", "active_turn": None}, unit["id"])
+            self.store.put("actor", ident, {"kind": "lead", "unit": unit["id"], "checkout": routed["checkout"],
+                           "run": run["id"], "attempt": run["attempt"], "state": "idle", "active_turn": None,
+                           "cwd": cwd}, unit["id"])
             return {"actor": ident, "unit": unit["id"]}
         if method == "run/status":
-            return self.store.get(params["run"]) if "run" in params else self.status(params.get("checkout"))
+            return dict(self.store.get(params["run"]), **participants.surface(self, self.store.get(params["run"])["unit"])) if "run" in params else self.status(params.get("checkout"))
         if method == "run/list":
             return self.runs.listing(params["cwd"], params.get("limit", 50))
         if method == "run/result":
@@ -1046,13 +1266,17 @@ class Daemon:
             return await arm(self, params)
         if method == "claim/acquire":
             self.ledger.require_owned(self.store.get(self.store.get(params["actor"])["checkout"]))
-            return await self.custody.acquire(self.store.get(params["actor"]), params["paths"])
+            return await self.custody.acquire(self.store.get(params["actor"]), params["paths"], params.get("cwd"))
         if method == "claim/list":
-            return {"claims": self.custody.claims(params["checkout"]), "custody": self.custody.active(params["checkout"])}
+            ids = participants.checkout_ids(self.store, params["unit"]) if params.get("unit") else [params["checkout"]]
+            return {"claims": [dict(c, root=self.store.get(key)["root"]) for key in ids for c in self.custody.claims(key)
+                               if not params.get("unit") or c["unit"] == params["unit"]],
+                    "custody": [c for key in ids for c in self.custody.active(key)
+                                if not params.get("unit") or c["unit"] == params["unit"]]}
         if method == "claim/release-request":
-            return self.custody.release_request(self.store.get(params["actor"]), params["paths"])
+            return self.custody.release_request(self.store.get(params["actor"]), params["paths"], params.get("cwd"))
         if method == "claim/handback":
-            return await self.custody.release(self.store.get(params["unit"]), params.get("paths"))
+            return await self.custody.release(self.store.get(params["unit"]), params.get("paths"), params.get("cwd"))
         if method == "command/declare":
             return self.custody.declare(self.store.get(params["actor"]), params["command"], params["reason"])
         if method == "custody/reconcile":
@@ -1070,14 +1294,26 @@ class Daemon:
             actor = self.store.get(params["actor"])
             if actor["kind"] != "lead" or params["kind"] != "lead-edit":
                 raise CoordinatorError("NATIVE_BOUND", "Writer operations must originate in native hooks")
-            expected = await self.expected_images(self.store.get(actor["checkout"]), params["changes"])
-            await self.custody.acquire(actor, list(expected))
-            return await self.ledger.prepare(actor, "lead-edit", {"expected": expected}, list(expected))
+            groups = {}
+            entries = params["changes"].items() if isinstance(params["changes"], dict) else ((c["path"], c["image"]) for c in params["changes"])
+            for path, image in entries:
+                routed = routing.route(self.store, actor, path, params.get("cwd"))
+                groups.setdefault(routed["checkout"], {})[routed["path"]] = image
+            expected = {key: await self.expected_images(self.store.get(key), values) for key, values in groups.items()}
+            await self.custody.acquire(actor, [routing.qualified(key, p) for key, values in expected.items() for p in values])
+            if len(expected) == 1:
+                key, images = next(iter(expected.items()))
+                return await self.ledger.prepare(dict(actor, checkout=key), "lead-edit", {"expected": images}, list(images))
+            from .operations import prepare
+            return await prepare(self.ledger, actor, "lead-edit", {"expected": expected}, expected)
         if method == "operation/complete":
             operation = self.store.get(params["operation"])
             if operation["kind"] != "lead-edit" or operation["state"] != "prepared":
                 raise CoordinatorError("OPERATION_STATE", "Only a prepared lead edit can complete through RPC")
             try:
+                if operation.get("parts"):
+                    from .operations import verify
+                    return await verify(self.ledger, operation, operation["intended"]["expected"], "exact", {"executor": "lead-editor"})
                 return await self.ledger.verify(operation, operation["intended"]["expected"], "exact", {"executor": "lead-editor"})
             except BaseException as exc:
                 await self.ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__))
@@ -1090,10 +1326,13 @@ class Daemon:
         if method == "unknown/restore":
             from .recovery import restore_unknown
             return await restore_unknown(self, params)
+        if method == "lead/mailbox":
+            from .lead import mailbox
+            return {"mailbox": mailbox(self.store, params["session_id"], params["unit"])}
         if method == "message/send":
             return await self.messages.send(params.get("sender", "lead"), params["recipient"], params["text"], params["wake"])
         if method == "message/inbox":
-            return self.messages.inbox(params.get("recipient", "lead"), params.get("cursor", ""), params.get("limit", 100))
+            return self.messages.inbox(params.get("recipient", "lead"), params.get("cursor", ""), params.get("limit", 100), params.get("session_id", ""))
         if method == "message/wake":
             message = self.store.get(params["message"])
             if message["delivery"] != "pending" or params["wake"] not in ("queue", "start"):
@@ -1105,35 +1344,19 @@ class Daemon:
         if method == "message/retry":
             return await self.messages.retry_requested(params["message"])
         if method == "message/ack":
-            if params.get("actor", "lead") != "lead":
+            if params.get("actor", "lead") != "lead" and not params.get("actor", "").startswith("lead_mailbox_"):
                 raise CoordinatorError("NATIVE_BOUND", "Writer acknowledgements must originate from native actor metadata")
-            return self.messages.ack("lead", params["message"])
+            return self.messages.ack(params.get("actor", "lead"), params["message"], params.get("session_id", ""))
         if method.startswith("unit/"):
             unit = self.store.get(params["unit"])
-            async with self.ledger.lifecycle.hold(unit["checkout"]):
+            async with self.ledger.lifecycle.hold_many(participants.checkout_ids(self.store, unit)):
                 async with self.unit_locks.hold(unit["id"]):
-                    self.ledger.require_owned(self.store.get(unit["checkout"]))
+                    for checkoutid in participants.checkout_ids(self.store, unit):
+                        self.ledger.require_owned(self.store.get(checkoutid))
                     return await self.unit_dispatch(method, params)
         if method == "admission/check":
             from .admission import Admission
             return await Admission(self.store).check(params)
-        if method == "daemon/stop":
-            from .writer import TERMINAL
-            if any(r["state"] not in TERMINAL | {"idle"} for r in self.store.all("run") if r.get("workflow") or r["state"] == "admitting"):
-                raise CoordinatorError("NOT_QUIESCENT", "Settle workflow admission, transitions and cancellation before stopping")
-            if any(a.get("active_turn") for a in self.store.all("actor")) or any(c["state"] != "released" for c in self.store.all("custody")):
-                raise CoordinatorError("NOT_QUIESCENT", "Reconcile writers and custody before stopping")
-            if any(m["recipient"] != "lead" and m["state"] not in ("entered_context", "acknowledged")
-                   and (m["delivery"] in ("submitting", "submitted", "uncertain") or
-                        m["delivery"] == "pending" and m["wake"] != "none") for m in self.store.all("message")):
-                raise CoordinatorError("DELIVERY_UNSETTLED", "Cancel or reconcile queued/uncertain native deliveries before stopping")
-            for listener in list(self.store.all("listener")):
-                if listener["state"] not in ("stopped", "dead"):
-                    await self.stop_listener(listener)
-            for checkout in list(self.store.all("checkout")):
-                await self.release_lease(checkout["id"], stopping=True)
-            self.stop.set()
-            return {"stopping": True}
         if method == "records/list":
             # Paginated diagnostic surface, not an attribution or adoption API.
             records = list(self.store.all(params["kind"]))
@@ -1149,14 +1372,24 @@ class Daemon:
             unit = self.store.get(params["unit"])
             return {"unit": unit, "run": self.runs.summary(self.store.get(unit["run"])),
                     "unknown": self.store.unresolved(unit["checkout"]),
-                    "publications": list(self.store.all("publication", unit["id"]))}
+                    "publications": list(self.store.all("publication", unit["id"])), **participants.surface(self, unit)}
         if method == "unit/recover":
+            if self.store.get(params["unit"]).get("project_revision"):
+                from .group_publish import GroupPublisher
+                group = GroupPublisher(self)
+                if params.get("action") == "abandon":
+                    return await group.reopen(params["unit"], abandon=True)
+                current = group.current(params["unit"])
+                return await group.reconcile(current) if current else []
             if params.get("action") == "abandon":
                 return await publisher.abandon(params["unit"])
             publications = [p for p in self.store.all("publication", params["unit"]) if p["phase"] not in ("abandoned", "complete")]
             return [await publisher.reconcile(p) for p in publications]
         if method == "unit/reopen":
             unit = self.store.get(params["unit"])
+            if unit.get("project_revision"):
+                from .group_publish import GroupPublisher
+                return await GroupPublisher(self).reopen(unit["id"])
             if unit["state"] != "sealed" or any(p["phase"] != "abandoned" for p in self.store.all("publication", unit["id"])):
                 raise CoordinatorError("UNIT_REOPEN", "Only a sealed unit without a publication journal can reopen")
             await publisher.quiescent(unit, allow_quarantined=True)
@@ -1165,7 +1398,7 @@ class Daemon:
             self.store.event("unit/reopened", unit["id"], {"invalidated_seal": unit["previous_seal"]})
             return {"unit": unit["id"], "state": "open", "review_required": True}
         if method == "unit/seal":
-            return await publisher.seal(params["unit"], params.get("validation", []))
+            return await publisher.seal(params["unit"], params.get("validation", []), params.get("publication_order"))
         if method == "unit/review-record":
             return publisher.review(params["unit"], params["evidence"])
         if method == "unit/publish":
@@ -1175,6 +1408,15 @@ class Daemon:
         raise CoordinatorError("METHOD", "Unknown unit method")
 
     async def rpc(self, reader, writer):
+        task = asyncio.current_task()
+        self.rpc_tasks.add(task)
+        try:
+            await self.rpc_request(reader, writer)
+        finally:
+            self.inflight.pop(task, None)
+            self.rpc_tasks.discard(task)
+
+    async def rpc_request(self, reader, writer):
         request = {}
         try:
             # Stream the line without StreamReader's implicit 64 KiB line cap.
@@ -1193,6 +1435,9 @@ class Daemon:
             if set(request) - {"id", "method", "params", "key"}:
                 raise CoordinatorError("RPC_FIELDS", "Unknown RPC envelope field")
             method, params, key = request["method"], request.get("params", {}), request.get("key")
+            self.admit_rpc(method, params)
+            # Includes requests queued on an idempotency lock, before dispatch.
+            self.inflight[asyncio.current_task()] = method
             fingerprint = digest([method, params])
             if key is not None and (not isinstance(key, str) or not key):
                 raise CoordinatorError("RPC_KEY", "An idempotency key must be a nonempty string")
@@ -1205,6 +1450,7 @@ class Daemon:
                         raise CoordinatorError("RPC_UNCERTAIN", "Prior request may have effects; reconcile its durable records")
                     answer = json.loads(cached["response"])
                 else:
+                    self.admit_rpc(method, params)
                     if key:
                         self.store.db.execute("INSERT INTO idempotency VALUES(?,?,?,NULL)", (key, fingerprint, "pending"))
                     try:
@@ -1227,7 +1473,7 @@ class Daemon:
     async def maintenance(self):
         while not self.stop.is_set():
             await asyncio.sleep(1)
-            if not self.ready:
+            if not self.ready or self.draining:
                 continue
             try:
                 await self.leases.call("ping")
@@ -1235,7 +1481,7 @@ class Daemon:
                 self.store.event("lease/redundancy_unavailable", None, exc.envelope())
                 continue
             for actor in list(self.store.all("actor")):
-                if actor.get("listener") and any(c["actor"] == actor["id"] for c in self.custody.active(actor["checkout"])):
+                if actor.get("listener") and any(c["actor"] == actor["id"] for c in self.custody.unit_active(actor["unit"])):
                     try:
                         await self.settle_actor(actor)
                     except (CoordinatorError, OSError):

@@ -210,8 +210,16 @@ The first `abraham` call starts the **writer coordinator**, a per-user daemon (s
 change each writer made, and what nobody can explain. When native admission fails, `abraham` falls
 back to `codex exec` and says so at the top of its answer.
 
+**A Codex project is one unit.** When the folder `abraham` targets belongs to a project of the Codex
+app (its Projects), the writer's unit is the whole project. The coordinator registers every repository
+of the project and starts the writer under it, so the thread shows in the Codex app and can change any
+of them. When several projects hold the folder, the one that also holds your session's folder wins.
+If that still leaves several, `abraham` refuses and names them, and `abraham(project=<id>)` picks one.
+A folder in no project is one repository, as before. The coordinator only reads projects: it never
+creates, changes or deletes one.
+
 - **Claims.** `abraham(claims=["src/api/", "tests/api/"])` gives the writer those paths, relative to
-  the repository root. A claim that overlaps another writer's is refused, naming the holder. Writers
+  its folder or absolute, in any repository of its unit. A claim that overlaps another writer's is refused, naming the holder. Writers
   ask each other, and you, through messages (`coordinator_send`, `coordinator_inbox`).
 - **Attribution.** A writer's `apply_patch` edits are recorded exactly. Its commands are held in
   custody: files they may have changed, until the command and anything it left running have exited.
@@ -221,17 +229,29 @@ back to `codex exec` and says so at the top of its answer.
 - **Your own edits.** In a checkout the coordinator has registered, Claude's Edit and Write go through
   a hook. They are recorded as yours, and refused on a path another writer claims. A Bash command
   that changes files is recorded as yours when, while it ran, no writer was working, no command was
-  held and no other lead Bash command was running in that checkout; otherwise what it changed is
-  UNKNOWN. A change made while a writer's run is under way is
+  held and no other lead Bash command was running in any repository the coordinator has registered.
+  Otherwise what it changed is UNKNOWN. A command run from a folder that holds several registered
+  repositories is credited in each of them. A change made while a writer's run is under way is
   UNKNOWN, and it stops that run's hand-off as blocked. So while writers run, change files with Edit
   and Write.
 - **Publishing a unit.** A writer's work is published with `coordinator_seal`, then
-  `code_review(sealed_unit=…)`, then `coordinator_publish`, which makes the commit. The push gate
+  `code_review(sealed_unit=…)`, then `coordinator_publish`, which makes the commit. For a project's
+  unit, one seal and one review cover every repository it changed, and `coordinator_publish` checks
+  them all before it commits in any. A unit stopped midway is **partly published**: its committed
+  repositories keep their commits, `coordinator_unit(action="recover")` continues it, and none of its
+  repositories can be pushed until it is complete. The push gate
   refuses a plain `git commit` that would take another writer's paths or UNKNOWN content (see Push
   gate).
 - **UNKNOWN content.** `coordinator_unit(action="unknown")` lists it; `action="restore"` puts the last
   known content back, and you then make the change again with Edit or Write.
 - **Watching.** The Codex Office shows these writers, and Send now puts a note into a running turn.
+- **Updating.** The first `abraham` or lead tool call of a newer release replaces an older
+  release's coordinator, which migrates the state. It stops only the daemon it checked, and only
+  when nothing is in flight. While something is (a lead edit or command, a writer's turn, a
+  publication), that call is refused with `DAEMON_OUTDATED`, and the old daemon keeps serving.
+  Lead edits made during the replacement wait for the new daemon. A coordinator from before 2.4.0 is
+  never stopped by a call. Stop it once, when no session is editing, with the command the refusal
+  names. Sessions that still run an older release keep working until you restart them.
 
 Known limits, measured on macOS:
 
@@ -257,8 +277,10 @@ Known limits, measured on macOS:
   ignored folder and force-adds: the coordinator never saw who wrote it. To publish such a file,
   make the change with Edit or Write.
 - What one of your Bash commands changes is credited to you only when the coordinator answered
-  before the command ran (within the hook's 3 s) and nothing else ran in that checkout meanwhile,
-  another session's command included. On a very large checkout, where that answer takes longer,
+  before the command ran (within the hook's 3 s) and nothing else ran in any registered repository
+  meanwhile, another session's command included.
+- Lead tools choose a project from the list the coordinator kept when it last registered one. A
+  project created or changed in the Codex app since then is seen at the next `abraham` dispatch. On a very large checkout, where that answer takes longer,
   the changes are UNKNOWN; make them with Edit or Write.
 
 ## The Codex Office
@@ -280,7 +302,10 @@ session and project.
 - **Writers on the writer coordinator show too.** They are not `codex exec` runs, so the office asks
   the coordinator for them and reads each one's conversation from its Codex thread's own rollout
   file. Their header shows the paths they claim, and any UNKNOWN content or unread messages. When the
-  coordinator does not answer, they show as last seen, and the page says so.
+  coordinator does not answer, they show as last seen, and the page says so. A project's writer shows
+  its project (🗂) and, for each repository, its claims, UNKNOWN content and publication phase. A
+  unit being published or partly published is marked ⚠, and a Claude session's such unit is named in
+  the status line.
 
 **Roles.** Each worker's role comes from the first of these that applies:
 1. The role you pick from the role menu in its header.
@@ -399,7 +424,10 @@ unit's paths, or content of unknown origin, is refused with the units and paths 
 is given: publish that work with the unit tools, or leave those paths out. What a commit takes is
 read from its own arguments: the index, `-a`, or its pathspecs. Your own unit's paths and free paths
 get the usual decision. A command the gate can't read as one plain commit keeps its token and gets
-the list as a note. A push is gated as before. Without coordinator state on the machine, the check
+the list as a note. A push is gated as before, except while a unit is **being published** or is
+**partly published**. A push of any of its repositories is refused, naming which of them have its
+commit, and no token opens it: let the publication finish, or recover the unit. The repository is the
+one git itself selects for the push (`-C`, `--git-dir`, `--work-tree`, `GIT_DIR`). Without coordinator state on the machine, the check
 costs one directory lookup; with the coordinator down, the reason says so.
 
 **Where it runs.** A session-start hook puts the plugin's git shim first on the Bash tool's PATH,

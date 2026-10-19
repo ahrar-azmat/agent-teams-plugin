@@ -15,6 +15,15 @@ def refusal(code, message, details=None):
     return CoordinatorError(code, message, details)
 
 
+def plugin_version(root=None):
+    """The version in this plugin's manifest: which release of the coordinator code is running."""
+    try:
+        manifest = Path(root or Path(__file__).resolve().parents[1]) / ".claude-plugin" / "plugin.json"
+        return json.loads(manifest.read_text(encoding="utf-8"))["version"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def sync_directory(path):
     descriptor = os.open(path, os.O_RDONLY)
     try:

@@ -16,6 +16,17 @@ import uuid
 from .client import CoordinatorError, validate_state
 
 
+# Partial indexes contain only live occupancy. Finished history advances the
+# durable clock instead of being reread for every lead Bash fingerprint.
+WINDOW_ACTIVE = {
+    "actor": "kind='actor' AND (json_extract(data,'$.active_turn') IS NOT NULL OR json_extract(data,'$.state')='running')",
+    "operation": "kind='operation' AND json_extract(data,'$.state') IN ('prepared','allowed','running')",
+    "custody": "kind='custody' AND json_extract(data,'$.state')!='released'",
+    "lead_hook": "kind='lead_hook' AND ((json_extract(data,'$.tool')='Bash' AND json_extract(data,'$.state')='observed') OR "
+                 "(json_extract(data,'$.tool') IN ('Write','Edit','MultiEdit','NotebookEdit') AND json_extract(data,'$.state')='received'))",
+}
+
+
 def uid(prefix):
     return prefix + "_" + uuid.uuid4().hex
 
@@ -97,7 +108,7 @@ class Store:
         INSERT OR IGNORE INTO migrations VALUES(1,unixepoch());
         """)
         current = self.db.execute("SELECT max(version) FROM migrations").fetchone()[0]
-        if current not in (1, 2):
+        if current not in (1, 2, 3):
             raise CoordinatorError("SCHEMA_VERSION", "Unknown ledger migration version")
         if current == 1:
             with self.transaction():
@@ -105,6 +116,55 @@ class Store:
                     identity TEXT PRIMARY KEY, checkout TEXT REFERENCES records(id),
                     state TEXT NOT NULL, members TEXT NOT NULL)""")
                 self.db.execute("INSERT INTO migrations VALUES(2,?)", (time.time(),))
+        if current < 3:
+            # Sidecars preserve every legacy record revision and receipt binding.
+            # Do not use executescript here: it may commit an open transaction.
+            with self.transaction():
+                from .participants import capture
+                for unit in list(self.all("unit")):
+                    checkout = self.get(unit["checkout"])
+                    capture(self, unit["id"], checkout, unit, [], 0)
+                for action in ("UPDATE", "DELETE"):
+                    self.db.execute("CREATE TRIGGER immutable_project_" + action.lower() +
+                                    " BEFORE " + action + " ON records WHEN OLD.kind IN ('project_revision','project_root')"
+                                    " BEGIN SELECT RAISE(ABORT,'immutable project revision'); END")
+                self.db.execute("INSERT INTO migrations VALUES(3,?)", (time.time(),))
+        # Also installs on an earlier P1 schema-3 database without rewriting any
+        # historical records. A restart invalidates its old attribution windows.
+        with self.transaction():
+            self.db.execute("CREATE TABLE IF NOT EXISTS mutation_clock("
+                            "id INTEGER PRIMARY KEY CHECK(id=1), effects INTEGER NOT NULL, lead_hooks INTEGER NOT NULL)")
+            self.db.execute("INSERT OR IGNORE INTO mutation_clock VALUES(1,0,0)")
+            for action in ("INSERT", "UPDATE", "DELETE"):
+                refs = ("OLD", "NEW") if action == "UPDATE" else ("OLD",) if action == "DELETE" else ("NEW",)
+                effects = " OR ".join(ref + ".kind IN ('operation','custody','custody_request') OR (" + ref +
+                    ".kind='actor' AND coalesce(json_extract(" + ref + ".data,'$.kind'),'')!='lead')" for ref in refs)
+                hooks = " OR ".join(ref + ".kind='lead_hook'" for ref in refs)
+                for column, condition in (("effects", effects), ("lead_hooks", hooks)):
+                    self.db.execute("CREATE TRIGGER IF NOT EXISTS mutation_" + column + "_" + action.lower() +
+                        " AFTER " + action + " ON records WHEN " + condition + " BEGIN UPDATE mutation_clock SET " +
+                        column + "=" + column + "+1 WHERE id=1; END")
+            for kind, condition in WINDOW_ACTIVE.items():
+                self.db.execute("CREATE INDEX IF NOT EXISTS window_" + kind +
+                    " ON records(" + ("json_extract(data,'$.deadline')," if kind == "lead_hook" else "") +
+                    "id) WHERE " + condition)
+            # Consumer lookups must not deserialize every historical unit or
+            # session before applying their checkout/session filter.
+            for name, expression, condition in (
+                ("lead_session_id", "json_extract(data,'$.session_id'),id", "kind='lead_session'"),
+                ("participant_checkout", "json_extract(data,'$.checkout'),parent", "kind='participant'"),
+                ("open_publication", "parent", "kind='publication' AND json_extract(data,'$.phase') NOT IN ('complete','abandoned')"),
+                ("unfinished_unit", "id", "kind='unit' AND json_extract(data,'$.publication_state') IN ('prepared','partially_published')"),
+                ("unfinished_unit_v2", "id", "kind='unit' AND json_extract(data,'$.publication_state') IN ('prepared','publishing','partially_published')"),
+                ("message_unit", "json_extract(data,'$.unit'),id", "kind='message'"),
+                ("message_recipient", "json_extract(data,'$.recipient'),id", "kind='message'"),
+                ("mailbox_session", "json_extract(data,'$.session_id'),id", "kind='lead_mailbox'"),
+                ("claim_checkout", "json_extract(data,'$.checkout'),id", "kind='claim' AND json_extract(data,'$.state')='held'"),
+                ("visible_run", "json_extract(data,'$.created') DESC,id DESC", "kind='run' AND "
+                 "(json_extract(data,'$.workflow') IS NOT NULL OR json_extract(data,'$.project_revision') IS NOT NULL)"),
+            ):
+                self.db.execute("CREATE INDEX IF NOT EXISTS " + name + " ON records(" + expression + ") WHERE " + condition)
+            self.db.execute("CREATE INDEX IF NOT EXISTS unknown_checkout ON unknowns(checkout)")
         generation = self.get("daemon", required=False)
         self.generation = (generation or {}).get("generation", 0) + 1
         self.put("meta", "daemon", {"generation": self.generation, "pid": os.getpid(),
@@ -149,6 +209,36 @@ class Store:
             args.append(parent)
         for row in self.db.execute(query + " ORDER BY id", args):
             yield dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
+
+    def selected(self, query, args=()):
+        """Decode only records selected by an internal, parameterized query."""
+        for row in self.db.execute(query, args):
+            yield dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
+
+    def lead_sessions(self, session_id):
+        return self.selected("SELECT * FROM records WHERE kind='lead_session' AND "
+                             "json_extract(data,'$.session_id')=? ORDER BY id", (session_id,))
+
+    def window_state(self, ident, mine, now):
+        """Global quiet occupancy plus a constant-size durable mutation stamp.
+
+        SQL triggers advance counters in the same transaction as every record
+        transition. Subtracting this hook's revision excludes only its own saves.
+        """
+        for kind in ("lead_hook", "actor", "operation", "custody"):
+            query = "SELECT id FROM records INDEXED BY window_" + kind + " WHERE " + WINDOW_ACTIVE[kind]
+            args = []
+            if kind == "lead_hook":
+                query += " AND json_extract(data,'$.deadline')>? AND id!=?"
+                args = [now, ident]
+            elif kind == "actor" and mine:
+                query += " AND id NOT IN (" + ",".join("?" for _ in mine) + ")"
+                args = sorted(mine)
+            if self.db.execute(query + " LIMIT 1", args).fetchone():
+                return None
+        clock = self.db.execute("SELECT effects,lead_hooks FROM mutation_clock WHERE id=1").fetchone()
+        own = self.db.execute("SELECT revision FROM records WHERE id=? AND kind='lead_hook'", (ident,)).fetchone()
+        return [clock["effects"], clock["lead_hooks"] - (own["revision"] if own else 0)]
 
     def blob(self, content):
         """Persist before referencing; works with bytes or a binary stream."""

@@ -197,9 +197,11 @@ class Admission:
 
     async def fingerprint(self, listener, schema_digest):
         connection = listener.connection
-        effective = await connection.call("config/read", {"cwd": str(listener.repo), "includeLayers": True})
+        roots = getattr(listener, "roots", [str(listener.repo)])
+        configurations = await asyncio.gather(*(connection.call("config/read", {"cwd": root, "includeLayers": True}) for root in roots))
+        effective = configurations[roots.index(str(listener.repo))]
         requirements = await connection.call("configRequirements/read", {})
-        hooks = await connection.call("hooks/list", {"cwds": [str(listener.repo)]})
+        hooks = await connection.call("hooks/list", {"cwds": roots})
         features = []
         async for response in native.page(connection, "experimentalFeature/list", {}):
             features.extend(response["data"])
@@ -209,7 +211,8 @@ class Admission:
             inventory = re.findall(r"`([^`]+)`", str(exc))[1:]
         else:
             raise CoordinatorError("METHOD_INVENTORY", "Unknown method was unexpectedly accepted")
-        missing = set(native.METHODS) - set(inventory)
+        required = native.BASELINE_METHODS | (native.PROJECT_METHODS if getattr(listener, "project_revision", None) else set())
+        missing = required - set(inventory)
         if missing:
             raise CoordinatorError("METHOD_INVENTORY", "Required native methods unavailable", {"missing": sorted(missing)})
         binary = native.native_codex()
@@ -217,7 +220,7 @@ class Admission:
         version = (await proc.communicate())[0].decode().strip()
         config = effective.get("config", {})
         complete_policy = version == "codex-cli 0.163.0" and requirements.get("requirements") is None and bool(listener.trace_rules)
-        return {"binary": binary, "binary_digest": native.file_digest(binary), "version": version,
+        result = {"binary": binary, "binary_digest": native.file_digest(binary), "version": version,
                 "user_agent": listener.initialized["userAgent"], "methods": sorted(set(inventory)),
                 "schema_digest": schema_digest, "config_digest": digest(config), "requirements_digest": digest(requirements),
                 "features": features, "hooks_digest": digest(hooks), "hook_program_digest": native.file_digest(Path(__file__).with_name("hooks.py")),
@@ -234,6 +237,10 @@ class Admission:
                 "case_sensitive": listener.case_sensitive if hasattr(listener, "case_sensitive") else case_sensitive(listener.repo),
                 "socket": {key: listener.endpoint.get(key) for key in ("measured_limit", "uid", "mode")},
                 "adapter_digest": native.adapter_digest()}
+        if getattr(listener, "project_revision", None):
+            result["project"] = {"revision": listener.project_revision, "roots": roots, "cwd": str(listener.repo),
+                                 "configuration_digests": [digest(c) for c in configurations]}
+        return result
 
     async def writer_gate(self, daemon, listenerid, thread_response, fixture=False):
         listener = self.store.get(listenerid)
@@ -246,16 +253,21 @@ class Admission:
             if listener.get("policy_traces"):
                 break
             await asyncio.sleep(0.01)
-        adapter = SimpleNamespace(connection=daemon.connections[listenerid], repo=Path(checkout["root"]),
+        from . import participants
+        actor = self.store.get(listener["actor"])
+        unit = self.store.get(actor["unit"])
+        roots = participants.roots(self.store, unit)
+        cwd = self.store.get(actor["run"]).get("thread_cwd", checkout["root"])
+        adapter = SimpleNamespace(connection=daemon.connections[listenerid], repo=Path(cwd),
+                                  roots=roots, project_revision=unit.get("project_revision"),
                                   initialized={"userAgent": listener["user_agent"]}, trace_rules=listener.get("policy_traces", []),
                                   endpoint=listener["endpoint"],
                                   case_sensitive=checkout["case_sensitive"])
         fingerprint = await self.fingerprint(adapter, schema_digest)
-        hooks = await adapter.connection.call("hooks/list", {"cwds": [checkout["root"]]})
-        own = [h for e in hooks["data"] for h in e["hooks"] if any(
-               h.get("key") == expected.get("key") for expected in listener.get("hooks", []))]
-        if len(own) != 2 or any(h.get("trustStatus") != "trusted" or h.get("enabled") is not True for h in own):
-            raise CoordinatorError("HOOK_TRUST", "Every listener must prove effective hook trust, including on a cache hit")
+        hooks = await adapter.connection.call("hooks/list", {"cwds": roots})
+        native.coordinator_hooks(hooks, roots, expected=listener.get("hooks", []))
+        from .projects import verify_thread
+        verify_thread(thread_response, unit, cwd, roots)
         fingerprint["thread_policy"] = native.policy_echo(thread_response)
         fingerprint["model"] = thread_response.get("model")
         fingerprint["provider"] = thread_response.get("modelProvider")
@@ -299,7 +311,7 @@ class Admission:
             temporary_roots = {Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve()}
             parent = self.store.root / "calibrations" if any(p in self.store.root.parents for p in temporary_roots) else None
             directory = tempfile.mkdtemp(prefix="software-workflows-admission-", dir=parent)
-            calibration = await self.check({"scratch": directory})
+            calibration = await self.check({"scratch": directory, "probes": list(PROBES) + (["projects"] if fingerprint.get("project") else [])})
             if not calibration["completed"]:
                 raise CoordinatorError("ADMISSION_INCOMPLETE", "Required runtime probes did not all complete")
             record = {"fingerprint": fingerprint, "fingerprint_digest": binding,
@@ -318,7 +330,7 @@ class Admission:
         directory = scratch_directory(params["scratch"]) / uid("admission")
         directory.mkdir(mode=0o700)
         requested = params.get("probes") or list(PROBES)
-        if set(requested) - set(PROBES) - {"exec_policy"}:
+        if set(requested) - set(PROBES) - {"exec_policy", "projects"}:
             raise CoordinatorError("ADMISSION_PROBE", "Unknown capability probe")
         schema_directory, schema_digest = await self.schema()
         results = []
@@ -350,6 +362,10 @@ class Admission:
         if not value["completed"]:
             raise CoordinatorError("ADMISSION_FAILED", "One or more required red/green native observations failed", value)
         return value
+
+    async def probe_projects(self, directory):
+        from .project_admission import probe
+        return await probe(directory)
 
     async def probe_hooks(self, directory):
         observations = {}

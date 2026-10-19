@@ -162,15 +162,25 @@ def runtime_configuration(directory, run):
     if not provider.get("base_url", "").startswith("http://127.0.0.1:") or provider.get("requires_openai_auth") is not False or config.get("features.plugins") is not False:
         raise CoordinatorError("FIXTURE_CONFIG", "Fixture must use unauthenticated loopback with plugin sync disabled")
     home = directory / ("home-" + run)
+    if record.get("native_home"):
+        requested = Path(record["native_home"])
+        home = scratch_directory(requested)
+        if requested != home or directory not in home.parents:
+            raise CoordinatorError("FIXTURE_HOME", "Shared native home must be a physical private directory inside this fixture")
     home.mkdir(mode=0o700, exist_ok=True)
     return home, config
 
 
-def serve(directory, plan):
+def serve(directory, plan, native_home=None):
     directory = scratch_directory(directory)
     from .processes import identity
     with Provider(plan=plan) as provider:
         manifest = {"pid": os.getpid(), "birth": identity(os.getpid())["birth"], "config": provider.config}
+        if native_home:
+            home = scratch_directory(native_home)
+            if Path(native_home) != home or directory not in home.parents:
+                raise CoordinatorError("FIXTURE_HOME", "Shared native home must be inside this fixture")
+            manifest["native_home"] = str(home)
         (directory / "fixture.json").write_text(json.dumps(manifest))
         os.chmod(directory / "fixture.json", 0o600)
         print(json.dumps({"fixture": str(directory), "pid": os.getpid(), "port": provider.server.server_port}), flush=True)

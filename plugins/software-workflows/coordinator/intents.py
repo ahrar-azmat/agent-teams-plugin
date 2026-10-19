@@ -5,6 +5,8 @@ serialization have no measured full-image adapter and receive a concrete refusal
 """
 import asyncio
 import codecs
+import hashlib
+import os
 import time
 from pathlib import Path
 
@@ -17,7 +19,7 @@ from .store import digest, uid
 
 FILES = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 # One lead Bash transition (Pre: reconcile, fingerprint, record; Post: fingerprint, reconcile) at a
-# time per checkout, so no other lead command can start between a quiet check and its use.
+# time globally, so no other lead command can start between a quiet check and its use.
 BASH_TRANSITIONS = KeyedLocks()
 # What was outside git's view when each lead Bash command began: {hook id: (deadline, entries)}.
 HIDDEN = {}
@@ -68,18 +70,46 @@ def intended(tool, data, raw):
     return bom + value.encode(encoding)
 
 
-def exec_writing(root):
-    """An exec write holds the tree's lock through its codex child, named in the lock's payload."""
+def exec_window(root):
+    """Live occupancy and retained evidence of a completed exec writer.
+
+    The lock file survives release and names the run's child. Its digest must
+    remain in the window after that child exits; a live-only check loses it.
+    """
     import re
     from .compat import _pid_alive, _write_lock_path
+    tree = None
+    if isinstance(root, dict):
+        # The lock is keyed by the tree as it is now, the identity an exec writer derives for it
+        # (compat._tree_identity): a deleted checkout has no tree to hold, a re-created one its own lock.
+        root = root["root"]
+        try:
+            work = os.stat(root)
+        except (FileNotFoundError, NotADirectoryError):
+            return False, None
+        except OSError:
+            return True, None
+        tree = f"{work.st_dev}-{work.st_ino}"
     try:
-        text = _write_lock_path(root).read_text(encoding="utf-8", errors="replace")
+        with _write_lock_path(root, tree).open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            raw = stream.read()
+            after = os.fstat(stream.fileno())
+    except FileNotFoundError:
+        return False, None
     except OSError:
-        return False
+        return True, None
+    def identity(info):
+        return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+    if identity(before) != identity(after):
+        return True, None
+    stamp = [identity(after), hashlib.sha256(raw).hexdigest()]
+    text = raw.decode("utf-8", errors="replace")
     if text.startswith("coordinator "):
-        return False  # the coordinator's own lease: its native writers are the actors and custody above
+        return False, stamp  # native writers are covered by the durable clock and occupancy
     match = re.search(r"\bchild=(\d+) cstart=(\S+)", text)
-    return bool(match) and _pid_alive(int(match.group(1)), "" if match.group(2) == "-" else match.group(2))
+    busy = bool(match) and _pid_alive(int(match.group(1)), "" if match.group(2) == "-" else match.group(2))
+    return busy, stamp
 
 
 def bash_deadline(data, limits):
@@ -105,49 +135,34 @@ def bash_deadline(data, limits):
 FILE_HOOK_S = 180
 
 
-def others_running(daemon, checkout, ident):
-    """Another lead call in this checkout that the daemon has received and that may still write
-    outside any prepared operation, within its deadline: a Bash call not yet completed, or a file
-    edit not yet prepared (a prepared one is a pending operation, which reconciliation skips).
-    Synchronous: callers check it with nothing awaited before they act."""
-    now = time.time()
-    return any(other["id"] != ident and other.get("checkout") == checkout["id"] and now < other.get("deadline", 0)
-               and (other.get("tool") == "Bash" and other.get("state") == "observed"
-                    or other.get("tool") in FILES and other.get("state") == "received")
-               for other in daemon.store.all("lead_hook"))
-
-
 def quiet(daemon, checkout, mine, ident):
-    """The synchronous part of `window`: the fingerprint, or None. `mine` are this session's actors."""
-    if others_running(daemon, checkout, ident):
+    """A global, generation-fenced stamp, without rereading finished history.
+
+    `mine` are this session's lead actors. Only this hook's own record updates
+    are subtracted from the durable clock; its operations still invalidate it.
+    """
+    clock = daemon.store.window_state(ident, mine, time.time())
+    if clock is None:
         return None
     marks = []
-    for other in daemon.store.all("actor"):
-        if other["checkout"] != checkout["id"] or other["id"] in mine:
-            continue
-        if other.get("active_turn") or other.get("state") == "running":
+    for registered in daemon.store.all("checkout"):
+        busy, stamp = exec_window(registered)
+        if busy:
             return None
-        marks.append([other["id"], other["_revision"]])
-    # Every other lead call here, finished ones too: one that starts or ends while this window is
-    # open changes it after it has left the active set (what it wrote outside git's view, its own
-    # reconcile never saw).
-    marks += [[other["id"], other["_revision"]] for other in daemon.store.all("lead_hook")
-              if other["id"] != ident and other.get("checkout") == checkout["id"]]
-    if daemon.custody.active(checkout["id"]):
-        return None
-    if any(o["checkout"] == checkout["id"] and o["state"] in ("prepared", "allowed", "running") for o in daemon.store.all("operation")):
-        return None
-    return digest(sorted(marks))
+        marks.append([registered["id"], stamp])
+    return digest([daemon.store.generation, clock, marks])
 
 
 async def window(daemon, checkout, mine, ident):
     """A fingerprint of what besides this lead's command could change files here, or None while
     something could: another lead Bash command still running (in any session), a writer's turn, a
     pending patch or edit, command custody (a command or its held survivors), or an exec write
-    holding the tree. A turn that starts and ends inside the window still rewrites its actor's
-    record, and another lead call its own record, so the fingerprint changes."""
+    holding the tree. Completed operations, released custody, writer turns and
+    other lead calls advance durable counters; completed exec writers leave a
+    changed lock-file stamp. None disappears when it leaves the active set."""
     # The one await comes first: everything after it reads the store without yielding.
-    if await asyncio.to_thread(exec_writing, checkout["root"]):
+    if any(busy for busy, _ in await asyncio.gather(*(asyncio.to_thread(exec_window, c)
+                                                    for c in daemon.store.all("checkout")))):
         return None
     return quiet(daemon, checkout, mine, ident)
 
@@ -155,15 +170,39 @@ async def window(daemon, checkout, mine, ident):
 async def arm(daemon, params):
     """The hook got the answer to a lead Bash call's Pre before the host ran the command: only then
     is what Pre recorded a state from before the command, so only an armed window names the lead.
-    A hook that gave up waiting (3 s) never arms it, and the call's effects stay UNKNOWN."""
+    Losing the initial Pre reply means no confirmation and no attribution. Losing
+    this confirmation's reply may leave a persisted arm; a same-token retry
+    acknowledges that decision without reopening or extending its window."""
     ident, token = params.get("observed"), params.get("arm")
     record = daemon.store.get(ident, required=False) if isinstance(ident, str) and ident.startswith("lead_hook_") else None
-    if (not record or record.get("tool") != "Bash" or record.get("state") != "observed" or not token
-            or record.get("arm") != token or record.get("armed")):
+    if (not record or record.get("tool") != "Bash" or not token
+            or record.get("generation") != daemon.store.generation or record.get("arm") != token
+            or record.get("window_invalidated_generation")):
+        return {"armed": False}
+    if record.get("armed"):
+        return {"armed": True}
+    if (record.get("state") != "observed" or time.time() > record.get("arm_deadline", float("inf"))
+            or record.get("window") is None
+            or quiet(daemon, None, set(record.get("session_actors") or []), ident) != record["window"]):
         return {"armed": False}
     record["armed"] = True
     daemon.store.save(record)
     return {"armed": True}
+
+
+def invalidate_windows(daemon):
+    """Fence every outstanding Bash call before recovery can admit hooks."""
+    with daemon.store.transaction():
+        for record in list(daemon.store.all("lead_hook")):
+            if record.get("tool") != "Bash" or record.get("state") != "observed":
+                continue
+            record.setdefault("armed_before_recovery", bool(record.get("armed")))
+            record.update(armed=False, arm=None, window=None, arrival=None,
+                          window_invalidated_generation=daemon.store.generation)
+            daemon.store.save(record)
+    # The calls remain observed until Post/deadline: an old command may still
+    # write, but cannot attribute bytes using a lost pre-restart hidden listing.
+    HIDDEN.clear()
 
 
 async def dispatch(daemon, payload):
@@ -185,6 +224,12 @@ async def dispatch(daemon, payload):
     session, call = payload.get("session_id"), payload.get("tool_use_id")
     if not isinstance(session, str) or not session or not isinstance(call, str) or not call:
         raise CoordinatorError("LEAD_HOOK_IDENTITY", "Host session_id and tool_use_id are required")
+    reach_ids = {checkout["id"]}
+    for revision in daemon.store.all("project_revision"):
+        ids = {b["checkout"] for b in revision["bindings"]}
+        if checkout["id"] in ids:
+            reach_ids.update(ids)
+    reach = [daemon.store.get(key) for key in sorted(reach_ids)]
     ident = "lead_hook_" + digest([checkout["identity"], session, call])
     data = payload.get("tool_input") or {}
     signature = digest([tool, data])
@@ -197,10 +242,11 @@ async def dispatch(daemon, payload):
         # transitions, the ledger): a hook that gives up waiting (its client's 3 s) lets the command
         # or the edit go ahead, so a call the daemon has received counts as possibly writing from here.
         deadline = bash_deadline(data, payload.get("bash_limits")) if tool == "Bash" else time.time() + FILE_HOOK_S
-        mapping = daemon.store.get("lead_session_" + digest([checkout["identity"], session]), required=False)
+        from .lead import session_actors
         fields = {"tool": tool, "state": "observed" if tool == "Bash" else "received", "input_digest": signature,
-                  "checkout": checkout["id"], "window": None, "deadline": deadline,
-                  "session_actors": [mapping["actor"]] if mapping else []}
+                  "generation": daemon.store.generation,
+                  "checkout": checkout["id"], "reach": sorted(reach_ids), "window": None, "deadline": deadline, "arm_deadline": time.time() + 3,
+                  "session_actors": session_actors(daemon.store, checkout["id"], session)}
         if tool == "Bash":
             # Quiet as the call arrives? The window taken at the end of Pre must equal this, so a call
             # that started and ended in between (another lead's, a writer's turn) leaves none.
@@ -213,28 +259,44 @@ async def dispatch(daemon, payload):
             # becomes visible before the reconcile below is settled there as not its doing.
             for key in [key for key, (until, _) in HIDDEN.items() if until < time.time()]:
                 del HIDDEN[key]
-            HIDDEN[ident] = (deadline, await asyncio.to_thread(hidden, checkout))
+            listings = await asyncio.gather(*(asyncio.to_thread(hidden, c) for c in reach))
+            HIDDEN[ident] = (deadline, dict(zip([c["id"] for c in reach], listings)))
     from .lead import attach
-    mapping = await attach(daemon, checkout["id"], session)
+    mapping = await attach(daemon, checkout["id"], session, cwd=payload.get("cwd"), hook=True)
     actor = daemon.store.get(mapping["actor"])
     if tool == "Bash":
-        async with BASH_TRANSITIONS.hold(checkout["id"]):
+        async with BASH_TRANSITIONS.hold("global"):
             if fresh:
+                from .participants import contains, published_participant
+                receipt_units = {}
+                for participant in reach:
+                    if contains(daemon.store, actor["unit"], participant["id"]):
+                        receipt_units[participant["id"]] = actor["unit"]
+                    else:
+                        # Reach includes older revisions too. Keep their receipts
+                        # in a unit that owns that checkout, without repinning the
+                        # current unit or widening its publication membership.
+                        sibling = await attach(daemon, participant["id"], session,
+                                               cwd=participant["root"], hook=True)
+                        receipt_units[participant["id"]] = sibling["unit"]
                 # What changed before this command is not its doing: settle that first, so only changes
                 # made inside the window can become the lead's.
-                await daemon.ledger.reconcile(checkout, reason="before lead Bash: " + ident)
+                await daemon.ledger.reconcile_many(reach, reason="before lead Bash: " + ident, target=checkout["id"])
                 record = daemon.store.get(ident)
                 mine = set(record.get("session_actors") or []) | {actor["id"]}
                 now = await window(daemon, checkout, mine, ident)
                 held = now is not None and now == record.get("arrival")
                 # The window counts only once the hook has the answer before the command runs (`arm`).
                 record.update(unit=actor["unit"], actor=actor["id"], session_actors=sorted(mine),
+                              receipt_units=receipt_units,
+                              published_participants=[published for key, unitid in receipt_units.items()
+                                  if (published := published_participant(daemon.store, unitid, key))],
                               window=now if held else None, arm=uid("arm") if held else None)
                 daemon.store.save(record)
             if event != "PreToolUse" and record and record["state"] == "reconciled":
                 # A second completion for the same call (Post and Failure, or a retried hook) names nobody:
                 # its window closed with the first.
-                result = await daemon.ledger.reconcile(checkout, reason="possible lead Bash effects: " + ident)
+                result = await daemon.ledger.reconcile_many(reach, reason="possible lead Bash effects: " + ident, target=checkout["id"])
                 return dict(result, attribution="UNKNOWN-context-only", executed_again=False, duplicate=True)
             if event != "PreToolUse":
                 # A command that ran while nothing else could change files here is the lead's: what it
@@ -244,24 +306,34 @@ async def dispatch(daemon, payload):
                 attribute = None
                 mine = set(record.get("session_actors") or []) | {actor["id"]} if record else {actor["id"]}
                 if (record and record.get("window") is not None and record.get("armed")
-                        and record["window"] == await window(daemon, checkout, mine, ident)):
+                        and record.get("generation") == daemon.store.generation
+                        and time.time() <= record["deadline"] and record["window"] == await window(daemon, checkout, mine, ident)):
                     attribute = {"attribution": "lead-command", "operation": ident, "unit": actor["unit"],
-                                 "hidden": HIDDEN.get(ident, (None, None))[1],
-                                 "excluded": [normalize(checkout, c["path"])["key"] for c in daemon.custody.claims(checkout["id"])
-                                              if c["unit"] != actor["unit"]],
+                                 "checkouts": {c["id"]: {
+                                     "unit": record.get("receipt_units", {}).get(c["id"], actor["unit"]),
+                                     "hidden": (HIDDEN.get(ident, (None, {}))[1] or {}).get(c["id"]),
+                                     "excluded": [normalize(c, claim["path"])["key"] for claim in daemon.custody.claims(c["id"])
+                                         if claim["unit"] != record.get("receipt_units", {}).get(c["id"], actor["unit"])]}
+                                     for c in reach if c["id"] in record.get("receipt_units", {})
+                                     and c["id"] in (HIDDEN.get(ident, (None, {}))[1] or {})},
                                  # checked again after the scan: anything that started meanwhile voids it
                                  "still_quiet": lambda: quiet(daemon, checkout, mine, ident) == record["window"]}
-                result = await daemon.ledger.reconcile(checkout, reason="possible lead Bash effects: " + ident, attribute=attribute)
+                result = await daemon.ledger.reconcile_many(reach, reason="possible lead Bash effects: " + ident, target=checkout["id"], attribute=attribute)
                 HIDDEN.pop(ident, None)
                 if record:
                     record["state"] = "reconciled"
                     daemon.store.save(record)
                 return dict(result, attribution="lead-command" if "attributed" in result else "UNKNOWN-context-only", executed_again=False)
             answer = {"coordinated": True, "observed": ident, "executed_again": False}
+            if record and record.get("published_participants"):
+                answer["published_participants"] = record["published_participants"]
             if fresh and record.get("arm"):
                 answer["arm"] = record["arm"]
             return answer
-    path = normalize(checkout, target)["path"]
+    from .routing import route, qualified
+    routed = route(daemon.store, actor, target, payload.get("cwd"))
+    path = routed["path"]
+    actor = dict(actor, checkout=routed["checkout"])
     if event == "PreToolUse":
         def refused():  # denied: it writes nothing
             daemon.store.put("lead_hook", ident, {"tool": tool, "state": "refused", "input_digest": signature,
@@ -289,6 +361,12 @@ async def dispatch(daemon, payload):
         conflicts = daemon.custody.conflicts(checkout["id"], actor["unit"], [normalize(checkout, path)])
         if conflicts:
             refuse(conflicts)
+        from .participants import require_writable
+        try:
+            require_writable(daemon.store, actor["unit"], checkout["id"])
+        except CoordinatorError:
+            refused()
+            raise
         if tool == "NotebookEdit":
             intended(tool, data, b"")  # Concrete refusal before taking a claim.
         pre = await asyncio.to_thread(read_path, daemon.store, checkout, path)
@@ -296,17 +374,19 @@ async def dispatch(daemon, payload):
         content = intended(tool, data, raw)
         image = {"blob": daemon.store.blob(content), "mode": pre["mode"] or "100644"}
         try:
-            await daemon.custody.acquire(actor, [path])
+            await daemon.custody.acquire(actor, [qualified(checkout["id"], path)])
+            operation = await daemon.ledger.prepare(actor, "lead-edit", {"expected": {path: image}, "host_tool": tool, "input_digest": signature}, [path],
+                                                    native={"session_id": session, "tool_use_id": call})
         except CoordinatorError as exc:
-            if exc.code == "CLAIM_CONFLICT" and exc.details.get("conflicts"):
-                refused()  # lost the claim to a concurrent edit: the hook denies it too
+            if not exc.operational and (exc.code == "PREFIX_PUBLISHED" or
+                                        exc.code == "CLAIM_CONFLICT" and exc.details.get("conflicts")):
+                refused()  # Every authoritative denial writes nothing, including a replay.
             raise
-        operation = await daemon.ledger.prepare(actor, "lead-edit", {"expected": {path: image}, "host_tool": tool, "input_digest": signature}, [path],
-                                                native={"session_id": session, "tool_use_id": call})
         if operation["pre"][path] != pre:
             await daemon.ledger.quarantine(operation, "pre-image changed during host intent preparation")
             raise CoordinatorError("LEAD_PREIMAGE_CHANGED", "Prepare the edit again against the current pre-image")
         daemon.store.put("lead_hook", ident, {"unit": actor["unit"], "actor": actor["id"], "tool": tool,
+                         "checkout": checkout["id"], "deadline": daemon.store.get(ident)["deadline"],
                          "state": "prepared", "input_digest": signature, "operation": operation["id"]}, actor["unit"])
         return {"coordinated": True, "operation": operation["id"]}
     if not record or record["state"] in ("received", "refused", "unrecorded"):

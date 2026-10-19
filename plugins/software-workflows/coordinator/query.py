@@ -10,16 +10,21 @@ import time
 from .client import Client, CoordinatorError
 
 
-def query_checkout(cwd, session_id="", timeout=0.25, state=None):
+def query_checkout(cwd, session_id="", timeout=0.25, state=None, git_common=None):
     started = time.monotonic()
+    params = {"cwd": str(cwd), "session_id": session_id}
+    if git_common is not None:
+        params["git_common"] = str(git_common)  # answered under "repository"; a release before 2.4.0 ignores it
     try:
-        value = Client(state=state, timeout=timeout).call("checkout/query", {"cwd": str(cwd), "session_id": session_id})
+        value = Client(state=state, timeout=timeout).call("checkout/query", params)
         if not isinstance(value, dict) or not {"available", "fresh", "status", "registered", "checkout", "units", "unknown", "own_unit"} <= set(value):
             raise CoordinatorError("RPC_RESPONSE", "Malformed checkout observation", operational=True)
     except (OSError, ValueError, KeyError, CoordinatorError) as exc:
         value = {"available": False, "fresh": False, "generation": None, "registered": None,
                  "status": "coordinator_down", "checkout": None, "units": [], "unknown": [], "own_unit": None,
                  "reason": getattr(exc, "code", type(exc).__name__)}
+    for key, default in (("root", None), ("projects", []), ("publications", [])):
+        value.setdefault(key, default)
     value["elapsed_ms"] = round((time.monotonic() - started) * 1000, 3)
     return value
 

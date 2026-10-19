@@ -1,7 +1,10 @@
-"""Python 3.9 JSONL client. The client never imports or opens the ledger."""
+"""Python 3.9 JSONL client. The client never imports the ledger; it opens one read-only only to
+see what an older release's daemon has in flight before stopping it (lead_work_in_flight)."""
+import contextlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import socket
 import stat
@@ -127,6 +130,67 @@ def launch_environment():
     return environment
 
 
+def superseded(running):
+    """Whether a running daemon is an older release than this client's code; one that reports no
+    version predates 2.4.0. An unreadable version on either side never retires anything."""
+    from .runtime import plugin_version
+    mine = plugin_version()
+    try:
+        return mine is not None and (running is None or
+                                     tuple(map(int, running.split("."))) < tuple(map(int, mine.split("."))))
+    except (AttributeError, ValueError):
+        return False
+
+
+def _held(path):
+    import fcntl
+    try:
+        with open(path, "rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    except FileNotFoundError:
+        return False
+    except BlockingIOError:
+        return True
+    return False
+
+
+# Held by the one process starting or replacing the daemon, from its last look at the running daemon
+# through the start of its own; the lead hooks wait while it is held instead of going unrecorded.
+UPGRADE_LOCK = "upgrade.lock"
+LEAD_OPERATIONS = ("lead-edit", "restore", "lead-command")
+
+
+def lead_work_in_flight(state):
+    """What a daemon from before 2.4.0 has in flight that its stop guard does not wait for: lead edits,
+    hooks and commands, and publications, read from its ledger without writing. {class: count}."""
+    import sqlite3
+    from urllib.parse import quote
+    found = {}
+    try:
+        db = sqlite3.connect("file:" + quote(str(Path(state) / "ledger.sqlite")) + "?mode=ro", uri=True, timeout=5)
+        try:
+            rows = db.execute("SELECT kind, json_extract(data,'$.state'), json_extract(data,'$.kind'), "
+                              "json_extract(data,'$.deadline'), json_extract(data,'$.phase') FROM records "
+                              "WHERE kind IN ('lead_hook','operation','publication')").fetchall()
+        finally:
+            db.close()
+    except sqlite3.Error as exc:
+        return {"unreadable ledger (" + type(exc).__name__ + ")": 1}
+    now = time.time()
+    for kind, status, operation, deadline, phase in rows:
+        if kind == "operation" and operation in LEAD_OPERATIONS and status in ("prepared", "allowed", "running"):
+            name = "lead " + operation
+        elif kind == "lead_hook" and status in ("received", "observed") and (deadline is None or deadline > now):
+            name = "lead hook"
+        elif kind == "publication" and phase not in (None, "complete", "abandoned"):
+            name = "publication"
+        else:
+            continue
+        found[name] = found.get(name, 0) + 1
+    return found
+
+
 class Client:
     def __init__(self, state=None, timeout=30):
         self.state = validate_state(state_root(state))
@@ -161,11 +225,140 @@ class Client:
             raise CoordinatorError("RPC_RESPONSE", "Coordinator response has no result", operational=True)
         return response["result"]
 
-    def ensure(self, timeout=30, python=None, inherited_fds=None):
+    def status(self):
+        """The running daemon's daemon/status, or None when none answers. A daemon on its way out
+        answers DAEMON_DRAINING, which is raised."""
         try:
             return self.call("daemon/status")
         except (FileNotFoundError, ConnectionRefusedError):
-            pass
+            return None
+
+    def current(self, timeout):
+        """daemon/status, or None when none answers, waiting out a daemon that is stopping: it either
+        exits (then its locks are waited for too, so a new one can start) or, its stop refused, serves on."""
+        deadline = time.monotonic() + timeout
+        stopping = False
+        while True:
+            try:
+                status = self.status()
+            except CoordinatorError as exc:
+                if exc.code != "DAEMON_DRAINING" or time.monotonic() >= deadline:
+                    raise
+                stopping = True
+                time.sleep(0.05)
+                continue
+            if status is None and stopping:
+                while time.monotonic() < deadline and any(_held(self.state / name) for name in ("supervisor.lock", "worker.lock")):
+                    time.sleep(0.05)
+            return status
+
+    @contextlib.contextmanager
+    def upgrading(self, timeout):
+        """Hold <state>/upgrade.lock: one process at a time starts or replaces the daemon."""
+        import fcntl
+        self.state = validate_state(self.state, create=True)
+        fd = os.open(str(self.state / UPGRADE_LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise CoordinatorError("DAEMON_START", "Another process is still starting or replacing the "
+                                               "coordinator", {"lock": str(self.state / UPGRADE_LOCK)}, True)
+                    time.sleep(0.05)
+            yield
+        finally:
+            os.close(fd)
+
+    def stop_command(self):
+        plugin = Path(__file__).resolve().parents[1]
+        return "cd {} && {} -B -m coordinator --state {} daemon stop".format(
+            shlex.quote(str(plugin)), shlex.quote(daemon_python()), shlex.quote(str(self.state)))
+
+    def retire(self, status, timeout):
+        """Stop the older release's daemon that `status` describes, so this client starts its own in its
+        place; False when another process replaced it first. Only a daemon that drains (2.4.0 and later)
+        is stopped, and only that process: it refuses while work is pending and admits nothing new while
+        it decides. One from before 2.4.0 cannot promise that, so it is left running and reported."""
+        details = {"running": status.get("version"), "pid": status.get("pid")}
+        if "draining-stop" not in (status.get("capabilities") or []) or not status.get("boot"):
+            command = self.stop_command()
+            raise CoordinatorError("DAEMON_OUTDATED", "A coordinator from before 2.4.0 is running. It cannot confirm "
+                                   "that no lead edit, hook or publication is in flight, so it is not replaced "
+                                   "automatically: stop it once, when no session is editing, with `" + command +
+                                   "`. The next call then starts this release.", dict(details, stop=command), True)
+        try:
+            self.call("daemon/stop", {"expect": {"pid": status.get("pid"), "boot": status["boot"]}})
+        except (FileNotFoundError, ConnectionRefusedError):
+            pass  # it is gone already
+        except CoordinatorError as exc:
+            if exc.code == "DAEMON_REPLACED":
+                return False
+            if not exc.operational or exc.code == "DAEMON_DRAINING":
+                raise CoordinatorError("DAEMON_OUTDATED", "An older coordinator release is running with unsettled "
+                                       "work; it is replaced once that work settles", dict(details, reason=exc.code,
+                                       pending=exc.details.get("pending", exc.details)), True) from exc
+            # Otherwise the answer was lost as it exited (RPC_UNCERTAIN): its locks say whether it did.
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not any(_held(self.state / name) for name in ("supervisor.lock", "worker.lock")):
+                return True
+            time.sleep(0.05)
+        raise CoordinatorError("DAEMON_OUTDATED", "The older coordinator release did not stop", details, True)
+
+    def stop(self, timeout=30):
+        """Stop the running daemon, holding the upgrade lock. One that drains (2.4.0 and later) decides
+        itself; for one from before 2.4.0 its ledger is read first, and the stop is refused while lead
+        work is in flight there."""
+        with self.upgrading(timeout):
+            status = self.call("daemon/status")
+            if "draining-stop" in (status.get("capabilities") or []) and status.get("boot"):
+                return self.call("daemon/stop", {"expect": {"pid": status.get("pid"), "boot": status["boot"]}})
+            pending = lead_work_in_flight(self.state)
+            if pending:
+                raise CoordinatorError("NOT_QUIESCENT", "Lead work is in flight in the older coordinator; stop it "
+                                       "once that settles", {"pending": pending})
+            return self.call("daemon/stop")
+
+    def ensure(self, timeout=30, python=None, inherited_fds=None):
+        try:
+            status = self.status()
+        except CoordinatorError as exc:
+            if exc.code != "DAEMON_DRAINING":
+                raise
+            status = None  # being stopped, most likely replaced: wait behind whoever holds the lock
+        else:
+            if status is not None and not superseded(status.get("version")):
+                return status
+        with self.upgrading(timeout):
+            for _ in range(3):
+                # Looked at again under the lock: another process may have started or replaced it.
+                status = self.current(timeout)
+                if status is None:
+                    status = self.settled(self.start(timeout, python, inherited_fds), timeout)
+                if not superseded(status.get("version")):
+                    return status
+                self.retire(status, timeout)
+        raise CoordinatorError("DAEMON_OUTDATED", "An older coordinator release kept taking the daemon's place",
+                               {"running": status.get("version"), "pid": status.get("pid")}, True)
+
+    def settled(self, status, timeout):
+        """The status of the daemon this client just started, once it has finished recovery and admits
+        work (or the time is up): the upgrade lock stays held until then, so the lead hooks wait across
+        the whole replacement instead of meeting RECOVERING."""
+        deadline = time.monotonic() + timeout
+        while not status.get("ready") and time.monotonic() < deadline:
+            time.sleep(0.05)
+            try:
+                status = self.call("daemon/status")
+            except (FileNotFoundError, ConnectionRefusedError):
+                break
+        return status
+
+    def start(self, timeout=30, python=None, inherited_fds=None):
         self.state = validate_state(self.state, create=True)
         # Each detached supervisor competes for the same flock; losers simply exit.
         started = time.time()

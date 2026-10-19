@@ -305,7 +305,8 @@ class Custody:
         self.condition = asyncio.Condition()
 
     def claims(self, checkout):
-        return [r for r in self.store.all("claim") if r["checkout"] == checkout and r["state"] == "held"]
+        return list(self.store.selected("SELECT * FROM records WHERE kind='claim' AND "
+                    "json_extract(data,'$.state')='held' AND json_extract(data,'$.checkout')=? ORDER BY id", (checkout,)))
 
     def active(self, checkout):
         return [r for r in self.store.all("custody") if r["checkout"] == checkout and r["state"] != "released"]
@@ -322,17 +323,23 @@ class Custody:
                                       "kind": "custody", "reservation": reservation["id"]})
         return conflicts
 
-    async def acquire(self, actor, paths):
-        checkout = self.store.get(actor["checkout"])
-        self.ledger.require_owned(checkout)
-        unit = self.store.get(actor["unit"])
-        if unit["state"] != "open":
-            raise CoordinatorError("UNIT_FROZEN", "Cannot claim paths for a sealed unit")
-        normalized = [normalize(checkout, path) for path in paths]
+    def unit_active(self, unitid):
+        return [r for r in self.store.all("custody", unitid) if r["state"] != "released"]
+
+    async def acquire(self, actor, paths, cwd=None):
+        from .routing import grouped
+        groups = grouped(self.store, actor, paths, cwd)
+        normalized = {key: [normalize(self.store.get(key), path) for path in values] for key, values in groups.items()}
+        for key in groups:
+            self.ledger.require_owned(self.store.get(key))
         async with self.condition:
             if self.store.get(actor["unit"])["state"] != "open":
-                raise CoordinatorError("UNIT_FROZEN", "Unit froze before its claim could be granted")
-            conflicts = self.conflicts(checkout["id"], actor["unit"], normalized)
+                raise CoordinatorError("UNIT_FROZEN", "Cannot claim paths for a sealed unit")
+            from .participants import require_writable
+            for key in groups:
+                require_writable(self.store, actor["unit"], key)
+            conflicts = [dict(conflict, checkout=key, root=self.store.get(key)["root"])
+                         for key, values in normalized.items() for conflict in self.conflicts(key, actor["unit"], values)]
             if conflicts:
                 request = uid("request")
                 self.store.put("claim_request", request, {"actor": actor["id"], "unit": actor["unit"],
@@ -340,29 +347,33 @@ class Custody:
                 raise CoordinatorError("CLAIM_CONFLICT", "Scope held by " + conflicts[0]["holder"] +
                                        "; send a message to that holder or the lead, then request lead-authorized handback",
                                        {"conflicts": conflicts, "request": request})
-            held = {(c["unit"], c["key"]): c for c in self.claims(checkout["id"])}
             result = []
             with self.store.transaction():
-                for path in normalized:
-                    existing = held.get((actor["unit"], path["key"]))
-                    if existing:
-                        result.append(existing["id"])
-                    else:
-                        ident = uid("claim")
-                        self.store.put("claim", ident, dict(path, checkout=checkout["id"], unit=actor["unit"],
-                                                           actor=actor["id"], state="held"), actor["unit"])
-                        result.append(ident)
+                for key, values in normalized.items():
+                    held = {c["key"]: c for c in self.claims(key) if c["unit"] == actor["unit"]}
+                    for path in values:
+                        existing = held.get(path["key"])
+                        if existing:
+                            result.append(existing["id"])
+                        else:
+                            ident = uid("claim")
+                            held[path["key"]] = self.store.put("claim", ident, dict(path, checkout=key, root=self.store.get(key)["root"],
+                                                               unit=actor["unit"], actor=actor["id"], state="held"), actor["unit"])
+                            result.append(ident)
                 self.store.event("claim/acquired", actor["id"], {"claims": result})
             return {"claims": result}
 
-    def release_request(self, actor, paths):
+    def release_request(self, actor, paths, cwd=None):
+        from .routing import grouped, qualified
+        resolved = grouped(self.store, actor, paths, cwd)
         ident = uid("request")
         self.store.put("release_request", ident, {"unit": actor["unit"], "actor": actor["id"],
-                       "paths": paths, "state": "pending_lead"}, actor["unit"])
+                       "paths": paths, "qualified_paths": [qualified(key, path) for key, values in resolved.items() for path in values],
+                       "state": "pending_lead"}, actor["unit"])
         return {"request": ident, "state": "pending_lead", "message": "Claims stay held until the lead authorizes handback or publication reconciles"}
 
-    async def release(self, unit, paths=None):
-        if any(r["unit"] == unit["id"] for r in self.active(unit["checkout"])):
+    async def release(self, unit, paths=None, cwd=None):
+        if self.unit_active(unit["id"]):
             raise CoordinatorError("CUSTODY_HELD", "Reconcile command custody before releasing claims")
         for operation in self.store.all("operation", unit["id"]):
             if operation["state"] not in ("verified", "reconciled", "denied", "resolved"):
@@ -370,13 +381,15 @@ class Custody:
         if paths is not None:
             if not isinstance(paths, list):
                 raise CoordinatorError("CLAIM_PATHS", "Handback paths must be a list or omitted for all claims")
-            paths = [normalize(self.store.get(unit["checkout"]), p)["path"] for p in paths]
+            from .routing import grouped
+            actor = dict(unit=unit["id"], checkout=unit["checkout"])
+            paths = grouped(self.store, actor, paths, cwd)
         released = []
         async with self.condition:
             with self.store.transaction():
-                for claim in self.claims(unit["checkout"]):
-                    if claim["unit"] == unit["id"] and (paths is None or claim["path"] in paths):
-                        released.append({"id": claim["id"], "path": claim["path"]})
+                for claim in self.store.all("claim", unit["id"]):
+                    if claim["state"] != "released" and (paths is None or claim["path"] in paths.get(claim["checkout"], [])):
+                        released.append({"id": claim["id"], "path": claim["path"], "checkout": claim["checkout"], "root": self.store.get(claim["checkout"])["root"]})
                         claim["state"] = "released"
                         self.store.save(claim)
                 self.store.event("claim/released", unit["id"], {"paths": paths})
@@ -408,62 +421,75 @@ class Custody:
                             if d["state"] == "available" and d["command"] == command), None)
         level = "shared" if declaration else "exclusive"
         ident = uid("custody")
-        request = self.store.put("custody_request", ident + "_request", {"actor": actor["id"], "unit": actor["unit"],
-                                 "level": level, "state": "waiting", "created": time.time(), "generation": self.store.generation}, actor["unit"])
-        deadline = asyncio.get_running_loop().time() + timeout
-        async with self.condition:
-            while True:
-                self.ledger.require_owned(self.store.get(actor["checkout"]))
-                if self.store.get(actor["unit"])["state"] != "open":
-                    record = self.store.get(request["id"])
-                    record["state"] = "interrupted"
-                    self.store.save(record)
-                    raise CoordinatorError("UNIT_FROZEN", "Unit froze while waiting for command custody")
-                if operation and self.store.get(operation)["state"] != "prepared":
-                    record = self.store.get(request["id"])
-                    record["state"] = "interrupted"
-                    self.store.save(record)
-                    raise CoordinatorError("CUSTODY_INTENT_CHANGED", "The invocation advanced without a valid custody grant; reconcile its effects")
-                if declaration and self.store.get(declaration["id"])["state"] != "available":
-                    declaration, level = None, "exclusive"
-                active = self.active(actor["checkout"])
-                excludes = [c["key"] for c in self.claims(actor["checkout"]) if c["unit"] != actor["unit"]]
-                proposed = {"checkout": actor["checkout"], "level": level, "excludes": excludes, "operation": operation}
-                conflicts = [r for r in active if effect_conflict(proposed, r)]
-                # Existing exact patches also keep exclusive commands from entering their scope.
-                pending = [o for o in self.store.all("operation") if o["checkout"] == actor["checkout"] and
-                           o["kind"] in ("patch", "lead-edit", "restore") and o["state"] in ("prepared", "allowed", "running")]
-                checkout = self.store.get(actor["checkout"])
-                pending = [o for o in pending if effect_conflict(proposed, path_effect(checkout, o["paths"], o["id"]))]
-                if not conflicts and not pending:
-                    break
-                left = deadline - asyncio.get_running_loop().time()
-                if left <= 0:
-                    record = self.store.get(request["id"])
-                    record.update(state="denied", holders=[r["unit"] for r in conflicts])
-                    self.store.save(record)
-                    raise CoordinatorError("CUSTODY_WAIT", "Custody wait reached the safe hook deadline; retry or message the holder",
-                                           {"holders": [r["unit"] for r in conflicts]})
-                try:
-                    await asyncio.wait_for(self.condition.wait(), min(left, 1))
-                except asyncio.TimeoutError:
-                    pass
-            excludes = [c["key"] for c in self.claims(actor["checkout"]) if c["unit"] != actor["unit"]]
+        self.store.put("custody_request", ident + "_request", {"actor": actor["id"], "unit": actor["unit"],
+                       "level": level, "state": "waiting", "created": time.time(), "generation": self.store.generation}, actor["unit"])
+        request = self.store.get(ident + "_request")
+        try:
+            deadline = asyncio.get_running_loop().time() + timeout
+            from .participants import checkout_ids, require_writable
             from .processes import baseline
-            process_baseline = await asyncio.to_thread(baseline)
-            with self.store.transaction():
-                if declaration:
-                    declaration["state"] = "consumed"
-                    declaration["invocation"] = ident
-                    self.store.save(declaration)
-                record = self.store.get(request["id"])
-                record["state"] = "granted"
-                self.store.save(record)
-                self.store.put("custody", ident, {"checkout": actor["checkout"], "unit": actor["unit"],
-                               "actor": actor["id"], "operation": operation, "command": command,
-                               "level": level, "excludes": excludes, "state": "held", "created": time.time(),
-                               "terminals": [], "processes": [], "process_baseline": process_baseline, "generation": self.store.generation}, actor["unit"])
-            return self.store.get(ident)
+            checkouts = [self.store.get(key) for key in checkout_ids(self.store, actor["unit"])]
+            async with self.condition:
+                process_baseline = None
+                while True:
+                    for checkout in checkouts:
+                        self.ledger.require_owned(checkout)
+                        require_writable(self.store, actor["unit"], checkout["id"])
+                    if self.store.get(actor["unit"])["state"] != "open" or operation and self.store.get(operation)["state"] != "prepared":
+                        request.update(state="interrupted")
+                        self.store.save(request)
+                        raise CoordinatorError("CUSTODY_INTENT_CHANGED", "Unit or invocation changed while waiting for custody")
+                    if declaration and self.store.get(declaration["id"])["state"] != "available":
+                        declaration, level = None, "exclusive"
+                    proposed = [{"checkout": c["id"], "level": level, "operation": operation,
+                                 "excludes": [claim["key"] for claim in self.claims(c["id"]) if claim["unit"] != actor["unit"]]}
+                                for c in checkouts]
+                    conflicts = [r for item in proposed for r in self.active(item["checkout"]) if effect_conflict(item, r)]
+                    pending = [o for item in proposed for o in self.store.all("operation")
+                               if o["checkout"] == item["checkout"] and o["kind"] in ("patch", "lead-edit", "restore")
+                               and o["state"] in ("prepared", "allowed", "running")
+                               and effect_conflict(item, path_effect(self.store.get(item["checkout"]), o["paths"], o["id"]))]
+                    if not conflicts and not pending:
+                        if process_baseline is None:
+                            process_baseline = await asyncio.to_thread(baseline)
+                            continue  # Recheck every checkout after the asynchronous collection.
+                        break
+                    process_baseline = None
+                    left = deadline - asyncio.get_running_loop().time()
+                    if left <= 0:
+                        request.update(state="denied", holders=[r["unit"] for r in conflicts])
+                        self.store.save(request)
+                        raise CoordinatorError("CUSTODY_WAIT", "Custody wait reached the safe hook deadline; retry or message the holder",
+                                               {"holders": [r["unit"] for r in conflicts]})
+                    try:
+                        await asyncio.wait_for(self.condition.wait(), min(left, 1))
+                    except asyncio.TimeoutError:
+                        pass
+                with self.store.transaction():
+                    if declaration:
+                        declaration.update(state="consumed", invocation=ident)
+                        self.store.save(declaration)
+                    request["state"] = "granted"
+                    self.store.save(request)
+                    ids = []
+                    for index, item in enumerate(proposed):
+                        key = ident if index == 0 else uid("custody")
+                        ids.append(key)
+                        self.store.put("custody", key, dict(item, unit=actor["unit"], actor=actor["id"], command=command,
+                                       group=ident, state="held", created=time.time(), terminals=[], processes=[],
+                                       process_baseline=process_baseline, generation=self.store.generation), actor["unit"])
+                    root = self.store.get(ident)
+                    root["members"] = ids
+                    self.store.save(root)
+                return self.store.get(ident)
+        finally:
+            # A failed process snapshot or cancelled hook never granted custody.
+            # Close its durable wait record so settlement cannot wait forever
+            # for an acquisition that has already returned a refusal.
+            current = self.store.get(request["id"])
+            if current["state"] == "waiting":
+                current.update(state="interrupted", reason="custody acquisition ended before grant")
+                self.store.save(current)
 
     async def relinquish(self, reservation):
         async with self.condition:

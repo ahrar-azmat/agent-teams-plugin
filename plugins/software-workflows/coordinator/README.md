@@ -1,6 +1,8 @@
-# Writer coordinator — software-workflows 2.3.5
+# Writer coordinator — software-workflows 2.4.0 / P1
 
-C1 runs several native Codex app-server writers in one original checkout. C2
+C1 runs native Codex app-server writers in their original checkouts. A native
+Codex project is one unit spanning all of its repositories; several projects can
+share the same checkout ledger, claims and custody. C2
 connects Abraham, the run tools and Claude lead operations to that durable
 coordinator. The package does not import `server.py`; the MCP server uses the
 same Python client and JSONL RPC as the CLI. Actual verification results are in
@@ -10,8 +12,8 @@ The central rule is that **claims and custody coordinate access; only a verified
 operation establishes authorship**. Shell commands, MCP calls, external editors,
 missing hook evidence and crash gaps cannot acquire authorship from matching
 hashes. Their unexplained changes are UNKNOWN and block publication. One
-exception rests on timing: a lead Bash command that ran while nothing else could
-change the checkout is recorded as `lead-command` for the lead's unit (see the
+exception rests on timing: a lead Bash command whose armed window stays globally
+quiet is recorded as `lead-command` throughout its reconciliation reach (see the
 Bash contract below and its known limits).
 
 ## Start and discover
@@ -57,7 +59,7 @@ python3 -B -m coordinator rpc run/status '{"checkout":"checkout_…"}'
 
 `run/start.mode` is `native` by default. Use **`"mode":"lead"`** for a lead
 unit without starting a native listener. `task` may be empty to admit an idle
-writer before sending its first message. Each root owns one private listener,
+writer before sending its first message. Each writer owns one private listener,
 one coordinator WebSocket connection and a namespace for its native IDs.
 
 Native writers retain the user's normal CODEX_HOME, provider, MCP configuration
@@ -66,6 +68,269 @@ and unrelated hook trust. C1 passes session flags for approvals `never`, sandbox
 TTY. It validates the effective modes and the start/resume policy echoes.
 Incompatible managed settings cause refusal. This is cooperative coordination
 with full access, not operating-system confinement against arbitrary code.
+
+## Native projects, revisions and selection
+
+Production discovery only calls native `project/list` and `project/read`, with
+the experimental capability enabled. It follows every native list page. It
+never creates or changes native projects, reads a guessed project file, or
+treats discovery failure as an empty list. The adapter matches Codex 0.163.0;
+unknown methods and fields are refused.
+
+```sh
+python3 -B -m coordinator rpc project/list '{}'
+python3 -B -m coordinator rpc project/resolve '{"cwd":"/workspace/Frontend/sub","dispatch_cwd":"/workspace"}'
+python3 -B -m coordinator rpc project/register '{"project":"native-project-id"}'
+python3 -B -m coordinator rpc project/status '{"project":"native-project-id"}'
+python3 -B -m coordinator rpc run/start '{"project":"native-project-id","cwd":"/workspace/Frontend/sub","dispatch_cwd":"/workspace","task":"Implement the change across the project"}'
+```
+
+`project/list` returns native project objects in native order as `data`, with
+`next_cursor:null` after full pagination. `project/resolve` accepts absolute
+`cwd`, optional `dispatch_cwd` and optional explicit `project`; it returns
+`project:{id,name}|null`, `singleton`, and, for a project, `thread_cwd` and ordered
+`runtime_workspace_roots`. `project/register` accepts either `project` or `cwd`
+(and optional `dispatch_cwd`), and returns the activated revision. `project/status`
+returns the active revision, revision history and resumable preparations. These
+methods also accept `fixture` for a validated disposable provider home.
+`project/resolve {registered:true,...}` reuses the complete native catalog saved
+by registration when an active revision covers the target. It otherwise discovers
+live projects. A project result includes `registered`, indicating whether that
+revision is ready for lead attachment. Default resolution remains live discovery.
+
+Selection finds projects whose native roots contain the target cwd. When several
+match, it narrows them using the actual host session folder. Remaining ambiguity
+returns `PROJECT_AMBIGUOUS` with candidate IDs and names. An explicit `project`
+must contain the target. Successful discovery with no candidate keeps the legacy
+singleton path. A Codex binary with neither project method also selects singleton.
+An unavailable coordinator or singleton startup/admission failure before production
+keeps 2.3.5's exec fallback. Once a project is selected, no error falls back.
+An unresolved discovery error refuses before dispatch and never advertises a run
+that does not exist. The host lead hook supplies `dispatch_cwd` from its
+payload; the server does not invent it from its process working directory.
+
+Registration resolves each ordered native root to a canonical Git checkout and
+optional repository-relative prefix. Multiple subdirectory roots may share a
+single checkout participant; duplicate physical directories are refused. An
+outer Git view that owns an inner repository's path is refused with both roots.
+An outer repository that ignores its nested repositories can register normally.
+Non-Git roots, disappearing or replaced identities, submodules, unsupported base
+modes and unsupported paths retain explicit refusals naming the root.
+
+All checkouts are prepared, then native membership and physical identities are
+read again before one SQLite transaction activates an immutable revision and its
+bindings. Interrupted preparation can leave reusable checkout baselines, but no
+usable partial project revision. A changed membership activates a new revision;
+existing units and lead sessions remain pinned to their original participants.
+The shared checkout identity is independent of project identity.
+
+Schema migration **3** adds singleton participant sidecars to legacy units in one
+transaction. It does not rewrite their record revisions, receipt IDs, UNKNOWN
+history, seals or publication journals. In-flight legacy publication keeps its
+original binding format and engine. An actual 2.3.5 reader refuses schema 3 with
+`SCHEMA_VERSION: Unknown ledger migration version`; downgrade is unsupported.
+
+Project admission adds measured project capabilities to singleton admission. Its
+fingerprint includes the native binary, generated experimental schemas, adapter,
+all-root effective config/hook evidence, revision, root order and cwd. Identical
+hook definitions repeated across roots are deduplicated after coverage checks.
+`hooks/list` takes `cwds`; `config/read` is queried with each singular `cwd`.
+Native start receives `projectId` and every `runtimeWorkspaceRoots` entry. Resume
+receives the pinned cwd and roots, **not** a nonexistent resume `projectId` field.
+Effective roots, cwd and persisted project association must match before turns,
+queued delivery or wakes. On 0.163.0, measured child threads inherit roots while
+their own native project association is null; their recorded native ancestry
+keeps them in the parent's unit, and resume checks that observed association.
+
+For operational fixtures, `fixture serve --native-home DIR` accepts a private,
+physical directory beneath the disposable fixture directory. Discovery and all
+writers then use that same native home. Provision projects externally through
+scratch native RPC; production discovery has no project mutation interface.
+
+## Project paths, custody and receipts
+
+String paths are absolute or relative to the actual actor/tool cwd. Lead tools
+use their supplied cwd, including participant subfolders. Explicit qualification
+uses `{"root_id":"checkout_…","path":"repository/relative.txt"}`. The router
+finds the deepest physical Git boundary, including registered non-participants.
+Explicit outer qualification entering an inner repository returns
+`PATH_ROOT_MISMATCH` and its correct root; an ordinary relative path crossing to
+a participating inner repository routes there. Unregistered nested Git boundaries
+and paths outside the unit are refused. Existing symlink, hardlink, case,
+Unicode, `.git` and path-type checks still apply.
+
+Persisted paths remain `(checkout, repository-relative path)`. Claims, reads,
+dependencies, pages and diffs include root identity so two `same.txt` files never
+collide. Existing singleton string arguments and scalar response fields remain.
+`lead-edit` and `operation/prepare` accept a path-to-image map, or a list of
+`{"path":<string or qualified path>,"image":<complete image>}` entries.
+
+A native project patch has one parent invocation and per-checkout parts. Every
+claim and pre-image is reserved before the hook allows execution. All parts must
+pass native lifecycle, post-payload, computed-image, head and custody checks
+before one SQLite transaction writes any receipts. Cross-repository moves bind
+both source deletion and destination creation to the source pre-image. A partial
+or interrupted group is quarantined in every affected checkout, with no successful
+part receipts. Quarantine marks the parent and all parts in one transaction before
+waiting for reconciliation locks. Completion re-reads their durable states inside
+the receipt transaction: a quarantined invocation cannot become verified again.
+Recovery does not grant group authorship retrospectively from
+matching history. Restoring known bytes still requires a new verified edit to
+resolve authorship; it never adopts unexplained bytes.
+
+Opaque commands reserve every participant together, excluding other units'
+existing claims independently in each checkout. Conflicts are rechecked after
+asynchronous process collection. The complete group is reconciled concurrently
+before release; descendants and uncertain process identity retain custody.
+Checkout lifecycle locks are acquired in sorted, deduplicated checkout-ID order,
+then the unit publication lock. Ledger locks protect observations and receipt
+application. Publication order is separate from lock order.
+
+Lead Bash quietness covers all registered checkouts, active writer turns,
+custody, pending operations, lead-hook records and exclusive execution. Durable
+mutation counters retain every operation/custody transition, writer actor update
+and other lead call, including completed work. SQL triggers advance the counters
+atomically with record changes; only the current hook's own revision is subtracted.
+Partial indexes check live occupancy without rescanning finished history. Retained
+exec-lock payload digests and file identities detect writers that already exited.
+Pre/Post reconciliation reaches every checkout in every stored project revision
+containing the target; hidden listings start at arrival, before attachment.
+Observations finish for all roots before the final synchronous quiet check and
+receipt transaction. Quiet-window attribution applies to every checkout in that
+reach, using each checkout's arrival-time hidden listing and excluding its other
+units' claims. Participants already published for the receiving unit are excluded
+at the final receipt check: their later changes become UNKNOWN. Bash Pre lists
+their roots and installed commits, and the host hook explains this before the
+command runs. Writable participants in the same command retain normal attribution.
+Post reports attributed paths per participant. Older-revision
+checkouts outside the current pinned unit use a separate session unit that owns
+them; no existing unit's membership is widened. Exact mediated edits retain
+their stronger evidence. The first arm must arrive within three seconds; retries
+with the same token acknowledge the persisted result without extending or reopening
+the window. Arrival, confirmation and Post are generation-fenced. Recovery clears
+every outstanding Bash window before hooks are admitted, including unarmed calls.
+File-tool refusals that deny execution (`PREFIX_PUBLISHED` and authoritative
+`CLAIM_CONFLICT`) are durably terminal before returning. They leave no live hook
+occupancy. Replaying a denied Pre reevaluates it: an unchanged restriction denies
+again; a cleared restriction permits normal preparation.
+
+Recovery restores canonical ownership and every recoverable participant lease
+before reconnecting listeners. It quarantines interrupted group operations,
+verifies resumed native bindings, and only then advances turns or deliveries.
+
+## Whole-unit review and publication
+
+Project sealing freezes a version-2 vector containing the pinned revision,
+generation, recorded publication order and every participant's identity, branch,
+base, candidate or unchanged marker, provenance, dependencies and validation
+digest. UNKNOWN overlapping mutation scope or recorded reads in any participant
+blocks the whole seal. Unrelated UNKNOWN remains non-blocking. Unchanged
+participants do not manufacture empty commits. `unit/diff` retains a combined
+`diff` and adds root-labelled `participants`; review preparation binds its complete
+digest before inference. Bound `code_review` always starts a fresh independent
+session and rechecks the complete vector when recording the answer.
+
+`unit/seal.publication_order`, when supplied, is a complete permutation of
+participant checkout IDs. The default is native root order deduplicated by
+checkout. Changing the order changes the binding and requires a new review.
+Publication preflights **every** participant, including unchanged ones, before
+any ref update, creates the group/repository journals and owns every required
+index lock first, then publishes in the recorded order. Commits retain the
+existing deterministic metadata and compare-and-swap ref/index recovery.
+The group and unit persist `publication_state:"publishing"` before repository
+publication starts. Every participant's query retains that blocking state through
+the ref-update/checkpoint gap and recovery, including the interval after the last
+repository journal completes but before group finalization.
+
+Git cannot atomically update independent repositories. A completed prefix is
+reported as `publication_state:"partially_published"`, visible from every
+participant, with per-repository phase and commit. Claims remain held until the
+whole group completes. Recovery examines actual refs/commits/indexes to recognize
+a ref installed before its SQLite checkpoint, and repeats idempotently.
+
+If a later base moves, recovery stops and preserves the installed prefix. Use
+`unit/reopen` explicitly, then seal and obtain a new complete-vector review before
+publishing the suffix. Reopen increments the generation, preserves prefix commits
+in the next vector, invalidates old reviews and supersedes only journals proven
+unapplied. Overlapping changed bases require new verified work after reopening;
+there is no silent rebase. Already published participants remain read-only for
+that unit: claims, mediated edits and command custody refuse `PREFIX_PUBLISHED`,
+naming the root and installed commit. Further edits there require a new unit.
+Resealing also refuses if a completed prefix's receipt rows differ from its
+published seal, rather than omitting work recorded by an older implementation.
+This compares the unit's own scoped receipts with the installed vector, not with
+later UNKNOWN heads. Those later bytes remain UNKNOWN and cannot enter the old
+unit's candidate. They do not by themselves prevent its writable remainder from
+being reviewed and published with the original prefix commit preserved. The
+exception is a read dependency: when a writer of the unit recorded a read
+(`read_file`, `list_paths`) of a path whose bytes later became UNKNOWN, the seal
+refuses `UNKNOWN_DEPENDENCY`, as for any UNKNOWN content the unit's work read.
+A participant counts as published from the moment the unit's current
+publication records the unit's commit for it (`commit_created`, which precedes
+the ref update), before any reopen, until `abandon()` proves the ref unmoved or a
+reopen keeps it in the prefix. A lead Bash change there is UNKNOWN, and a lead
+file edit is refused: "already published", or "being published" while the ref
+update may or may not have happened.
+`unit/recover {unit,action:"abandon"}` records explicit
+abandonment with the installed prefix retained. Claim handback is still explicit
+and subject to settled custody; it never erases installed commit evidence.
+
+## Consumer and lead session surfaces
+
+`checkout/query {cwd,session_id}` is observational: it starts no daemon and does
+no registration, native discovery, Git command or reconciliation. Alongside its
+legacy fields it returns `root`, `projects:[{id,name}]`, and every non-complete
+participating publication as `{unit,phase,state,participants:[{root,phase,commit?}]}`.
+Older pinned revisions remain visible. Partial publication survives `fresh:false`
+during recovery. Python 3.9 query clients supply empty defaults for old daemons.
+
+`run/list`, each `run/status` form, and `unit/status` expose `project:{id,name}|null`,
+`participants:[{root,checkout,branch,base,claims,unknown_count,phase,commit?}]`, and
+`publication_state:""|"prepared"|"publishing"|"partially_published"|"complete"`. Legacy scalar
+fields retain their original checkout meaning. `participant_revision` changes
+with membership, claim, UNKNOWN and publication progress; run summaries include
+it in their observable revision. `claim/list {unit}` covers all participants;
+`claim/list {checkout}` keeps the original checkout-global view.
+
+Server lead tools accept `project`, trusted `dispatch_cwd`, and cwd in any
+participant. A supplied `unit` uses its pinned membership. Lead mailboxes are
+identified by **session plus unit**; reading does not acknowledge messages, and
+another session gets another mailbox. Legacy pending messages and acknowledgment
+records are preserved, including the raw RPC's legacy `lead` mailbox.
+Without an explicit unit, `coordinator_inbox(session_id=S)` reads the union of
+S's writer and lead mailboxes. Its acknowledgements check the owning session;
+an explicit unit keeps the original single-mailbox scope. Lead-tool unread
+notices use the same session union. Aggregation changes neither message IDs nor
+recipients and never acknowledges a message by reading it.
+The common lead-tool wrapper carries the caller's session through normal and
+early-return notices, including Abraham completion, `codex_runs`,
+`codex_resume_run`, `codex_cancel_run`, `codex_run_log`, and `code_review`.
+Helpers inherit that call's session context. An explicitly empty session retains
+the legacy `lead` mailbox; another session does not see this session's mail.
+
+Lead tools reuse the registered native catalog instead of spawning native discovery
+or re-registering roots on every call. Explicit `project/register` and each Abraham
+dispatch refresh that catalog and membership. New lead units adopt the active
+revision; existing session units keep their pinned revision until published, or
+until the caller explicitly selects another unit/project. Native ambiguity rules
+still apply to explicit lead tools, including unregistered projects in the catalog.
+
+Host hooks have no project selector. They use only registered revisions, narrowed
+by the session folder, and never start native discovery. One candidate selects
+that project; no candidate or several candidates select a singleton checkout
+unit. An existing matching session unit stays pinned. Selection ambiguity never
+fails a hook. Checkout queries select unfinished publication journals and indexed
+session/participant records before building responses; run lists construct full
+status only for the returned page, rather than every historical run.
+
+These are cooperative guardrails. Writers retain full filesystem/network access;
+project membership is not an OS boundary. Effects outside participants become
+UNKNOWN when that registered checkout is reconciled. A globally quiet window
+does not establish causality against arbitrary external editors anywhere in its
+reconciliation reach. Such an edit during an armed quiet window can be credited
+to the lead. Existing limitations in detecting fully detached, markerless processes
+remain. The push gate's behavior when the coordinator is unreachable is unchanged;
+gate and Office consumer changes are outside P1's write boundary.
 
 ## RPC and C2 contract
 
@@ -104,9 +369,32 @@ including cancelled waiters, and retire after the last caller leaves. Durable
 SQLite idempotency records remain. `daemon/status.locks` exposes the RPC, actor,
 message, checkout and unit registry sizes for diagnosis.
 
+`daemon/status` advertises `capabilities:["draining-stop"]` and a unique `boot`
+for this process start. Automatic replacement can bind `daemon/stop` to
+`expect:{pid,boot}`. A mismatch returns `DAEMON_REPLACED` with the current PID,
+boot and version before entering a drain. The CLI may omit `expect`.
+
+Stop first refuses `NOT_QUIESCENT` with counts under `details.pending` when
+recovery, workflows, writer turns, custody, deliveries, live lead hooks,
+pending operations or mutating RPCs would be interrupted. Publication RPCs are
+also counted separately. This refusal leaves admission unchanged. Otherwise,
+new mutations receive retryable `DAEMON_DRAINING` while admitted requests and
+completion calls finish. RPC settlement has a one-second bound; a timeout returns
+`NOT_QUIESCENT` and immediately resumes admission without cancelling the requests.
+Once settled, the daemon closes admission, detaches listeners and releases leases
+before stopping. Listener identity and settlement safeguards still apply.
+
+Host hooks use three-second client calls within a fourteen-second budget, below
+their fifteen-second host timeout. If a call encounters an unavailable or draining
+daemon while the client's `upgrade.lock` is held, the hook waits for that lock to
+be released and retries once with the same host invocation identity. It reserves
+time for the retry and, for Bash Pre, the arm call. Without a held upgrade lock it
+takes the existing unavailable path immediately. A replacement cannot rearm a
+Bash window that belonged to the retired generation.
+
 | Method | Parameters and result |
 |---|---|
-| `daemon/status` | Optional `checkout`; generation, PID/birth, readiness, writers, tasks, claims, custody, pending requests and messages. |
+| `daemon/status` | Optional `checkout`; generation, PID/birth, `boot`, `capabilities`, `draining`, readiness, version, writers, claims, custody, pending requests and messages. |
 | `checkout/register` | `path`; serializes canonical registration and returns only a ready, complete baseline. Pre-existing dirty bytes are UNKNOWN. |
 | `checkout/reconcile` | `checkout`, optional `paths`; returns new UNKNOWN IDs and scanned count. `resolve_quarantine:true` with a full scan clears a resolved I/O quarantine, never UNKNOWN history. |
 | `checkout/revisions` | `checkout`, optional `path`, `cursor`, `limit`; paginated immutable revision records. |
@@ -129,8 +417,8 @@ message, checkout and unit registry sizes for diagnosis.
 | `unknown/list` | `checkout`, optional `paths`; unresolved UNKNOWNs, context and restoration links. |
 | `unknown/restore` | `actor`, `unknown`, `revision`; restore a known receipt for a path. For checkout-wide `*`, use `revisions:{path:revision_id_or_null}` covering every ledger path. Null is accepted only for baseline absence. |
 | `message/send` | `recipient`, `text`, required `wake:"none|queue|start"`, optional lead `sender`; durable message record. |
-| `message/inbox` | Optional `recipient` (default lead), `cursor`, `limit`; includes total unread count independently of pagination. Reading does not acknowledge or claim context entry. |
-| `message/ack` | `message`; RPC acknowledges only as the lead. Writers acknowledge through native-bound tools. |
+| `message/inbox` | Optional `recipient` (default lead), `cursor`, `limit`, `session_id`; a nonempty session selects all its unit mailboxes. Includes total unread count independently of pagination. Reading does not acknowledge or claim context entry. |
+| `message/ack` | `message`, optional lead `actor` or `session_id`; a session may acknowledge only messages in its own mailboxes. Writers acknowledge through native-bound tools. |
 | `message/wake` | `message`, `wake:"queue|start"`; explicitly wake a pending idle recipient. |
 | `message/retry` | `message`; reconcile native history/queue before an explicitly requested retry of uncertain delivery. |
 | `unit/seal` | `unit`, optional `validation` array; freezes a candidate from verified receipt blobs. |
@@ -140,7 +428,7 @@ message, checkout and unit registry sizes for diagnosis.
 | `unit/reopen` | `unit`; reopen a sealed unit with no publication or only provably abandoned journals, invalidating its review. |
 | `admission/check` | `scratch`, optional `probes`; real native capability observations, never external model inference. |
 | `records/list` | `kind`, optional `cursor`, `limit`; paginated diagnostic records, not a way to adopt changes. |
-| `daemon/stop` | No parameters; refuses active workflow transitions/turns, retained custody, or waking/uncertain message deliveries. |
+| `daemon/stop` | Optional `expect:{pid,boot}`; bound, draining stop. Refuses pending work with `NOT_QUIESCENT` counts; new admissions during drain return retryable `DAEMON_DRAINING`. |
 
 Read every returned page until its cursor is null. Page sizes are not total
 history limits. No successful result means a truncated scan was considered clean.
@@ -203,6 +491,11 @@ Native function tools are `claim`, `release`, `declare`, `send`, `inbox`, `ack`,
 `list_paths` pages known revisions and records those dependencies. They invoke no
 shell, filters, credential helpers or Git hooks. Arbitrary shell strings never
 receive the fixed-reader exemption.
+Project pages use an opaque JSON `[checkout_id, repository_relative_path]`
+cursor, ordered by checkout ID and then path. Indexed SQL applies the cursor and
+limit in each repository, materializing at most the page size plus one row across
+the participants. Checkout metadata is read at most once per root per call.
+Singleton cursors remain plain paths; malformed project cursors refuse `PAGE_CURSOR`.
 
 The fixed Python hook command contains only its program and state-root path.
 Session, child, turn and tool-use identity come from the native payload. C1 calls
@@ -370,7 +663,8 @@ back the branch. Claims release only after complete reconciliation.
 ## Recovery and refusals
 
 Worker generations and attempt generations fence interrupted work. Startup first
-reestablishes canonical checkout ownership, then reconnects registered listeners,
+invalidates outstanding lead Bash windows, reestablishes canonical checkout ownership,
+then reconnects registered listeners,
 initializes/resumes without starting inference,
 pages full history, resolves children lazily, replays durable received evidence,
 checks terminals/processes and reconciles filesystem bytes. It then reconciles
@@ -566,19 +860,25 @@ edit goes ahead unrecorded, so what it wrote reconciles as UNKNOWN. The
 refusal names a full-file Write route. Direct hook observations are not evidence
 of the host's encoding/serialization behavior; see VERIFY.md for coverage.
 
-Bash hooks never run the command again. PreToolUse reconciles the checkout, so
+Bash hooks never run the command again. PreToolUse reconciles the project reach, so
 what changed before the command is not its doing, and records a quiet-window
-fingerprint: None while another lead Bash command in this checkout is still
+fingerprint: None while another lead Bash command in any registered checkout is still
 running (until its host deadline), a writer's turn is active, a patch or edit is
-pending, command custody is active, or an exec write holds the tree. The
-fingerprint covers every writer actor's record and every other lead call's
-record in the checkout, finished ones included, and is taken twice: as the call
-arrives and at the end of Pre. A call that started or ended in between (another
-session's command that wrote an ignored file, a writer's turn) changes it, and
-the window is not opened. The window is **armed** only when the hook received
+pending, command custody is active, or an exec write holds a registered tree. The
+fingerprint binds the daemon generation, durable mutation counters and retained
+exec-lock fingerprints. Finished operations, released custody and completed exec
+writers still change it, without a scan of their history. It is checked at arrival,
+the end of Pre, confirmation, and before Post attribution. A call that started and
+ended in between changes it, and the window is not opened.
+The window is **armed** only when the hook received
 Pre's answer before the host ran the command: the answer carries a one-time
-token and the hook confirms it (`lead-hook/armed`); a hook that gave up waiting
-(its client's 3 s) never confirms, and the command's effects are UNKNOWN. Post
+token and the hook confirms it (`lead-hook/armed`). Losing the initial Pre reply
+(the client's 3 s timeout) means no confirmation and UNKNOWN effects. Losing the
+confirmation reply is different: the arm may already be durable. The hook reports
+`"armed": "uncertain"` in that case, otherwise `true` or `false`; the later Post
+uses the persisted decision. Same-token confirmation retries are idempotent and
+do not extend the deadline. Recovery explicitly clears old windows and tokens;
+their Post is UNKNOWN. Post
 (or Failure) reconciles again: when the window was armed and unchanged at both
 ends, what changed outside other units' claims is recorded as `lead-command` for
 the lead's unit; otherwise it is UNKNOWN. A second completion for the same call
@@ -613,4 +913,4 @@ During recovery available can be true while fresh is false. The CLI exits 0 only
 for fresh coordinated/uncoordinated answers, otherwise 2. Query code never starts
 a daemon, registers a checkout, opens SQLite, calibrates/binds sockets or writes
 a cache. It reports the ledger's current knowledge without filesystem reconcile.
-The existing gate is intentionally unchanged; the lead owns wiring this API in.
+The gate's consumer integration is lead-owned and outside this unit.

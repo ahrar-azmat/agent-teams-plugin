@@ -4,8 +4,9 @@ import re
 import time
 
 from .client import CoordinatorError
-from .publish import Publisher, BINDING
+from .publish import Publisher, BINDING, binding
 from .store import digest, uid
+from . import gitio, routing
 
 
 def verdict(answer):
@@ -30,6 +31,9 @@ def verdict(answer):
 
 
 async def prepare(daemon, params):
+    unit = daemon.store.get(params["unit"])
+    routing.route(daemon.store, dict(unit=unit["id"], checkout=unit["checkout"]), ".",
+                  params.get("target_cwd", params["cwd"]), directory=True)
     result = await Publisher(daemon).diff(params["unit"])
     ident = uid("review_job")
     daemon.store.put("review_job", ident, {"unit": params["unit"], "binding": result["binding"],
@@ -66,10 +70,16 @@ def complete(daemon, params):
             try:
                 unit = daemon.store.get(job["unit"])
                 seal = daemon.store.get(unit.get("seal"), required=False)
-                if unit["state"] != "sealed" or not seal or any(evidence.get(key) != seal[key] for key in BINDING):
+                if unit["state"] != "sealed" or not seal or any(evidence.get(key) != value for key, value in binding(seal).items()):
                     raise CoordinatorError("REVIEW_BINDING", "Saved completion is stale; reseal and obtain a review of the current candidate")
+                if seal.get("binding_version") == 2:
+                    diffs = ["Repository: " + item["root"] + "\n" + (gitio.git(item["root"],
+                        ["diff", "--no-ext-diff", "--no-textconv", item["base"], item["candidate"]]).stdout.decode("utf-8", "strict")
+                        if item["candidate"] else "") for item in seal["vector"]]
+                    if digest("\n".join(diffs)) != job["diff_digest"]:
+                        raise CoordinatorError("REVIEW_DIFF_CHANGED", "Complete candidate diff no longer matches the dispatched review")
                 prior = next((r for r in daemon.store.all("review", job["unit"]) if r.get("valid") is not False
-                    and all(r.get(k) == evidence.get(k) for k in (*BINDING, "answer_digest", "review_identity", "completed", "verdict"))), None)
+                    and all(r.get(k) == evidence.get(k) for k in (*job["binding"], "answer_digest", "review_identity", "completed", "verdict"))), None)
                 recorded = {"review": prior["id"]} if prior else Publisher(daemon).review(job["unit"], evidence)
                 job.update(state="recorded", review=recorded["review"])
             except CoordinatorError as exc:

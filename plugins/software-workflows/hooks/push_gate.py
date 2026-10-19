@@ -268,6 +268,16 @@ COORD_STATUS_NOTE = (
     " (Note: the status of this checkout could not be read ({why}), so this gate "
     "could not check whether the commit takes another writer's files.)"
 )
+# A writer unit spanning several repositories publishes them one after another (2.4.0); until
+# all are done, its committed prefix must not leave the machine alone.
+COORD_PARTIAL_REASON = (
+    "PUSH GATE: a writer unit that spans this repository is being published or is partially published: "
+    "some of its repositories may have its commit, others not yet.{units}\nFinish it first: a "
+    "publication under way completes on its own, and coordinator_unit(action=\"recover\", unit=…) "
+    "continues one that stopped; if a repository's branch moved since the review, "
+    "coordinator_unit(action=\"reopen\", unit=…), seal, review and publish again. Then push. "
+    "No acknowledgement opens this."
+)
 
 # ONE-SHOT ACKNOWLEDGEMENT (round 30). The gate DENIES rather than asks —
 # a hook "ask" is auto-approved in some host permission modes, "deny" is
@@ -829,6 +839,7 @@ def _inspect_tree(cwd):
 
 
 _COMMIT_WORD_RE = re.compile(r"(?i)\bcommit\b")
+_PUSH_WORD_RE = re.compile(r"(?i)\bpush\b")
 COORD_TIMEOUT_S = 0.25  # the coordinator answers from memory; coordinator/query.py's default
 # Reconciling reads and stores each path a commit would take (one fsync per new content);
 # a slow answer falls back to the stored list, with a note.
@@ -940,15 +951,163 @@ def _pathspec_paths(cwd, where, specs):
     return None
 
 
-def _coordinator_query(cwd, session):
+def _coordinator_query(cwd, session, git_common=None):
     """The coordinator's observational answer for `cwd` (../coordinator/query.py,
     Python 3.9, loaded by path under a private package name: it never starts or
     registers anything), or None when its state directory does not exist —
-    the coordinator never ran on this machine."""
+    the coordinator never ran on this machine. With `git_common`, the answer's
+    publications are those of that repository's registered checkouts (2.4.0)."""
     state = os.environ.get("SOFTWARE_WORKFLOWS_STATE") or os.path.expanduser("~/.local/state/software-workflows")
     if not os.path.isdir(state):
         return None
-    return _coordinator_module("query").query_checkout(cwd, session, COORD_TIMEOUT_S)
+    if git_common is None:
+        return _coordinator_module("query").query_checkout(cwd, session, COORD_TIMEOUT_S)
+    return _coordinator_module("query").query_checkout(cwd, session, COORD_TIMEOUT_S, git_common=git_common)
+
+
+def _git_invocation(semantic):
+    """(subcommand, -C directories in order) of ONE plain `git [globals] <subcommand> …`, or None
+    when the text is not one such command or names its repository another way (--git-dir,
+    --work-tree). The git shim decides each real invocation with its exact argv and cwd."""
+    toks = _tokenize(semantic)
+    segs = _segments(toks) if toks is not None else None
+    if not segs or len(segs) != 1 or not segs[0] or segs[0][0].lower() != "git":
+        return None
+    seg, k, chdirs = segs[0], 1, []
+    while k < len(seg) and seg[k].startswith("-"):
+        if seg[k] == "-C" and k + 1 < len(seg):
+            chdirs.append(seg[k + 1])
+        elif seg[k].startswith(("--git-dir", "--work-tree")):
+            return None
+        k += 2 if seg[k] in ("-c", "-C") else 1
+    return (seg[k].lower() if k < len(seg) else ""), chdirs
+
+
+def _same_repository(target, answer):
+    """Whether the checkout the coordinator matched is the repository git works in at `target`
+    (the coordinator answers with the deepest registered checkout containing it). An answer
+    without a root (2.3.x) is taken as matching."""
+    root = answer.get("root")
+    if not root:
+        return True
+    td = _load_treedigest()
+    try:
+        proc = subprocess.run(td.git_argv(target, ("rev-parse", "--show-toplevel")), env=td.git_env(),
+                              capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if proc.returncode:
+        return True
+    top = proc.stdout.decode("utf-8", "surrogateescape").strip()
+    try:
+        return os.path.samefile(top, root)
+    except OSError:
+        return os.path.realpath(top) == os.path.realpath(root)
+
+
+_ROUTING_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_CEILING_DIRECTORIES",
+                 "GIT_DISCOVERY_ACROSS_FILESYSTEM")
+_ROUTING_OPTS = ("-C", "--git-dir", "--work-tree", "--bare")
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# The git shim's exact (folder, repository-selecting options, routing variables) of the invocation it decides.
+_ARGV_ROUTING = None
+
+
+def _routing(opts):
+    """git's repository-selecting global options, as argv, from _git_parse's (option, value) pairs."""
+    out = []
+    for opt, val in opts:
+        if opt in _ROUTING_OPTS:
+            out += [opt] if val is None else [opt, val]
+    return out
+
+
+def _text_routing(semantic):
+    """(options, variables) that select the repository of ONE plain git invocation in the text: its
+    leading VAR=value assignments and its global options, git named or given by path. None otherwise."""
+    toks = _tokenize(semantic)
+    segs = _segments(toks) if toks is not None else None
+    if not segs or len(segs) != 1:
+        return None
+    seg, i, variables = segs[0], 0, {}
+    while i < len(seg) and _ASSIGNMENT_RE.match(seg[i]):
+        name, _, value = seg[i].partition("=")
+        if name in _ROUTING_VARS:
+            variables[name] = value
+        i += 1
+    if i >= len(seg) or os.path.basename(seg[i]) != "git":
+        return None
+    return _routing(_git_parse(seg[i + 1:])[1]), variables
+
+
+def _routed_repository(cwd, options, variables):
+    """(working-tree root or None, absolute common git directory) of the repository git selects from
+    `cwd` with these options and variables, as git itself resolves them, or None when there is none
+    or git cannot say. The common directory is the repository's identity: it need not sit in any
+    working tree (--separate-git-dir, a linked worktree, --git-dir without a work tree)."""
+    env = _load_treedigest().git_env()  # inherited routing is scrubbed; the command's own comes back
+    env.update(variables)
+
+    def ask(*what):
+        try:
+            proc = subprocess.run(["git", *options, "rev-parse", *what], cwd=cwd, env=env,
+                                  capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        out = proc.stdout.decode("utf-8", "surrogateescape").strip()
+        return out if proc.returncode == 0 and out else None
+    common = ask("--path-format=absolute", "--git-common-dir")
+    return None if common is None else (ask("--show-toplevel"), common)
+
+
+def _publishing(p):
+    """Whether a publication entry holds pushes back: being published (a ref may already have moved)
+    or partially published. A participant whose journal is under way, or that has the commit while the
+    unit is not complete, counts whatever the state says."""
+    return p.get("state") in ("publishing", "partially_published") or any(
+        (q.get("phase") or "") not in ("", "complete", "abandoned") or q.get("commit") and p.get("state") != "complete"
+        for q in p.get("participants") or [])
+
+
+def _publication_block(cwd, session, semantic):
+    """A push of a repository in which a writer unit is being published or is partially published is
+    refused: the unit's other repositories may not have its commits yet. No acknowledgement opens it.
+    The repository is the one git selects for the push, resolved by git itself: the shim gives its exact
+    folder, options and environment; the hook reads one plain git invocation from the text, else the
+    folder (the shim then decides each real push). The coordinator matches it by its common git
+    directory, so every registered checkout of that repository counts, wherever its git directory
+    lives. Machines without coordinator state, unregistered repositories and an unavailable
+    coordinator cost nothing."""
+    if _ARGV_ROUTING is not None:
+        start, options, variables = _ARGV_ROUTING
+    else:
+        start, (options, variables) = cwd, _text_routing(semantic) or ([], {})
+        variables = dict({k: os.environ[k] for k in _ROUTING_VARS if k in os.environ}, **variables)
+    resolved = _routed_repository(start, options, variables)
+    if resolved is None:
+        return ""  # no repository: nothing of a unit's to publish
+    top, common = resolved
+    target = top or (os.path.dirname(common) if os.path.basename(common) == ".git" else start)
+    try:
+        answer = _coordinator_query(target, session, common)
+    except Exception:
+        return ""
+    if not answer or not answer.get("available"):
+        return ""
+    if "repository" not in answer:
+        # A coordinator before 2.4.0 matches by folder only: the deepest registered checkout holding
+        # `target` must be the repository git works in there.
+        if answer.get("status") != "coordinated" or not _same_repository(target, answer):
+            return ""
+    partial = [p for p in answer.get("publications") or [] if _publishing(p)]
+    if not partial:
+        return ""
+    units = "".join(
+        "\n- unit " + str(p.get("unit")) + ": " + ", ".join(
+            f"{q.get('root')} {'has it' if q.get('commit') or q.get('phase') == 'complete' else 'not yet' if q.get('phase') else 'unchanged'}"
+            for q in p.get("participants") or [])  # no journal: nothing of the unit's to publish there
+        for p in partial)
+    return COORD_PARTIAL_REASON.format(units=units)
 
 
 def _coordinator_reconcile(checkout, paths):
@@ -990,10 +1149,25 @@ def _coordinator_check(cwd, session, kind, info, semantic, insp):
     # one plain `git [globals] commit …` (_commit_scope reads -C, which _lone_kind's form check does not)
     scope = _commit_scope(semantic) if kind != "push" else None
     certain = kind == "commit" or info.get("form") == "commit" or scope is not None
-    if kind == "push" or (not certain and not _COMMIT_WORD_RE.search(semantic)):
+    # A push, or text naming one that is not one plain git command (an env prefix, a compound
+    # command): checked against the folder's repository here; the git shim checks each real push
+    # with its own argv and folder.
+    call = _git_invocation(semantic) if kind != "push" else None
+    if kind == "push" or scope is None and _PUSH_WORD_RE.search(semantic) and (call is None or call[0] == "push"):
+        blocked = _publication_block(cwd, session, semantic)
+        if blocked or kind == "push":
+            return blocked, ""
+    if not certain and not _COMMIT_WORD_RE.search(semantic):
         return "", ""
+    # The repository the commit records into: its own -C directories, in order, from cwd
+    # (`git -C Smartpay_Backend commit` from the outer folder is the inner repository's commit).
+    target = cwd
+    for d in (scope[2][0] if scope else []):
+        target = os.path.join(target, d)
+    if target != cwd:
+        insp = _inspect_tree(target)
     try:
-        answer = _coordinator_query(cwd, session)
+        answer = _coordinator_query(target, session)
     except Exception as exc:
         return "", COORD_DOWN_NOTE.format(why=f"its client did not load: {type(exc).__name__}")
     if answer is None:
@@ -1007,6 +1181,8 @@ def _coordinator_check(cwd, session, kind, info, semantic, insp):
         return "", COORD_UNSURE_NOTE.format(what="no longer recognises this checkout as the one it registered")
     if answer.get("status") != "coordinated":
         return "", ""
+    if not _same_repository(target, answer):
+        return "", ""  # an unregistered repository inside a registered one: nothing it coordinates
     note = "" if answer.get("fresh") else COORD_UNSURE_NOTE.format(what="is still reconciling after a start")
     if insp.get("lines") is None:
         if not answer.get("unknown") and not any(u.get("unit") != answer.get("own_unit") and u.get("paths")
@@ -1044,7 +1220,7 @@ def _coordinator_check(cwd, session, kind, info, semantic, insp):
         # Content changed since the coordinator last scanned is in no stored list yet.
         try:
             _coordinator_reconcile(answer.get("checkout"), carried)
-            settled, why = _coordinator_query(cwd, session), "its answer after settling was unusable"
+            settled, why = _coordinator_query(target, session), "its answer after settling was unusable"
         except Exception as exc:
             settled, why = None, type(exc).__name__
         # Only a usable answer about the same checkout replaces the first: an unavailable one lists
@@ -2895,6 +3071,8 @@ def _argv_main(real_git, args):
         semantic += cur[k:]
         if any(t.startswith(("--receive-pack", "--upload-pack", "--exec")) for t in cur[k + 1:]):
             direct = False  # transport overrides run a program
+    global _ARGV_ROUTING  # the repository a push publishes: git's own reading of this exact argv and environment
+    _ARGV_ROUTING = (cwd0, _routing(opts), {v: os.environ[v] for v in _ROUTING_VARS if v in os.environ})
     try:
         accepted, reason = _decide(command, cwd, "bash", os.environ.get("CODEX_GATE_TRANSCRIPT", ""),
                                    os.environ.get(ACK_ENV, "").strip(), direct,

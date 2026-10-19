@@ -21,6 +21,11 @@ from .store import digest, uid, fsync_dir
 BINDING = ("repository", "unit", "base", "candidate", "seal", "provenance", "validation_digest")
 
 
+def binding(seal):
+    keys = ("binding_version", "unit", "seal", "project_revision", "generation", "publication_order", "vector", "validation_digest") if seal.get("binding_version") == 2 else BINDING
+    return {key: seal[key] for key in keys}
+
+
 class Publisher:
     def __init__(self, daemon):
         self.daemon, self.store = daemon, daemon.store
@@ -45,7 +50,7 @@ class Publisher:
                 terminals = await connection.call("thread/backgroundTerminals/list", {"threadId": actor["thread"]})
                 if terminals["data"] or terminals.get("nextCursor"):
                     raise CoordinatorError("BACKGROUND_TERMINAL", "Background terminal inventory is not empty")
-        if any(c["unit"] == unit["id"] for c in self.daemon.custody.active(unit["checkout"])):
+        if self.daemon.custody.unit_active(unit["id"]):
             raise CoordinatorError("CUSTODY_HELD", "Command custody has not been reconciled")
         for operation in self.store.all("operation", unit["id"]):
             if allow_quarantined and operation["state"] == "quarantined":
@@ -78,8 +83,11 @@ class Publisher:
                     raise CoordinatorError("UNPUBLISHED_DEPENDENCY", "Operation read an unpublished other-unit revision",
                                            {"unit": row["unit"], "revision": revision})
 
-    async def seal(self, unitid, validation):
+    async def seal(self, unitid, validation, order=None):
         unit = self.store.get(unitid)
+        if unit.get("project_revision"):
+            from .group_publish import GroupPublisher
+            return await GroupPublisher(self.daemon).seal(unitid, validation, order)
         if unit["state"] not in ("open", "sealed"):
             raise CoordinatorError("UNIT_FROZEN", "Unit cannot be sealed in its current state")
         attemptid = uid("seal_attempt")
@@ -115,7 +123,7 @@ class Publisher:
     async def scope_rows(self, unit, seal=None, sealing=False):
         checkout = self.store.get(unit["checkout"])
         self.daemon.ledger.require_owned(checkout)
-        paths = self.daemon.ledger.mutation_scope(unit["id"])
+        paths = self.daemon.ledger.mutation_scope(unit["id"], unit["checkout"])
         if not paths:
             raise CoordinatorError("UNIT_EMPTY", "Unit has no mutation scope")
         await self.daemon.ledger.reconcile(checkout, paths)
@@ -228,8 +236,8 @@ class Publisher:
         if unit["state"] != "sealed":
             raise CoordinatorError("UNIT_NOT_SEALED", "Review evidence requires an immutable seal")
         seal = self.store.get(unit["seal"])
-        for key in BINDING:
-            if evidence.get(key) != seal[key]:
+        for key, value in binding(seal).items():
+            if evidence.get(key) != value:
                 raise CoordinatorError("REVIEW_BINDING", "Review evidence does not match sealed " + key)
         if evidence.get("verdict") != "pass" or evidence.get("completed") is not True or not evidence.get("review_identity"):
             raise CoordinatorError("REVIEW_INCOMPLETE", "A completed, identified passing review is required")
@@ -246,6 +254,9 @@ class Publisher:
         if not unit.get("seal"):
             raise CoordinatorError("UNIT_NOT_SEALED", "Seal before asking for an object review")
         seal, checkout = self.store.get(unit["seal"]), self.store.get(unit["checkout"])
+        if seal.get("binding_version") == 2:
+            from .group_publish import GroupPublisher
+            return await GroupPublisher(self.daemon).diff(unitid)
         result = await asyncio.to_thread(gitio.git, checkout["root"], ["diff", "--no-ext-diff", "--no-textconv", seal["base"], seal["candidate"]])
         return {"binding": {key: seal[key] for key in BINDING}, "diff": result.stdout.decode("utf-8", "strict")}
 
@@ -293,6 +304,9 @@ class Publisher:
 
     async def publish(self, unitid, reviewid, metadata):
         unit = self.store.get(unitid)
+        if unit.get("project_revision"):
+            from .group_publish import GroupPublisher
+            return await GroupPublisher(self.daemon).publish(unitid, reviewid, metadata)
         existing = next((p for p in self.store.all("publication", unitid) if p["phase"] != "abandoned"), None)
         if existing:
             if existing["review"] != reviewid or existing["metadata"] != metadata:
@@ -331,7 +345,8 @@ class Publisher:
 
     async def reconcile(self, publication):
         unit = self.store.get(publication["unit"])
-        seal, checkout = self.store.get(publication["seal"]), self.store.get(unit["checkout"])
+        seal, checkout = self.store.get(publication["seal"]), self.store.get(publication.get("checkout", unit["checkout"]))
+        unit = dict(unit, checkout=checkout["id"])
         if publication["phase"] in ("complete", "abandoned"):
             return publication
         await asyncio.to_thread(self.repository_identity, checkout)
@@ -388,10 +403,11 @@ class Publisher:
             # No await between completion, publication state and claim release.
             async with self.daemon.custody.condition:
                 with self.store.transaction():
-                    unit.update(state="published", commit=publication["commit"])
-                    self.store.save(unit)
+                    if not publication.get("group"):
+                        unit.update(state="published", commit=publication["commit"])
+                        self.store.save(unit)
                     for claim in self.daemon.custody.claims(checkout["id"]):
-                        if claim["unit"] == unit["id"]:
+                        if claim["unit"] == unit["id"] and not publication.get("group"):
                             claim["state"] = "released"
                             self.store.save(claim)
                     publication["phase"] = "complete"
@@ -414,16 +430,16 @@ class Publisher:
             raise CoordinatorError("CHECKOUT_IDENTITY_CHANGED", "Publication repository identity changed; explicit recovery required")
         return metadata
 
-    async def abandon(self, unitid):
+    async def abandon(self, unitid, publication=None):
         """Abandon only a provably unapplied journal, under native ref locks."""
         unit = self.store.get(unitid)
-        publications = [p for p in self.store.all("publication", unitid) if p["phase"] != "abandoned"]
+        publications = [publication] if publication else [p for p in self.store.all("publication", unitid) if p["phase"] != "abandoned"]
         if len(publications) != 1:
             raise CoordinatorError("PUBLICATION_ABANDON", "Exactly one active publication journal is required")
         publication = publications[0]
         if publication["phase"] not in ("prepared", "commit_created"):
             return await self.reconcile(publication)
-        checkout, seal = self.store.get(unit["checkout"]), self.store.get(publication["seal"])
+        checkout, seal = self.store.get(publication.get("checkout", unit["checkout"])), self.store.get(publication["seal"])
         await finish(self.ensure_index_lock(checkout, publication))
         metadata = await asyncio.to_thread(self.repository_identity, checkout)
         if metadata["branch"] != seal["branch"]:

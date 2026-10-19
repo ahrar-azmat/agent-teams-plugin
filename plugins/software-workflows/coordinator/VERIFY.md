@@ -6891,3 +6891,4088 @@ repository. Every run below exited 0.
 | lease_repro.py | `<plugin venv python> -B lease_repro.py <plugin> /private/tmp/swlr both`, then `… cancel` |
 | office_native2.py, drive3.sh | `drive3.sh`: the scenario on `/private/tmp/swon3`, port 8768, driven by `node cdp.mjs <steps>.json` |
 
+
+## 2.4.0
+
+P1 implementation runs, 2026-10-19. Starting checkout HEAD:
+`108d99651fb7ab9f36320a616eca8dc3d6d195eb` (2.3.5), clean working tree.
+All venues below are disposable under `/private/tmp/sw-p1-240`. No real SmartPay
+repository or user native home was opened. No real-model run was used. The native
+backend is `codex-cli 0.163.0`, with the existing loopback Responses fixture
+provider; daemon Python `3.15.0`, compatibility Python `3.9.6`, Git `2.56.0`.
+The 2.3.5 Python source was copied unchanged to `/private/tmp/sw-p1-240/old`
+before edits. No test files or harness were added.
+
+### Model and migration — real legacy state, kill, retry, downgrade
+
+The inline operational session recorded in `legacy-red.log` used the actual
+2.3.5 daemon and `Client.call`, in this order: `checkout/register`,
+`checkout/reconcile` of external `unrelated.txt`, then for each of two lead units
+`run/start`, `lead-edit`, `unit/seal`, `unit/review-record`. The first unit was
+published; the second remained sealed. The review answers in this migration
+setup are explicitly fixture records, not model reviews. Scratch base commits
+were made with `hash-object`/`write-tree`/`commit-tree` plumbing. The checkout
+under implementation was not used as a publication venue.
+
+Invocation: `PYTHONPATH=/private/tmp/sw-p1-240/old CODEX_ORACLE_LOG_DIR=/private/tmp/sw-p1-240/legacy-logs /opt/homebrew/bin/python3.15 -B -`
+(stdin operational commands; complete RPC requests and responses in
+`/private/tmp/sw-p1-240/legacy-red.log`). Exit **0**. Red calls to `project/list`,
+`project/register`, `project/resolve` each returned `METHOD`, "Unknown coordinator
+method". The daemon answered `{"stopping":true}`.
+
+Migration invocation: `PYTHONPATH=plugins/software-workflows /opt/homebrew/bin/python3.15 -B -`.
+An inline fork ran the real `Store('/private/tmp/sw-p1-240/legacy-state')` with a
+scratch-process trace pause immediately before `INSERT INTO migrations VALUES(3,?)`.
+The parent observed SIGSTOP and sent SIGKILL to that exact child. No pause was
+inserted in product source. Parent command exit **0**; killed child signal **9**.
+Output, verbatim from `/private/tmp/sw-p1-240/migration.log`:
+
+```text
+PAUSED True
+KILL_SIGNAL 9
+AFTER_KILL 2 0
+RESTART_SCHEMA 3
+LEGACY_UNCHANGED {'records': True, 'resolutions': True, 'revisions': True, 'unknowns': True}
+```
+
+`AFTER_KILL` is the schema version and participant count before restart. The
+comparison includes complete original record rows (including their revisions)
+for units, seals, publications, reviews and operations, and every row of
+`revisions`, `unknowns`, `resolutions`. Restart added two singleton participants.
+
+Actual downgrade command: `PYTHONPATH=/private/tmp/sw-p1-240/old /opt/homebrew/bin/python3.15 -B -`
+with `Store('/private/tmp/sw-p1-240/legacy-state')`; exit **2**, exact refusal:
+`SCHEMA_VERSION: Unknown ledger migration version`. This is the old reader's own
+message, not a new diagnostic attributed to old software.
+
+Migrated publication invocation:
+`PYTHONPATH=plugins/software-workflows CODEX_ORACLE_LOG_DIR=/private/tmp/sw-p1-240/legacy-logs /opt/homebrew/bin/python3.15 -B -`.
+It started the actual new daemon, invoked `unit/publish` with the saved legacy
+seal/review and original metadata, and stopped the daemon. Exit **0**;
+`/private/tmp/sw-p1-240/legacy-green.log` records phase `complete`, commit
+`c1fe0c2ac54f524f958ee0770859279b2ebb9882`, no unresolved publication paths, then
+`STOP {'stopping': True}`.
+
+### Native projects — red before green, actual engine
+
+Raw 2.3.5 `ProbeListener` invocation:
+`PYTHONPATH=/private/tmp/sw-p1-240/old /opt/homebrew/bin/python3.15 -B -`.
+Exit **0**; complete output `/private/tmp/sw-p1-240/native-red.log`. Requests used
+`unchecked=True` solely to bypass the old adapter, so the negative is a native
+RPC measurement. Experimental off returned native code **-32600** for both
+`project/list` and `project/read`, with `requires experimentalApi capability`.
+After enabling it in the same disposable home, omitted roots returned precisely
+`["/private/tmp/sw-p1-240/native-red/repo"]`. A project start returned both ordered
+roots and its project ID. Resume of the loaded thread with only the sibling
+requested still returned the original two roots. No turn was sent after that
+mismatch. `thread/read` and `SELECT project_id FROM threads WHERE id = ?` in the
+disposable `state_5.sqlite` both returned
+`01a15311-e1f7-7f10-9e13-a03076e8238c`. A new app-server process cold-resumed the
+same thread with both correct roots and the same project. Both processes stopped.
+
+Product admission command (exit **0**):
+
+```sh
+PYTHONPATH=plugins/software-workflows CODEX_ORACLE_LOG_DIR=/private/tmp/sw-p1-240/logs \
+  /opt/homebrew/bin/python3.15 -B -m coordinator --state /private/tmp/sw-p1-240/admission-state \
+  admission --scratch /private/tmp/sw-p1-240/admission --probe projects
+```
+
+Output `/private/tmp/sw-p1-240/admission-projects.log` reports `completed:true`,
+project probe `passed:true`, both negative/positive observations true, adapter
+`PROJECT_THREAD_MISMATCH`, and `no_inference_after_mismatch:true`. Full report:
+`/private/tmp/sw-p1-240/admission/admission_8a3ed51b208045bd88eab9debe4ea23a/report.json`.
+This repeats raw experimental-off refusals and omitted roots before positive
+start, same-process reconnect and new-process cold resume. Fixture child
+`01a15316-bd48-7b73-b0cf-074d5a831cbe` was actually spawned: resume with **no root
+override** returned both parent roots (`inherited:true`). This is runtime
+inheritance evidence, not a schema inference. Mode: approvals `never`, sandbox
+`danger-full-access`, live web configuration, V2 agents enabled. Visual Codex app
+placement and the real user's project listing remain **UNVERIFIED**.
+
+
+### Native child cold resume — final admission
+
+The initial child probe above measured inheritance in the original app-server.
+The final probe also cold-resumed that child in a new process. Command:
+
+```sh
+PYTHONPATH=plugins/software-workflows PYTHONDONTWRITEBYTECODE=1 \
+  /opt/homebrew/bin/python3.15 -B -m coordinator \
+  --state /private/tmp/sw-p1-240/admission-final-state \
+  admission --scratch /private/tmp/sw-p1-240/admission-cold-child --probe projects
+```
+
+Exit **0**; `admission-cold-child.log`, report
+`admission-cold-child/admission_0d1934a5b1884ab8879e15104b153462/report.json`.
+`completed:true`, project `passed:true`. Child
+`01a15357-656c-7262-be22-96afee342d16` inherited both roots; its cold-resume result
+contained those same roots. Both its original and cold native `projectId` were
+**null**. This measured 0.163.0 behavior required recording the child's own
+association separately from its ancestry-backed coordinator unit. The coordinator
+does not invent a child project association or a `projectId` resume parameter.
+An earlier `admission-final.log` reused an already-running daemon and therefore
+was not evidence for the newly added cold-child probe; the final command above
+used a fresh daemon. These runs used only the fixture provider.
+
+### Registration, physical identity, revisions and selection
+
+Venue: `repos/` and `project-state/` beneath `/private/tmp/sw-p1-240`; native home
+`fx/native`, shared with fixture writers. Native projects were provisioned by
+external scratch `project/create` RPCs. Production coordinator code only reads
+projects. Operational invocation: `PYTHONPATH=plugins/software-workflows
+PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.15 -B -` (inline `Client.call`
+requests). `registration.log` exit **0** records the following order:
+
+| Request / deliberate negative | Actual response |
+| --- | --- |
+| `project/register` for outer tracking `Inner/a.txt` | `PROJECT_OWNERSHIP`, roots `repos/badouter` and `repos/badouter/Inner`, path `Inner/a.txt` |
+| Non-Git native root | `PROJECT_ROOT_NOT_GIT`, root `repos/nongit` |
+| Tracked symlink in base | `BASE_TYPE`, path `link`, root `repos/unsupported` |
+| Ignored-inner SmartPay shape, one registration | Immutable revision `project_revision_1b61e5de27446d3af5ace3720dd73de9fe82baccee4dac51646f4bbf84a3eb99`, three checkout bindings |
+| Overlapping Frontend project | Reused `checkout_c10c0a4bab39478480c50c6ce13f6782` |
+| Backend plus Backend/sub native roots | Two bindings, one checkout ID `checkout_c72fb28a3d9b418cb87040d9ceefcd51`; prefixes `""` and `"sub"` |
+
+The two selection requests were:
+
+```json
+{"cwd":"/private/tmp/sw-p1-240/repos/outer/Frontend/sub","dispatch_cwd":"/private/tmp/sw-p1-240/repos/outer"}
+{"cwd":"/private/tmp/sw-p1-240/repos/outer/Frontend/sub","dispatch_cwd":"/private/tmp/sw-p1-240/repos/outer/Frontend"}
+```
+
+The first returned SmartPay project `01a15317-8363-7071-b4cc-62fa062d19a0`,
+`singleton:false`, thread cwd `repos/outer/Frontend`, and all three ordered roots.
+The second returned `PROJECT_AMBIGUOUS` naming both SmartPay and Frontend
+(`01a15317-8363-7071-b4cc-63051259a25c`). The daemon stopped successfully.
+
+`registration-extra.log`, inline operational command, exit **0**, extended this:
+
+- The actual native engine first refused duplicate physical roots with **-32602**,
+  `duplicate resolved project root`. That native refusal is not falsely labelled
+  as coordinator `PROJECT_DUPLICATE_ROOT` evidence.
+- A scratch-only process trace paused `Projects.register` immediately before its
+  final `project/read`. SIGKILL **9** left two prepared checkouts and one preparation,
+  **zero project/revision records**. The in-flight client reported `RPC_UNCERTAIN`.
+  Restart activated revision `project_revision_34a29753441a154bbe50087c44f42b49f2b305e20fdf686bfec0f3668584e3a9`
+  using the same checkout IDs.
+- Unit `unit_a15a7a1199ab43fc9f328f2fdc3dab48` retained that two-participant revision
+  after native membership added Three and registration activated
+  `project_revision_10cbaf6544bfcad61506b1b683fd1a0ec6074773f61d459f5b592d2671b58aba`.
+  New membership had three participants; the old unit still had two.
+- Temporarily moving Three produced `PROJECT_ROOT_NOT_GIT`; restoring it returned
+  the existing active revision.
+- External provisioning added 101 pagination projects. `project/list` returned
+  **109 total projects**, including all 101 names, `next_cursor:null`. No artificial
+  project-count cap was applied. All setup app-servers and the worker exited **0**.
+
+`registration-final.log`, exit **0**, used fresh One/Two/Three repositories and
+project `01a15362-beb6-71e2-82c2-d7b367778121`. After native creation with distinct
+roots, Two was temporarily replaced with an alias to One. The coordinator now
+returned **`PROJECT_DUPLICATE_ROOT`**, naming both roots. Restoring Two activated
+`project_revision_b609881971f454204aed966d40cff36d8f53fcde6f23fe1d0a65b7d1e5d366df`.
+Replacing Two with a newly initialized repository returned **`CHECKOUT_IDENTITY_CHANGED`**;
+restoring its original directory retained the same active revision.
+
+For the concurrent membership negative, the worker paused before its final native
+read; an independent native `project/update` added Three; then SIGCONT resumed the
+worker. Registration returned **`PROJECT_CHANGED`** with both snapshots. The old
+active revision remained usable, and the failed preparation was `incomplete`.
+A new registration activated
+`project_revision_4ef8f0fffc78b8ccbd9ebdae2f4515de60996683747d3f5b0e5dde2954975ea0`
+with three bindings. Every native process and worker stopped with exit **0**.
+The exact inline registration command is preserved below.
+
+### Routed operations — negatives, native patch and move
+
+`operations2.log`, exit **0**, uses `project-state`, the three `repos/outer` roots,
+fixture provider `fx`, and actual 0.163.0 native turns in full-access mode. The
+negative requests preceded the native patch:
+
+```json
+{"actor":"actor_0483fc0bdf4947c4ba96744a8c700e03","paths":[{"root_id":"checkout_eac48d8e1c5f439aa77f8d5e5a4f5630","path":"Backend/same.txt"}]}
+{"actor":"actor_0483fc0bdf4947c4ba96744a8c700e03","paths":["/private/tmp/sw-p1-240/repos/outside/same.txt"]}
+```
+
+`claim/acquire` returned `PATH_ROOT_MISMATCH` naming Backend's checkout, then
+`PATH_ESCAPE` naming the registered outside checkout and every participant.
+The subsequent native request was:
+
+```json
+{"project":"01a15317-8363-7071-b4cc-62fa062d19a0","cwd":"/private/tmp/sw-p1-240/repos/outer/Frontend/sub","mode":"native","fixture":"/private/tmp/sw-p1-240/fx","task":"P1_PATCH"}
+```
+
+Unit `unit_295091ed43734a99beaee549dc9d3aef` received one native patch updating both
+Backend/same.txt and Frontend/same.txt, then a cross-repository move from
+Backend/move.txt to Frontend/moved.txt. Durable operation records contain the
+native call/turn/thread identity, both hook completions, post payload, per-part
+pre-images, computed images and native `fileChange` endpoints. All four resulting
+file revisions were `exact`, including source deletion and destination creation
+for the move. Claims/results are qualified by checkout despite identical names.
+The complete RPC/operation output remains in `operations2.log`. The first attempt
+(`operations.log`, exit **1**) reached a recovering daemon and was retried; it was
+not counted as native patch evidence.
+
+The shared-checkout claim negative was also exercised through the actual MCP
+server in `integration2.log` and `integration3.log`: a unit of the separate
+Frontend project attempted the already-claimed Frontend path and received
+`CLAIM_CONFLICT` identifying the SmartPay unit. That refusal was checked before
+sealing/review.
+
+`atomic-extra.log`, exit **0**, added the partial-application negative with real
+`operation/prepare` / `operation/complete`: two `a.txt` images were prepared, but
+only One's bytes were installed. Completion returned **`POSTIMAGE_MISMATCH`**;
+the exact-receipt count was **0**, and both affected checkouts had UNKNOWN records.
+Restoring each known baseline returned `restored_requires_new_edit`. A subsequent
+complete mediated edit returned `verified`. Restoring bytes alone was not counted
+as authorship. The same session later exercised publication guards below.
+
+A final real router invocation exposed a variable-shadowing defect: passing the
+checkout root as a file path returned `{"path":"","key":""}`. After renaming the
+ancestor-loop variable, `routing-root-final.log` (exit **0**) records:
+
+```text
+ROOT_PATH False GIT_STATE the lead records; Git metadata is not a writer path
+ROOT_PATH True {'path': '', 'key': '', 'checkout': 'checkout_de2307d5fe1c405aafecc720948a3272', 'root': '/private/tmp/sw-p1-240/registration-extra/One'}
+```
+
+The second call explicitly requested directory scope, as server participant-cwd
+validation requires. This was a direct operational router call against scratch
+state, not a native inference claim.
+
+### Global lead windows and recovery — actual red, then green
+
+The old `108d996` export ran the A-writer/B-lead race before the quietness fix.
+`race-red2.log` exited **0** and recorded B's concurrent writer-caused bytes as
+`lead-command` (revision `rev_d350…`). This is the deliberately unsafe red result.
+The same operational scenario against P1 (`race-green2.log`) refused arming and
+returned `UNKNOWN-context-only`, with UNKNOWN in B and no lead-command receipt.
+Its initial orchestration exited **1** only because stop was requested while
+custody was still settling; the subsequent operational check observed completed
+run, zero custody and `{"stopping":true}`, exit **0**. `race-red.log` and
+`race-green.log` were earlier setup attempts, not accepted race evidence.
+
+`project-windows3.log`, exit **0**, ran repeated actual lead Pre/arm/Post calls
+against the registered publication project. In two quiet windows the target
+same.txt received `lead-command`; concurrently introduced Frontend sibling files
+received UNKNOWN (`unknown_66cb…` and `unknown_2438…`). Pre took **68.8/67.4 ms**;
+Post **63.9/65.7 ms**. A second lead call starting and finishing in another root
+inside the first window invalidated the first window; its target became UNKNOWN.
+Completed calls remain in the global revision fingerprint.
+`project-windows.log` failed startup/runtime allocation and `project-windows2.log`
+had an inline path-construction error (both exit **1**); neither was counted as a
+successful window. The interrupted record was handled before the accepted run.
+
+The native cross-root crash uncovered and fixed a substantive recovery bug:
+
+| Run | Actual crash / outcome |
+| --- | --- |
+| `patch-crash.log`, exit **1** | Direct worker lacked native supervisor custody; no accepted patch run. |
+| `patch-crash2.log`, orchestration exit **0**, **semantic RED** | SIGKILL immediately before the receipt transaction, after both actual files changed. Recovery incorrectly replayed native history into two exact receipts. Script exit alone did not establish correctness. |
+| `patch-crash3.log`, exit **0**, accepted | The same interruption after adding the all-group recovery quarantine barrier: parent and both parts quarantined, **zero receipts**, both path claims held, UNKNOWN in Backend and Frontend. |
+
+Accepted unit: `unit_b855abd2b62646b4832e6fd389d6d37e`; parent
+`op_7cecba7e518a40b88f74ffd347e5b4f7`. The exact pause was `operations.verify`,
+immediately before `with ledger.store.transaction()` (line 125 at the run).
+Worker **88770**, birth `1792399243:85192`, was verified before SIGKILL. Both actual
+files contained the fixture's changed bytes. The actual supervisor recovered
+worker **90628**, generation **2**. Before and after restart:
+
+```text
+RECEIPTS []
+CLAIMS [('checkout_5a1dd23333de41c58e84bb688799bd52', 'same.txt', 'held'),
+        ('checkout_1a3ac2e930d24faca64f2a8cf1462b65', 'same.txt', 'held')]
+```
+
+After restart, Backend UNKNOWN included
+`unknown_238fb5f439064ca7bab76f3ac901e295` and
+`unknown_813f92b07ed048f3859929a20c2544c5`; Frontend included
+`unknown_61c8a708d72e4b1c96cbee23019a6b11` and
+`unknown_2711ead8d0cc41cf87a0dd67529966ba`. The unchanged outer checkout had none.
+Provider: **2 requests, errors `[]`**. Worker/supervisor shutdown completed with
+exit **0**. This measures retained patch claims and supervisor lease coverage;
+no opaque command was executing in this particular patch-crash scenario.
+
+Scratch-only trace pauses were supplied in the child process, never product
+source. Python emitted its multithreaded-fork deprecation warning in this run;
+the accepted process identities, actual writes, signal, restart and ledger
+results were still measured, rather than inferred from the warning or script exit.
+
+### Scan timing and arming deadline
+
+`latency-shape.log`, exit **0**, used newly generated scratch repositories whose
+actual Git views had **57, 1,291 and 1,495** paths. These are synthetic size-matched
+repositories, not copies or inspections of real SmartPay. Registration took
+**3,777.0 ms**. An arm after **3.1 s** returned `{"armed":false}` and Post returned
+`UNKNOWN-context-only`. Three subsequent normal windows reported:
+
+| Window | Pre ms | Post ms | Arm | Attribution |
+| --- | ---: | ---: | --- | --- |
+| 1 | 380.7 | 372.6 | true | lead-command |
+| 2 | 383.7 | 389.7 | true | lead-command |
+| 3 | 383.7 | 379.7 | true | lead-command |
+
+Each response reported all three scan counts `[1291,57,1495]`. Setup app-server
+exit **0**, daemon stop successful. No timing claim is made for real SmartPay or
+for external clones not read during this run.
+
+### Complete-vector publication, preflight and actual ref/checkpoint crashes
+
+`publication.log`, exit **0**, first introduced overlapping UNKNOWN in participant
+2. Whole-unit sealing refused; no participant ref moved. Restore plus a new exact
+edit allowed a version-2 seal with outer unchanged and Backend/Frontend candidates.
+A foreign Frontend index lock returned `INDEX_LOCKED` before any ref update.
+Removing that owned scratch obstruction allowed group completion: two repository
+commits, no manufactured outer empty commit. Reviews in this low-level publication
+session were explicitly labelled fixture records, not independent model reviews.
+The actual independent server review is recorded separately below.
+
+`publication-crash4.log`, exit **0**, used real repository journals and real Git
+refs. A scratch process trace paused `Publisher.reconcile` **after** successful
+`git update-ref` and immediately **before** assigning `phase="ref_updated"` in
+SQLite. The stored journal was still `commit_created`; the printed actual ref
+already held the deterministic commit. The exact child birth was checked before
+SIGKILL **9**. The in-flight publish client reported `RPC_UNCERTAIN`.
+
+For the unchanged-suffix case, recovery recognized the installed prefix, repaired
+its index, finished the suffix, and a second restart produced the same tips:
+
+```text
+Backend  c06f3323b9cffcc79bc8ef1050aff554a6b5862b
+Frontend 36dc4d2822bc09e0257d8c675974ef0b57ed5190
+UNCHANGED True
+publication_state complete
+```
+
+For the moved-base case, unit `unit_eb5fefe6365f4e2c9dadfdf3a6165613` installed
+Backend prefix **`b11ef265ba8e9b56e51f7c470b817c045007d042`** before the kill.
+While the worker was down, external scratch Git plumbing advanced Frontend from
+`36dc4d2822bc09e0257d8c675974ef0b57ed5190` to
+`84c147e0259216cefdc337dc0d1e7ccc6fc1229a` with a non-overlapping external.txt change.
+Restart stopped with `publication_state:"partially_published"`, kept both claims,
+and both Backend and Frontend `checkout/query` responses exposed:
+
+```json
+{"phase":"partially_published","state":"partially_published","participants":[
+  {"root":"/private/tmp/sw-p1-240/pubrepos","phase":""},
+  {"root":"/private/tmp/sw-p1-240/pubrepos/Backend","phase":"complete","commit":"b11ef265ba8e9b56e51f7c470b817c045007d042"},
+  {"root":"/private/tmp/sw-p1-240/pubrepos/Frontend","phase":"prepared"}
+]}
+```
+
+Old continuation returned **`STALE_BASE`**. Explicit `unit/reopen` made generation
+**2**, preserving the Backend commit in `published_prefix`. The new seal preserved
+that prefix and froze the new suffix base. Publication using the old review
+returned **`REVIEW_BINDING`**. A new complete-vector fixture review allowed suffix
+commit **`db5e5b833b4d8330e461c053d82459c070e74820`**; another restart left both tips
+unchanged. Every worker stopped with exit **0**. Earlier publication-crash attempts
+1–3 failed scratch setup/ownership/native-idempotency/review-digest setup and are
+not substituted for this accepted real ref/checkpoint run.
+
+`atomic-extra.log`, exit **0**, then tested **unchanged-participant preflight**:
+Three was explicitly unchanged in the seal; its foreign index lock still returned
+`INDEX_LOCKED`. Output: `NO_REFS_AFTER_LOCK True`. Changing Two's frozen bytes
+returned `UNKNOWN_BLOCKS_PUBLICATION`; `NO_REFS_AFTER_BYTES True`. Explicit reopen,
+restore and a new exact edit invalidated the old review (`REVIEW_BINDING`). New
+review publication completed group `publication_group_25a4032207c1457a84bb5826c80bb28b`.
+
+### Actual MCP server dispatch, lead tools and independent vector review
+
+The real launcher was prepared with the existing requirements:
+
+```sh
+CLAUDE_PLUGIN_DATA=/private/tmp/sw-p1-240/plugin-data \
+  CODEX_ORACLE_PYTHON=/opt/homebrew/bin/python3.15 \
+  /opt/homebrew/bin/python3.15 -B plugins/software-workflows/run_server.py --prepare
+```
+
+Exit **0** (`server-prepare.log`). MCP sessions used its actual scratch venv,
+`/private/tmp/sw-p1-240/plugin-data/venv/91e1e736a04fad0e/bin/python`, and launched
+`run_server.py` over stdio. No user plugin-data or configuration directory was
+used. `integration2.log` and `integration3.log` each exited **0**, using fresh
+scratch repositories, state and native home. Requests went through real `abraham`,
+lead tools and `code_review`; all inference was the existing loopback fixture.
+
+Measured behavior:
+
+- Frontend target plus Frontend dispatch returned `PROJECT_AMBIGUOUS`; an invalid
+  explicit native project returned a refusal. Neither became exec fallback.
+- Frontend/sub target plus outer dispatch selected the complete project and chose
+  Frontend as native thread cwd. All three ordered runtime roots were returned.
+- A real `/bin/sleep 2` writer command held **three** participant custody records.
+  Its following native patch initially failed in `integration.log`: one part of
+  command custody was still held when the next hook arrived. That was a semantic
+  failure despite orchestration exit **0**. Group settlement was fixed and the
+  next patch hook now settles the preceding group before requesting path claims.
+  Both accepted runs then produced exact Backend and Frontend patch receipts.
+- A separate overlapping Frontend project could not claim the shared path:
+  `CLAIM_CONFLICT` named its existing holder. Claim lists included checkout/root.
+- Lead tools accepted participant subfolders. A deliberately non-Git outside cwd
+  returned `CHECKOUT_ROOT`; this particular request was not a `UNIT_SCOPE` probe.
+- `coordinator_send`/`coordinator_inbox` used session-plus-unit lead mailboxes.
+  Another session's inbox was empty; the owning session received and explicitly
+  acknowledged its message.
+- `unit/diff` and bound `code_review` included every vector participant. The review
+  ran in a **fresh independent native session**, returned a passing fixture answer,
+  and recorded the complete binding/diff digest. It did not reuse the writer's
+  thread. Review inference was local fixture inference, not a real-model judgment.
+- `checkout/query`, `run/list`, each exercised `run/status` form, and `unit/status`
+  were requested from the participant roots and included project, participant and
+  publication fields. Queries included older pinned revision membership.
+
+`integration3.log` added actual native dynamic `read_file` calls to outer/same.txt
+and Backend/same.txt. Their durable read records had different checkout and
+revision IDs. An external change to the outer read dependency caused sealing to
+refuse **`UNKNOWN_DEPENDENCY`**. After restore and a new exact edit, complete-vector
+sealing and the independent review succeeded. Its fixture recorded **7 requests,
+errors `[]`**; integration2 recorded **5 requests, errors `[]`**. Both stopped their
+daemon and server. The exact integration command and request calls are below.
+
+### Existing regression drivers and final settlement correction
+
+The supplied drivers were not edited or copied into the repository. Their path
+prefix is:
+
+```text
+/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad
+```
+
+Actual command forms (each case had a new scratch directory):
+
+```sh
+/opt/homebrew/bin/python3.15 -B "$S/projects/r11_ledger.py" "$PLUGIN" "$VENUE" "$CASE"
+/opt/homebrew/bin/python3.15 -B "$S/projects/r11_promote.py" "$PLUGIN" "$VENUE"
+/opt/homebrew/bin/python3.15 -B "$S/projects/r12_checks.py" "$PLUGIN" "$VENUE"
+HOOK_PY=/usr/bin/python3 /opt/homebrew/bin/python3.15 -B "$S/projects/r13_checks.py" "$CALIBRATION" "$VENUE" "$CASE"
+HOOK_PY=/usr/bin/python3 /opt/homebrew/bin/python3.15 -B "$S/projects/r14_checks.py" "$CALIBRATION" "$VENUE" "$CASE"
+```
+
+`PLUGIN` was this checkout's `plugins/software-workflows`. `CALIBRATION` was a
+scratch export of this implementation with **only** the marked `R13PAUSE_BEFORE`,
+`R14PAUSE_ATTACH`, `R13PAUSE_AFTER` blocks copied from the supplied fixed14p source
+at equivalent points. No pause was added to this checkout. Final r13/r14 command
+arguments and exits are in `/private/tmp/sw-p1-240/regression-final.log`.
+
+| Existing driver / case | Exit | Actual result / log |
+| --- | ---: | --- |
+| r11_ledger refresh | 0 | 20,000-path refresh detected deletion; `r11_ledger-refresh.log` |
+| r11_ledger folder | 0 | Tracked file-to-directory handling; `r11_ledger-folder.log` |
+| r11_ledger submodule | 0 | Explicit unsupported submodule refusal; `r11_ledger-submodule.log` |
+| r11_ledger uncached | 0 | Uncached path handling; `r11_ledger-uncached.log` |
+| r11_ledger stall | 0 | `GIT_TIMEOUT`, stalled Git process gone; `r11_ledger-stall.log` |
+| r11_ledger killed | 0 | Interrupted baseline retried; `r11_ledger-killed.log` |
+| r11_promote | 0 | `r11_promote-all.log` |
+| r12_checks | 0 | `r12_checks-all.log` |
+| r13 pause-after, pause-before, alias, collapsed | 0 each | Initial runs and latest `final-r13_checks-*.log` |
+| r14 reappear, overlap, pathmagic, control | 0 each | Initial runs and latest `final-r14_checks-*.log` |
+| lead_bash2.py | 0 | Latest `last-lead_bash2.log`: active writer/conflicting scope UNKNOWN, idle quiet command lead-command |
+| lead_bash3.py | 0 | `last-lead_bash3.log`: overlapping windows UNKNOWN; alone lead-command; duplicate completion UNKNOWN |
+| lead_hooks_edge.py | 0 | `last-lead_hooks_edge.log`: claim conflict replay; notebook adapter refusal; UNKNOWN notebook |
+| settle_check.py accepted rerun | 0 | `settle-retry-final.log`: SLEEP 27.7 s including admission; MARKED 10.1 s; ESCAPE 2.1 s; all completed, custody 0 |
+
+The m3 drivers were executed with the scratch plugin venv. An in-memory source
+substitution changed their hardcoded user plugin-data directory to the disposable
+one above; applicable hook subprocesses used `HOOK_PY=/usr/bin/python3`. The
+lead_bash3 driver's 400-character response truncation was removed in memory so its
+JSON parser could accept the new additive response fields. This is a driver
+compatibility adjustment, not a product response truncation. Its initial unadjusted
+run exited **1**. The first lead_bash2 attempt was interrupted (**130**) after it
+exposed a new custody-record `_kind` bug; that bug was fixed and repeated actual
+runs completed. Logs retain these failures.
+
+The last pre-fix `settle_check.py` orchestration exited **0**, but its ESCAPE case
+was **not green**: 300.9 s, cancelled, `PENDING_HOOK`. SQLite showed the real cause:
+OS process baseline inspection returned `PROCESS_UNREADABLE` for PID 3365; the
+native hook correctly denied the command, but its durable custody request stayed
+`waiting`. The final acquisition cleanup marks an ungranted request `interrupted`
+on failure or cancellation. A new complete driver run produced the accepted
+results above, **9 provider requests, errors `[]`, stop successful**.
+
+An additional actual in-process custody cancellation against the scratch ledger
+(`custody-cancel-final.log`, command exit **0**) held one reservation, began a
+conflicting acquisition and cancelled that waiting task. Output:
+
+```text
+WAITING [('custody_66a3247a3fee49c8b6f4d93cee153dce_request', 'waiting')]
+CANCELLED True
+AFTER_CANCEL [('custody_66a3247a3fee49c8b6f4d93cee153dce_request', 'interrupted')]
+NO_PARTIAL_RESERVATIONS []
+OBSERVABLE_REVISION 2 3 4
+```
+
+The last line is the unit surface revision before claim, after acquisition and
+after explicit handback. No shell command was executed by that reservation-only
+check. In the accepted native ESCAPE run, a fully detached markerless `/bin/sleep 8`
+was still alive when custody released at 2.1 s. That is the previously documented
+full-access guardrail limitation, not a claim of descendant containment.
+
+### Overlapping moved suffix — final recovery run
+
+`publication-overlap-final.log` exited **0**, with the same actual ref/checkpoint
+SIGKILL boundary as above. This time the independent suffix commit changed
+**same.txt**, overlapping the unit's work. The Frontend base moved to
+`058d768d30a7dd9e0354560cf980f6e3eaa40db9`. Recovery preserved the Backend prefix.
+Old continuation returned `STALE_BASE`; after explicit reopen, sealing returned:
+
+```text
+OVERLAPPING_BASE_RED BASE_SCOPE_CHANGED {'path': 'same.txt', 'root': '/private/tmp/sw-p1-240/pubrepos/Frontend'}
+EXPLICIT_SUFFIX_INDEX_ALIGNED_TO_NEW_BASE fce12a480b061fd0d2cc7e0d7ae9c4bbb3357eae
+FRESH_VERIFIED_SUFFIX verified
+OLD_REVIEW REVIEW_BINDING
+```
+
+The operator explicitly aligned the disposable suffix index with its externally
+changed base, then made a new mediated suffix edit. This action is recorded; it
+was not an automatic rebase by publication. The new vector and new fixture review
+completed group `publication_group_9e1d065f089940eeb432e8b8236109e1`. A second restart
+left these exact tips unchanged:
+
+```text
+Backend  bbc2d7a32b6c1167f084a7600db7e2852d17555f
+Frontend 27f00af373e66373d4cb0bc9dc24e01a6ea8b7cb
+UNCHANGED True
+```
+
+Both workers stopped with exit **0**. The unchanged Backend commit is the installed
+prefix, not a second commit manufactured during resealing.
+
+### Inline operational command bodies
+
+The following are the actual program bodies supplied inline to Python (`-B -`
+or `-B -c`), retained here so the requests, crash locations and inspection queries
+are reviewable without adding a script or harness file. The process prefix was
+`PYTHONPATH=plugins/software-workflows PYTHONDONTWRITEBYTECODE=1`.
+Use `/opt/homebrew/bin/python3.15` for coordinator-only bodies; the MCP integration
+and native patch-crash bodies used
+`/private/tmp/sw-p1-240/plugin-data/venv/91e1e736a04fad0e/bin/python`.
+Publication bodies used
+`SOFTWARE_WORKFLOWS_RUNTIME=/private/tmp/sw-p1-240/pub-rt`.
+All logs named below are beneath `/private/tmp/sw-p1-240`; accepted exits are **0**.
+
+These are execution transcripts, not idempotent scripts to run again against the
+same directories. A repeat must use fresh disposable directories and provision
+its own native fixture projects. No native project mutation was added to the
+production coordinator.
+
+<details>
+<summary>Registration interruption, membership pinning and pagination — registration-extra.log</summary>
+
+```python
+import asyncio,concurrent.futures,json,os,signal,sqlite3,sys,time
+from pathlib import Path
+from coordinator import gitio,native,processes
+from coordinator.client import Client,CoordinatorError
+from coordinator.daemon import worker
+w=Path('/private/tmp/sw-p1-240/registration-extra');w.mkdir(mode=0o700);state=w/'state';fixture=Path('/private/tmp/sw-p1-240/fx');home=fixture/'native'
+roots=[w/'One',w/'Two',w/'Three']
+for root in roots:
+ root.mkdir();gitio.git(root,['init','-q']);(root/'a.txt').write_text('base\n');gitio.git(root,['add','--','a.txt'])
+ tip=gitio.text(root,['commit-tree',gitio.text(root,['write-tree'])],data=b'base\n',extra_env={'GIT_AUTHOR_NAME':'Scratch','GIT_AUTHOR_EMAIL':'scratch@invalid','GIT_COMMITTER_NAME':'Scratch','GIT_COMMITTER_EMAIL':'scratch@invalid'});gitio.git(root,['update-ref','HEAD',tip])
+alias=w/'Alias';alias.symlink_to(roots[0],target_is_directory=True)
+async def native_calls(calls):
+ p=await asyncio.create_subprocess_exec(native.native_codex(),'app-server','--listen','stdio://',env=native.environment(CODEX_HOME=str(home)),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+ async def rpc(i,m,a):
+  p.stdin.write((json.dumps({'id':i,'method':m,'params':a})+'\n').encode());await p.stdin.drain()
+  while True:
+   r=json.loads(await p.stdout.readline())
+   if r.get('id')==i:return r
+ try:
+  await rpc(1,'initialize',{'clientInfo':{'name':'P1-scratch-registration','version':'1'},'capabilities':{'experimentalApi':True}});p.stdin.write(b'{"method":"initialized"}\n');await p.stdin.drain()
+  return [await rpc(i,m,a) for i,(m,a) in enumerate(calls,2)]
+ finally:p.stdin.close();print('NATIVE_EXIT',await p.wait(),flush=True)
+def create(name,paths):return ('project/create',{'name':name,'roots':[{'path':str(p)} for p in paths],'metadata':{},'idempotencyKey':str(w)+name})
+created=asyncio.run(native_calls([create('Interrupted',[*roots[:2]]),create('Duplicate physical',[roots[0],alias])]))
+print('PROVISION',json.dumps(created),flush=True);project=created[0]['result']['project']['id'];duplicate=created[1].get('result',{}).get('project',{}).get('id')
+client=Client(state,timeout=120);pid=None;marker=w/'prepared.json';source=Path('plugins/software-workflows/coordinator/projects.py').resolve();line=next(i for i,s in enumerate(source.read_text().splitlines(),1) if 'final = snapshot(' in s)
+def start(pause=False):
+ global pid
+ pid=os.fork()
+ if pid==0:
+  if pause:
+   def trace(frame,event,arg):
+    if frame.f_code.co_filename==str(source):
+     if event=='line' and frame.f_lineno==line and not marker.exists():
+      marker.write_text(json.dumps({'pid':os.getpid(),'birth':processes.identity(os.getpid())['birth'],'preparation':frame.f_locals['preparationid']}));os.kill(os.getpid(),signal.SIGSTOP)
+     return trace
+    return None
+   sys.settrace(trace)
+  os._exit(worker(state))
+ for _ in range(900):
+  try:
+   if client.call('daemon/status')['ready']:return
+  except (OSError,CoordinatorError):pass
+  time.sleep(.1)
+ raise RuntimeError('worker start')
+def stop():
+ global pid
+ print('STOP',client.call('daemon/stop'),flush=True);print('WORKER_EXIT',os.waitpid(pid,0)[1],flush=True);pid=None
+try:
+ start(True)
+ if duplicate:
+  try:client.call('project/register',{'project':duplicate,'fixture':str(fixture)})
+  except CoordinatorError as e:print('DUPLICATE_RED',e.code,e.details,flush=True)
+ with concurrent.futures.ThreadPoolExecutor() as pool:
+  future=pool.submit(client.call,'project/register',{'project':project,'fixture':str(fixture)})
+  for _ in range(1200):
+   if marker.exists():break
+   if future.done():raise RuntimeError(str(future.result()))
+   time.sleep(.01)
+  with sqlite3.connect('file:'+str(state/'ledger.sqlite')+'?mode=ro',uri=True) as db:
+   print('PRE_KILL_COUNTS',db.execute("SELECT kind,count(*) FROM records WHERE kind IN ('checkout','project','project_revision','project_preparation') GROUP BY kind").fetchall(),flush=True)
+  saved=json.loads(marker.read_text());assert processes.identity(pid)['birth']==saved['birth'];os.kill(pid,signal.SIGKILL);print('KILL',os.waitpid(pid,0)[1],saved,flush=True);pid=None
+  try:future.result()
+  except Exception as e:print('INTERRUPTED',getattr(e,'code',type(e).__name__),flush=True)
+ start();first=client.call('project/register',{'project':project,'fixture':str(fixture)});print('RETRY_REVISION',first['id'],[b['checkout'] for b in first['bindings']],flush=True)
+ unit=client.call('run/start',{'project':project,'cwd':str(roots[0]),'mode':'lead','fixture':str(fixture)})
+ print('OLD_UNIT',unit['unit'],flush=True)
+ print('NATIVE_UPDATE',json.dumps(asyncio.run(native_calls([('project/update',{'projectId':project,'roots':[{'path':str(p)} for p in roots]})]))),flush=True)
+ second=client.call('project/register',{'project':project,'fixture':str(fixture)});status=client.call('unit/status',{'unit':unit['unit']});print('NEW_REVISION',second['id'],'NEW_MEMBERS',len(second['bindings']),'OLD_MEMBERS',len(status['participants']),'OLD_PIN',status['unit']['project_revision'],flush=True)
+ roots[2].rename(w/'Three-moved')
+ try:client.call('project/register',{'project':project,'fixture':str(fixture)})
+ except CoordinatorError as e:print('DISAPPEARED_RED',e.code,e.details,flush=True)
+ (w/'Three-moved').rename(roots[2]);print('RESTORED_REVISION',client.call('project/register',{'project':project,'fixture':str(fixture)})['id'],flush=True)
+ calls=[create('Pagination '+str(i),[w/('Unused-'+str(i))]) for i in range(101)]
+ page=asyncio.run(native_calls(calls));print('PAGE_PROVISION',len(page),'ERRORS',[r.get('error') for r in page if 'error' in r],flush=True)
+ listed=client.call('project/list',{'fixture':str(fixture)});print('PAGINATED_LIST',len(listed['data']),'CURSOR',listed['next_cursor'],'PAGE_NAMES',sum(p['name'].startswith('Pagination ') for p in listed['data']),flush=True)
+ stop()
+finally:
+ if pid:stop()
+```
+
+</details>
+
+<details>
+<summary>Duplicate roots, identity replacement and concurrent membership change — registration-final.log</summary>
+
+```python
+import asyncio,concurrent.futures,json,os,signal,sys,time
+from pathlib import Path
+from coordinator import gitio,native,processes
+from coordinator.client import Client,CoordinatorError
+from coordinator.daemon import worker
+w=Path('/private/tmp/sw-p1-240/registration-final');w.mkdir(mode=0o700);state=w/'state';fx=Path('/private/tmp/sw-p1-240/fx')
+roots=[w/'One',w/'Two',w/'Three']
+def repo(root):
+ root.mkdir();gitio.git(root,['init','-q']);(root/'a.txt').write_text('base\n')
+ oid=gitio.text(root,['hash-object','-w','--stdin'],data=b'base\n');gitio.git(root,['update-index','--add','--cacheinfo','100644',oid,'a.txt'])
+ tip=gitio.text(root,['commit-tree',gitio.text(root,['write-tree'])],data=b'base\n',extra_env={'GIT_AUTHOR_NAME':'Fixture','GIT_AUTHOR_EMAIL':'fixture@invalid','GIT_COMMITTER_NAME':'Fixture','GIT_COMMITTER_EMAIL':'fixture@invalid'});gitio.git(root,['update-ref','HEAD',tip])
+for root in roots:repo(root)
+async def rpc(method,args):
+ p=await asyncio.create_subprocess_exec(native.native_codex(),'app-server','--listen','stdio://',env=native.environment(CODEX_HOME=str(fx/'native')),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+ async def call(i,m,a):
+  p.stdin.write((json.dumps({'id':i,'method':m,'params':a})+'\n').encode());await p.stdin.drain()
+  while True:
+   r=json.loads(await p.stdout.readline())
+   if r.get('id')==i:return r
+ try:
+  await call(1,'initialize',{'clientInfo':{'name':'P1-scratch-registration','version':'1'},'capabilities':{'experimentalApi':True}})
+  p.stdin.write(b'{"method":"initialized"}\n');await p.stdin.drain()
+  return await call(2,method,args)
+ finally:p.stdin.close();print('NATIVE_EXIT',await p.wait(),flush=True)
+project=asyncio.run(rpc('project/create',{'name':'Registration final','roots':[{'path':str(p)} for p in roots[:2]],'metadata':{},'idempotencyKey':str(w)}))['result']['project']['id']
+client=Client(state,timeout=120);pid=None;marker=w/'paused.json';source=Path('plugins/software-workflows/coordinator/projects.py').resolve();line=next(i for i,s in enumerate(source.read_text().splitlines(),1) if 'final = snapshot(' in s)
+def start(pause=False):
+ global pid
+ pid=os.fork()
+ if pid==0:
+  if pause:
+   def trace(frame,event,arg):
+    if frame.f_code.co_filename==str(source):
+     if event=='line' and frame.f_lineno==line and not marker.exists():
+      marker.write_text(json.dumps({'pid':os.getpid(),'birth':processes.identity(os.getpid())['birth']}));os.kill(os.getpid(),signal.SIGSTOP)
+     return trace
+    return None
+   sys.settrace(trace)
+  os._exit(worker(state))
+ for _ in range(300):
+  try:
+   if client.call('daemon/status')['ready']:return
+  except (OSError,CoordinatorError):pass
+  time.sleep(.1)
+ raise RuntimeError('start')
+def stop():
+ global pid
+ print('STOP',client.call('daemon/stop'),flush=True);print('WORKER_EXIT',os.waitpid(pid,0)[1],flush=True);pid=None
+def register():
+ return client.call('project/register',{'project':project,'fixture':str(fx)})
+try:
+ start()
+ roots[1].rename(w/'Two-original');roots[1].symlink_to(roots[0],target_is_directory=True)
+ try:register()
+ except CoordinatorError as e:print('DUPLICATE_RED',e.code,e.details,flush=True)
+ finally:roots[1].unlink();(w/'Two-original').rename(roots[1])
+ active=register();print('DUPLICATE_RECOVERED',active['id'],flush=True)
+ roots[1].rename(w/'Two-original');repo(roots[1])
+ try:register()
+ except CoordinatorError as e:print('IDENTITY_RED',e.code,e.details,flush=True)
+ finally:roots[1].rename(w/'Two-replacement');(w/'Two-original').rename(roots[1])
+ print('IDENTITY_RECOVERED',register()['id'],flush=True)
+ stop();start(True)
+ with concurrent.futures.ThreadPoolExecutor() as pool:
+  future=pool.submit(register)
+  for _ in range(1000):
+   if marker.exists():break
+   if future.done():raise RuntimeError(str(future.result()))
+   time.sleep(.01)
+  print('MEMBERSHIP_UPDATE',asyncio.run(rpc('project/update',{'projectId':project,'roots':[{'path':str(p)} for p in roots]})),flush=True)
+  saved=json.loads(marker.read_text());assert processes.identity(pid)['birth']==saved['birth'];os.kill(pid,signal.SIGCONT)
+  try:future.result()
+  except CoordinatorError as e:print('MEMBERSHIP_RED',e.code,e.details,flush=True)
+ status=client.call('project/status',{'project':project})
+ print('ACTIVE_RETAINED',status,flush=True)
+ newer=register();print('MEMBERSHIP_RECOVERED',newer['id'],len(newer['bindings']),flush=True)
+ stop()
+finally:
+ if pid:
+  os.kill(pid,signal.SIGCONT);stop()
+```
+
+</details>
+
+<details>
+<summary>Partial exact operation and all-participant preflight — atomic-extra.log</summary>
+
+```python
+import base64,hashlib,json,os,sqlite3,time
+from pathlib import Path
+from coordinator.client import Client,CoordinatorError
+from coordinator import gitio
+w=Path('/private/tmp/sw-p1-240/registration-extra');state=w/'state';fixture=Path('/private/tmp/sw-p1-240/fx')
+os.environ.update(SOFTWARE_WORKFLOWS_FIXTURE=str(fixture))
+c=Client(state,timeout=180);c.ensure()
+while True:
+ try:
+  projects=c.call('records/list',{'kind':'project','limit':1000})['data'];break
+ except CoordinatorError as e:
+  if e.code!='RECOVERING':raise
+  time.sleep(.1)
+project=next(p['project'] for p in projects if p['name']=='Interrupted')
+def refuse(label,method,args):
+ try:print(label,'UNEXPECTED_SUCCESS',c.call(method,args),flush=True)
+ except CoordinatorError as e:print(label,e.code,e.details,flush=True)
+def review(unit):
+ s=c.call('unit/seal',{'unit':unit});diff=c.call('unit/diff',{'unit':unit});answer='Verdict: Ship it\nExplicit operational fixture review.'
+ r=c.call('unit/review-record',{'unit':unit,'evidence':dict(diff['binding'],completed=True,verdict='pass',answer=answer,answer_digest=hashlib.sha256(answer.encode()).hexdigest(),review_identity={'run':'fixture-partial','thread':'fixture-partial'})});return s,r['review']
+meta=dict(json.loads(Path('/private/tmp/sw-p1-240/publication-input.json').read_text())['metadata'],message='P1 exact edit after interrupted part')
+try:
+ run=c.call('run/start',{'project':project,'cwd':str(w/'One'),'mode':'lead','fixture':str(fixture)})
+ members={Path(p['root']).name:p for p in run['participants']};paths=[w/n/'a.txt' for n in ('One','Two')]
+ baseline={n:c.call('checkout/revisions',{'checkout':members[n]['checkout'],'path':'a.txt'})['data'][0]['id'] for n in ('One','Two')}
+ changes={str(p):{'mode':'100644','bytes_base64':base64.b64encode(b'intended\n').decode()} for p in paths}
+ op=c.call('operation/prepare',{'actor':run['actor'],'kind':'lead-edit','changes':changes});print('PREPARED_PARTS',op['parts'],flush=True)
+ paths[0].write_text('intended\n')
+ refuse('PARTIAL_RED','operation/complete',{'operation':op['id']})
+ with sqlite3.connect('file:'+str(state/'ledger.sqlite')+'?mode=ro',uri=True) as db:print('PARTIAL_EXACT_RECEIPTS',db.execute('SELECT count(*) FROM revisions WHERE unit=? AND attribution="exact"',(run['unit'],)).fetchone()[0],flush=True)
+ for n in ('One','Two'):
+  u=c.call('unknown/list',{'checkout':members[n]['checkout']})['data'];print('AFFECTED_UNKNOWN',n,[x['id'] for x in u],flush=True)
+  print('RESTORE',n,c.call('unknown/restore',{'actor':run['actor'],'unknown':u[0]['id'],'revision':baseline[n]}),flush=True)
+ print('EXACT_GREEN',c.call('lead-edit',{'actor':run['actor'],'changes':changes})['state'],flush=True)
+ s,rid=review(run['unit']);print('SEALED',[(v['root'],v['unchanged']) for v in s['vector']],flush=True)
+ tips={n:gitio.text(w/n,['rev-parse','HEAD']) for n in members}
+ # Even an unchanged participant's foreign lock must stop the entire group.
+ lock=w/'Three/.git/index.lock';lock.write_text('foreign scratch lock\n')
+ refuse('UNCHANGED_PARTICIPANT_LOCK','unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta});lock.unlink()
+ print('NO_REFS_AFTER_LOCK',all(gitio.text(w/n,['rev-parse','HEAD'])==tip for n,tip in tips.items()),flush=True)
+ paths[1].write_text('foreign frozen bytes\n')
+ refuse('FROZEN_BYTES_RED','unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta})
+ print('NO_REFS_AFTER_BYTES',all(gitio.text(w/n,['rev-parse','HEAD'])==tip for n,tip in tips.items()),flush=True)
+ print('REOPEN',c.call('unit/reopen',{'unit':run['unit']}),flush=True)
+ rows=c.call('checkout/revisions',{'checkout':members['Two']['checkout'],'path':'a.txt'})['data'];known=next(r['id'] for r in rows if r['unit']==run['unit'] and r['attribution']=='exact')
+ unresolved=c.call('unknown/list',{'checkout':members['Two']['checkout']})['data'];print('RESTORE_FROZEN',c.call('unknown/restore',{'actor':run['actor'],'unknown':unresolved[-1]['id'],'revision':known}),flush=True)
+ print('NEW_EXACT',c.call('lead-edit',{'actor':run['actor'],'changes':changes})['state'],flush=True)
+ s,newreview=review(run['unit']);refuse('OLD_REVIEW_RED','unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta})
+ print('PUBLISHED',json.dumps(c.call('unit/publish',{'unit':run['unit'],'review':newreview,'metadata':meta})),flush=True)
+ print('STOP',c.call('daemon/stop'),flush=True)
+except BaseException:
+ try:print('STOP_ERROR_PATH',c.call('daemon/stop'),flush=True)
+ except Exception as e:print('STOP_ERROR',str(e),flush=True)
+ raise
+```
+
+</details>
+
+<details>
+<summary>Native cross-root patch crash and supervisor recovery — patch-crash3.log</summary>
+
+```python
+import asyncio,base64,hashlib,json,os,sys,time
+from pathlib import Path
+from mcp import ClientSession,StdioServerParameters
+from mcp.client.stdio import stdio_client
+from coordinator import gitio,native,processes
+from coordinator.daemon import worker,supervise
+import concurrent.futures,signal
+from coordinator.client import Client,CoordinatorError
+from coordinator.fixture import Provider
+w=Path('/private/tmp/sw-p1-240/patch-crash3');w.mkdir(mode=0o700);repo=w/'outer';repo.mkdir()
+for root in (repo,repo/'Backend',repo/'Frontend'):
+ root.mkdir(exist_ok=True);gitio.git(root,['init','-q']);(root/'same.txt').write_text('baseline\n')
+ if root==repo:(root/'.gitignore').write_text('*\n!.gitignore\n!same.txt\n')
+ else:(root/'sub').mkdir()
+ gitio.git(root,['add','--','same.txt']+(['.gitignore'] if root==repo else []))
+ tip=gitio.text(root,['commit-tree',gitio.text(root,['write-tree'])],data=b'base\n',extra_env={'GIT_AUTHOR_NAME':'Scratch','GIT_AUTHOR_EMAIL':'scratch@invalid','GIT_COMMITTER_NAME':'Scratch','GIT_COMMITTER_EMAIL':'scratch@invalid'});gitio.git(root,['update-ref','HEAD',tip])
+fixture=w/'fixture';fixture.mkdir(mode=0o700);home=fixture/'native';home.mkdir(mode=0o700)
+state=w/'state';runtime=w/'rt'
+patch='*** Begin Patch\n*** Update File: '+str(repo/'Backend/same.txt')+'\n@@\n-baseline\n+backend integration\n*** Update File: '+str(repo/'Frontend/same.txt')+'\n@@\n-baseline\n+frontend integration\n*** End Patch'
+plan={'default':[{'patch':patch},{'text':'native patch finished'}]}
+env=dict(os.environ,CLAUDE_PLUGIN_DATA='/private/tmp/sw-p1-240/plugin-data',SOFTWARE_WORKFLOWS_STATE=str(state),SOFTWARE_WORKFLOWS_RUNTIME=str(runtime),CODEX_ORACLE_LOG_DIR=str(w/'logs'),CODEX_HOME=str(home),SOFTWARE_WORKFLOWS_FIXTURE=str(fixture),CODEX_ORACLE_MAX_RUNTIME_S='300',TMPDIR=str(w))
+for k in ('CODEX_SESSION_ID','CODEX_THREAD_ID','CODEX_TOOL_CALL_ID'):env.pop(k,None)
+os.environ.update({k:env[k] for k in ('SOFTWARE_WORKFLOWS_STATE','SOFTWARE_WORKFLOWS_RUNTIME','CODEX_ORACLE_LOG_DIR','TMPDIR')})
+client=Client(state,timeout=240)
+async def setup():
+ p=await asyncio.create_subprocess_exec(native.native_codex(),'app-server','--listen','stdio://',env=native.environment(CODEX_HOME=str(home)),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+ async def rpc(i,m,a):
+  p.stdin.write((json.dumps({'id':i,'method':m,'params':a})+'\n').encode());await p.stdin.drain()
+  while True:
+   d=json.loads(await p.stdout.readline())
+   if d.get('id')==i:return d['result']
+ try:
+  await rpc(1,'initialize',{'clientInfo':{'name':'scratch-project-setup','version':'1'},'capabilities':{'experimentalApi':True}});p.stdin.write(b'{"method":"initialized"}\n');await p.stdin.drain()
+  ids=[]
+  for i,(name,roots) in enumerate((('Integration SmartPay',[repo,repo/'Backend',repo/'Frontend']),('Integration Frontend',[repo/'Frontend'])),2):
+   ids.append((await rpc(i,'project/create',{'name':name,'roots':[{'path':str(r)} for r in roots],'metadata':{},'idempotencyKey':name}))['project']['id'])
+  return ids
+ finally:p.stdin.close();print('SETUP_APP_EXIT',await p.wait(),flush=True)
+with Provider(plan=plan) as provider:
+ (fixture/'fixture.json').write_text(json.dumps({'pid':os.getpid(),'birth':processes.identity(os.getpid())['birth'],'config':provider.config,'native_home':str(home)}));os.chmod(fixture/'fixture.json',0o600)
+ conf=provider.config['model_providers.c1_fixture']
+ (home/'config.toml').write_text('model = "gpt-6-astra"\nmodel_provider = "c1_fixture"\n[features]\nplugins = false\nshell_snapshot = false\n[model_providers.c1_fixture]\n'+'\n'.join(k+' = '+json.dumps(v) for k,v in conf.items())+'\n')
+
+ project,frontend=asyncio.run(setup())
+ marker=w/'before-receipts.json'
+ source=Path('plugins/software-workflows/coordinator/operations.py').resolve()
+ line=max(i for i,s in enumerate(source.read_text().splitlines(),1) if s=='        with ledger.store.transaction():')
+ pid=None
+ def start(pause=False):
+  global pid
+  pid=os.fork()
+  if pid==0:
+   import subprocess
+   original=subprocess.Popen
+   trace_program = """import os,sys,signal,json
+from pathlib import Path
+from coordinator import processes
+from coordinator.daemon import worker
+source=Path(sys.argv[2]);marker=Path(sys.argv[3]);line=int(sys.argv[4])
+def trace(frame,event,arg):
+ if frame.f_code.co_filename==str(source):
+  if event=='line' and frame.f_lineno==line and not marker.exists():
+   marker.write_text(json.dumps({'pid':os.getpid(),'birth':processes.identity(os.getpid())['birth'],'operation':frame.f_locals['operation']['id'],'line':line}));os.kill(os.getpid(),signal.SIGSTOP)
+  return trace
+ return None
+sys.settrace(trace)
+raise SystemExit(worker(Path(sys.argv[1])))
+"""
+   def launch(args,*values,**kwargs):
+    if pause and 'worker' in args and 'coordinator' in args:
+     args=[sys.executable,'-B','-c',trace_program,str(state),str(source),str(marker),str(line)]
+    return original(args,*values,**kwargs)
+   subprocess.Popen=launch
+   os._exit(supervise(state))
+  for _ in range(900):
+   try:
+    status=client.call('daemon/status')
+    if status['ready']:print('READY',status['generation'],status['pid'],flush=True);return
+   except (OSError,CoordinatorError):pass
+   time.sleep(.1)
+  raise RuntimeError('start failed')
+ def stop():
+  global pid
+  print('STOP',client.call('daemon/stop'),flush=True);print('WORKER_EXIT',os.waitpid(pid,0)[1],flush=True);pid=None
+ try:
+  start(True)
+  run=client.call('run/start',{'project':project,'cwd':str(repo/'Frontend/sub'),'fixture':str(fixture),'mode':'native','task':'P1 cross-root patch interrupted before receipts'})
+  print('RUN',json.dumps(run),flush=True)
+  until=time.time()+120
+  while not marker.exists() and time.time()<until:time.sleep(.05)
+  saved=json.loads(marker.read_text());assert processes.identity(saved['pid'])['birth']==saved['birth']
+  print('CRASH_LOCATION',saved,flush=True)
+  print('ACTUAL_BYTES',{n:(repo/n/'same.txt').read_text() for n in ('Backend','Frontend')},flush=True)
+  import sqlite3
+  def evidence():
+   with sqlite3.connect('file:'+str(state/'ledger.sqlite')+'?mode=ro',uri=True) as db:
+    records=[(r[0],r[1],json.loads(r[2])) for r in db.execute('SELECT id,kind,data FROM records')]
+    print('PARTS',[(key,row['checkout'],row['state'],row.get('parent_operation')) for key,kind,row in records if kind=='operation'],flush=True)
+    print('RECEIPTS',db.execute('SELECT checkout,path,attribution FROM revisions WHERE attribution="exact"').fetchall(),flush=True)
+    print('CLAIMS',[(row['checkout'],row['path'],row['state']) for key,kind,row in records if kind=='claim'],flush=True)
+  evidence()
+  os.kill(saved['pid'],signal.SIGKILL);print('SIGKILL_WORKER',saved['pid'],flush=True)
+  for _ in range(900):
+   try:
+    status=client.call('daemon/status')
+    if status['ready'] and status['pid']!=saved['pid']:print('RECOVERED_READY',status['generation'],status['pid'],flush=True);break
+   except (OSError,CoordinatorError):pass
+   time.sleep(.1)
+  else:raise RuntimeError('recovery did not finish')
+  print('RECOVERY_STATUS',json.dumps(client.call('run/status',{'run':run['run']})),flush=True)
+  evidence()
+  for member in run['participants']:
+   print('UNKNOWN',member['root'],json.dumps(client.call('unknown/list',{'checkout':member['checkout']})),flush=True)
+  stop()
+ finally:
+  if pid:stop()
+
+ print('PROVIDER',len(provider.requests),provider.errors,flush=True)
+```
+
+</details>
+
+<details>
+<summary>Ref/checkpoint crash, idempotence and non-overlapping moved suffix — publication-crash4.log</summary>
+
+```python
+import hashlib,base64,concurrent.futures,json,os,signal,sys,time
+from pathlib import Path
+from coordinator import gitio,processes
+from coordinator.client import Client,CoordinatorError
+from coordinator.daemon import worker
+from coordinator.query import query_checkout
+base=Path('/private/tmp/sw-p1-240');config=json.loads((base/'pub-project.json').read_text());state=Path(config['state']);roots=Path(config['root']);fixture=base/'fx';project=config['project']
+meta=dict(json.loads((base/'publication-input.json').read_text())['metadata'],message='P1 crash interval publication')
+publishfile=Path('plugins/software-workflows/coordinator/publish.py').resolve();pause_line=next(i for i,line in enumerate(publishfile.read_text().splitlines(),1) if line.strip()=='publication["phase"] = "ref_updated"')
+client=Client(state,timeout=240);pid=None
+def start(marker=None):
+ global pid
+ pid=os.fork()
+ if pid==0:
+  if marker:
+   def trace(frame,event,arg):
+    if frame.f_code.co_filename==str(publishfile):
+     if event=='line' and frame.f_lineno==pause_line and not marker.exists():
+      marker.write_text(json.dumps({'pid':os.getpid(),'birth':processes.identity(os.getpid())['birth'],'publication':frame.f_locals['publication'],'checkout':frame.f_locals['checkout']['root'],'line':pause_line}));os.kill(os.getpid(),signal.SIGSTOP)
+     return trace
+    return None
+   sys.settrace(trace)
+  os._exit(worker(state))
+ until=time.time()+90
+ while time.time()<until:
+  try:
+   st=client.call('daemon/status')
+   if st['ready']:print('READY',st['generation'],st['pid'],flush=True);return
+  except (OSError,CoordinatorError):pass
+  time.sleep(.1)
+ raise RuntimeError('worker not ready')
+def stop():
+ global pid
+ if pid:print('STOP',client.call('daemon/stop'),flush=True);print('WORKER_EXIT',os.waitpid(pid,0)[1],flush=True);pid=None
+def review(unit):
+ seal=client.call('unit/seal',{'unit':unit,'validation':[]});diff=client.call('unit/diff',{'unit':unit})
+ r=client.call('unit/review-record',{'unit':unit,'evidence':dict(diff['binding'],completed=True,verdict='pass',answer='Verdict: Ship it\nExplicit fixture review; no model inference.',answer_digest=hashlib.sha256(b'Verdict: Ship it\nExplicit fixture review; no model inference.').hexdigest(),review_identity={'run':'fixture-crash','thread':'fixture-crash'})})
+ return seal,r['review']
+try:
+ for scenario in ('idempotent','moved-base'):
+  marker=base/(scenario+'-ref-gap3.json');start(marker)
+  saved_run=base/(scenario+'-unit.json')
+  if saved_run.exists():
+   run=json.loads(saved_run.read_text());client.call('unit/reopen',{'unit':run['unit']})
+  else:run=client.call('run/start',{'project':project,'cwd':str(roots/'Frontend'),'fixture':str(fixture),'mode':'lead','task':scenario})
+  print('RUN',scenario,json.dumps(run),flush=True)
+  (base/(scenario+'-unit.json')).write_text(json.dumps(run))
+  changes={str(roots/n/'same.txt'):{'mode':'100644','bytes_base64':base64.b64encode((scenario+' '+n+'\n').encode()).decode()} for n in ('Backend','Frontend')}
+  print('EDIT',json.dumps(client.call('lead-edit',{'actor':run['actor'],'changes':changes})),flush=True)
+  seal,rid=review(run['unit']);print('SEAL',json.dumps(seal),flush=True)
+  oldtips={str(r):gitio.text(r,['rev-parse','HEAD']) for r in (roots,roots/'Backend',roots/'Frontend')}
+  with concurrent.futures.ThreadPoolExecutor() as pool:
+   future=pool.submit(client.call,'unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta})
+   until=time.time()+60
+   while not marker.exists() and time.time()<until:
+    if future.done():print('EARLY',future.result(),flush=True);raise RuntimeError('did not pause')
+    time.sleep(.01)
+   saved=json.loads(marker.read_text());assert processes.identity(pid)['birth']==saved['birth']
+   print('CRASH_LOCATION',json.dumps(saved),flush=True);print('ACTUAL_TIPS',{r:gitio.text(r,['rev-parse','HEAD']) for r in oldtips},flush=True)
+   os.kill(pid,signal.SIGKILL);print('SIGKILL',os.waitpid(pid,0)[1],flush=True);pid=None
+   try:future.result(timeout=10)
+   except Exception as e:print('INTERRUPTED_RPC',getattr(e,'code',type(e).__name__),flush=True)
+  if scenario=='moved-base':
+   r=roots/'Frontend';old=gitio.text(r,['rev-parse','HEAD']);env={'GIT_INDEX_FILE':str(base/'moved-suffix3.index')}
+   gitio.git(r,['read-tree',old],extra_env=env);oid=gitio.text(r,['hash-object','-w','--stdin'],data=b'new suffix base\n');gitio.git(r,['update-index','--add','--cacheinfo','100644',oid,'external.txt'],extra_env=env)
+   tip=gitio.text(r,['commit-tree',gitio.text(r,['write-tree'],extra_env=env),'-p',old],data=b'Independent suffix base\n',extra_env={'GIT_AUTHOR_NAME':'Scratch','GIT_AUTHOR_EMAIL':'scratch@invalid','GIT_COMMITTER_NAME':'Scratch','GIT_COMMITTER_EMAIL':'scratch@invalid'});gitio.git(r,['update-ref','HEAD',tip,old]);print('MOVED_SUFFIX',old,tip,flush=True)
+  start();status=client.call('unit/status',{'unit':run['unit']});print('RECOVERED',json.dumps(status),flush=True)
+  for r in (roots/'Backend',roots/'Frontend'):print('QUERY',str(r),json.dumps(query_checkout(r,'',5,state)),flush=True)
+  if scenario=='moved-base':
+   try:client.call('unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta})
+   except CoordinatorError as e:print('OLD_CONTINUATION',e.code,flush=True)
+   print('REOPEN',json.dumps(client.call('unit/reopen',{'unit':run['unit']})),flush=True)
+   seal,newrid=review(run['unit']);print('NEW_VECTOR',json.dumps(seal),flush=True)
+   try:client.call('unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta})
+   except CoordinatorError as e:print('OLD_REVIEW',e.code,flush=True)
+   print('SUFFIX_COMPLETE',json.dumps(client.call('unit/publish',{'unit':run['unit'],'review':newrid,'metadata':meta})),flush=True)
+  tips={str(r):gitio.text(r,['rev-parse','HEAD']) for r in (roots/'Backend',roots/'Frontend')};stop();start();print('SECOND_RESTART_TIPS',{r:gitio.text(r,['rev-parse','HEAD']) for r in tips},'UNCHANGED',all(gitio.text(r,['rev-parse','HEAD'])==tip for r,tip in tips.items()),flush=True);print('FINAL_STATUS',json.dumps(client.call('unit/status',{'unit':run['unit']})),flush=True);stop()
+finally:
+ if pid:stop()
+```
+
+</details>
+
+<details>
+<summary>Overlapping moved suffix, explicit resolution and new review — publication-overlap-final.log</summary>
+
+```python
+import hashlib,base64,concurrent.futures,json,os,signal,sys,time
+from pathlib import Path
+from coordinator import gitio,processes
+from coordinator.client import Client,CoordinatorError
+from coordinator.daemon import worker
+from coordinator.query import query_checkout
+base=Path('/private/tmp/sw-p1-240');config=json.loads((base/'pub-project.json').read_text());state=Path(config['state']);roots=Path(config['root']);fixture=base/'fx';project=config['project']
+meta=dict(json.loads((base/'publication-input.json').read_text())['metadata'],message='P1 crash interval publication')
+publishfile=Path('plugins/software-workflows/coordinator/publish.py').resolve();pause_line=next(i for i,line in enumerate(publishfile.read_text().splitlines(),1) if line.strip()=='publication["phase"] = "ref_updated"')
+client=Client(state,timeout=240);pid=None
+def start(marker=None):
+ global pid
+ pid=os.fork()
+ if pid==0:
+  if marker:
+   def trace(frame,event,arg):
+    if frame.f_code.co_filename==str(publishfile):
+     if event=='line' and frame.f_lineno==pause_line and not marker.exists():
+      marker.write_text(json.dumps({'pid':os.getpid(),'birth':processes.identity(os.getpid())['birth'],'publication':frame.f_locals['publication'],'checkout':frame.f_locals['checkout']['root'],'line':pause_line}));os.kill(os.getpid(),signal.SIGSTOP)
+     return trace
+    return None
+   sys.settrace(trace)
+  os._exit(worker(state))
+ until=time.time()+90
+ while time.time()<until:
+  try:
+   st=client.call('daemon/status')
+   if st['ready']:print('READY',st['generation'],st['pid'],flush=True);return
+  except (OSError,CoordinatorError):pass
+  time.sleep(.1)
+ raise RuntimeError('worker not ready')
+def stop():
+ global pid
+ if pid:print('STOP',client.call('daemon/stop'),flush=True);print('WORKER_EXIT',os.waitpid(pid,0)[1],flush=True);pid=None
+def review(unit):
+ seal=client.call('unit/seal',{'unit':unit,'validation':[]});diff=client.call('unit/diff',{'unit':unit})
+ r=client.call('unit/review-record',{'unit':unit,'evidence':dict(diff['binding'],completed=True,verdict='pass',answer='Verdict: Ship it\nExplicit fixture review; no model inference.',answer_digest=hashlib.sha256(b'Verdict: Ship it\nExplicit fixture review; no model inference.').hexdigest(),review_identity={'run':'fixture-crash','thread':'fixture-crash'})})
+ return seal,r['review']
+try:
+ for scenario in ('moved-overlap',):
+  marker=base/(scenario+'-ref-gap-final.json');start(marker)
+  saved_run=base/(scenario+'-unit.json')
+  if saved_run.exists():
+   run=json.loads(saved_run.read_text());client.call('unit/reopen',{'unit':run['unit']})
+  else:run=client.call('run/start',{'project':project,'cwd':str(roots/'Frontend'),'fixture':str(fixture),'mode':'lead','task':scenario})
+  print('RUN',scenario,json.dumps(run),flush=True)
+  (base/(scenario+'-unit.json')).write_text(json.dumps(run))
+  changes={str(roots/n/'same.txt'):{'mode':'100644','bytes_base64':base64.b64encode((scenario+' '+n+'\n').encode()).decode()} for n in ('Backend','Frontend')}
+  print('EDIT',json.dumps(client.call('lead-edit',{'actor':run['actor'],'changes':changes})),flush=True)
+  seal,rid=review(run['unit']);print('SEAL',json.dumps(seal),flush=True)
+  oldtips={str(r):gitio.text(r,['rev-parse','HEAD']) for r in (roots,roots/'Backend',roots/'Frontend')}
+  with concurrent.futures.ThreadPoolExecutor() as pool:
+   future=pool.submit(client.call,'unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta})
+   until=time.time()+60
+   while not marker.exists() and time.time()<until:
+    if future.done():print('EARLY',future.result(),flush=True);raise RuntimeError('did not pause')
+    time.sleep(.01)
+   saved=json.loads(marker.read_text());assert processes.identity(pid)['birth']==saved['birth']
+   print('CRASH_LOCATION',json.dumps(saved),flush=True);print('ACTUAL_TIPS',{r:gitio.text(r,['rev-parse','HEAD']) for r in oldtips},flush=True)
+   os.kill(pid,signal.SIGKILL);print('SIGKILL',os.waitpid(pid,0)[1],flush=True);pid=None
+   try:future.result(timeout=10)
+   except Exception as e:print('INTERRUPTED_RPC',getattr(e,'code',type(e).__name__),flush=True)
+  if scenario=='moved-overlap':
+   r=roots/'Frontend';old=gitio.text(r,['rev-parse','HEAD']);env={'GIT_INDEX_FILE':str(base/'moved-overlap-final.index')}
+   gitio.git(r,['read-tree',old],extra_env=env);oid=gitio.text(r,['hash-object','-w','--stdin'],data=b'new suffix base\n');gitio.git(r,['update-index','--add','--cacheinfo','100644',oid,'same.txt'],extra_env=env)
+   tip=gitio.text(r,['commit-tree',gitio.text(r,['write-tree'],extra_env=env),'-p',old],data=b'Independent suffix base\n',extra_env={'GIT_AUTHOR_NAME':'Scratch','GIT_AUTHOR_EMAIL':'scratch@invalid','GIT_COMMITTER_NAME':'Scratch','GIT_COMMITTER_EMAIL':'scratch@invalid'});gitio.git(r,['update-ref','HEAD',tip,old]);print('MOVED_SUFFIX',old,tip,flush=True)
+  start();status=client.call('unit/status',{'unit':run['unit']});print('RECOVERED',json.dumps(status),flush=True)
+  for r in (roots/'Backend',roots/'Frontend'):print('QUERY',str(r),json.dumps(query_checkout(r,'',5,state)),flush=True)
+  if scenario=='moved-overlap':
+   try:client.call('unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta})
+   except CoordinatorError as e:print('OLD_CONTINUATION',e.code,flush=True)
+   print('REOPEN',json.dumps(client.call('unit/reopen',{'unit':run['unit']})),flush=True)
+   try:client.call('unit/seal',{'unit':run['unit'],'validation':[]})
+   except CoordinatorError as e:print('OVERLAPPING_BASE_RED',e.code,e.details,flush=True)
+   gitio.git(roots/'Frontend',['update-index','--cacheinfo','100644',oid,'same.txt'])
+   print('EXPLICIT_SUFFIX_INDEX_ALIGNED_TO_NEW_BASE',oid,flush=True)
+   print('FRESH_VERIFIED_SUFFIX',client.call('lead-edit',{'actor':run['actor'],'changes':{str(roots/'Frontend'/'same.txt'):{'mode':'100644','bytes_base64':base64.b64encode(b'overlapping base explicitly resolved\\n').decode()}}})['state'],flush=True)
+   seal,newrid=review(run['unit']);print('NEW_VECTOR',json.dumps(seal),flush=True)
+   try:client.call('unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta})
+   except CoordinatorError as e:print('OLD_REVIEW',e.code,flush=True)
+   print('SUFFIX_COMPLETE',json.dumps(client.call('unit/publish',{'unit':run['unit'],'review':newrid,'metadata':meta})),flush=True)
+  tips={str(r):gitio.text(r,['rev-parse','HEAD']) for r in (roots/'Backend',roots/'Frontend')};stop();start();print('SECOND_RESTART_TIPS',{r:gitio.text(r,['rev-parse','HEAD']) for r in tips},'UNCHANGED',all(gitio.text(r,['rev-parse','HEAD'])==tip for r,tip in tips.items()),flush=True);print('FINAL_STATUS',json.dumps(client.call('unit/status',{'unit':run['unit']})),flush=True);stop()
+finally:
+ if pid:stop()
+```
+
+</details>
+
+<details>
+<summary>Actual MCP dispatch, native reads and independent vector review — integration3.log</summary>
+
+```python
+import asyncio,base64,hashlib,json,os,sys,time
+from pathlib import Path
+from mcp import ClientSession,StdioServerParameters
+from mcp.client.stdio import stdio_client
+from coordinator import gitio,native,processes
+from coordinator.client import Client,CoordinatorError
+from coordinator.fixture import Provider
+w=Path('/private/tmp/sw-p1-240/integration3');w.mkdir(mode=0o700);repo=w/'outer';repo.mkdir()
+for root in (repo,repo/'Backend',repo/'Frontend'):
+ root.mkdir(exist_ok=True);gitio.git(root,['init','-q']);(root/'same.txt').write_text('baseline\n')
+ if root==repo:(root/'.gitignore').write_text('*\n!.gitignore\n!same.txt\n')
+ else:(root/'sub').mkdir()
+ gitio.git(root,['add','--','same.txt']+(['.gitignore'] if root==repo else []))
+ tip=gitio.text(root,['commit-tree',gitio.text(root,['write-tree'])],data=b'base\n',extra_env={'GIT_AUTHOR_NAME':'Scratch','GIT_AUTHOR_EMAIL':'scratch@invalid','GIT_COMMITTER_NAME':'Scratch','GIT_COMMITTER_EMAIL':'scratch@invalid'});gitio.git(root,['update-ref','HEAD',tip])
+fixture=w/'fixture';fixture.mkdir(mode=0o700);home=fixture/'native';home.mkdir(mode=0o700)
+state=w/'state';runtime=w/'rt'
+patch='*** Begin Patch\n*** Update File: '+str(repo/'Backend/same.txt')+'\n@@\n-baseline\n+backend integration\n*** Update File: '+str(repo/'Frontend/same.txt')+'\n@@\n-baseline\n+frontend integration\n*** End Patch'
+plan={'default':[{'text':'Brief: run the requested scratch command, then edit the two named files.'}],'routes':{'PHASE 2 of 2':[{'command':'/bin/sleep 2','arguments':{'yield_time_ms':10000}},{'tool':'read_file','arguments':{'path':str(repo/'same.txt')}},{'tool':'read_file','arguments':{'path':str(repo/'Backend/same.txt')}},{'patch':patch},{'text':'Finished both project repositories.'}],'IMMUTABLE CANDIDATE BINDING':[{'text':'Verdict: Ship it\nBoth repository candidates match the disposable fixture request.'}]}}
+env=dict(os.environ,CLAUDE_PLUGIN_DATA='/private/tmp/sw-p1-240/plugin-data',SOFTWARE_WORKFLOWS_STATE=str(state),SOFTWARE_WORKFLOWS_RUNTIME=str(runtime),CODEX_ORACLE_LOG_DIR=str(w/'logs'),CODEX_HOME=str(home),SOFTWARE_WORKFLOWS_FIXTURE=str(fixture),CODEX_ORACLE_MAX_RUNTIME_S='300',TMPDIR=str(w))
+for k in ('CODEX_SESSION_ID','CODEX_THREAD_ID','CODEX_TOOL_CALL_ID'):env.pop(k,None)
+os.environ.update({k:env[k] for k in ('SOFTWARE_WORKFLOWS_STATE','SOFTWARE_WORKFLOWS_RUNTIME','CODEX_ORACLE_LOG_DIR','TMPDIR')})
+client=Client(state,timeout=240)
+async def setup():
+ p=await asyncio.create_subprocess_exec(native.native_codex(),'app-server','--listen','stdio://',env=native.environment(CODEX_HOME=str(home)),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+ async def rpc(i,m,a):
+  p.stdin.write((json.dumps({'id':i,'method':m,'params':a})+'\n').encode());await p.stdin.drain()
+  while True:
+   d=json.loads(await p.stdout.readline())
+   if d.get('id')==i:return d['result']
+ try:
+  await rpc(1,'initialize',{'clientInfo':{'name':'scratch-project-setup','version':'1'},'capabilities':{'experimentalApi':True}});p.stdin.write(b'{"method":"initialized"}\n');await p.stdin.drain()
+  ids=[]
+  for i,(name,roots) in enumerate((('Integration SmartPay',[repo,repo/'Backend',repo/'Frontend']),('Integration Frontend',[repo/'Frontend'])),2):
+   ids.append((await rpc(i,'project/create',{'name':name,'roots':[{'path':str(r)} for r in roots],'metadata':{},'idempotencyKey':name}))['project']['id'])
+  return ids
+ finally:p.stdin.close();print('SETUP_APP_EXIT',await p.wait(),flush=True)
+async def main():
+ project,frontend=await setup();(w/'ids.json').write_text(json.dumps(dict(project=project,frontend=frontend)))
+ params=StdioServerParameters(command='/opt/homebrew/bin/python3.15',args=['-B',str(Path('plugins/software-workflows/run_server.py').resolve())],env=env,cwd=str(w))
+ async with stdio_client(params,errlog=open(w/'stderr.log','w')) as streams:
+  async with ClientSession(*streams) as session:
+   await session.initialize()
+   async def call(name,params):
+    r=await session.call_tool(name,params);text='\n'.join(i.text for i in r.content if i.type=='text');print('MCP',name,text,flush=True);return text
+   await call('abraham',dict(task='P1_INTEGRATION ambiguity negative',cwd=str(repo/'Frontend/sub'),dispatch_cwd=str(repo/'Frontend'),session_id='lead-integration'))
+   await call('abraham',dict(task='P1_INTEGRATION invalid project negative',cwd=str(repo/'Frontend/sub'),dispatch_cwd=str(repo),project='missing-project-id',session_id='lead-integration'))
+   task=asyncio.create_task(call('abraham',dict(task='P1_INTEGRATION run command and edit backend/frontend',cwd=str(repo/'Frontend/sub'),dispatch_cwd=str(repo),session_id='lead-integration')))
+   seen=False
+   while not task.done():
+    try:
+     rows=await asyncio.to_thread(client.call,'run/list',{'cwd':str(repo)})
+     for row in rows['data']:
+      if row['custody'] and not seen:print('GROUP_CUSTODY',json.dumps(row['custody']),flush=True);seen=True
+    except Exception:pass
+    await asyncio.sleep(.1)
+   await task
+   runs=client.call('run/list',{'cwd':str(repo)})['data'];run=runs[-1];unit=run['unit'];(w/'run.json').write_text(json.dumps(run))
+   await call('coordinator_claims',dict(action='list',unit=unit,cwd=str(repo/'Backend/sub'),dispatch_cwd=str(repo),session_id='lead-integration'))
+   await call('coordinator_claims',dict(action='acquire',paths=['same.txt'],cwd=str(repo/'Frontend'),project=frontend,dispatch_cwd=str(repo/'Frontend'),session_id='other-project-lead'))
+   await call('coordinator_claims',dict(action='acquire',paths=['outside.txt'],unit=unit,cwd=str(w),dispatch_cwd=str(repo),session_id='lead-integration'))
+   actor=client.call('records/list',{'kind':'actor','limit':100})['data']
+   root=next(a for a in actor if a['unit']==unit and a['kind']=='root')
+   msg=client.call('message/send',{'sender':root['id'],'recipient':'lead','text':'project unit message','wake':'none'});print('MESSAGE',json.dumps(msg),flush=True)
+   await call('coordinator_inbox',dict(unit=unit,cwd=str(repo/'Backend/sub'),dispatch_cwd=str(repo),session_id='other-session'))
+   await call('coordinator_inbox',dict(unit=unit,cwd=str(repo/'Frontend/sub'),dispatch_cwd=str(repo),session_id='lead-integration'))
+   await call('coordinator_inbox',dict(unit=unit,acknowledge=[msg['id']],cwd=str(repo/'Backend/sub'),dispatch_cwd=str(repo),session_id='lead-integration'))
+   reads=client.call('records/list',{'kind':'read','limit':1000})['data'];print('QUALIFIED_READS',json.dumps(reads),flush=True)
+   rootid=next(p['checkout'] for p in run['participants'] if p['root']==str(repo))
+   baseline=next(r['id'] for r in client.call('checkout/revisions',{'checkout':rootid,'path':'same.txt'})['data'] if r['attribution']=='baseline')
+   (repo/'same.txt').write_text('external dependency change\\n')
+   try:print('DEPENDENCY_UNEXPECTED_SEAL',client.call('unit/seal',{'unit':unit}),flush=True)
+   except CoordinatorError as e:print('DEPENDENCY_RED',e.code,e.details,flush=True)
+   lead=client.call('lead/attach',{'unit':unit,'cwd':str(repo)})['actor']
+   unknown=client.call('unknown/list',{'checkout':rootid})['data'][0]['id']
+   print('DEPENDENCY_RESTORE',client.call('unknown/restore',{'actor':lead,'unknown':unknown,'revision':baseline}),flush=True)
+   print('DEPENDENCY_NEW_EXACT',client.call('lead-edit',{'actor':lead,'changes':{'same.txt':{'mode':'100644','bytes_base64':base64.b64encode(b'baseline\\n').decode()}},'cwd':str(repo)})['state'],flush=True)
+   await call('coordinator_seal',dict(unit=unit,cwd=str(repo/'Backend/sub'),dispatch_cwd=str(repo),session_id='lead-integration'))
+   await call('code_review',dict(sealed_unit=unit,cwd=str(repo/'Backend/sub'),dispatch_cwd=str(repo),project=project,infra=True,web_search=False,session='continue',code_or_diff=''))
+   for r in (repo,repo/'Backend',repo/'Frontend'):
+    print('SURFACES',str(r),json.dumps({'query':client.call('checkout/query',{'cwd':str(r),'session_id':'lead-integration'}),'runs':client.call('run/list',{'cwd':str(r)}),'status':client.call('run/status',{'run':run['run']})}),flush=True)
+   print('REVIEWS',json.dumps(client.call('records/list',{'kind':'review_job','limit':100})),flush=True)
+with Provider(plan=plan) as provider:
+ (fixture/'fixture.json').write_text(json.dumps({'pid':os.getpid(),'birth':processes.identity(os.getpid())['birth'],'config':provider.config,'native_home':str(home)}));os.chmod(fixture/'fixture.json',0o600)
+ conf=provider.config['model_providers.c1_fixture']
+ (home/'config.toml').write_text('model = "gpt-6-astra"\nmodel_provider = "c1_fixture"\n[features]\nplugins = false\nshell_snapshot = false\n[model_providers.c1_fixture]\n'+'\n'.join(k+' = '+json.dumps(v) for k,v in conf.items())+'\n')
+ try:asyncio.run(main())
+ finally:
+  print('PROVIDER',len(provider.requests),provider.errors,flush=True)
+  try:print('STOP',client.call('daemon/stop'),flush=True)
+  except Exception as e:print('STOP_ERROR',getattr(e,'code',type(e).__name__),flush=True)
+```
+
+</details>
+
+<details>
+<summary>Project lead windows and external sibling effects — project-windows3.log</summary>
+
+```python
+import base64,json,os,time,sqlite3
+from pathlib import Path
+from coordinator.client import Client,CoordinatorError
+w=Path('/private/tmp/sw-p1-240'); info=json.loads((w/'pub-project.json').read_text());root=Path(info['root'])
+os.environ.update(SOFTWARE_WORKFLOWS_FIXTURE=str(w/'fx'),SOFTWARE_WORKFLOWS_RUNTIME=str(w/'pub-rt'),SOFTWARE_WORKFLOWS_PYTHON='/opt/homebrew/bin/python3.15')
+c=Client(Path(info['state']),timeout=180);c.ensure()
+for _ in range(600):
+ try:
+  p=c.call('project/status',{'project':info['project']});break
+ except CoordinatorError as e:
+  if e.code!='RECOVERING':raise
+  time.sleep(.05)
+bind=p['revision']['bindings']; ids={Path(b['root']).name:b['checkout'] for b in bind}
+print('BINDINGS',json.dumps(bind),flush=True)
+try:
+ lead=c.call('lead/session',{'checkout':ids[root.name],'session_id':'p1-window','project':info['project'],'cwd':str(root),'dispatch_cwd':str(root),'fixture':str(w/'fx')});print('LEAD',lead['unit'],flush=True)
+ def event(call,ev,cwd=root):
+  return c.call('lead-hook/dispatch',{'payload':{'hook_event_name':ev,'tool_name':'Bash','tool_input':{'command':'scratch external sibling calibration'},'session_id':'p1-window','tool_use_id':call,'cwd':str(cwd)}})
+ print('CLOSE_INTERRUPTED',event('quiet-0','PostToolUse'),flush=True)
+ for n in range(2,4):
+  started=time.monotonic();pre=event('quiet-'+str(n),'PreToolUse');pre_ms=(time.monotonic()-started)*1000
+  arm=c.call('lead-hook/armed',{'observed':pre['observed'],'arm':pre.get('arm')});print('PRE_ARM',n,round(pre_ms,1),pre,arm,flush=True)
+  (root/'same.txt').write_text('target '+str(n)+'\n');(root/'Frontend'/('sibling-'+str(n)+'.txt')).write_text('external sibling\n')
+  started=time.monotonic();post=event('quiet-'+str(n),'PostToolUse');print('POST',n,round((time.monotonic()-started)*1000,1),json.dumps(post),flush=True)
+ # A different checkout's call starts and ends entirely inside the target window.
+ pre=event('transient-a','PreToolUse');print('A_ARM',c.call('lead-hook/armed',{'observed':pre['observed'],'arm':pre.get('arm')}),flush=True)
+ other=event('transient-b','PreToolUse',root/'Backend');print('B_PRE',other,flush=True)
+ event('transient-b','PostToolUse',root/'Backend')
+ (root/'same.txt').write_text('transient cross-root\n')
+ print('TRANSIENT_POST',json.dumps(event('transient-a','PostToolUse')),flush=True)
+ for key in (ids[root.name],ids['Frontend']):
+  print('UNKNOWN',key,json.dumps(c.call('unknown/list',{'checkout':key})),flush=True)
+ print('STOP',c.call('daemon/stop'),flush=True)
+except BaseException:
+ try:print('STOP_AFTER_ERROR',c.call('daemon/stop'),flush=True)
+ except Exception as e:print('STOP_ERROR',str(e),flush=True)
+ raise
+```
+
+</details>
+
+<details>
+<summary>Size-matched project latency and expired arming — latency-shape.log</summary>
+
+```python
+import asyncio,json,os,time
+from pathlib import Path
+from coordinator import gitio,native
+from coordinator.client import Client,CoordinatorError
+w=Path('/private/tmp/sw-p1-240/latency-shape');w.mkdir(mode=0o700);root=w/'outer';state=w/'state';fx=Path('/private/tmp/sw-p1-240/fx');home=fx/'native'
+for path,count in ((root,56),(root/'Backend',1291),(root/'Frontend',1495)):
+ path.mkdir(parents=True,exist_ok=True);gitio.git(path,['init','-q'])
+ names=['f'+str(i)+'.txt' for i in range(count)]
+ for name in names:(path/name).write_text('baseline\n')
+ if path==root:(path/'.gitignore').write_text('*\n!.gitignore\n!f*.txt\n');names.append('.gitignore')
+ gitio.git(path,['add','--',*names]);tip=gitio.text(path,['commit-tree',gitio.text(path,['write-tree'])],data=b'latency scratch base\n',extra_env={'GIT_AUTHOR_NAME':'Scratch','GIT_AUTHOR_EMAIL':'scratch@invalid','GIT_COMMITTER_NAME':'Scratch','GIT_COMMITTER_EMAIL':'scratch@invalid'});gitio.git(path,['update-ref','HEAD',tip])
+ print('GIT_VIEW',path,len(gitio.git(path,['ls-files','-z']).stdout.split(b'\0'))-1,flush=True)
+async def setup():
+ p=await asyncio.create_subprocess_exec(native.native_codex(),'app-server','--listen','stdio://',env=native.environment(CODEX_HOME=str(home)),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+ async def call(i,m,a):
+  p.stdin.write((json.dumps({'id':i,'method':m,'params':a})+'\n').encode());await p.stdin.drain()
+  while True:
+   r=json.loads(await p.stdout.readline())
+   if r.get('id')==i:return r['result']
+ try:
+  await call(1,'initialize',{'clientInfo':{'name':'latency-scratch','version':'1'},'capabilities':{'experimentalApi':True}});p.stdin.write(b'{"method":"initialized"}\n');await p.stdin.drain()
+  return (await call(2,'project/create',{'name':'P1 latency shape','roots':[{'path':str(p)} for p in (root,root/'Backend',root/'Frontend')],'metadata':{},'idempotencyKey':str(w)}))['project']['id']
+ finally:p.stdin.close();print('SETUP_EXIT',await p.wait(),flush=True)
+project=asyncio.run(setup());os.environ['SOFTWARE_WORKFLOWS_FIXTURE']=str(fx);c=Client(state,timeout=180);c.ensure()
+while not c.call('daemon/status')['ready']:time.sleep(.05)
+try:
+ start=time.monotonic();revision=c.call('project/register',{'project':project,'fixture':str(fx)});print('REGISTRATION_MS',round(1000*(time.monotonic()-start),1),flush=True)
+ main=revision['bindings'][0]['checkout'];lead=c.call('lead/session',{'checkout':main,'project':project,'session_id':'latency','cwd':str(root),'dispatch_cwd':str(root),'fixture':str(fx)})
+ def hook(i,event):
+  return c.call('lead-hook/dispatch',{'payload':{'cwd':str(root),'session_id':'latency','tool_use_id':'latency-'+str(i),'tool_name':'Bash','tool_input':{'command':'scratch calibration'},'hook_event_name':event}})
+ pre=hook(0,'PreToolUse');time.sleep(3.1);print('EXPIRED_ARM',c.call('lead-hook/armed',{'observed':pre['observed'],'arm':pre.get('arm')}),flush=True);(root/'f0.txt').write_text('expired window\n');print('EXPIRED_POST',hook(0,'PostToolUse')['attribution'],flush=True)
+ for i in range(1,4):
+  start=time.monotonic();pre=hook(i,'PreToolUse');prems=1000*(time.monotonic()-start);arm=c.call('lead-hook/armed',{'observed':pre['observed'],'arm':pre.get('arm')});start=time.monotonic();post=hook(i,'PostToolUse');postms=1000*(time.monotonic()-start);print('LATENCY',i,{'pre_ms':round(prems,1),'post_ms':round(postms,1),'armed':arm['armed'],'attribution':post['attribution'],'scanned':[p['paths_scanned'] for p in post['participants']]},flush=True)
+ print('STOP',c.call('daemon/stop'),flush=True)
+except BaseException:
+ try:print('STOP_ERROR_PATH',c.call('daemon/stop'),flush=True)
+ except Exception as e:print('STOP_ERROR',str(e),flush=True)
+ raise
+```
+
+</details>
+
+
+### Final native disconnect and live replacement
+
+The final source review extended a live transport gap to every participant and
+fenced both writer submission and mailbox delivery again after asynchronous lease
+restoration. An incomplete multi-checkout patch is quarantined before reconnect
+can consume queued native history.
+
+The actual MCP/native scenario was repeated as `integration4.log` and
+`integration5.log`, using the same disposable setup and fixture plan as
+integration3, followed by an identity-checked SIGTERM of its native listener.
+**integration4 exited 1:** the listener disappeared between the initial process
+check and socket attachment; the background reconciliation recorded
+`FileNotFoundError` and did not finish. The fixture stayed at seven requests.
+All three checkouts correctly retained `native notification gap` UNKNOWN.
+This was a blocked recovery, not an accepted result.
+
+The fix rechecks the exact PID/birth after a failed attachment before selecting
+replacement recovery. It never advances work on an unsuccessful bind.
+**integration5 exited 0**, with this actual terminal evidence:
+
+```text
+NATIVE_LISTENER_KILL 22763 1792400966:504489
+RECONNECTED listener_316da84649f9416d9a7fb6f0f15b2c78 01a1536c-4425-79e2-a092-f46af7d9e423 reconciled
+GAP_UNKNOWN /private/tmp/sw-p1-240/integration5/outer [('*', 'native notification gap')]
+GAP_UNKNOWN /private/tmp/sw-p1-240/integration5/outer/Backend [('*', 'native notification gap')]
+GAP_UNKNOWN /private/tmp/sw-p1-240/integration5/outer/Frontend [('*', 'native notification gap')]
+PROVIDER 7 []
+STOP {'stopping': True}
+```
+
+The replacement resumed the same native thread. The normal recovery path checked
+its pinned cwd, ordered roots and project association before marking it reconciled.
+There was no additional inference request after the disconnect. This run was
+after the final recovery/writer/message changes. The earlier regression drivers
+used the source snapshots recorded above; the last custody correction was rerun
+through settle_check and the cancellation calibration.
+
+<details>
+<summary>Actual server, reads, complete-vector review and native replacement — integration5.log</summary>
+
+The inline command used
+`PYTHONPATH=plugins/software-workflows PYTHONDONTWRITEBYTECODE=1 /private/tmp/sw-p1-240/plugin-data/venv/91e1e736a04fad0e/bin/python -B -`
+with the following body; output was redirected to
+`/private/tmp/sw-p1-240/integration5.log`. The preceding red used the same body
+with the venue changed to `integration4`, before the attachment-race fix.
+
+```python
+import asyncio,base64,hashlib,json,os,sys,time
+from pathlib import Path
+from mcp import ClientSession,StdioServerParameters
+from mcp.client.stdio import stdio_client
+from coordinator import gitio,native,processes
+from coordinator.client import Client,CoordinatorError
+from coordinator.fixture import Provider
+w=Path('/private/tmp/sw-p1-240/integration5');w.mkdir(mode=0o700);repo=w/'outer';repo.mkdir()
+for root in (repo,repo/'Backend',repo/'Frontend'):
+ root.mkdir(exist_ok=True);gitio.git(root,['init','-q']);(root/'same.txt').write_text('baseline\n')
+ if root==repo:(root/'.gitignore').write_text('*\n!.gitignore\n!same.txt\n')
+ else:(root/'sub').mkdir()
+ gitio.git(root,['add','--','same.txt']+(['.gitignore'] if root==repo else []))
+ tip=gitio.text(root,['commit-tree',gitio.text(root,['write-tree'])],data=b'base\n',extra_env={'GIT_AUTHOR_NAME':'Scratch','GIT_AUTHOR_EMAIL':'scratch@invalid','GIT_COMMITTER_NAME':'Scratch','GIT_COMMITTER_EMAIL':'scratch@invalid'});gitio.git(root,['update-ref','HEAD',tip])
+fixture=w/'fixture';fixture.mkdir(mode=0o700);home=fixture/'native';home.mkdir(mode=0o700)
+state=w/'state';runtime=w/'rt'
+patch='*** Begin Patch\n*** Update File: '+str(repo/'Backend/same.txt')+'\n@@\n-baseline\n+backend integration\n*** Update File: '+str(repo/'Frontend/same.txt')+'\n@@\n-baseline\n+frontend integration\n*** End Patch'
+plan={'default':[{'text':'Brief: run the requested scratch command, then edit the two named files.'}],'routes':{'PHASE 2 of 2':[{'command':'/bin/sleep 2','arguments':{'yield_time_ms':10000}},{'tool':'read_file','arguments':{'path':str(repo/'same.txt')}},{'tool':'read_file','arguments':{'path':str(repo/'Backend/same.txt')}},{'patch':patch},{'text':'Finished both project repositories.'}],'IMMUTABLE CANDIDATE BINDING':[{'text':'Verdict: Ship it\nBoth repository candidates match the disposable fixture request.'}]}}
+env=dict(os.environ,CLAUDE_PLUGIN_DATA='/private/tmp/sw-p1-240/plugin-data',SOFTWARE_WORKFLOWS_STATE=str(state),SOFTWARE_WORKFLOWS_RUNTIME=str(runtime),CODEX_ORACLE_LOG_DIR=str(w/'logs'),CODEX_HOME=str(home),SOFTWARE_WORKFLOWS_FIXTURE=str(fixture),CODEX_ORACLE_MAX_RUNTIME_S='300',TMPDIR=str(w))
+for k in ('CODEX_SESSION_ID','CODEX_THREAD_ID','CODEX_TOOL_CALL_ID'):env.pop(k,None)
+os.environ.update({k:env[k] for k in ('SOFTWARE_WORKFLOWS_STATE','SOFTWARE_WORKFLOWS_RUNTIME','CODEX_ORACLE_LOG_DIR','TMPDIR')})
+client=Client(state,timeout=240)
+async def setup():
+ p=await asyncio.create_subprocess_exec(native.native_codex(),'app-server','--listen','stdio://',env=native.environment(CODEX_HOME=str(home)),stdin=asyncio.subprocess.PIPE,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.DEVNULL)
+ async def rpc(i,m,a):
+  p.stdin.write((json.dumps({'id':i,'method':m,'params':a})+'\n').encode());await p.stdin.drain()
+  while True:
+   d=json.loads(await p.stdout.readline())
+   if d.get('id')==i:return d['result']
+ try:
+  await rpc(1,'initialize',{'clientInfo':{'name':'scratch-project-setup','version':'1'},'capabilities':{'experimentalApi':True}});p.stdin.write(b'{"method":"initialized"}\n');await p.stdin.drain()
+  ids=[]
+  for i,(name,roots) in enumerate((('Integration SmartPay',[repo,repo/'Backend',repo/'Frontend']),('Integration Frontend',[repo/'Frontend'])),2):
+   ids.append((await rpc(i,'project/create',{'name':name,'roots':[{'path':str(r)} for r in roots],'metadata':{},'idempotencyKey':name}))['project']['id'])
+  return ids
+ finally:p.stdin.close();print('SETUP_APP_EXIT',await p.wait(),flush=True)
+async def main():
+ project,frontend=await setup();(w/'ids.json').write_text(json.dumps(dict(project=project,frontend=frontend)))
+ params=StdioServerParameters(command='/opt/homebrew/bin/python3.15',args=['-B',str(Path('plugins/software-workflows/run_server.py').resolve())],env=env,cwd=str(w))
+ async with stdio_client(params,errlog=open(w/'stderr.log','w')) as streams:
+  async with ClientSession(*streams) as session:
+   await session.initialize()
+   async def call(name,params):
+    r=await session.call_tool(name,params);text='\n'.join(i.text for i in r.content if i.type=='text');print('MCP',name,text,flush=True);return text
+   await call('abraham',dict(task='P1_INTEGRATION ambiguity negative',cwd=str(repo/'Frontend/sub'),dispatch_cwd=str(repo/'Frontend'),session_id='lead-integration'))
+   await call('abraham',dict(task='P1_INTEGRATION invalid project negative',cwd=str(repo/'Frontend/sub'),dispatch_cwd=str(repo),project='missing-project-id',session_id='lead-integration'))
+   task=asyncio.create_task(call('abraham',dict(task='P1_INTEGRATION run command and edit backend/frontend',cwd=str(repo/'Frontend/sub'),dispatch_cwd=str(repo),session_id='lead-integration')))
+   seen=False
+   while not task.done():
+    try:
+     rows=await asyncio.to_thread(client.call,'run/list',{'cwd':str(repo)})
+     for row in rows['data']:
+      if row['custody'] and not seen:print('GROUP_CUSTODY',json.dumps(row['custody']),flush=True);seen=True
+    except Exception:pass
+    await asyncio.sleep(.1)
+   await task
+   runs=client.call('run/list',{'cwd':str(repo)})['data'];run=runs[-1];unit=run['unit'];(w/'run.json').write_text(json.dumps(run))
+   await call('coordinator_claims',dict(action='list',unit=unit,cwd=str(repo/'Backend/sub'),dispatch_cwd=str(repo),session_id='lead-integration'))
+   await call('coordinator_claims',dict(action='acquire',paths=['same.txt'],cwd=str(repo/'Frontend'),project=frontend,dispatch_cwd=str(repo/'Frontend'),session_id='other-project-lead'))
+   await call('coordinator_claims',dict(action='acquire',paths=['outside.txt'],unit=unit,cwd=str(w),dispatch_cwd=str(repo),session_id='lead-integration'))
+   actor=client.call('records/list',{'kind':'actor','limit':100})['data']
+   root=next(a for a in actor if a['unit']==unit and a['kind']=='root')
+   msg=client.call('message/send',{'sender':root['id'],'recipient':'lead','text':'project unit message','wake':'none'});print('MESSAGE',json.dumps(msg),flush=True)
+   await call('coordinator_inbox',dict(unit=unit,cwd=str(repo/'Backend/sub'),dispatch_cwd=str(repo),session_id='other-session'))
+   await call('coordinator_inbox',dict(unit=unit,cwd=str(repo/'Frontend/sub'),dispatch_cwd=str(repo),session_id='lead-integration'))
+   await call('coordinator_inbox',dict(unit=unit,acknowledge=[msg['id']],cwd=str(repo/'Backend/sub'),dispatch_cwd=str(repo),session_id='lead-integration'))
+   reads=client.call('records/list',{'kind':'read','limit':1000})['data'];print('QUALIFIED_READS',json.dumps(reads),flush=True)
+   rootid=next(p['checkout'] for p in run['participants'] if p['root']==str(repo))
+   baseline=next(r['id'] for r in client.call('checkout/revisions',{'checkout':rootid,'path':'same.txt'})['data'] if r['attribution']=='baseline')
+   (repo/'same.txt').write_text('external dependency change\\n')
+   try:print('DEPENDENCY_UNEXPECTED_SEAL',client.call('unit/seal',{'unit':unit}),flush=True)
+   except CoordinatorError as e:print('DEPENDENCY_RED',e.code,e.details,flush=True)
+   lead=client.call('lead/attach',{'unit':unit,'cwd':str(repo)})['actor']
+   unknown=client.call('unknown/list',{'checkout':rootid})['data'][0]['id']
+   print('DEPENDENCY_RESTORE',client.call('unknown/restore',{'actor':lead,'unknown':unknown,'revision':baseline}),flush=True)
+   print('DEPENDENCY_NEW_EXACT',client.call('lead-edit',{'actor':lead,'changes':{'same.txt':{'mode':'100644','bytes_base64':base64.b64encode(b'baseline\\n').decode()}},'cwd':str(repo)})['state'],flush=True)
+   await call('coordinator_seal',dict(unit=unit,cwd=str(repo/'Backend/sub'),dispatch_cwd=str(repo),session_id='lead-integration'))
+   await call('code_review',dict(sealed_unit=unit,cwd=str(repo/'Backend/sub'),dispatch_cwd=str(repo),project=project,infra=True,web_search=False,session='continue',code_or_diff=''))
+   for r in (repo,repo/'Backend',repo/'Frontend'):
+    print('SURFACES',str(r),json.dumps({'query':client.call('checkout/query',{'cwd':str(r),'session_id':'lead-integration'}),'runs':client.call('run/list',{'cwd':str(r)}),'status':client.call('run/status',{'run':run['run']})}),flush=True)
+   print('REVIEWS',json.dumps(client.call('records/list',{'kind':'review_job','limit':100})),flush=True)
+   import signal
+   listeners=client.call('records/list',{'kind':'listener','limit':100})['data']
+   listener=next(l for l in listeners if l['unit']==unit and l.get('root_thread')==root['thread'])
+   observed=processes.identity(listener['pid'])
+   if observed and observed['birth']==listener['birth']:
+    print('NATIVE_LISTENER_KILL',listener['pid'],listener['birth'],flush=True)
+    os.kill(listener['pid'],signal.SIGTERM)
+   for _ in range(600):
+    await asyncio.sleep(.1)
+    candidates=client.call('records/list',{'kind':'listener','limit':100})['data']
+    resumed=next((l for l in candidates if l.get('replaces')==listener['id'] and l.get('recovery_state')=='reconciled'),None)
+    if resumed:
+     print('RECONNECTED',resumed['id'],resumed['root_thread'],resumed['recovery_state'],flush=True)
+     break
+   else:raise RuntimeError('native reconnect did not finish')
+   for p in run['participants']:
+    print('GAP_UNKNOWN',p['root'],[(x['path'],x['reason']) for x in client.call('unknown/list',{'checkout':p['checkout']})['data']],flush=True)
+with Provider(plan=plan) as provider:
+ (fixture/'fixture.json').write_text(json.dumps({'pid':os.getpid(),'birth':processes.identity(os.getpid())['birth'],'config':provider.config,'native_home':str(home)}));os.chmod(fixture/'fixture.json',0o600)
+ conf=provider.config['model_providers.c1_fixture']
+ (home/'config.toml').write_text('model = "gpt-6-astra"\nmodel_provider = "c1_fixture"\n[features]\nplugins = false\nshell_snapshot = false\n[model_providers.c1_fixture]\n'+'\n'.join(k+' = '+json.dumps(v) for k,v in conf.items())+'\n')
+ try:asyncio.run(main())
+ finally:
+  print('PROVIDER',len(provider.requests),provider.errors,flush=True)
+  try:print('STOP',client.call('daemon/stop'),flush=True)
+  except Exception as e:print('STOP_ERROR',getattr(e,'code',type(e).__name__),flush=True)
+```
+
+</details>
+
+### Partial publication during recovery, explicit abandonment and handback
+
+`publication-abandon-final.log` exited **0**. This repeated the real
+ref-update/checkpoint SIGKILL boundary in the existing disposable publication
+repositories. Unit `unit_f2c5a8997ae24207964bd30fb7aca4db` installed Backend commit
+`6e31925bd3a9081cbc999205a5f3f967eae7dba2`; the later Frontend base was independently
+moved to `7eed8daf46b828c1a68b16241ee444e5e76e07e6`. The old continuation first
+refused `STALE_BASE`.
+
+Both Backend and Frontend queries were sampled during real worker recovery.
+They exposed `fresh:false`, the installed prefix commit and
+`state:"partially_published"`, including during a second restart. In the earlier
+unreconciled checkpoint interval they honestly showed `state:"prepared"` with
+`phase:"commit_created"`; recovery then inspected Git and advanced the durable
+journal. The query itself performed no Git discovery.
+
+Explicit `unit/recover {unit,action:"abandon"}` recorded group phase
+`abandoned`, retained the completed-prefix journal and commit, and reopened
+generation 2 with `publication_state:"partially_published"`. Explicit
+`claim/handback {unit}` then released **two** settled claims. Both checkout
+queries still exposed the prefix. Actual output included:
+
+```text
+SIGKILL 9
+OLD_CONTINUATION STALE_BASE
+HANDBACK ... "count": 2, "message": "Claims released", "released": true
+UNCHANGED_TIPS_AFTER_ABANDON True
+STOP {'stopping': True}
+WORKER_EXIT 0
+```
+
+The intact prefix was not rolled back and no suffix commit was installed by
+abandonment. The abandoned group, old review and repository journals remain
+inspectable in the scratch ledger.
+
+<details>
+<summary>Actual partial-publication abandonment command — publication-abandon-final.log</summary>
+
+```sh
+PYTHONPATH=plugins/software-workflows PYTHONDONTWRITEBYTECODE=1 \
+SOFTWARE_WORKFLOWS_RUNTIME=/private/tmp/sw-p1-240/pub-rt \
+SOFTWARE_WORKFLOWS_FIXTURE=/private/tmp/sw-p1-240/fx \
+/opt/homebrew/bin/python3.15 -B - > /private/tmp/sw-p1-240/publication-abandon-final.log 2>&1
+```
+
+Inline stdin body:
+
+```python
+import hashlib,base64,concurrent.futures,json,os,signal,sys,time
+from pathlib import Path
+from coordinator import gitio,processes
+from coordinator.client import Client,CoordinatorError
+from coordinator.daemon import worker
+from coordinator.query import query_checkout
+base=Path('/private/tmp/sw-p1-240');config=json.loads((base/'pub-project.json').read_text());state=Path(config['state']);roots=Path(config['root']);fixture=base/'fx';project=config['project']
+meta=dict(json.loads((base/'publication-input.json').read_text())['metadata'],message='P1 crash interval publication')
+publishfile=Path('plugins/software-workflows/coordinator/publish.py').resolve();pause_line=next(i for i,line in enumerate(publishfile.read_text().splitlines(),1) if line.strip()=='publication["phase"] = "ref_updated"')
+client=Client(state,timeout=240);pid=None
+observed_unit=None
+def start(marker=None):
+ global pid
+ pid=os.fork()
+ if pid==0:
+  if marker:
+   def trace(frame,event,arg):
+    if frame.f_code.co_filename==str(publishfile):
+     if event=='line' and frame.f_lineno==pause_line and not marker.exists():
+      marker.write_text(json.dumps({'pid':os.getpid(),'birth':processes.identity(os.getpid())['birth'],'publication':frame.f_locals['publication'],'checkout':frame.f_locals['checkout']['root'],'line':pause_line}));os.kill(os.getpid(),signal.SIGSTOP)
+     return trace
+    return None
+   sys.settrace(trace)
+  os._exit(worker(state))
+ until=time.time()+90
+ while time.time()<until:
+  try:
+   st=client.call('daemon/status')
+   if observed_unit and not st['ready']:
+    for r in (roots/'Backend',roots/'Frontend'):
+     q=query_checkout(r,'',5,state)
+     pubs=[p for p in q.get('publications',[]) if p['unit']==observed_unit]
+     if pubs:print('RECOVERING_QUERY',str(r),json.dumps({'fresh':q['fresh'],'publications':pubs}),flush=True)
+   if st['ready']:print('READY',st['generation'],st['pid'],flush=True);return
+  except (OSError,CoordinatorError):pass
+  time.sleep(.1)
+ raise RuntimeError('worker not ready')
+def stop():
+ global pid
+ if pid:print('STOP',client.call('daemon/stop'),flush=True);print('WORKER_EXIT',os.waitpid(pid,0)[1],flush=True);pid=None
+def review(unit):
+ seal=client.call('unit/seal',{'unit':unit,'validation':[]});diff=client.call('unit/diff',{'unit':unit})
+ r=client.call('unit/review-record',{'unit':unit,'evidence':dict(diff['binding'],completed=True,verdict='pass',answer='Verdict: Ship it\nExplicit fixture review; no model inference.',answer_digest=hashlib.sha256(b'Verdict: Ship it\nExplicit fixture review; no model inference.').hexdigest(),review_identity={'run':'fixture-crash','thread':'fixture-crash'})})
+ return seal,r['review']
+try:
+ marker=base/'abandon-final-ref-gap.json';start(marker)
+ run=client.call('run/start',{'project':project,'cwd':str(roots/'Frontend'),'fixture':str(fixture),'mode':'lead','task':'explicit partial publication abandonment'})
+ observed_unit=run['unit'];print('RUN',run['unit'],flush=True)
+ changes={str(roots/n/'same.txt'):{'mode':'100644','bytes_base64':base64.b64encode(('abandon '+n+'\n').encode()).decode()} for n in ('Backend','Frontend')}
+ print('EDIT',client.call('lead-edit',{'actor':run['actor'],'changes':changes})['state'],flush=True)
+ seal,rid=review(run['unit']);print('SEAL',seal['id'],flush=True)
+ with concurrent.futures.ThreadPoolExecutor() as pool:
+  future=pool.submit(client.call,'unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta})
+  until=time.time()+60
+  while not marker.exists() and time.time()<until:
+   if future.done():print('EARLY',future.result(),flush=True);raise RuntimeError('did not pause')
+   time.sleep(.01)
+  saved=json.loads(marker.read_text())
+  if processes.identity(pid)['birth']!=saved['birth']:raise RuntimeError('process identity changed')
+  print('CRASH_LOCATION',json.dumps(saved),flush=True)
+  os.kill(pid,signal.SIGKILL);print('SIGKILL',os.waitpid(pid,0)[1],flush=True);pid=None
+  try:future.result(timeout=10)
+  except Exception as e:print('INTERRUPTED_RPC',getattr(e,'code',type(e).__name__),flush=True)
+ r=roots/'Frontend';old=gitio.text(r,['rev-parse','HEAD']);env={'GIT_INDEX_FILE':str(base/'abandon-suffix.index')}
+ gitio.git(r,['read-tree',old],extra_env=env);oid=gitio.text(r,['hash-object','-w','--stdin'],data=b'abandon independent base\n');gitio.git(r,['update-index','--add','--cacheinfo','100644',oid,'abandon-external.txt'],extra_env=env)
+ tip=gitio.text(r,['commit-tree',gitio.text(r,['write-tree'],extra_env=env),'-p',old],data=b'Abandon suffix base moved\n',extra_env={'GIT_AUTHOR_NAME':'Scratch','GIT_AUTHOR_EMAIL':'scratch@invalid','GIT_COMMITTER_NAME':'Scratch','GIT_COMMITTER_EMAIL':'scratch@invalid'});gitio.git(r,['update-ref','HEAD',tip,old]);print('MOVED_SUFFIX',old,tip,flush=True)
+ start();status=client.call('unit/status',{'unit':run['unit']});print('PARTIAL_STATUS',status['publication_state'],json.dumps(status['participants']),flush=True)
+ try:client.call('unit/publish',{'unit':run['unit'],'review':rid,'metadata':meta})
+ except CoordinatorError as e:print('OLD_CONTINUATION',e.code,flush=True)
+ tips={str(r):gitio.text(r,['rev-parse','HEAD']) for r in (roots/'Backend',roots/'Frontend')}
+ stop();start()
+ abandoned=client.call('unit/recover',{'unit':run['unit'],'action':'abandon'});print('ABANDON',json.dumps(abandoned),flush=True)
+ print('HANDBACK',json.dumps(client.call('claim/handback',{'unit':run['unit']})),flush=True)
+ groups=client.call('records/list',{'kind':'publication_group','limit':100})['data'];print('ABANDONED_GROUPS',json.dumps([g for g in groups if g['unit']==run['unit']]),flush=True)
+ for r in (roots/'Backend',roots/'Frontend'):print('ABANDON_QUERY',str(r),json.dumps(query_checkout(r,'',5,state)),flush=True)
+ print('UNCHANGED_TIPS_AFTER_ABANDON',all(gitio.text(r,['rev-parse','HEAD'])==tip for r,tip in tips.items()),flush=True)
+ (base/'abandon-final-unit.json').write_text(json.dumps(run))
+ stop()
+finally:
+ if pid:stop()
+```
+
+</details>
+
+### Registered non-participant server scope
+
+`server-boundary-final.log`, actual MCP stdio server, exited **0**. It registered
+a separate scratch Git checkout, then called `coordinator_claims` for the pinned
+publication unit from that checkout's subfolder **before** the participant
+positive. Actual output:
+
+```text
+REGISTER_OUTSIDE checkout_a59f729177a3417eb5c75f9a7695cde8
+NONPARTICIPANT_RED {"code": "UNIT_SCOPE", "message": "Target folder belongs to none of this unit's participants", "details": {}, "kind": "refusal"}
+PARTICIPANT_GREEN {"claims": [], "custody": []}
+STOP {'stopping': True}
+```
+
+<details>
+<summary>Actual server boundary command — server-boundary-final.log</summary>
+
+Command prefix:
+`PYTHONPATH=plugins/software-workflows PYTHONDONTWRITEBYTECODE=1 /private/tmp/sw-p1-240/plugin-data/venv/91e1e736a04fad0e/bin/python -B -`.
+Output went to `/private/tmp/sw-p1-240/server-boundary-final.log`.
+
+```python
+import asyncio,json,os,time
+from pathlib import Path
+from mcp import ClientSession,StdioServerParameters
+from mcp.client.stdio import stdio_client
+from coordinator import gitio
+from coordinator.client import Client
+base=Path('/private/tmp/sw-p1-240');w=base/'server-boundary-final';w.mkdir(mode=0o700);other=w/'Other';other.mkdir();(other/'sub').mkdir();(other/'a.txt').write_text('outside project\n')
+gitio.git(other,['init','-q']);gitio.git(other,['add','--','a.txt']);tip=gitio.text(other,['commit-tree',gitio.text(other,['write-tree'])],data=b'Outside participant scratch\n',extra_env={'GIT_AUTHOR_NAME':'Scratch','GIT_AUTHOR_EMAIL':'scratch@invalid','GIT_COMMITTER_NAME':'Scratch','GIT_COMMITTER_EMAIL':'scratch@invalid'});gitio.git(other,['update-ref','HEAD',tip])
+config=json.loads((base/'pub-project.json').read_text());run=json.loads((base/'abandon-final-unit.json').read_text());root=Path(config['root']);(root/'Backend/sub').mkdir(exist_ok=True)
+env=dict(os.environ,CLAUDE_PLUGIN_DATA=str(base/'plugin-data'),SOFTWARE_WORKFLOWS_STATE=config['state'],SOFTWARE_WORKFLOWS_RUNTIME=str(base/'pub-rt'),CODEX_ORACLE_LOG_DIR=str(w/'logs'),CODEX_HOME=str(base/'fx/native'),SOFTWARE_WORKFLOWS_FIXTURE=str(base/'fx'),TMPDIR=str(w))
+for k in ('CODEX_SESSION_ID','CODEX_THREAD_ID','CODEX_TOOL_CALL_ID'):env.pop(k,None)
+os.environ.update({k:env[k] for k in ('SOFTWARE_WORKFLOWS_STATE','SOFTWARE_WORKFLOWS_RUNTIME','CODEX_ORACLE_LOG_DIR','TMPDIR')})
+client=Client(Path(config['state']),timeout=180);client.ensure()
+while not client.call('daemon/status')['ready']:time.sleep(.05)
+print('REGISTER_OUTSIDE',client.call('checkout/register',{'path':str(other)})['id'],flush=True)
+async def main():
+ params=StdioServerParameters(command='/opt/homebrew/bin/python3.15',args=['-B',str(Path('plugins/software-workflows/run_server.py').resolve())],env=env,cwd=str(w))
+ with (w/'stderr.log').open('w') as errlog:
+  async with stdio_client(params,errlog=errlog) as streams:
+   async with ClientSession(*streams) as session:
+    await session.initialize()
+    for label,cwd in (('NONPARTICIPANT_RED',other/'sub'),('PARTICIPANT_GREEN',root/'Backend/sub')):
+     response=await session.call_tool('coordinator_claims',{'action':'list','unit':run['unit'],'cwd':str(cwd),'dispatch_cwd':str(root),'session_id':'boundary-final'})
+     text='\n'.join(i.text for i in response.content if i.type=='text');print(label,text,flush=True)
+     if label=='NONPARTICIPANT_RED' and 'UNIT_SCOPE' not in text:raise RuntimeError('missing scope refusal')
+     if label=='PARTICIPANT_GREEN' and ('UNIT_SCOPE' in text or '"claims"' not in text):raise RuntimeError('participant subfolder refused')
+try:asyncio.run(main())
+finally:print('STOP',client.call('daemon/stop'),flush=True)
+```
+
+</details>
+
+### Final validators and Python compatibility
+
+These commands ran after the last product source edit. There is no additional
+coordinator build/linter configuration or newly written test suite. Compatibility
+checks parsed/compiled in memory with bytecode disabled.
+
+| Command | Actual exit | Actual output |
+| --- | ---: | --- |
+| Strict plugin validator below | 0 | `✔ Validation passed` |
+| Strict marketplace validator below | 0 | `✔ Validation passed` |
+| Python 3.15 parse/compile below | 0 | `PY315_AST_OK 38 3.15.0 PY311_GRAMMAR_OK` |
+| Python 3.9 parse/import below | 0 | `PY39_PARSE_IMPORT_OK 10 modules 6 hooks 3.9.6` |
+| `git diff --check` after the evidence append | 0 | No output |
+
+Exact commands:
+
+```sh
+CLAUDE_CONFIG_DIR=/private/tmp/sw-p1-240/validate-plugin-final TMPDIR=/private/tmp/sw-p1-240/validate-tmp claude plugin validate --strict plugins/software-workflows
+```
+
+```sh
+CLAUDE_CONFIG_DIR=/private/tmp/sw-p1-240/validate-market-final TMPDIR=/private/tmp/sw-p1-240/validate-tmp claude plugin validate --strict .
+```
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.15 -B - <<'PY'
+import ast,sys
+from pathlib import Path
+p=Path('plugins/software-workflows')
+files=sorted((p/'coordinator').glob('*.py'))+[p/'server.py',p/'run_server.py']
+for path in files:
+ source=path.read_text();ast.parse(source,filename=str(path),feature_version=(3,11));compile(source,str(path),'exec')
+print('PY315_AST_OK',len(files),sys.version.split()[0],'PY311_GRAMMAR_OK')
+PY
+```
+
+```sh
+PYTHONPATH=plugins/software-workflows PYTHONDONTWRITEBYTECODE=1 CODEX_ORACLE_LOG_DIR=/private/tmp/sw-p1-240/import-logs /usr/bin/python3 -B - <<'PY'
+import ast,importlib,sys
+from pathlib import Path
+p=Path('plugins/software-workflows')
+modules=['__init__','__main__','client','runtime','hooks','query','registry','compat','gitio','roles']
+for name in modules:
+ path=p/'coordinator'/(name+'.py');ast.parse(path.read_text(),filename=str(path));importlib.import_module('coordinator'+('' if name=='__init__' else '.'+name))
+hooks=sorted((p/'hooks').glob('*.py'))
+for path in hooks:ast.parse(path.read_text(),filename=str(path))
+print('PY39_PARSE_IMPORT_OK',len(modules),'modules',len(hooks),'hooks',sys.version.split()[0])
+PY
+```
+
+The 38-file check covers coordinator modules, server.py and run_server.py.
+The separate Python 3.9 check covers all six Python hook files and imports all ten
+listed client-side modules. Python 3.11 grammar passed; actual execution using a
+3.11 interpreter was not available and is not claimed.
+
+### Cleanup, repository boundary and remaining limits
+
+The original persistent fixture provider PID 29553 (birth
+`1792396068:562071`) was stopped earlier after identity verification. The final
+publication/boundary provider PID 29770 (birth `1792401338:889198`) was likewise
+checked and SIGTERM'd; its CLI process exited **0**. The final admission daemon
+returned `{"ok":true,"result":{"stopping":true}}` with CLI exit **0**. Every other
+accepted scenario records its own stop/finally path above. Failed attempts were
+also inspected during cleanup.
+
+The final read-only inventory compared stored PID/birth identities with the OS,
+and separately inspected process command identities without printing arbitrary
+arguments or environment data. It exited **0**:
+
+```text
+SCRATCH_DATABASES 55
+TRACKED_PROCESS_IDENTITIES 133 {'project_discovery': 82, 'listener': 51}
+LIVE_TRACKED []
+SCRATCH_PROCESS_MATCHES []
+NATIVE_APP_SERVERS []
+INVENTORY_ERRORS []
+MARKERLESS_SLEEP_11052 None
+REAL_COORDINATOR_STATE_EXISTS False
+```
+
+There were no surviving scratch daemon, supervisor, fixture, MCP server or native
+app-server processes. The previously observed markerless sleep had exited. The
+real coordinator state directory remains absent; no user's Codex home or real
+SmartPay repository was used.
+
+<details>
+<summary>Final process inventory command</summary>
+
+```sh
+PYTHONPATH=plugins/software-workflows PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.15 -B - <<'PY'
+import collections,json,os,re,sqlite3,subprocess
+from pathlib import Path
+from coordinator import processes
+base=Path('/private/tmp/sw-p1-240'); tracked={}; databases=[]; errors=[]
+for path in sorted(base.rglob('ledger.sqlite')):
+ try:
+  db=sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)
+  for kind,data in db.execute("SELECT kind,data FROM records WHERE kind IN ('listener','project_discovery','custody')"):
+   row=json.loads(data)
+   for item in ([row] if kind!='custody' else row.get('processes',[])):
+    if item.get('pid') and item.get('birth'):tracked[(item['pid'],item['birth'])]=kind
+  db.close();databases.append(str(path))
+ except Exception as exc:errors.append({'path':str(path),'error':type(exc).__name__})
+live=[]
+for (pid,birth),kind in tracked.items():
+ try:
+  item=processes.identity(pid)
+  if item and item['birth']==birth and not item['zombie']:live.append({'pid':pid,'birth':birth,'kind':kind})
+ except Exception as exc:errors.append({'pid':pid,'error':getattr(exc,'code',type(exc).__name__)})
+raw=subprocess.run(['ps','-axo','pid=,ppid=,command='],text=True,capture_output=True,check=True).stdout
+rows=[]
+for line in raw.splitlines():
+ parts=line.strip().split(None,2)
+ if len(parts)==3:rows.append((int(parts[0]),int(parts[1]),parts[2]))
+ancestors={os.getpid()};current=os.getpid();parents={pid:ppid for pid,ppid,cmd in rows}
+while current in parents and parents[current] not in ancestors:
+ current=parents[current];ancestors.add(current)
+scratch=[];native=[]
+for pid,ppid,cmd in rows:
+ if pid in ancestors:continue
+ if str(base) in cmd and any(x in cmd for x in ('coordinator','run_server.py','app-server','fixture')):scratch.append({'pid':pid,'ppid':ppid})
+ if re.search(r'(?:^|/)codex\s+app-server(?:\s|$)',cmd):native.append({'pid':pid,'ppid':ppid})
+print('SCRATCH_DATABASES',len(databases));print('TRACKED_PROCESS_IDENTITIES',len(tracked),dict(collections.Counter(tracked.values())))
+print('LIVE_TRACKED',json.dumps(live));print('SCRATCH_PROCESS_MATCHES',json.dumps(scratch));print('NATIVE_APP_SERVERS',json.dumps(native));print('INVENTORY_ERRORS',json.dumps(errors))
+print('MARKERLESS_SLEEP_11052',processes.identity(11052))
+print('REAL_COORDINATOR_STATE_EXISTS',Path('/Users/ahrar/.local/state/software-workflows').exists())
+if live or scratch or errors:raise SystemExit(1)
+PY
+```
+
+</details>
+
+A read-only Git/boundary inventory exited **0** and reported:
+
+```text
+CHANGED_FILES 30
+OUTSIDE_BOUNDARY []
+STAGED_FILES []
+HEAD 108d99651fb7ab9f36320a616eca8dc3d6d195eb
+```
+
+All changes are uncommitted and unstaged. The six new modules are
+`group_publish.py`, `operations.py`, `participants.py`,
+`project_admission.py`, `projects.py` and `routing.py`, all under coordinator.
+No gate, gitshim, Office, root documentation, manifest, skill, command or agent
+file was edited. No test/harness file was created. The lead still owns consumer
+integration and the version/changelog work outside P1's permitted boundary.
+
+**Deviations and UNVERIFIED limits:**
+
+- Native 0.163.0 child threads measurably inherit all roots but persist a null
+  native project association. The implementation preserves the measured child
+  association and native ancestry rather than inventing a projectId resume field
+  or refusing an otherwise valid native child. Both original and cold-resumed
+  child roots were measured in the dedicated admission run.
+- Real Codex UI placement and the user's native project list remain UNVERIFIED.
+  Computer-use access to the Codex app was explicitly disallowed; it was not
+  bypassed. No real-model run was used. Fixture transport, execution and review
+  binding were measured, not model judgment.
+- Latency was measured on scratch repositories with exactly 57, 1,291 and 1,495
+  Git-view paths. Real SmartPay repositories and external clones were outside
+  this run's allowed scope, so their latency remains UNVERIFIED.
+- Patch-crash quarantine/claim retention, all-participant command custody,
+  background-descendant settlement and listener replacement were each exercised.
+  A combined worker crash during a simultaneous multi-root opaque command with
+  a surviving marked descendant was not separately run.
+- Native/OS behavior outside this macOS host, actual Python 3.11 execution,
+  arbitrary user hook/MCP configurations and every possible crash instruction
+  boundary remain UNVERIFIED. Successful grammar/import checks do not establish
+  those behaviors.
+- The supplied drivers needed the scratch-only pause placement and in-memory
+  path/JSON-length adaptations recorded above. No calibration pause or new test
+  harness was installed in this checkout. Original 108d996 red evidence is
+  specifically identified above; later discovered failures are labelled by their
+  actual intermediate implementation and are not misrepresented as old-version
+  runs.
+
+Full-access writers, quiet-window attribution and an unreachable-coordinator
+gate retain their documented guardrail limits. P1 adds no sandbox or gate
+hardening.
+
+### Turn-15 addendum: completed mutations, recovery fencing and confirmation
+
+Read `charter_240_t15.md` completely and applied it after P1. The venue was
+`/private/tmp/sw-p1-t15`; the backend was the real local coordinator/SQLite,
+real Python 3.9 host hook and, for the native regressions, the existing fixture
+provider through the real Codex app-server and MCP server. No real-model request
+was used. Installed engine: **codex-cli 0.163.0**; daemon Python **3.15.0**,
+SQLite **3.54.1**; hook/client Python **3.9.6**.
+
+The addendum changes `store.py`, `intents.py`, `recovery.py`,
+`hooks/coordinator_lead.py`, this log and coordinator README. It adds no RPC
+method, test file or production calibration pause.
+
+- SQLite triggers increment durable counters in the same transaction as every
+  operation, custody/custody-request, non-lead actor and lead-hook record change.
+  The current hook's own revision is subtracted from the lead-hook counter.
+  Partial indexes inspect active occupancy; completed history is not reread.
+- The global fingerprint also retains the digest and filesystem identity of
+  each registered checkout's exec lock after its child exits. It includes the
+  daemon generation. Confirmation checks the fingerprint before first arming.
+- Recovery clears every observed Bash record's arm/token/window before its first
+  await and before hooks are admitted. Records remain observed until completion
+  or deadline because their old commands may still be running.
+- Same-token confirmation retries acknowledge the saved decision without
+  extending or reopening the window. A missing confirmation reply reports
+  `"armed": "uncertain"`; losing the initial Pre reply still leaves it unarmed.
+
+#### Calibration and red-before-green evidence
+
+`red/software-workflows` is the P1 tree copied **before** these fixes.
+`green/software-workflows` is the fixed tree. Each has only the requested
+`R14PAUSE_ATTACH` 2-second pause after hidden listing/before attachment and
+`R15ARM_DELAY` pause after saving the arm. The latter was set to 4 seconds by
+the existing driver. Neither pause exists in this checkout.
+
+The supplied driver is `$S/projects/r15_checks.py`, where:
+
+```sh
+S=/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad
+HOOK_PY=/usr/bin/python3 /opt/homebrew/bin/python3.15 -B "$S/projects/r15_checks.py" /private/tmp/sw-p1-t15/red/software-workflows /private/tmp/sw-p1-t15/red-rpc-overlap rpc-overlap
+```
+
+The same command form ran `exec-overlap`, `restart`, `lost-confirm`,
+`control` in their corresponding `red-<case>` venues and `rpc-cross` in
+`red-rpc-cross2`. All red commands exited **0**: these drivers print semantic
+results rather than failing their process on an incorrect attribution.
+
+After the fixes, all six cases ran in `green-<case>` venues using the green
+copy and the same interpreter/hook interpreter. The green invocation executed
+the existing source in memory, removing only its 150-character Pre-context
+display truncation. No expected result or product behavior was substituted.
+The driver source used for the green batch had SHA-256
+`731fd1dea55ac39bec94f2a438cdda89ecf97572a228e807f44c269d9202ad1a`.
+
+| Case | Pre-addendum P1 result | Fixed result | Fixed exit |
+| --- | --- | --- | ---: |
+| rpc-overlap | A completed in 0.09 s, custody released; B credited `gen.txt` as `lead-command` — **RED** | A 0.10 s, B Pre 2.1 s, armed false; `gen.txt: ['UNKNOWN']` | 0 |
+| exec-overlap | Completed simulated exec writer disappeared from live checks; B credited `gen.txt` — **RED** | Child 47192 exited; retained lock changed the stamp; B armed false, `gen.txt: ['UNKNOWN']` | 0 |
+| rpc-cross | A RPC in repo2 completed in 0.09 s; B in repo credited `gen.txt` — **RED** | A 0.09 s, B Pre 2.1 s; armed false, `gen.txt: ['UNKNOWN']` | 0 |
+| restart | P1's existing generation comparison already made A's Post UNKNOWN, but the recovered record stayed armed with a token/window — **invalidation RED** | Generation 2; A Post `UNKNOWN-context-only`; `a.txt: ['baseline', 'UNKNOWN']`; old windows explicitly cleared | 0 |
+| lost-confirm | Hook reported armed false after 3.1 s; store was true; Post credited `made.txt` — **status RED** | Hook 3.1 s: `"armed": "uncertain"`; store true; `made.txt: ['lead-command']` | 0 |
+| control | Quiet command credited, armed true | Pre 0.2 s, armed true; `made.txt: ['lead-command']` | 0 |
+
+Logs are `red-<case>.log`, `green-<case>.log`, and
+`red-rpc-cross2.log` under the venue. The lead added the driver's native
+`rpc-cross` case while this run was ongoing. An earlier in-memory cross
+adaptation in `red-rpc-cross.log` attached an extra actor during the window
+and therefore was an invalid calibration; it is **not** counted as red or green
+acceptance. The native `rpc-cross` runs above supersede it.
+
+The restart distinction is intentional: the addendum's released-2.3.5 result is
+not relabelled as a fresh P1 reproduction. This P1 tree already fenced Post by
+generation, so its fresh defect was the still-armed durable record.
+
+#### Confirmation retry and recovery-record evidence
+
+Additional real RPCs were inserted into the existing driver **in memory**, first
+against red and then green. Both confirmation runs exited **0**:
+
+```text
+red:
+CONFIRM_REPEAT {'armed': False}
+CONFIRM_WRONG_TOKEN {'armed': False}
+CONFIRM_REPEAT_AFTER_DEADLINE {'armed': False}
+CONFIRM_RECORD_REVISIONS 3 3
+
+green:
+CONFIRM_REPEAT {'armed': True}
+CONFIRM_WRONG_TOKEN {'armed': False}
+CONFIRM_REPEAT_AFTER_DEADLINE {'armed': True}
+CONFIRM_RECORD_REVISIONS 3 3
+```
+
+The repeat-after-deadline request followed a 3.2-second wait. No retry rewrote
+the record or extended its deadlines. The subsequent real Post still credited
+the quiet control's `made.txt`.
+
+The recovery audit additionally registered an unconfirmed Bash Pre, stopped and
+restarted the daemon, and read the records **after generation 2 became ready but
+before either Post**. Both red/green audit commands exited **0**:
+
+```text
+red armed record:
+state=observed generation=1 armed=True
+window_invalidated_generation=None has_window=True has_token=True
+red unarmed record:
+state=observed generation=1 armed=None
+window_invalidated_generation=None
+
+green formerly armed record:
+state=observed generation=1 armed=False armed_before_recovery=True
+window_invalidated_generation=2 has_window=False has_token=False
+green unarmed record:
+state=observed generation=1 armed=False armed_before_recovery=False
+window_invalidated_generation=2 has_window=False has_token=False
+```
+
+Logs: `red-confirmation.log`, `green-confirmation.log`,
+`red-recovery-audit.log`, `green-recovery-audit.log`.
+The r13 pause-before/after regressions below separately confirm that loss of the
+**initial Pre reply** leaves the promoted bytes UNKNOWN.
+
+<details>
+<summary>Exact in-memory confirmation/recovery audit invocation</summary>
+
+```sh
+/opt/homebrew/bin/python3.15 -B - <<'PY'
+import os,pathlib,subprocess,sys
+base=pathlib.Path("/private/tmp/sw-p1-t15")
+script=pathlib.Path("/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/projects/r15_checks.py")
+original=script.read_text().replace("context(pre)[:150]","context(pre)").replace("context(pre_b)[:150]","context(pre_b)")
+retry='''    observed = json.loads(context(pre))["observed"]
+    db = sqlite3.connect(f"file:{STATE}/ledger.sqlite?mode=ro", uri=True)
+    row = db.execute("SELECT data,revision FROM records WHERE id=?", (observed,)).fetchone()
+    token = json.loads(row[0])["arm"]
+    print("CONFIRM_REPEAT", c.call("lead-hook/armed", {"observed": observed, "arm": token}))
+    print("CONFIRM_WRONG_TOKEN", c.call("lead-hook/armed", {"observed": observed, "arm": "wrong-token"}))
+    time.sleep(3.2)
+    print("CONFIRM_REPEAT_AFTER_DEADLINE", c.call("lead-hook/armed", {"observed": observed, "arm": token}))
+    print("CONFIRM_RECORD_REVISIONS", row[1], db.execute("SELECT revision FROM records WHERE id=?", (observed,)).fetchone()[0])
+    db.close()
+'''
+unarmed='''    unarmed = c.call("lead-hook/dispatch", {"payload": {"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "true"}, "cwd": REPO, "session_id": "lead-unarmed", "tool_use_id": "unconfirmed"}})
+'''
+audit='''    db = sqlite3.connect(f"file:{STATE}/ledger.sqlite?mode=ro", uri=True)
+    for (raw,) in db.execute("SELECT data FROM records WHERE kind='lead_hook' ORDER BY id"):
+        record = json.loads(raw)
+        print("RECOVERED_WINDOW_BEFORE_POST", {key: record.get(key) for key in ("state", "generation", "armed", "armed_before_recovery", "window_invalidated_generation")}, "has_window", record.get("window") is not None, "has_token", record.get("arm") is not None)
+    db.close()
+'''
+for scenario in ("confirmation","recovery-audit"):
+    for tree in ("red","green"):
+        source=original
+        if scenario=="confirmation":
+            source=source.replace('    write("made.txt", "made\\n")',retry+'    write("made.txt", "made\\n")')
+            assert retry in source
+            case="control"
+        else:
+            source=source.replace('    print("  stop:", c.call("daemon/stop"))',unarmed+'    print("  stop:", c.call("daemon/stop"))')
+            source=source.replace('    write("a.txt", "a\\nby B\\n")',audit+'    write("a.txt", "a\\nby B\\n")')
+            assert unarmed in source and audit in source
+            case="restart"
+        venue=base/(tree+"-"+scenario)
+        argv=[str(script),str(base/tree/"software-workflows"),str(venue),case]
+        print("RUN",tree,scenario,flush=True)
+        result=subprocess.run([sys.executable,"-B","-c","import sys; sys.argv="+repr(argv)+"; exec(compile("+repr(source)+","+repr(str(script))+",'exec'))"],env=dict(os.environ,HOOK_PY="/usr/bin/python3"),capture_output=True,text=True)
+        output=result.stdout+result.stderr; (base/(tree+"-"+scenario+".log")).write_text(output)
+        print(output,flush=True);print("EXIT",tree,scenario,result.returncode,flush=True)
+        if result.returncode:sys.exit(result.returncode)
+
+PY
+```
+
+</details>
+
+#### Durable transition evidence and history cost
+
+Read-only SQLite inspection of the finished real runs exited **0**:
+
+```text
+green-rpc-overlap:
+  actors=2 custody=1 custody_request=1 lead_hook=1 operation=1
+  CLOCK (10, 3) REVISION_SUMS (10, 3)
+  custody=released operation=reconciled
+green-rpc-cross:
+  actors=2 custody=1 custody_request=1 lead_hook=1 operation=1
+  CLOCK (10, 3) REVISION_SUMS (10, 3)
+  custody=released operation=reconciled
+history-retry after explicit settlement:
+  actors=1 custody=41 custody_request=41 lead_hook=91 operation=41
+  CLOCK (414, 363) REVISION_SUMS (414, 363)
+  all 41 custody records released; all 41 operations reconciled
+```
+
+Thus completed mutations remain represented after their live occupancy is gone.
+`counter-records.log` retains this output.
+
+The accepted history run used a fresh actual daemon and **520 actual**
+Pre → confirm → `/usr/bin/true` → Post cycles, without fabricated history rows.
+It exited **0**, stopped its daemon, and produced `history-final.log`:
+
+```text
+BEFORE COUNTS {'actor': 1} CLOCK (0, 0) REVISION_SUMS (0, 0)
+FIRST_10_MEDIAN_MS 56.117 43.249
+LAST_10_MEDIAN_MS 59.742 46.662
+AFTER COUNTS {'actor': 1, 'lead_hook': 520}
+CLOCK (0, 2080) REVISION_SUMS (0, 2080)
+```
+
+The two timing columns are Pre+confirmation and Post RPC elapsed milliseconds.
+The occupancy queries' SQLite VM steps were unchanged before/after: actor **8**,
+operation **8**, custody **8**, lead_hook **11**. Query plans used the partial
+`window_actor`, `window_operation`, `window_custody` indexes and a deadline
+search on `window_lead_hook`. These results demonstrate that completed lead-hook
+history is not scanned. Fingerprint work still scales with registered checkouts
+and live occupancy; this is not a claim about unbounded project counts.
+
+Two earlier history attempts are retained as failures, not counted as accepted:
+`history.log` exited **1** after assuming every sample would arm; a real custody
+transition correctly invalidated one. Its outstanding Post was completed as
+UNKNOWN and cleanup exited **0**. `history-retry.log` exited **1** on
+`PROCESS_UNREADABLE` while repeatedly starting very short opaque commands;
+custody was retained. Explicit `custody/reconcile` proved absence, released
+`custody_ca3909623d414b82976e098faedb1f07`, and daemon/stop then succeeded
+(cleanup exit **0**). No authorship was granted for those uncertain effects.
+The final measurement uses the hook cycles directly, avoiding an unrelated
+process-birth race in the timing sample.
+
+<details>
+<summary>Exact accepted real history-growth invocation</summary>
+
+```sh
+/opt/homebrew/bin/python3.15 -B - <<'PY' > /private/tmp/sw-p1-t15/history-final.log 2>&1
+import os,pathlib,sys,json,sqlite3,time,subprocess,statistics
+script=pathlib.Path("/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/projects/r15_checks.py")
+sys.argv=[str(script),str(pathlib.Path("plugins/software-workflows").resolve()),"/private/tmp/sw-p1-t15/history-final","control"]
+__file__=str(script)
+exec(compile(script.read_text().split('\nif CASE == "rpc-overlap":')[0],str(script),"exec"))
+from coordinator.store import WINDOW_ACTIVE
+actor=c.call("lead/session",{"checkout":CID,"session_id":"history"})["actor"]
+db=sqlite3.connect(f"file:{STATE}/ledger.sqlite?mode=ro",uri=True)
+def snapshot(label):
+    counts=dict(db.execute("SELECT kind,count(*) FROM records WHERE kind IN ('lead_hook','operation','custody','actor','custody_request') GROUP BY kind"))
+    clock=db.execute("SELECT effects,lead_hooks FROM mutation_clock").fetchone()
+    effect_revisions=db.execute("SELECT coalesce(sum(revision),0) FROM records WHERE kind IN ('operation','custody','custody_request') OR (kind='actor' AND coalesce(json_extract(data,'$.kind'),'')!='lead')").fetchone()[0]
+    hook_revisions=db.execute("SELECT coalesce(sum(revision),0) FROM records WHERE kind='lead_hook'").fetchone()[0]
+    print(label,"COUNTS",counts,"CLOCK",clock,"REVISION_SUMS",(effect_revisions,hook_revisions),flush=True)
+    for kind,predicate in WINDOW_ACTIVE.items():
+        query="SELECT id FROM records INDEXED BY window_"+kind+" WHERE "+predicate
+        args=[]
+        if kind=="lead_hook":query+=" AND json_extract(data,'$.deadline')>? AND id!=?";args=[time.time(),"no-current-hook"]
+        query+=" LIMIT 1"
+        steps=[0]
+        def tick():steps[0]+=1;return 0
+        db.set_progress_handler(tick,1);db.execute(query,args).fetchall();db.set_progress_handler(None,0)
+        plan=[row[-1] for row in db.execute("EXPLAIN QUERY PLAN "+query,args)]
+        print(label,"QUERY",kind,"VM_STEPS",steps[0],"PLAN",plan,flush=True)
+def call_hook(index):
+    payload={"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"true"},"cwd":REPO,"session_id":"history","tool_use_id":"history-"+str(index)}
+    started=time.monotonic();pre=c.call("lead-hook/dispatch",{"payload":payload})
+    armed=c.call("lead-hook/armed",{"observed":pre["observed"],"arm":pre["arm"]}) if pre.get("arm") else {"armed":False}
+    pre_ms=(time.monotonic()-started)*1000
+    subprocess.run(["/usr/bin/true"],check=True,cwd=REPO)
+    payload.update(hook_event_name="PostToolUse",tool_response=DONE)
+    started=time.monotonic();post_result=c.call("lead-hook/dispatch",{"payload":payload})
+    if armed!={"armed":True} or post_result["attribution"]!="lead-command":print("WINDOW_REFUSED_DURING_TRANSITION",index,armed,post_result["attribution"],flush=True)
+    return pre_ms,(time.monotonic()-started)*1000
+try:
+    snapshot("BEFORE")
+    first=[call_hook(i) for i in range(10)]
+    print("FIRST_10_MEDIAN_MS",*[round(statistics.median(row[j] for row in first),3) for j in (0,1)],flush=True)
+    for i in range(10,510):
+        call_hook(i)
+        if (i+1)%100==0:print("COMPLETED_HOOK_CALLS",i+1,flush=True)
+    last=[call_hook(i) for i in range(510,520)]
+    print("LAST_10_MEDIAN_MS",*[round(statistics.median(row[j] for row in last),3) for j in (0,1)],flush=True)
+    snapshot("AFTER")
+finally:
+    db.close()
+    for attempt in range(20):
+        try:print("STOP",c.call("daemon/stop"),flush=True);break
+        except Exception:
+            if attempt==19:raise
+            time.sleep(0.5)
+
+PY
+```
+
+</details>
+
+#### Required regression reruns after the addendum
+
+The earlier P1 suite was repeated on the fixed source. All accepted driver exits
+below were **0**; semantic output was inspected, rather than treating exit 0
+alone as proof. Paths are beneath `/private/tmp/sw-p1-t15`.
+
+| Existing driver / cases | Accepted log / venue | Result |
+| --- | --- | --- |
+| r11_ledger refresh | `reg-r11_ledger-refresh.log` | 20,000-path reconcile detected deletion; UNKNOWN:deleted; 7.8 s scan |
+| r11_ledger folder | `reg-r11_ledger-folder.log` | File-to-directory change and new child UNKNOWN |
+| r11_ledger submodule | `reg-r11_ledger-submodule.log` | Explicit PATH_TYPE refusal |
+| r11_ledger uncached | `reg-r11_ledger-uncached.log` | Kept HEAD bytes remain baseline |
+| r11_ledger stall | `reg-r11_ledger-stall.log` | GIT_TIMEOUT after 3.6 s; cat-file 51208 gone |
+| r11_ledger killed | `reg-r11_ledger-killed-retry.log` | SIGKILL after 2.5 s; initializing → incomplete → ready |
+| r11_promote | `reg-r11_promote.log` | Old ignored generated.txt UNKNOWN; new made.txt lead-command |
+| r12_checks | `reg-r12_checks.log` | No-op touched/sedded bytes UNKNOWN; newly exposed bundle UNKNOWN; file→directory seal succeeded |
+| r13 pause-after, pause-before, alias, collapsed | `reg-r13_checks-<case>.log` | Timed-out Pre UNKNOWN; case alias and hidden paths remain UNKNOWN; eligible new files credited |
+| r14 reappear, overlap, pathmagic, control | `reg-r14_checks-<case>.log` | Reappearing/other-lead bytes UNKNOWN; pathmagic and quiet controls credited |
+| lead_bash3 | `reg-lead_bash3.log` | Overlap UNKNOWN; alone lead-command; duplicate Post UNKNOWN |
+| lead_hooks_edge | `reg-lead_hooks_edge.log` | Replayed CLAIM_CONFLICT; NOTEBOOK_ADAPTER_UNVERIFIED; notebook UNKNOWN |
+| lead_bash2 | `reg-lead_bash2-retry.log` | Active native custody: e.txt UNKNOWN; afterward f.txt lead-command; claimed w.txt UNKNOWN; fixture 3 requests, errors [] |
+| settle_check | `reg-settle_check-retry.log` | SLEEP 26.8 s, MARKED 10.2 s, ESCAPE 2.2 s; all completed, custody 0, settlement_refusal None; fixture 9 requests, errors [] |
+
+The lead_bash2 native command itself completed, but the workflow correctly
+reported `status:error` / `state:blocked` because the concurrent lead edit
+introduced UNKNOWN `e.txt`. This is not represented as a successful clean writer
+run. Both phases completed; the blocking UNKNOWN and each attribution above were
+read back from the ledger.
+
+`regression-final.log`, `regression-retry.log` and
+`regression-native-final.log` record exact interpreter/script/plugin/venue/case
+arguments, output and exits. Command forms are the earlier P1 forms, now with
+`reg-*` scratch venues. r13/r14 use
+`/private/tmp/sw-p1-t15/regression/software-workflows`, a separate fixed-tree
+copy with only the three marked fixed14p pauses at equivalent points:
+R13PAUSE_BEFORE, R14PAUSE_ATTACH, R13PAUSE_AFTER.
+
+Driver adaptations remained in memory: hooks use `/usr/bin/python3`; the m3
+plugin-data directory becomes `/private/tmp/sw-p1-240/plugin-data`;
+lead_bash3's 400-character JSON truncation is removed. The supplied files were
+not modified. Two invocation failures were corrected without product changes:
+
+- The initial killed-registration wrapper omitted `__file__`: driver exit
+  **1** before starting its child. The retry supplied the original filename and
+  used a fresh scratch repository.
+- The first lead_bash2 wrapper put the entire source in `python -c` arguments.
+  The existing mixed-version guard recognized its embedded server strings as an
+  unregistered legacy server and refused EXCLUSIVE_WRITER before inference.
+  Driver PID 56588, birth `1792402730:571486`, was identity-checked and
+  interrupted: child exit **-2** (outer wrapper **254**), fixture requests **0**,
+  errors **[]**, daemon stop succeeded. The accepted native runs passed their
+  source through stdin, keeping it out of the OS command line.
+
+<details>
+<summary>Exact accepted native regression wrapper</summary>
+
+```sh
+/opt/homebrew/bin/python3.15 -B - <<'PY'
+import os,pathlib,subprocess,sys,time
+base=pathlib.Path("/private/tmp/sw-p1-t15")
+scripts=pathlib.Path("/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad")
+plugin=str(pathlib.Path("plugins/software-workflows").resolve()); calibration=str(base/"regression/software-workflows")
+python="/opt/homebrew/bin/python3.15"; venv="/private/tmp/sw-p1-240/plugin-data/venv/91e1e736a04fad0e/bin/python"
+runs=[("projects/r11_ledger.py",c) for c in ("refresh","folder","submodule","uncached","stall","killed")]
+runs += [("projects/r11_promote.py",""),("projects/r12_checks.py","")]
+runs += [("projects/r13_checks.py",c) for c in ("pause-after","pause-before","alias","collapsed")]
+runs += [("projects/r14_checks.py",c) for c in ("reappear","overlap","pathmagic","control")]
+runs += [("m3/"+n+".py","") for n in ("lead_bash3","lead_hooks_edge","lead_bash2","settle_check")]
+all_logs=[]
+runs=runs[-2:]
+for relative,case in runs:
+    script=scripts/relative; name=script.stem+("-"+case if case else "")
+    venue=base/("reg-"+name+"-retry"); assert not venue.exists(),str(venue)
+    chosen=calibration if script.stem in ("r13_checks","r14_checks") else plugin
+    interpreter=venv if script.stem in ("lead_bash2","settle_check") else python
+    source=script.read_text()
+    source=source.replace('Path.home() / ".claude/plugins/data/software-workflows-inline"', 'Path("/private/tmp/sw-p1-240/plugin-data")')
+    source=source.replace('["/opt/homebrew/bin/python3",', '["/usr/bin/python3",')
+    if script.stem=="lead_bash3": source=source.replace('out.stdout.strip()[:400]', 'out.stdout.strip()')
+    argv=[str(script),chosen,str(venue)]+([case] if case else [])
+    program="import sys; __file__="+repr(str(script))+"; sys.argv="+repr(argv)+"; exec(compile("+repr(source)+","+repr(str(script))+",'exec'))"
+    cmd=[interpreter,"-B","-"]
+    env=dict(os.environ,HOOK_PY="/usr/bin/python3",PYTHONDONTWRITEBYTECODE="1",CODEX_ORACLE_LOG_DIR=str(venue/"logs"))
+    for key in ("SOFTWARE_WORKFLOWS_STATE","SOFTWARE_WORKFLOWS_RUNTIME","SOFTWARE_WORKFLOWS_FIXTURE","R15ARM_DELAY"): env.pop(key,None)
+    heading="RUN "+interpreter+" -B "+" ".join(argv)
+    print(heading,flush=True);started=time.monotonic()
+    result=subprocess.run(cmd,input=program,capture_output=True,text=True,env=env)
+    output=result.stdout+result.stderr; pathlib.Path(str(venue)+".log").write_text(output)
+    ending="EXIT "+name+" "+str(result.returncode)+" seconds="+str(round(time.monotonic()-started,2))
+    print(output,flush=True);print(ending,flush=True)
+    all_logs += [heading,output,ending]; (base/"regression-native-final.log").write_text("\n".join(all_logs))
+    if result.returncode:sys.exit(result.returncode)
+
+PY
+```
+
+</details>
+
+#### Final addendum validators, cleanup and boundary
+
+All final checks below exited **0** after the last product-source change:
+
+| Check | Output |
+| --- | --- |
+| `CLAUDE_CONFIG_DIR=/private/tmp/sw-p1-t15/validate-plugin TMPDIR=/private/tmp/sw-p1-t15/validate-tmp claude plugin validate --strict plugins/software-workflows` | ✔ Validation passed |
+| `CLAUDE_CONFIG_DIR=/private/tmp/sw-p1-t15/validate-marketplace TMPDIR=/private/tmp/sw-p1-t15/validate-tmp claude plugin validate --strict .` | ✔ Validation passed |
+| Earlier exact Python 3.15 in-memory parse/compile command | PY315_AST_OK 38 3.15.0 PY311_GRAMMAR_OK |
+| Earlier exact Python 3.9 command, scratch import logs under sw-p1-t15 | PY39_PARSE_IMPORT_OK 10 modules 6 hooks 3.9.6 |
+| `git diff --check` after this evidence append | No output |
+
+A final source comparison exited **0**: the accepted scratch copy's store,
+recovery and host-hook source still matched this checkout byte for byte;
+intents matched after removing only the two calibration pauses. No production
+Python source contains R13PAUSE, R14PAUSE or R15ARM_DELAY. No product source was
+changed after its accepted runs.
+
+All failed-attempt daemons were also settled/stopped. The final process inventory
+used the earlier exact cleanup command with **both**
+`/private/tmp/sw-p1-240` and `/private/tmp/sw-p1-t15` as roots. It compared
+stored PID/birth identities to the OS and exited **0**:
+
+```text
+SCRATCH_DATABASES 98
+TRACKED_PROCESS_IDENTITIES 146 {'project_discovery': 87, 'listener': 59}
+LIVE_TRACKED []
+SCRATCH_PROCESS_MATCHES []
+NATIVE_APP_SERVERS []
+INVENTORY_ERRORS []
+MARKERLESS_SLEEP_92340 None
+REAL_COORDINATOR_STATE_EXISTS False
+```
+
+Output: `/private/tmp/sw-p1-t15/cleanup-final.log`. The final ESCAPE-case
+markerless sleep had exited. No daemon, supervisor, fixture provider, MCP server
+or native app-server from these runs survived.
+
+Read-only boundary inventory: **30 P1 files**, **no staged files**, HEAD still
+`108d99651fb7ab9f36320a616eca8dc3d6d195eb`. During this addendum, concurrent
+changes appeared in `hooks/push_gate.py`, `office/office.html` and
+`office/office.py`; this run did not edit or revert them. They are not included
+in the P1 changed-file list. No manifest, root documentation, skill, command,
+agent, gitshim or session-start edit was made by P1.
+
+The earlier P1 UNVERIFIED limits still apply: real-user Codex project listing/UI,
+real-model judgment, real SmartPay/clone latency, actual Python 3.11 execution,
+other platforms, arbitrary user configurations and the combined multi-root
+opaque-command/worker-crash/surviving-descendant scenario. The addendum's six
+acceptance cases, explicit recovery invalidation, repeated confirmation and
+required regression reruns were all exercised. The process-birth refusal in the
+extra history run is recorded above; it was not hidden or turned into authorship.
+
+### Addendum 2 — lead findings F1–F5 (2026-10-19)
+
+Read `charter_240_lead.md` and `p1_lead_findings.md` completely before
+changing these behaviors. This section supersedes the earlier P1 interpretation
+that quiet-window Bash attribution stops at the target checkout. **F5 explicitly
+requires attribution throughout the call's captured reconciliation reach.**
+The earlier external-sibling UNKNOWN result remains a historical measurement of
+the pre-addendum implementation, not the current acceptance expectation.
+
+All new behavioral runs used disposable native homes, scratch repositories and
+scratch state under `/private/tmp/sw-p1-f`. The native engine remained Codex
+**0.163.0**, with Python **3.15.0**, SQLite **3.54.1**, and actual Python **3.9.6**
+host hooks. Native turns used the existing fixture provider; no real-model run
+was used. No test file or test harness was added. The supplied drivers and inline
+operational commands below exercised the actual daemon, hooks, native app-server
+and MCP server. Driver exit 0 alone is not a behavioral pass: their printed
+responses, receipt histories and persisted records were inspected.
+
+The immutable red copy was `/private/tmp/sw-p1-f/red/software-workflows`,
+taken before any F1–F5 edit. The first green copy was
+`/private/tmp/sw-p1-f/green/software-workflows`. The final acceptance pass ran
+against this checkout after the last product-source edit. Every primary
+acceptance ran red before green. Fresh 2.3.5 comparisons used the supplied
+`projects/export235/plugins/software-workflows` export.
+
+#### Changes and contract decisions
+
+- **F1:** server startup is checked before discovery. An unavailable coordinator
+  retains singleton fallback; a selected project never falls back. Absence of
+  both project protocol schemas means the installed engine has no project API.
+  A partial/malformed capability inventory still refuses discovery. A refusal
+  names a durable handle only after a run is known to exist.
+- **F2:** registration persists the complete paginated native catalog with its
+  active revision. Lead tools use that registered catalog; explicit registration
+  and Abraham refresh it. Existing session units remain pinned, while a new
+  session uses the newly registered revision. No native process starts for a
+  cached lead-tool call.
+- **F3:** hooks select only from registered revisions, narrowed by the host
+  session folder. Zero or multiple candidates use a singleton unit. Explicit
+  tools retain PROJECT_AMBIGUOUS and the project selector.
+- **F4:** session, participant, held-claim, open-publication, unfinished-unit,
+  visible-run and UNKNOWN queries use indexed filters. Querying a publication
+  avoids loading claim/dependency/UNKNOWN surfaces for every historical unit.
+  The exec-lock check reuses the verified physical checkout identity rather than
+  spawning Git repeatedly; singleton exec lock naming remains unchanged.
+- **F5:** every captured reach checkout receives its own hidden-path evidence,
+  owning lead unit and other-unit claim exclusions. All observations finish
+  before one final synchronous global-window check and receipt transaction.
+  A checkout added to reach after arrival receives no attribution without its
+  arrival hidden listing. Roots belonging only to older revisions use a separate
+  owning session unit rather than silently widening a pinned unit.
+
+The schema remains version 3. New indexes install additively without rewriting
+legacy records or receipt/seal bindings. README documents refresh/pinning,
+hook selection, fallback, fast observations, full-reach attribution and its
+chosen limitation: an arbitrary external editor inside the reach can be credited
+during an otherwise globally quiet armed window.
+
+#### Primary red → green acceptance
+
+Exact command components:
+
+```sh
+S=/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad
+R=/private/tmp/sw-p1-f
+P=/Users/ahrar/Documents/agent-teams-plugin/plugins/software-workflows
+V=/private/tmp/sw-p1-240/plugin-data/venv/91e1e736a04fad0e/bin/python
+Y=/opt/homebrew/bin/python3.15
+HOOK_PY=/usr/bin/python3
+SEED_SCHEMAS=$S/projects/seed_schemas_0163
+PYTHONDONTWRITEBYTECODE=1
+```
+
+The wrapper below set the last three values in each subprocess's environment.
+Each log includes the full expanded argv, actual exit and elapsed time.
+The actual initial command was `$Y -B -` with this source on stdin:
+
+<details>
+<summary>Exact primary red and 2.3.5 comparison orchestration</summary>
+
+```python
+import os,subprocess,concurrent.futures,time
+from pathlib import Path
+s=Path("/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad")
+root=Path('/private/tmp/sw-p1-f')
+red=root/'red/software-workflows'
+old=s/'projects/export235/plugins/software-workflows'
+py='/opt/homebrew/bin/python3.15'
+venv='/private/tmp/sw-p1-240/plugin-data/venv/91e1e736a04fad0e/bin/python'
+cases=[('f1-no','fallback_check.py','no-daemon',red,venv),('f1-old','fallback_check.py','old-codex-resolve',red,venv),('f2-red','leadtool_timing.py','project',red,venv),('f2-old','leadtool_timing.py','checkout',old,venv),('f3-red','ambiguity_check.py','project',red,py),('f3-old','ambiguity_check.py','checkout',old,py),('f4-red','query_cost.py','10,100,300,600,1000',red,py),('f4-old','query_cost.py','10,100,300,600,1000',old,py),('f5-red','crossrepo_bash.py','project',red,py)]
+env=dict(os.environ,HOOK_PY='/usr/bin/python3',SEED_SCHEMAS=str(s/'projects/seed_schemas_0163'),PYTHONDONTWRITEBYTECODE='1')
+def run(job):
+ name,script,mode,tree,interpreter=job
+ cmd=[interpreter,'-B',str(s/'projects'/script),str(tree),str(root/name),mode]
+ start=time.monotonic()
+ with (root/(name+'.log')).open('w') as log:
+  log.write('COMMAND '+repr(cmd)+'\n');log.flush()
+  p=subprocess.run(cmd,stdout=log,stderr=subprocess.STDOUT,env=env)
+  log.write('\nEXIT '+str(p.returncode)+' ELAPSED '+str(round(time.monotonic()-start,3))+'\n')
+ print(name,p.returncode,round(time.monotonic()-start,2),flush=True)
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+ list(pool.map(run,cases))
+```
+
+</details>
+
+For the first green pass, the same wrapper used
+`red=root/'green/software-workflows'` and these exact jobs:
+
+```python
+cases=[
+ ('f1-no-green','fallback_check.py','no-daemon',red,venv),
+ ('f1-old-green','fallback_check.py','old-codex-resolve',red,venv),
+ ('f2-green','leadtool_timing.py','project',red,venv),
+ ('f3-green','ambiguity_check.py','project',red,py),
+ ('f4-green','query_cost.py','10,100,300,600,1000',red,py),
+ ('f5-green','crossrepo_bash.py','project',red,py)]
+```
+
+The final pass used `red=Path('plugins/software-workflows').resolve()`
+and replaced each job's `-green` suffix with `-final`; every other argument
+was unchanged. No venue was reused for these driver passes.
+
+| Run | Red result | First green result | Final result / actual exit |
+| --- | --- | --- | --- |
+| F1 no-daemon | STATE_PERMISSIONS became a refusal with a nonexistent durable handle; no fallback | `native_result: None`, fallback reason STATE_PERMISSIONS | Same, **0** |
+| F1 old-codex-resolve | SCHEMA_MISSING ProjectListParams | `project: null, singleton: true` | Same, **0** |
+| F2 calls 2–5 | 708 / 680 / 675 / 681 ms | 44 / 58 / 43 / 44 ms | 50 / 54 / 47 / 50 ms, **0** |
+| F3 overlapping native projects | lead-F unavailable; f.txt and g.txt UNKNOWN | Both sessions exact then armed lead-command; no UNKNOWN | Same, **0** |
+| F4 1,000 units | query 3,084.8 ms, gate available 0/7 | query 3.7 ms, gate available 7/7 | query 3.8 ms, gate available 7/7, **0** |
+| F5 command from outer root | Backend and Frontend deltas UNKNOWN | Both roots lead-command; local control unchanged | Same, **0** |
+
+All nine initial red/comparison driver processes and all six first-green
+processes exited **0**. The red failures are semantic failures shown above.
+The final six elapsed times were 0.513, 0.777, 7.071, 4.506, 51.704 and
+4.078 seconds respectively. Logs are `$R/f1-no*.log`,
+`$R/f1-old*.log`, `$R/f2-*.log` through `$R/f5-*.log`;
+`acceptance-final.log` records all six final exits.
+
+F2 fresh 2.3.5 baseline: first call **442 ms**, subsequent
+**44 / 46 / 46 / 44 ms**. First registration remains more expensive in the
+project case: red **4,111 ms**, first green **2,972 ms**, final **3,378 ms**.
+The required repeated calls are within twice the singleton baseline.
+
+F4 actual checkout/query medians, milliseconds:
+
+| Units | 2.3.5 | Red P1 | Final P1 | Final 250 ms gate client |
+| ---: | ---: | ---: | ---: | --- |
+| 10 | 0.4 | 1.4 | 0.4 | 7/7 available |
+| 100 | 0.7 | 13.6 | 0.7 | 7/7 available |
+| 300 | 1.3 | 67.4 | 1.3 | 7/7 available |
+| 600 | 2.3 | 932.4 | 2.3 | 7/7 available |
+| 1,000 | 3.5 | 3,084.8 | 3.8 | 7/7 available |
+
+The final 1,000-unit query maximum was 9.8 ms. These runs contain 1,000 real
+lead session/unit records created through the supplied operational driver.
+They do not claim constant time independent of response size: returning more
+live units still costs proportionally to the response.
+
+F3 final histories:
+`f.txt = [baseline, exact, lead-command]`,
+`g.txt = [baseline, exact, lead-command]`, `UNKNOWN paths: []`.
+F5 final histories:
+`b.txt = [baseline, lead-command, lead-command, lead-command]`,
+`f.txt = [baseline, lead-command]`, `UNKNOWN paths: []`.
+Post preserves the legacy target-only scalar `attributed` field; its
+`participants` array reports attribution in every root.
+
+#### Additional F1, F2/F3 and F5 evidence
+
+All three accepted inline operational commands below exited **0**.
+
+**F1 selected-project startup / genuinely unknown discovery — f1-private.log.**
+A disposable registered project had only ThreadStartParams removed from its
+scratch schema cache. Startup refused SCHEMA_MISSING with
+`safe_to_fallback: false`; the actual persisted run was
+`run_1027474678f246d38a7c1a3b37ef4e4c`, state refused,
+production_started false. The response named that existing handle and returned
+no fallback. Removing ProjectListParams while retaining ProjectReadParams then
+produced a genuine discovery refusal: **“Nothing was dispatched.”**, no handle,
+no codex_resume_run suggestion and no additional run record.
+
+<details>
+<summary>Exact selected-project and discovery command (plugin venv Python -B -)</summary>
+
+```python
+import pathlib,sys,os,asyncio,json,sqlite3
+s=pathlib.Path("/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad")
+script=s/"projects/ambiguity_check.py"
+sys.argv=[str(script),str(pathlib.Path("plugins/software-workflows").resolve()),"/private/tmp/sw-p1-f/f1-selected-private","project"]
+__file__=str(script)
+os.umask(0o077)
+exec(compile(script.read_text().split('\nfor session, folder, name in ')[0],str(script),"exec"))
+os.environ.update(SOFTWARE_WORKFLOWS_STATE=STATE,CLAUDE_CWD=OUTER)
+from coordinator import native
+schema=pathlib.Path(STATE)/"schemas"/native.file_digest(native.native_codex())
+missing=list(schema.rglob("ThreadStartParams.json"));assert len(missing)==1
+missing[0].unlink()
+import server
+try:
+ before=c.call("records/list",{"kind":"run","limit":100})["data"]
+ out=asyncio.run(server._native_abraham("F1 selected project startup refusal","","",[],FRONT,None,False,"f1-selected",None,time.monotonic(),dispatch_cwd=OUTER))
+ print("SELECTED_STARTUP",out,flush=True)
+ rows=c.call("records/list",{"kind":"run","limit":100})["data"]
+ print("RUNS",[(r["id"],r["state"],r["production_started"],r.get("refusal")) for r in rows],flush=True)
+ assert out[0] and out[1]=="" and len(rows)==len(before)+1 and not rows[-1]["production_started"]
+ assert "Durable handle:" in out[0]
+ missing=list(schema.rglob("ProjectListParams.json"));assert len(missing)==1;missing[0].unlink()
+ out=asyncio.run(server._native_abraham("F1 unknown discovery","","",[],FRONT,None,False,"f1-unknown",None,time.monotonic(),dispatch_cwd=OUTER))
+ print("UNKNOWN_DISCOVERY",out,flush=True)
+ assert out[0] and out[1]=="" and "Nothing was dispatched." in out[0] and "Durable handle" not in out[0] and "codex_resume_run" not in out[0]
+ assert len(c.call("records/list",{"kind":"run","limit":100})["data"])==len(rows)
+finally:print("STOP",c.call("daemon/stop"),flush=True)
+```
+
+</details>
+
+**F2/F3 catalog and revision pinning — f3-extra.log.**
+Both overlapping projects were registered. An explicit lead tool returned
+PROJECT_AMBIGUOUS with both IDs/names while discovery-record count stayed
+**2 → 2**. The hook for that same ambiguous folder selected a singleton,
+armed successfully and recorded lead-command; discovery count again stayed
+**2 → 2**. An external scratch-native project/update added Backend/sub as a
+distinct root in the existing Backend checkout. Before explicit registration
+the registered revision still had three bindings. Registration created a new
+four-binding revision; the existing unit retained its old revision, a new
+session acquired the new revision, and subsequent tools left discovery count
+**3 → 3**. No UNKNOWN remained.
+
+<details>
+<summary>Exact catalog/pinning command (plugin venv Python -B -)</summary>
+
+```python
+import pathlib,sys,os,asyncio,json,sqlite3
+s=pathlib.Path("/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad");script=s/"projects/ambiguity_check.py"
+sys.argv=[str(script),str(pathlib.Path("plugins/software-workflows").resolve()),"/private/tmp/sw-p1-f/f3-both","project"]
+__file__=str(script);os.umask(0o077)
+source=script.read_text().split('\nfor session, folder, name in ')[0].replace('text[:230]','text')
+exec(compile(source,str(script),"exec"))
+os.environ.update(SOFTWARE_WORKFLOWS_STATE=STATE,CLAUDE_CWD=OUTER)
+import server
+db=sqlite3.connect(f"file:{STATE}/ledger.sqlite?mode=ro",uri=True)
+def discoveries():return db.execute("SELECT count(*) FROM records WHERE kind='project_discovery'").fetchone()[0]
+try:
+ c.call("project/register",{"project":projects["Frontend"]})
+ before=discoveries()
+ out=asyncio.run(server._lead_request("claim/list",{},FRONT,"explicit-ambiguous",dispatch_cwd=FRONT))
+ print("LEAD_TOOL_AMBIGUOUS",out,"DISCOVERIES",before,discoveries(),flush=True)
+ assert "PROJECT_AMBIGUOUS" in out and before==discoveries()
+ command="echo hook-singleton >> f.txt"
+ print("AMBIGUOUS_HOOK_PRE",hook("PreToolUse","Bash",{"command":command},"hook-both",FRONT,"both"),flush=True)
+ subprocess.run(["/bin/sh","-c",command],cwd=FRONT,check=True)
+ print("AMBIGUOUS_HOOK_POST",hook("PostToolUse","Bash",{"command":command},"hook-both",FRONT,"both",{"tool_response":{"stdout":"","stderr":"","interrupted":False}}),flush=True)
+ mappings=[json.loads(row[0]) for row in db.execute("SELECT data FROM records WHERE kind='lead_session' AND json_extract(data,'$.session_id')='hook-both'")]
+ frontmap=next(m for m in mappings if json.loads(db.execute("SELECT data FROM records WHERE id=?",(m["checkout"],)).fetchone()[0])["root"]==FRONT)
+ print("HOOK_SINGLETON",frontmap["project"],"DISCOVERIES",before,discoveries(),flush=True)
+ assert frontmap["project"] is None and history("f.txt")[-1]=="lead-command" and before==discoveries()
+ out=asyncio.run(server._lead_request("claim/list",{},FRONT,"pinned",dispatch_cwd=OUTER));print("CACHED_TOOL",out,flush=True)
+ pinned=next(json.loads(r[0]) for r in db.execute("SELECT data FROM records WHERE kind='lead_session' AND json_extract(data,'$.session_id')='pinned'"))
+ oldunit=pinned["unit"];oldrev=json.loads(db.execute("SELECT data FROM records WHERE id=?",(oldunit,)).fetchone()[0])["project_revision"]
+ os.mkdir(BACK+"/sub")
+ app=subprocess.Popen([native.native_codex(),"app-server","--listen","stdio://"],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,env=dict(os.environ),cwd=W,text=True)
+ try:
+  rpc("initialize",{"clientInfo":{"name":"membership-fixture","version":"0"},"capabilities":{"experimentalApi":True}})
+  app.stdin.write('{"method":"initialized"}\n');app.stdin.flush()
+  rpc("project/update",{"projectId":projects["SmartPay"],"roots":[{"path":p} for p in (OUTER,BACK,FRONT,BACK+"/sub")]})
+ finally:app.stdin.close();app.wait(timeout=30);print("UPDATE_APP_EXIT",app.returncode,flush=True)
+ print("BEFORE_REGISTER_BINDINGS",len(c.call("project/status",{"project":projects["SmartPay"]})["revision"]["bindings"]),flush=True)
+ nextrev=c.call("project/register",{"project":projects["SmartPay"]})
+ out=asyncio.run(server._lead_request("claim/list",{},FRONT,"pinned",dispatch_cwd=OUTER))
+ same=json.loads(db.execute("SELECT data FROM records WHERE id=?",(oldunit,)).fetchone()[0])
+ print("PINNED_REVISION",oldrev,same["project_revision"],"ACTIVE_REVISION",nextrev["id"],"BINDINGS",len(nextrev["bindings"]),flush=True)
+ assert same["project_revision"]==oldrev and nextrev["id"]!=oldrev and len(nextrev["bindings"])==4
+ count=discoveries()
+ out=asyncio.run(server._lead_request("claim/list",{},FRONT,"new-revision-session",dispatch_cwd=OUTER))
+ newmap=next(json.loads(r[0]) for r in db.execute("SELECT data FROM records WHERE kind='lead_session' AND json_extract(data,'$.session_id')='new-revision-session'"))
+ newunit=json.loads(db.execute("SELECT data FROM records WHERE id=?",(newmap["unit"],)).fetchone()[0])
+ print("NEW_UNIT_REVISION",newunit["project_revision"],"DISCOVERIES",count,discoveries(),flush=True)
+ assert newunit["project_revision"]==nextrev["id"] and count==discoveries()
+ print("NO_UNKNOWN",unknown_paths(),flush=True);assert not unknown_paths()
+finally:db.close();print("STOP",c.call("daemon/stop"),flush=True)
+```
+
+</details>
+
+**F5 per-root hidden and claim exclusions — f5-extra.log.**
+A pre-existing ignored Backend/hidden.bin was force-added from the outer folder
+inside an armed window. Its history was **[UNKNOWN]**. Another unit then claimed
+Backend/b.txt. An outer command changed b.txt and Frontend/f.txt together:
+Backend history became **[baseline, UNKNOWN]**, while Frontend became
+**[baseline, lead-command]**. Full Post output identified both participants and
+their individual attributed/UNKNOWN paths. The pre-existing .gitignore change
+was separately UNKNOWN before either command.
+
+<details>
+<summary>Exact sibling-hidden and foreign-claim command (Python 3.15 -B -)</summary>
+
+```python
+import pathlib,sys,os,asyncio,json,sqlite3
+s=pathlib.Path("/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad");script=s/"projects/crossrepo_bash.py"
+sys.argv=[str(script),str(pathlib.Path("plugins/software-workflows").resolve()),"/private/tmp/sw-p1-f/f5-hidden","project"]
+__file__=str(script)
+source=script.read_text().split('\ncases = ')[0].replace('text[:230]','text')
+exec(compile(source,str(script),"exec"))
+try:
+ git(BACK,"ls-files","--error-unmatch","b.txt")
+ with open(BACK+"/.gitignore","w") as f:f.write("hidden.bin\n")
+ with open(BACK+"/hidden.bin","w") as f:f.write("older generated bytes\n")
+ # The ignore rule itself predates the command; reconcile it before the window.
+ cid=next(b["checkout"] for b in revision["bindings"] if b["root"]==BACK)
+ print("BEFORE",c.call("checkout/reconcile",{"checkout":cid}),flush=True)
+ command="git -C Backend add -f -- hidden.bin"
+ print("HIDDEN_PRE",hook("PreToolUse","Bash",{"command":command},"lead-O",OUTER,"hidden"),flush=True)
+ subprocess.run(["/bin/sh","-c",command],cwd=OUTER,check=True)
+ print("HIDDEN_POST",hook("PostToolUse","Bash",{"command":command},"lead-O",OUTER,"hidden",{"tool_response":{"stdout":"","stderr":"","interrupted":False}}),flush=True)
+ assert history("hidden.bin")==["UNKNOWN"]
+ print("HIDDEN_HISTORY",history("hidden.bin"),flush=True)
+ other=c.call("run/start",{"checkout":cid,"mode":"lead","task":"other unit claim"})
+ print("OTHER_CLAIM",c.call("claim/acquire",{"actor":other["actor"],"paths":["b.txt"]}),flush=True)
+ command="echo excluded >> Backend/b.txt; echo eligible >> Frontend/f.txt"
+ print("CLAIM_PRE",hook("PreToolUse","Bash",{"command":command},"lead-O",OUTER,"claim"),flush=True)
+ subprocess.run(["/bin/sh","-c",command],cwd=OUTER,check=True)
+ print("CLAIM_POST",hook("PostToolUse","Bash",{"command":command},"lead-O",OUTER,"claim",{"tool_response":{"stdout":"","stderr":"","interrupted":False}}),flush=True)
+ print("CLAIM_HISTORY",history("b.txt"),history("f.txt"),flush=True)
+ assert history("b.txt")[-1]=="UNKNOWN" and history("f.txt")[-1]=="lead-command"
+ print("UNKNOWN",unknown_paths(),flush=True)
+finally:print("STOP",c.call("daemon/stop"),flush=True)
+```
+
+</details>
+
+#### F4 actual hook and run/list timing at 1,000 sessions
+
+The first timing pass showed unnecessary repeated Git subprocess overhead:
+2.3.5 Pre/Post medians 76.712/66.766 ms, initial fixed tree
+87.644/72.966 ms. That measurement motivated the verified-identity exec-lock
+lookup in compat/intents. After that change, the following command exited **0**
+and produced these seven-sample medians:
+
+| Tree | Bash Pre including confirmation | Bash Post | run/list |
+| --- | ---: | ---: | ---: |
+| 2.3.5 | 92.269 ms | 78.066 ms | 3.283 ms |
+| Final window implementation | 69.011 ms | 53.889 ms | 2.002 ms |
+
+Both trees armed **7/7**, every Post returned lead-command, and each actual
+`/usr/bin/true` exited 0. Absolute latency varies with machine load; this is
+evidence that the new path did not acquire a history-size penalty, not a promise
+of the same speedup on every machine. run/list returned zero because these
+1,000 records were singleton lead-only sessions; populated project run/list
+responses were separately exercised through actual MCP integration below.
+
+<details>
+<summary>Exact timing command — f4-hook-timing-final.log (Python 3.15 -B -)</summary>
+
+```python
+import os,sys,pathlib,subprocess,json,time,statistics
+sys.path.insert(0,str(pathlib.Path("plugins/software-workflows").resolve()))
+from coordinator.client import Client
+root=pathlib.Path("/private/tmp/sw-p1-f")
+for label,tree,venue in (("235",pathlib.Path("/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad")/"projects/export235/plugins/software-workflows",root/"f4-old"),("240",pathlib.Path("plugins/software-workflows").resolve(),root/"f4-green")):
+ state,repo=venue/"state",venue/"repo"
+ env=dict(os.environ,PYTHONPATH=str(tree),CODEX_HOME=str(venue/"native"),CODEX_ORACLE_LOG_DIR=str(venue/"logs"),SOFTWARE_WORKFLOWS_STATE=str(state),PYTHONDONTWRITEBYTECODE="1")
+ launch=subprocess.run(["/opt/homebrew/bin/python3.15","-B","-m","coordinator","--state",str(state),"daemon","start"],capture_output=True,text=True,env=env)
+ print(label,"START_EXIT",launch.returncode,{"ready":json.loads(launch.stdout)["result"].get("ready")},flush=True);assert launch.returncode==0
+ c=Client(state,timeout=60)
+ while not c.call("daemon/status").get("ready",True):time.sleep(.1)
+ try:
+  pre_times=[];post_times=[];listing=[]
+  for i in range(7):
+   payload={"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"true"},"cwd":str(repo),"session_id":"s0","tool_use_id":"f4-final-timing-"+str(i)}
+   def hook():
+    start=time.monotonic()
+    result=subprocess.run(["/usr/bin/python3","-B",str(tree/"hooks/coordinator_lead.py")],input=json.dumps(payload),capture_output=True,text=True,env=env,cwd=repo)
+    elapsed=(time.monotonic()-start)*1000
+    assert result.returncode==0
+    text=json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+    body=json.loads(text[text.index("{"):]);return elapsed,body
+   elapsed,pre=hook();pre_times.append(elapsed)
+   assert pre.get("armed") is True,(label,pre)
+   result=subprocess.run(["/usr/bin/true"],cwd=repo);assert result.returncode==0
+   payload.update(hook_event_name="PostToolUse",tool_response={"stdout":"","stderr":"","interrupted":False})
+   elapsed,post=hook();post_times.append(elapsed);assert post["attribution"]=="lead-command"
+   start=time.monotonic();result=c.call("run/list",{"cwd":str(repo)});listing.append((time.monotonic()-start)*1000)
+  print(label,"1000_SESSIONS","PRE_MS",pre_times,"POST_MS",post_times,"RUN_LIST_MS",listing,"RETURNED",len(result["data"]),flush=True)
+  print(label,"MEDIANS",*[round(statistics.median(x),3) for x in (pre_times,post_times,listing)],flush=True)
+ finally:print(label,"STOP",c.call("daemon/stop"),flush=True)
+```
+
+</details>
+
+An additional query review caught a filtering edge: an explicitly abandoned
+partial group can have only complete/abandoned repository journals while its
+unit still carries an installed prefix. The first F4 optimization omitted it.
+The final query unions indexed open journals with indexed prepared/partial
+units. On the existing authorized scratch publication state, the first-green
+copy returned `PUBLICATIONS []` from both Backend and Frontend. The fixed tree
+returned `state: partially_published` and the installed Backend commit
+`6e31925bd3a9081cbc999205a5f3f967eae7dba2` from **both** roots.
+No Git refs were changed by this check.
+
+The red query used `f4PublicationFinalCode` below; its two red queries and stop
+succeeded, but immediate fixed-tree startup returned CLI **3** during shutdown.
+The subsequent explicit startup exited **0** and the final query/stop command
+exited **0**. Logs: `f4-publication-final.log`, `f4-publication-fixed.log`.
+
+<details>
+<summary>Exact red query and final fixed query commands (Python 3.15 -B -)</summary>
+
+```python
+import pathlib,sys,os,subprocess,json,time
+sys.path.insert(0,str(pathlib.Path("plugins/software-workflows").resolve()))
+from coordinator.client import Client
+base=pathlib.Path("/private/tmp/sw-p1-240");config=json.loads((base/"pub-project.json").read_text());unit=json.loads((base/"abandon-final-unit.json").read_text())["unit"]
+state=pathlib.Path(config["state"]);roots=pathlib.Path(config["root"]);home=pathlib.Path("/private/tmp/sw-p1-f/publication-query-home");home.mkdir(mode=0o700,exist_ok=True)
+env=dict(os.environ,CODEX_HOME=str(home),CODEX_ORACLE_LOG_DIR="/private/tmp/sw-p1-f/pub-query-logs",SOFTWARE_WORKFLOWS_RUNTIME=str(base/"pub-rt"))
+os.environ.update(env)
+for label,plugin in (("RED_FILTER",pathlib.Path("/private/tmp/sw-p1-f/green/software-workflows")),("FIXED_FILTER",pathlib.Path("plugins/software-workflows").resolve())):
+ launch=subprocess.run(["/opt/homebrew/bin/python3.15","-B","-m","coordinator","--state",str(state),"daemon","start"],capture_output=True,text=True,env=dict(env,PYTHONPATH=str(plugin)))
+ print(label,"START_EXIT",launch.returncode,flush=True);assert launch.returncode==0
+ c=Client(state,timeout=90)
+ try:
+  while not c.call("daemon/status")["ready"]:time.sleep(.1)
+  for root in (roots/"Backend",roots/"Frontend"):
+   q=c.call("checkout/query",{"cwd":str(root)});found=[p for p in q["publications"] if p["unit"]==unit]
+   print(label,str(root),"FRESH",q["fresh"],"PUBLICATIONS",json.dumps(found),flush=True)
+   if label=="RED_FILTER":assert not found
+   else:assert len(found)==1 and found[0]["state"]=="partially_published" and any(p.get("commit") for p in found[0]["participants"])
+ finally:print(label,"STOP",c.call("daemon/stop"),flush=True)
+```
+
+The successful separate fixed startup was:
+
+```sh
+PYTHONPATH=plugins/software-workflows PYTHONDONTWRITEBYTECODE=1 CODEX_HOME=/private/tmp/sw-p1-f/publication-query-home CODEX_ORACLE_LOG_DIR=/private/tmp/sw-p1-f/pub-query-logs SOFTWARE_WORKFLOWS_RUNTIME=/private/tmp/sw-p1-240/pub-rt /opt/homebrew/bin/python3.15 -B -m coordinator --state /private/tmp/sw-p1-240/pub-state daemon start
+```
+
+Followed by:
+
+```python
+import pathlib,sys,os,subprocess,json,time
+sys.path.insert(0,str(pathlib.Path("plugins/software-workflows").resolve()))
+from coordinator.client import Client
+base=pathlib.Path("/private/tmp/sw-p1-240");config=json.loads((base/"pub-project.json").read_text());unit=json.loads((base/"abandon-final-unit.json").read_text())["unit"]
+state=pathlib.Path(config["state"]);roots=pathlib.Path(config["root"]);home=pathlib.Path("/private/tmp/sw-p1-f/publication-query-home");home.mkdir(mode=0o700,exist_ok=True)
+env=dict(os.environ,CODEX_HOME=str(home),CODEX_ORACLE_LOG_DIR="/private/tmp/sw-p1-f/pub-query-logs",SOFTWARE_WORKFLOWS_RUNTIME=str(base/"pub-rt"))
+os.environ.update(env)
+label="FIXED_FILTER"
+c=Client(state,timeout=90)
+try:
+ until=time.monotonic()+120
+ while not c.call("daemon/status")["ready"]:
+  if time.monotonic()>until:raise RuntimeError("recovery did not finish")
+  time.sleep(.1)
+ for root in (roots/"Backend",roots/"Frontend"):
+  q=c.call("checkout/query",{"cwd":str(root)});found=[p for p in q["publications"] if p["unit"]==unit]
+  print(label,str(root),"FRESH",q["fresh"],"PUBLICATIONS",json.dumps(found),flush=True)
+  assert len(found)==1 and found[0]["state"]=="partially_published" and any(p.get("commit") for p in found[0]["participants"])
+finally:print(label,"STOP",c.call("daemon/stop"),flush=True)
+```
+
+</details>
+
+#### Turn-15 and charter §4 row 7 rerun
+
+The complete 26-driver batch ran twice after the F1–F5 fixes; **all 26 exits
+were 0 in each batch**. The final batch followed the exec-lock performance
+change. r13/r14/r15 used a calibration copy at
+`/private/tmp/sw-p1-f/calibration-final/software-workflows`; the only added
+behavior was the authorized R13PAUSE_BEFORE (6 s), R13PAUSE_AFTER (6 s),
+R14PAUSE_ATTACH (2 s) and R15ARM_DELAY scratch pauses at their equivalent
+points. No such pause was added to production source.
+
+| Final cases | Actual behavior | Exit |
+| --- | --- | ---: |
+| r15 rpc-overlap, rpc-cross, exec-overlap | A completed its operation during B's Pre; B armed false, promoted gen.txt UNKNOWN | 0 each |
+| r15 restart | Generation 2; old arm invalidated; a.txt baseline then UNKNOWN | 0 |
+| r15 lost-confirm | 3.1 s hook reply reports armed “uncertain”; store armed true; Post lead-command | 0 |
+| r15 control | Armed true, made.txt lead-command | 0 |
+| r11 refresh | Deletion 1 s into scan discovered; aaa.txt UNKNOWN:deleted | 0 |
+| r11 folder | x deletion and new x/y.txt both UNKNOWN | 0 |
+| r11 submodule | PATH_TYPE refusal naming sub | 0 |
+| r11 uncached | Cached baseline preserved; only .gitignore pre-existing UNKNOWN | 0 |
+| r11 stall | GIT_TIMEOUT after 3.6 s; cat-file process gone | 0 |
+| r11 killed | SIGKILL 2.5 s into registration; initializing → incomplete → retry ready | 0 |
+| r11_promote | Old ignored force-add UNKNOWN; newly created file lead-command | 0 |
+| r12_checks | touch/no-op sed/unignore old bytes UNKNOWN; new-file control credited; file-to-folder seal succeeded | 0 |
+| r13 pause-after, pause-before | Hook timed out at 3.1 s; promoted bytes UNKNOWN | 0 each |
+| r13 alias | Case alias did not turn old ignored bytes into authorship | 0 |
+| r13 collapsed | Three new files credited; three old hidden files UNKNOWN, all printed OK | 0 |
+| r14 reappear | Old hidden folder disappears/reappears during timeout; old.log UNKNOWN | 0 |
+| r14 overlap | Transient other call invalidated the window; gen.txt UNKNOWN | 0 |
+| r14 pathmagic, control | made.txt lead-command | 0 each |
+| lead_bash3 | Overlap UNKNOWN; isolated call credited; duplicate completion attributes nothing | 0 |
+| lead_hooks_edge | Foreign claim denied on replay; NotebookEdit explicitly unverified; n.ipynb UNKNOWN | 0 |
+| lead_bash2 | Writer-active e.txt UNKNOWN; later f.txt credited; writer-claimed w.txt UNKNOWN | 0 |
+| settle_check | SLEEP/MARKED/ESCAPE complete with custody 0 and no settlement refusal | 0 |
+
+Final native lead_bash2: **35.47 s**, fixture requests **3**, errors **[]**.
+Its workflow error status is the intended unresolved-UNKNOWN refusal, not a
+fixture/runtime failure. Final settle_check: **40.40 s** overall;
+SLEEP **27.1 s**, MARKED **10.1 s**, ESCAPE **2.1 s**; fixture requests **9**,
+errors **[]**. All daemons returned stopping true. The markerless ESCAPE sleep
+PID 79091 was gone at final cleanup.
+
+Logs: `$R/reg-*.log` for the first batch, `$R/regfinal-*.log` for the final
+batch. The final wrapper below was supplied on stdin to Python 3.15 with output
+captured by the invoking process. It keeps fixture driver source out of the OS
+command line and uses the permitted disposable plugin venv in place of the
+drivers' default user .claude plugin-data path. No user .claude path was read.
+
+<details>
+<summary>Exact final regression orchestration</summary>
+
+```python
+import os,pathlib,subprocess,sys,time,concurrent.futures
+base=pathlib.Path("/private/tmp/sw-p1-f")
+scripts=pathlib.Path("/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad")
+plugin=str(pathlib.Path("plugins/software-workflows").resolve());calibration=str(base/"calibration-final/software-workflows")
+python="/opt/homebrew/bin/python3.15";venv="/private/tmp/sw-p1-240/plugin-data/venv/91e1e736a04fad0e/bin/python"
+runs=[("projects/r15_checks.py",c) for c in ("rpc-overlap","exec-overlap","restart","lost-confirm","control","rpc-cross")]
+runs += [("projects/r11_ledger.py",c) for c in ("refresh","folder","submodule","uncached","stall","killed")]
+runs += [("projects/r11_promote.py",""),("projects/r12_checks.py","")]
+runs += [("projects/r13_checks.py",c) for c in ("pause-after","pause-before","alias","collapsed")]
+runs += [("projects/r14_checks.py",c) for c in ("reappear","overlap","pathmagic","control")]
+runs += [("m3/"+n+".py","") for n in ("lead_bash3","lead_hooks_edge","lead_bash2","settle_check")]
+def execute(job):
+ relative,case=job
+ script=scripts/relative;name=script.stem+("-"+case if case else "")
+ venue=base/("regfinal-"+name);assert not venue.exists(),str(venue)
+ chosen=calibration if script.stem in ("r13_checks","r14_checks","r15_checks") else plugin
+ interpreter=venv if script.stem in ("lead_bash2","settle_check") else python
+ source=script.read_text().replace('Path.home() / ".claude/plugins/data/software-workflows-inline"', 'Path("/private/tmp/sw-p1-240/plugin-data")')
+ source=source.replace('["/opt/homebrew/bin/python3",','["/usr/bin/python3",')
+ if script.stem=="lead_bash3":source=source.replace('out.stdout.strip()[:400]','out.stdout.strip()')
+ if script.stem=="r15_checks":source=source.replace('context(pre)[:150]','context(pre)').replace('context(pre_b)[:150]','context(pre_b)')
+ argv=[str(script),chosen,str(venue)]+([case] if case else [])
+ program="import sys; __file__="+repr(str(script))+"; sys.argv="+repr(argv)+"; exec(compile("+repr(source)+","+repr(str(script))+",'exec'))"
+ env=dict(os.environ,HOOK_PY="/usr/bin/python3",PYTHONDONTWRITEBYTECODE="1",PYTHONUNBUFFERED="1",CODEX_ORACLE_LOG_DIR=str(venue/"logs"),CODEX_HOME=str(venue/"native"))
+ for key in ("SOFTWARE_WORKFLOWS_STATE","SOFTWARE_WORKFLOWS_RUNTIME","SOFTWARE_WORKFLOWS_FIXTURE","R15ARM_DELAY"):env.pop(key,None)
+ started=time.monotonic()
+ with pathlib.Path(str(venue)+".log").open("w") as log:
+  log.write("COMMAND "+repr([interpreter,"-B",*argv])+"\n");log.flush()
+  result=subprocess.run([interpreter,"-B","-"],input=program,text=True,stdout=log,stderr=subprocess.STDOUT,env=env)
+  ending="EXIT "+name+" "+str(result.returncode)+" seconds="+str(round(time.monotonic()-started,2))
+  log.write("\n"+ending+"\n")
+ print(ending,flush=True)
+ return result.returncode
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+ codes=list(pool.map(execute,runs))
+print("ALL_EXITS",codes,flush=True)
+sys.exit(any(codes))
+```
+
+</details>
+
+The final unfinished-unit index/query change came after that batch started.
+It affects only observational publication selection, and was followed by the
+focused red/green publication query above and a fresh complete six-case
+acceptance pass, including all five query-history sizes. No window behavior
+changed after its final r15/r13/r14 runs.
+
+#### Actual server integration after F1–F5
+
+`/private/tmp/sw-p1-f/integration-final.log` exited **0**. It reran the exact
+inline command already recorded under “Actual server, reads, complete-vector
+review and native replacement — integration5.log”, changing only its venue to
+`/private/tmp/sw-p1-f/integration-final`. The command ran with the plugin venv,
+disposable CODEX_HOME and fixture provider; it opened the actual MCP stdio
+server through run_server.py.
+
+Observed outcomes:
+
+- Ambiguous and invalid-project dispatches refused before production, with
+  “Nothing was dispatched” and no fabricated handle.
+- One project writer and one listener covered all three participants. The
+  actual command used group custody; the native patch edited Backend and
+  Frontend, including identical filenames and participant subfolders.
+- Qualified reads/dependencies and cross-project claim conflicts were checked.
+  The dependency negative returned UNKNOWN_DEPENDENCY; restore plus exact
+  mediated work then allowed the complete-vector seal.
+- The fresh independent bound-review session recorded the digest and all three
+  participant candidates. Review job
+  `review_job_1d9f3e75cb6f46268be2aecf7920b30b` was recorded with verdict pass,
+  returncode 0 and its own native thread. This is fixture-controlled contract
+  evidence, not a claim about real-model review judgment.
+- Session/unit mailbox send, inbox and acknowledgment worked; observations,
+  run/list, run/status and unit/status exposed all participant fields from
+  each root.
+- SIGTERM of the listener caused replacement and verified cold binding before
+  continuing; each participant recorded a native-notification-gap UNKNOWN.
+- Setup app-server exited 0, fixture requests **7**, errors **[]**, daemon
+  returned stopping true.
+
+The already-recorded publication crash/reseal/review/abandon runs remain the
+group-publication evidence; this integration rerun did not manufacture new
+publication claims.
+
+#### Failed invocations and calibration corrections
+
+These are not counted as successful acceptance:
+
+1. The first selected-project extra run used a 0755 venue. The inherited
+   exclusive-writer guard detected the older installed server (PID 8923) and
+   refused before the intended schema failure. No fallback occurred. The
+   accepted 0700/umask-077 run above reached SCHEMA_MISSING as intended.
+   An intermediate status message incorrectly suggested a plugin reload;
+   it was corrected once the scratch namespace was fixed. No unrelated server
+   was stopped or reconfigured.
+2. The first attempt to extract the earlier integration command selected its
+   later AST-check block. `integration.log` therefore proves only parsing.
+   `integration-final.log` is the actual accepted MCP/native integration.
+3. The first publication-query command set SOFTWARE_WORKFLOWS_RUNTIME only in
+   the child launch environment, not in its own Client environment. It exited
+   **1** with ENDPOINT_OWNER; its finally stop had the same mismatch. The
+   corrected command used the matching runtime in both processes, queried and
+   stopped that daemon. Immediate replacement startup then returned CLI **3**;
+   the subsequent standalone startup exited **0** and the accepted fixed query
+   completed and stopped it. No failure was suppressed or treated as a green run.
+
+#### Final compatibility, validators and cleanup
+
+After the final source changes:
+
+| Exact check | Exit | Output |
+| --- | ---: | --- |
+| `CLAUDE_CONFIG_DIR=/private/tmp/sw-p1-f/validate-plugin TMPDIR=/private/tmp/sw-p1-f/validate-tmp claude plugin validate --strict plugins/software-workflows` | 0 | ✔ Validation passed |
+| `CLAUDE_CONFIG_DIR=/private/tmp/sw-p1-f/validate-marketplace TMPDIR=/private/tmp/sw-p1-f/validate-tmp claude plugin validate --strict .` | 0 | ✔ Validation passed |
+| Earlier exact Python 3.15 in-memory parse/compile command, also printing sqlite3.sqlite_version | 0 | PY315_AST_OK 38 3.15.0 PY311_GRAMMAR_OK SQLITE 3.54.1 |
+| Earlier exact Python 3.9 parse/import command with CODEX_ORACLE_LOG_DIR=/private/tmp/sw-p1-f/import-logs | 0 | PY39_PARSE_IMPORT_OK 10 modules 6 hooks 3.9.6 |
+| `git diff --check` | 0 | No output |
+
+The final process inventory used the previously recorded command over **all
+three** scratch roots: sw-p1-240, sw-p1-t15 and sw-p1-f. It compared stored
+PID/birth identities against the OS, excluded the inventory process's ancestors,
+and printed no arbitrary arguments or environment data. Exit **0**:
+
+```text
+SCRATCH_DATABASES 173
+TRACKED_PROCESS_IDENTITIES 222 {'project_discovery': 142, 'listener': 80}
+LIVE_TRACKED []
+SCRATCH_PROCESS_MATCHES []
+NATIVE_APP_SERVERS []
+INVENTORY_ERRORS []
+MARKERLESS_SLEEP_79091 None
+REAL_COORDINATOR_STATE_EXISTS True
+```
+
+**The last line differs from the earlier cleanup.** The real coordinator state
+directory now exists, with filesystem birth time
+2026-10-19T09:55:58.749284Z. Read-only process ancestry showed its worker 42969
+under supervisor 42957 → Python 41919 → **Claude 41810**, whereas this run is
+under Codex 8993 → the existing server 8923. It belongs to a separate concurrent
+process tree. It was not stopped, deleted, migrated or used for acceptance.
+All acceptance state/home paths above remained disposable. This report does
+not claim that the real state is absent.
+
+There are **31 P1 changed files**, all uncommitted working-tree edits.
+The lead-owned changes to push_gate.py, office.py and office.html remain
+untouched. No test/harness, manifest, root README/CHANGELOG, skill, command,
+agent, gitshim, session_start.py or gate_notice.py edit was made by P1.
+The final boundary/HEAD/staged inventory and whitespace check are recorded below.
+
+Still UNVERIFIED for the whole unit: real-user native project listing and UI
+placement; real-model judgment (zero real-model runs); real SmartPay or external
+clone latency; actual Python 3.11 execution (grammar only); other platforms and
+arbitrary user configurations; the combined multi-root opaque-command worker
+crash with a surviving marked descendant; every possible crash instruction
+boundary; and the host's NotebookEdit serializer. Native child root inheritance
+was measured earlier; native 0.163.0 child project_id remained null. None of
+these limitations was converted into a claim of success.
+
+Final read-only boundary inventory (`/private/tmp/sw-p1-f/boundary-final.log`)
+exited **0**:
+
+```text
+CHANGED_FILES 31
+OUTSIDE_BOUNDARY []
+STAGED_FILES []
+PRODUCTION_PAUSES []
+HEAD 108d99651fb7ab9f36320a616eca8dc3d6d195eb
+```
+
+The first whitespace check after appending this evidence exited **2**, reporting
+one new blank line at EOF in this file. That documentation-only whitespace was
+removed; the repeated `git diff --check` exited **0** with no output.
+
+
+### Lead record for 2.4.0 — 2026-10-19
+
+The lead diff-read the fix round, then ran the whole suite (`regress_240.sh`) on a snapshot of the
+final tree. The reading raised two suspicions. One was confirmed and fixed by the lead; the other
+was refuted by a run.
+
+**G1: a deleted or re-created registered repository voided every lead Bash window.** The fix round
+made `exec_window` report busy for any registered checkout whose root could not be read, or whose
+identity had changed. From the moment one registered repository was deleted, or re-cloned at the same
+path, a lead Bash change in every other repository was UNKNOWN. The check, `gone_checkout.py`:
+repositories A and B are registered, and a lead Bash `echo n >> a.txt` runs in A through the real
+`coordinator_lead.py`, once for each state of B.
+
+| Tree | B present | B deleted | B re-created |
+|---|---|---|---|
+| 2.3.5 (export of 108d996) | lead-command | lead-command | lead-command |
+| addendum-1 tree | lead-command | lead-command | lead-command |
+| fix round | lead-command | UNKNOWN | UNKNOWN |
+| final (lead's fix) | lead-command | lead-command | lead-command |
+
+Fix (`intents.exec_window`): the lock path comes from the tree as it is now, the identity
+`compat._tree_identity` gives an exec writer. A root that no longer exists holds no lock; any other
+stat failure still counts as busy.
+
+**Refuted: a target outside git.** The fix round's `CHECKOUT_ROOT` raise read as if it ended the exec
+fallback. `fallback_check.py … non-git` returns `(None, 'CHECKOUT_ROOT')`, a fallback, on 2.3.5, the
+addendum-1 tree and the final tree.
+
+**L1: `code_review(sealed_unit=…)` ignored an explicit session.** A bound review always started
+fresh, whatever `session` said. It now refuses a thread id in `session` before inference, and the tool
+documents `sealed_unit`.
+
+**Final suite:** `regress_240.sh <final snapshot> <its calibration copy> r18`. Every step exited 0.
+Two steps need a short folder, because a socket path must fit in 104 bytes, as in the 2.3.x suites:
+`lead_bash2` (`/private/tmp/swfl2-r18`) and `settle_check` (`/private/tmp/swfc-r18`, rerun).
+
+| Step | Result |
+|---|---|
+| r15 control / rpc-overlap / rpc-cross / exec-overlap / restart / lost-confirm | lead-command / UNKNOWN / UNKNOWN / UNKNOWN / UNKNOWN / "uncertain", then lead-command |
+| r14, r13, r11, r12, snapcheck, edgecheck, lead_bash, lead_hooks_edge | Identical, with times, ids and paths masked, to the addendum-1 tree's run, which matched the 2.3.5 records |
+| lead_bash3 | Overlapping windows UNKNOWN; alone lead-command; a duplicate completion attributes nothing |
+| lead_bash2 | e.txt UNKNOWN while the writer's command runs; f.txt lead-command after it; the claimed w.txt UNKNOWN; 3 provider requests, errors [] |
+| settle_check | 9 provider requests, errors []; the `/bin/sleep 8` survivor listed, as before |
+| gate_partial (calibration copy) | Every push form of Backend and Frontend is refused (PARTIAL), at the hook (plain, `-C`, acknowledgement-prefixed, `cd &&`, compound) and in the shim, with and without a token. Unregistered nested Other: token denial. Office: 0 workers, and the status line names the unit. After reopen, seal, review and publish: a token denial, then the acknowledged push ran, and the remote has 5d087f8 |
+| ambiguity (one folder in two projects) | lead-F: Edit exact, Bash lead-command. lead-O: Edit verified, Bash lead-command. UNKNOWN [] |
+| crossrepo (Bash from the outer folder) | b.txt and f.txt lead-command in their repositories; the control lead-command; UNKNOWN [] |
+| fallbacks | no-daemon `STATE_PERMISSIONS` → exec; no project API → `singleton: true`; non-git `CHECKOUT_ROOT` → exec |
+| gone_checkout | lead-command in all three states |
+| leadtool_timing (SmartPay shape) | 3,494 ms first (registration), then 65, 67, 69, 68 ms |
+| query_cost | Median 0.4 / 0.6 / 1.2 / 3.1 / 3.8 ms at 10 / 100 / 300 / 600 / 1,000 units; gate client answered 7 of 7 at each |
+
+Validators: `claude plugin validate --strict plugins/software-workflows` and
+`claude plugin validate --strict .` both report ✔ Validation passed (exit 0). Python 3.15
+`py_compile` passes over the server, the coordinator, the hooks and the office. Python 3.9 parses every
+hook, `coordinator/client.py` and `coordinator/runtime.py`.
+
+**Upgrade over a running daemon (added by the lead).** A client never checked which release its
+daemon ran, and the daemon has no idle exit. So after an update, a 2.4.0 session would keep calling a
+2.3.5 daemon that has no project methods. `daemon/status` now reports the plugin version, and
+`Client.ensure()` retires an older release's daemon. It calls `daemon/stop`, waits until
+`supervisor.lock` and `worker.lock` are free, then starts its own. A refused stop raises
+`DAEMON_OUTDATED`. Hooks never call `ensure()`. The check is `upgrade_check.py <2.3.5 export> <final
+tree> <work dir> idle|busy|same`, a real 2.3.5 daemon on scratch state with a registered repository:
+
+| Case | Result |
+|---|---|
+| idle | The 2.3.5 worker (version null) exited; 2.4.0 serving; migrations [1, 2] → [1, 2, 3]; `checkout/query` still knows the repository |
+| busy (calibration copy whose `daemon/stop` refuses `NOT_QUIESCENT`) | `DAEMON_OUTDATED` {running: null, reason: NOT_QUIESCENT}; the 2.3.5 worker keeps serving; migrations stay [1, 2] |
+| same (a 2.4.0 daemon) | Used as it is; the same worker pid |
+
+**Review turn 16, push-gate findings (the lead's file).** `_publication_block` now refuses while a
+unit's publication may already have moved a ref: state `publishing` or `partially_published`, any
+participant journal under way, or a participant holding the commit before the unit is complete. The
+repository it checks is the one git selects: `git rev-parse --path-format=absolute --git-common-dir` with
+the command's `-C`, `--git-dir`, `--work-tree` and `--bare` and its `GIT_DIR`-style variables. The shim
+passes its exact argv and environment. The hook reads one plain git invocation, which may be named by
+path or prefixed with assignments. The Office marks `publishing` (⚠ being published). Checks:
+`gate_partial.py` with two new parts, on a calibration copy of the tree before the gate change
+(`f2snap`) and one of the tree after it (`f3snap` plus the new `push_gate.py` and office).
+
+| Case | Before | After |
+|---|---|---|
+| Paused right after Backend's ref moved (`GATE_PAUSE=ref`): `checkout/query` shows `prepared`, Backend `ref_updated` with its commit, Frontend `prepared`. Hook `git push` in Backend; shim `git push` in Backend | token denial; token denial | PARTIAL refusal; PARTIAL refusal |
+| Partly published, from the unregistered Other: `git --git-dir=<Frontend>/.git --work-tree=<Frontend> push`, `GIT_DIR=../Frontend/.git git push`, `/usr/bin/git --git-dir=../Backend/.git push` (hook); `--git-dir=… --work-tree=…` and `GIT_DIR=<Backend>/.git` (shim) | five token denials | five PARTIAL refusals |
+| Every earlier case of the check (plain, `-C`, acknowledgement-prefixed, `cd &&`, compound, Other's own push, then the full token flow after reopen, seal, review and publish) | as recorded | unchanged |
+
+### Addendum 3 — blind review turn 16 (2026-10-19)
+
+Read `scratchpad/charter_240_r16.md` completely before changing the tree. This
+addendum fixes coordinator findings **R16-1, R16-2, R16-4, R16-5 and R16-6**.
+Finding R16-3 and the push-gate side of R16-2 belong to the lead. The externally
+visible blocking state is **`publication_state: "publishing"`**. No production
+pause, test file or verification driver was added to this checkout.
+
+All new venues, native homes, state roots, calibration exports, scripts and logs
+are under `/private/tmp/sw-p1-r16` (0700). The pre-edit export is
+`red/software-workflows`; `before.json` records the initial file SHA-256 values.
+The native executable was the installed darwin-arm64 vendor binary:
+`/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex`.
+`--version` exited **0**, output `codex-cli 0.163.0`. Coordinator execution used
+Python **3.15.0**, SQLite **3.54.1**. Hook/client compatibility used Python
+**3.9.6**. There were **zero real-model runs**.
+
+Publication runs exercised actual coordinator RPCs, SQLite, Git objects, refs
+and indexes. Their review completions were explicitly controlled
+`fixture-first` / `fixture-reopened` RPC completions, not model judgments.
+The inbox runs used the actual MCP stdio server, native app-server, native
+writer dynamic `send` tool and existing fixture provider. The quarantine and
+pagination runs used the actual in-process Daemon, registered native projects,
+real repositories and SQLite; the only interleaving instrumentation was outside
+this checkout. Native project creation was disposable setup, not a production
+discovery capability.
+
+#### Changes and the reason for each
+
+| File (relative to plugins/software-workflows) | Addendum 3 change |
+| --- | --- |
+| `coordinator/participants.py` | Shared `require_writable` refuses new work in a unit's already published participant, naming its root, checkout and installed commit. |
+| `coordinator/custody.py` | Claims and opaque command custody apply that rule to every affected participant, including after asynchronous baseline collection. |
+| `coordinator/ledger.py` | Preparation checks writability before and after pre-image reads. Quarantine atomically marks the parent and every part before waiting for reconciliation locks. Receipt application re-reads durable operation state. |
+| `coordinator/operations.py` | The receipt transaction re-reads the parent and all parts and checks the part vector before inserting any successful receipt. |
+| `coordinator/group_publish.py` | Resealing refuses changed prefix receipts; publication persists `publishing` before any repository can update a ref and retains a blocking state through uncertain recovery and finalization. |
+| `coordinator/observations.py` | Checkout queries include unfinished `publishing` units even when every repository journal has already completed. |
+| `coordinator/store.py` | Additive `unfinished_unit_v2`, `message_recipient` and `mailbox_session` indexes support the new queries without rewriting historical records. The prior partial index remains for existing schema-3 databases. |
+| `coordinator/messages.py` | Session inboxes aggregate the session's durable unit mailboxes; session acknowledgement checks the original recipient's owner. IDs, recipients and acknowledgement history remain intact. |
+| `coordinator/daemon.py` | Pass optional `session_id` to inbox and acknowledgement operations. The lead's daemon version reporting is retained. |
+| `server.py` | Default inbox/acknowledgement and unread notices use the session union. Explicit-unit scope remains exact. The lead's sealed-review explicit-session refusal and documentation are retained. |
+| `coordinator/tools.py` | Project path pages apply cursor/order/limit in indexed SQL, stop after the page plus one row, and read checkout metadata once per root. Malformed project cursors refuse `PAGE_CURSOR`. |
+| `coordinator/README.md` | Document the prefix restriction, blocking publication state, quarantine rule, session inbox schemas and bounded cursor behavior. |
+| `coordinator/VERIFY.md` | This evidence, including failed invocations and remaining limits. |
+
+The chosen R16-1 behavior is **refusal at mutation time**. A reopened unit can
+finish its unpublished suffix, but further changes in a published participant
+require a new unit. Opaque commands reserve all participants, so they also
+refuse if that reservation would include a published prefix. A defensive seal
+check catches conflicting receipt history created by an older implementation.
+
+#### Exact operational commands and exits
+
+The following names expand to these literal paths; every work argument was new:
+
+```sh
+R=/private/tmp/sw-p1-r16
+P=/Users/ahrar/Documents/agent-teams-plugin/plugins/software-workflows
+PY=/opt/homebrew/bin/python3.15
+VPY=/private/tmp/sw-p1-240/plugin-data/venv/91e1e736a04fad0e/bin/python
+```
+
+The drivers set only disposable state/runtime/native-home paths and fixture
+configuration. Scratch Git baselines use `init`, explicit-path `add`,
+`write-tree`, `commit-tree` and `update-ref`; no `git commit`, branch operation,
+checkout, stash or push was used. Author identity is per-process environment,
+not a Git configuration edit. Every production Git publication below was in
+its named scratch repository.
+
+Calibration creation (each exit **0**):
+
+```sh
+$PY -B $R/calibrate.py $R/red/software-workflows $R/red-cal/software-workflows
+$PY -B $R/calibrate.py $P $R/green-cal/software-workflows
+$PY -B $R/finalgap_calibrate.py $R/final/software-workflows $R/gap-red-cal/software-workflows
+$PY -B $R/finalgap_calibrate.py $P $R/gap-green-cal/software-workflows
+```
+
+`calibrate.py` inserts a pause **after the actual ref update, before saving
+`ref_updated`**, plus a restart pause before repository recovery inspects Git.
+The restart pause is after the new initial blocking-state save on the green
+tree. `finalgap_calibrate.py` pauses after the last repository journal completes
+but before group progress/finalization. Neither edits the production source.
+
+| Finding / venue (log is `$R/<venue>.log`) | Command after the variables above | Exit | Observed result |
+| --- | --- | ---: | --- |
+| R16-1 red: `r1-red2` | `$PY -B $R/publication_run.py $R/red-cal/software-workflows $R/r1-red2 reopen` | 0 | Published unit omitted a newly verified Backend edit and released both claims. |
+| R16-1 green: `r1-green` | `$PY -B $R/publication_run.py $R/green-cal/software-workflows $R/r1-green reopen` | 0 | Prefix edit refused; reviewed suffix completed; both working files equal committed bytes. |
+| R16-2 red: `r2-red2` | `$PY -B $R/publication_run.py $R/red-cal/software-workflows $R/r2-red2 crash` | 0 | Both queries exposed `prepared` after Backend's ref moved and during restart. |
+| R16-2 green: `r2-green` | `$PY -B $R/publication_run.py $R/green-cal/software-workflows $R/r2-green crash` | 0 | Both queries exposed `publishing` before and after SIGKILL, then completion. |
+| R16-4 parent red: `r4-red2` | `$PY -B $R/ledger_run.py $R/red/software-workflows $R/r4-red2 parent` | 0 | Quarantined parent and parts were overwritten to verified; two exact receipts appeared. |
+| R16-4 parent green: `r4-green` | `$PY -B $R/ledger_run.py $P $R/r4-green parent` | 0 | `OPERATION_STATE`; all three stay quarantined, zero unit receipts, both heads UNKNOWN. |
+| R16-4 part red: `r4-part-red` | `$PY -B $R/ledger_run.py $R/red/software-workflows $R/r4-part-red part` | 0 | Quarantining one part still allowed two exact receipts and verified states. |
+| R16-4 part green: `r4-part-green` | `$PY -B $R/ledger_run.py $P $R/r4-part-green part` | 0 | Quarantining one part quarantines the parent and both parts; zero unit receipts. |
+| R16-5 red: `r5-red2` | `$VPY -B $R/mail_run.py $R/red/software-workflows $R/r5-red2` | 0 | Native writer sent successfully; default session inbox was empty and no unread notice appeared. |
+| R16-5 green: `r5-green` | `$VPY -B $R/mail_run.py $P $R/r5-green` | 0 | Default session inbox and next lead-tool notice expose the writer's message. |
+| R16-5 two writers: `r5-two-green` | `$VPY -B $R/mail_two_run.py $P $R/r5-two-green` | 0 | Default inbox contains both; explicit unit contains one; acknowledgement of one leaves the other unread. |
+| R16-6 red: `r6-red2` | `$PY -B $R/ledger_run.py $R/red/software-workflows $R/r6-red2 page` | 0 | Each page materialized all 100,000 heads. |
+| R16-6 green: `r6-green` | `$PY -B $R/ledger_run.py $P $R/r6-green page` | 0 | Limit 1 materialized 2 heads; each default page materialized 101. |
+| R16-6 cursor edges: `r6-edges` | `$PY -B $R/pagination_edges.py` | 0 | Cross-root boundary, final/empty pages, malformed cursors and indexed query plan verified on the green database. |
+| R16-2 finalization gap red: `r2-gap-red` | `$PY -B $R/finalgap_run.py $R/gap-red-cal/software-workflows $R/r2-gap-red gap` | 0 | Both queries omitted the unfinished group when its only changed repository journal was complete. |
+| R16-2 finalization gap green: `r2-gap-green` | `$PY -B $R/finalgap_run.py $R/gap-green-cal/software-workflows $R/r2-gap-green gap` | 0 | Both changed and unchanged participants retained `publishing` until group completion. |
+
+These are diagnostic operational drivers: **exit 0 on a red run means the
+reproduction completed, not that the property's assertion passed**. The red
+behavior is recorded in the responses, receipts, files and journals below.
+Each original negative was measured on the saved pre-edit tree before its
+corresponding fix. The extra finalization-gap negative was measured on the
+first fixed snapshot before adding the v2 query index and predicate.
+
+#### R16-1: no verified prefix work is silently discarded
+
+The sequence was: register Backend/Frontend as one native project; start a lead
+unit; exact-edit `same.txt` in both roots; seal and bind a complete-vector review;
+publish; pause after Backend's actual ref update; independently advance
+Frontend's base using a same-tree commit; resume and observe the base refusal;
+explicitly reopen; attempt another mediated Backend edit; reseal, obtain a new
+review binding, and publish the suffix.
+
+Red unit `unit_49e1b982ec0e4598bbe3941cba5f5a51` accepted operation
+`op_e928ef31cd8449bda8c44a2155ad75b0` as `verified`, recording receipt
+`rev_58cc28aebeaa49738943e74c83ed82cc`. Its final state was `published`, with
+three exact unit receipts and both claims released. Backend's installed commit
+`50c6048dedf13920e59f07a3369abc8ba6ba3681` contained `Backend first`, while the
+working file contained `Backend SECOND\n`; `git diff -- same.txt` was nonempty.
+That is the reported defect, reproduced against actual Git state.
+
+Green unit `unit_b58ac6d133e1481dace680e2373e2fb5` refused the second edit:
+
+```json
+{"code":"PREFIX_PUBLISHED","message":"This participant is already published; new edits require a new unit","details":{"checkout":"checkout_b8772b4ac6674c90b5dd32179d9cf520","commit":"50c6048dedf13920e59f07a3369abc8ba6ba3681","root":"/private/tmp/sw-p1-r16/r1-green/Backend"},"kind":"refusal"}
+```
+
+After the new complete-vector review, Frontend published commit
+`67f246cbb7df7e6deaba0bfc223429bf049466ca`. The unit has exactly two exact
+receipts, both represented by the published vector; both working files match
+`git show HEAD:same.txt`, both `git diff -- same.txt` outputs are empty, and
+both claims are released only at group completion.
+
+#### R16-2: blocking state spans ref/checkpoint and finalization gaps
+
+At the first pause, Backend's actual ref was already
+`50c6048dedf13920e59f07a3369abc8ba6ba3681`, while its durable repository journal
+still said `commit_created`; Frontend's journal said `prepared`. Both claims
+remained held. Red queries in **both** roots returned group `state:"prepared"`.
+Green queries in both roots returned:
+
+```text
+unit: unit_b7145a56970a422aa5da12ffaa6340c2
+phase: publishing
+state: publishing
+participants: Backend commit_created / Frontend prepared
+```
+
+The green worker was PID **55958**, birth **1792407601:185436**. The driver
+compared this identity with `daemon/status` before sending SIGKILL. The
+supervisor restarted the worker. At the recovery pause, both queries returned
+`fresh:false`, still with `state:"publishing"`. Releasing recovery let the
+existing journal detect the installed prefix, repair/check its index, and finish
+the suffix. Final commits were the Backend commit above and Frontend
+`c3a365b5f351234116018abf990fd18e6cf12d6d`; both journals were `complete`, the
+unit was `published`, and both claims were released. The interrupted caller
+received a transport failure; that was expected at this crash point, not a
+publication-completion response.
+
+A further inspection found the final-journal interval: with Backend changed and
+Frontend explicitly unchanged, no open repository journal remains after Backend
+finishes. Before the v2 predicate, `checkout/query` returned `publications:[]`
+in both roots even though the unit was still publishing. The added index and
+predicate retain unit `unit_b8aab2214aab4a33ae9c9019c4e7c97e` with
+`state:"publishing"`, Backend `phase:"complete"` and Frontend `phase:""`.
+After group finalization, both queries correctly return an empty publications
+list. This extra red/green run covers an unchanged participant as well as the
+changed one.
+
+#### R16-4: quarantine wins the receipt-commit race
+
+The actual `operation/prepare` request described an exact edit to
+`Backend/f00000.txt` and `Frontend/f00000.txt`. After applying those bytes, the
+driver invoked `operation/complete`, paused verification **after its real
+filesystem reads while it still held the ledger locks**, and concurrently
+called the real `Ledger.quarantine`. It waited until the durable quarantine
+state existed, then released completion. A second pair of runs quarantined just
+one part instead of the parent.
+
+Red parent `op_5c549b5e48bc48068b013ac83907a086` and its two parts ended
+`verified`. Exact receipts `rev_2f7e6c1b319c42868515e01c84971d2f` and
+`rev_81421eb8d5cf4cc2941d3213f3715847` were inserted after quarantine; both
+heads were exact. The single-part red run also inserted two exact receipts.
+
+Green parent `op_d78e1f6d183940b08c87533354f064fe` refused completion with
+`OPERATION_STATE`, details `state:"quarantined"`. Parent and both parts remain
+quarantined, `SELECT * FROM revisions WHERE unit=?` returns **[]**, and both
+heads are UNKNOWN. In the single-part green run, parent
+`op_64c35cf902ba4938a4d57b38f4d9f652` and parts
+`op_6905507cd7294e0f8b4ac6904a9e4864` /
+`op_706f461b81e84702a0063ac464a8f347` also remain quarantined with no unit
+receipts. Their UNKNOWN heads are `rev_c0669b80b7d342dc8587f5f61eaa47ee` and
+`rev_66992c4624fb4407a0c8fe5faa9dd149`. No successful part was committed first.
+
+This exercises the operation RPC and the reconciliation/quarantine method at
+the precise race; it does not claim a separately timed native `run/resume`
+notification reproduction. The transaction check also protects singleton
+receipt application.
+
+#### R16-5: native writer mail reaches the owning session
+
+Actual MCP calls (each supplied the scratch repository as `cwd` and
+`dispatch_cwd`) were:
+
+```text
+abraham(task="R16_MAIL send a status message to lead using send", session_id="R16-S")
+coordinator_claims(session_id="R16-S")
+coordinator_inbox(session_id="R16-S")
+coordinator_inbox(session_id="R16-OTHER")
+coordinator_inbox(session_id="R16-S", unit=<writer unit>)
+coordinator_inbox(session_id="R16-OTHER", acknowledge=[<message>])
+coordinator_inbox(session_id="R16-S", acknowledge=[<message>])
+coordinator_claims(session_id="R16-S")
+```
+
+The fixture's implementation turn called native dynamic
+`send({recipient:"lead",text:"R16_NATIVE_WRITER_TO_SESSION_S",wake:"none"})`.
+Both red and green Abraham calls completed `status:ok`, `backend:"native"`,
+`approvalPolicy:"never"`, sandbox `dangerFullAccess`; rollout readback verified
+the effective mode. Each one-writer run made **3** fixture requests, errors
+**[]**.
+
+Red message `msg_4d5716ac7e6748889a09d2ac9391ad31` was present only through an
+explicit writer-unit inbox. Default S returned `data:[]`, `unread:0`; claims
+had no notice, and default acknowledgement failed `ACK_ACTOR`.
+
+Green message `msg_880190d0cfe94df992cad434dcd6291f`, from writer unit
+`unit_2071805560174f97a0c91a576019aaa7`, appeared in default S with `unread:1`.
+The next claims result included:
+
+```text
+[Coordinator: unread lead messages; use coordinator_inbox to read and explicitly acknowledge.]
+```
+
+Other session returned `data:[]`, `unread:0` and could not acknowledge the
+message (`ACK_ACTOR`). S's acknowledgement preserved the same message ID and
+mailbox recipient, changed its state from `persisted` revision 1 to
+`acknowledged` revision 2, and removed the notice when no unread mail remained.
+The two-writer extension made **6** fixture requests, errors **[]**: default S
+listed both messages, explicit-unit scope listed one, and acknowledging one
+left the other message and unread notice intact.
+
+#### R16-6: bounded work on 100,000 real paths
+
+Each venue contained two actual repositories with **50,000 files each**,
+committed via Git plumbing and registered together through native project
+registration. Registration produced **100,000** heads; no synthetic head rows
+were inserted. The measurement wrapped SQLite's row factory to count returned
+`path,revision` rows, and counted checkout `Store.get` calls. Each timed call
+included the real dynamic tool dispatch and its read-dependency records.
+
+| Page | Limit | Red time (ms) | Red head rows | Red checkout lookups | Green time (ms) | Green head rows | Green checkout lookups |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| First | 1 | 562.833 | 100,000 | 100,001 | 0.268 | 2 | 2 |
+| Next | 100 (default) | 572.903 | 100,000 | 100,000 | 0.474 | 101 | 2 |
+| Next | 100 (default) | 583.017 | 100,000 | 99,900 | 0.520 | 101 | 2 |
+| Next | 100 (default) | 576.241 | 100,000 | 99,800 | 0.428 | 101 | 2 |
+
+Cursors advanced continuously from `f00000.txt` to `f00100.txt`, `f00200.txt`
+and `f00300.txt`. A separate edge call returned the last file in the first
+checkout followed by the first two files in the next checkout, without losing
+or duplicating the shared filenames. The final page returned one file and a
+null cursor; the end cursor returned no rows. `not-json`, `[1,2]`, `{}` and
+`["one"]` all refused `PAGE_CURSOR`. Actual `EXPLAIN QUERY PLAN` output:
+
+```text
+SEARCH heads USING INDEX sqlite_autoindex_heads_1 (checkout=? AND path>?)
+```
+
+These are local, warm-database call timings, not end-to-end model or network
+latency claims. Materialized row counts establish the bounded-work change.
+
+Final inspection also removed the dependency-recording loop's repeated scan
+of the returned page: rows are now grouped by checkout in one pass before
+writing one read record per participant. A fresh 100,000-file run used:
+
+```sh
+$PY -B $R/ledger_run.py $P $R/r6-green-final page
+$PY -B $R/pagination_edges.py
+```
+
+Both exited **0**, in `r6-green-final.log` and `r6-edges-final.log`. The final
+four page times were **0.204 / 0.368 / 0.309 / 0.297 ms**, materializing
+**2 / 101 / 101 / 101** head rows, with **2** checkout lookups each. Read-only
+SQLite inspection found **8** read records and **301** revision references for
+those pages; every referenced revision matched its recorded checkout and path.
+The boundary-page database had **20** read records / **309** references, also
+with no checkout/path mismatches. Python compatibility was rerun after this
+adjustment with the same successful outputs below.
+
+#### Turn-15 and the existing regression batch
+
+```sh
+/opt/homebrew/bin/python3.15 -B /private/tmp/sw-p1-r16/regression_run.py > /private/tmp/sw-p1-r16/regression.log 2>&1
+```
+
+Wrapper exit **0**; **26 driver exits were 0**, recorded individually in
+`regression-exits.json` and `reg-<driver>-<case>.log`. It ran the supplied
+`scratchpad/projects` and `scratchpad/m3` drivers with at most two concurrent
+venues. `projects/mkcal.py` inserted the existing r13/r14/r15 pause blocks in
+`reg-cal/software-workflows` only. `HOOK_PY=/usr/bin/python3`, bytecode disabled.
+
+The external driver copies replace only disposable setup that violated this
+run's boundaries: the default user `.claude` plugin-data path becomes the
+existing disposable plugin venv; Git author configuration becomes process
+environment; baseline commits use plumbing; `init -b` becomes `init`; and bulk
+scratch deletion becomes an assertion that the venue is new. Product calls,
+hook payloads, fault injections and observed expectations are unchanged.
+Two output truncations were removed so the complete responses are recorded.
+The exact adaptation and argv are retained in `regression_run.py` and each log.
+
+| Cases | Observed behavior | Exit |
+| --- | --- | ---: |
+| r15 rpc-overlap / rpc-cross / exec-overlap | A's completed activity during B's Pre invalidated B; `armed:false`, promoted bytes UNKNOWN. | 0 each |
+| r15 restart | Generation change invalidated the old arm; `a.txt` became UNKNOWN. | 0 |
+| r15 lost-confirm | Hook returned after 3.2 s with `armed:"uncertain"`; durable record was armed true; Post correctly attributed lead-command. | 0 |
+| r15 control | Armed window attributed the new file lead-command. | 0 |
+| r11 refresh / folder | Late deletion detected; file-to-directory replacement recorded deletion and child as UNKNOWN. | 0 each |
+| r11 submodule / uncached | Submodule refused `PATH_TYPE`; cached baseline preserved without attributing old hidden bytes. | 0 each |
+| r11 stall / killed | `GIT_TIMEOUT` at about 3.6 s with cat-file gone; killed registration progressed initializing → incomplete → ready on retry. | 0 each |
+| r11_promote | Old ignored force-added bytes UNKNOWN; newly created bytes lead-command. | 0 |
+| r12_checks | Touch/no-op sed/unignore old bytes UNKNOWN; new-file control credited; exact file-to-folder edits sealed. | 0 |
+| r13 pause-after / pause-before / alias / collapsed | Expired windows and aliases did not grant authorship; collapsed-path controls credited three new files and kept three old hidden files UNKNOWN. | 0 each |
+| r14 reappear / overlap | Reappearing old hidden bytes and transient other lead call produced UNKNOWN. | 0 each |
+| r14 pathmagic / control | Valid new-file controls attributed lead-command. | 0 each |
+| lead_bash3 | Overlapping calls UNKNOWN; isolated call lead-command; duplicate completion attributed nothing. | 0 |
+| lead_hooks_edge | Foreign claim refused on replay; NotebookEdit refused `NOTEBOOK_ADAPTER_UNVERIFIED`, missing Pre refused `LEAD_PRE_MISSING`; notebook bytes UNKNOWN. | 0 |
+| lead_bash2 | Writer-active `e.txt` UNKNOWN; later `f.txt` lead-command; writer-claimed `w.txt` UNKNOWN. | 0 |
+| settle_check | SLEEP, MARKED and ESCAPE completed with custody 0 and no settlement refusal. | 0 |
+
+`lead_bash2` took **34.67 s**, made **3** fixture requests, errors **[]**.
+Its Abraham result was **status:error / state:blocked**, the expected unresolved
+UNKNOWN refusal after the concurrent lead edit. Read-only SQLite inspection
+confirmed implementation completion `success:false`, UNKNOWN `e.txt`, released
+command custody and exit code 0. This is not reported as an all-success Abraham
+run. `settle_check` took **41.43 s** overall; SLEEP **27.8 s**, MARKED **10.3 s**,
+ESCAPE **2.2 s**, fixture requests **9**, errors **[]**. The reported markerless
+`/bin/sleep 8` PID 66137 was gone by cleanup.
+
+The batch snapshot already contained the five main fixes. The subsequent
+`unfinished_unit_v2` query addition was verified separately by the finalization
+red/green pair above. No window behavior changed after the r15/r13/r14 batch;
+the other code adjustments were moving an existing custody import to the
+surrounding import block and grouping page dependencies in one pass, verified
+by the fresh pagination runs above. The full original P1 acceptance matrix was
+not repeated by this addendum.
+
+#### Failed setup invocations and audit corrections
+
+These failures are retained and are not counted as accepted red/green runs:
+
+- `r1-red` exited **1**: the first scratch pause block omitted `import json`,
+  so the driver timed out waiting for its marker. The actual ref had moved;
+  the finally block released pauses and stopped the daemon. Corrected only
+  the calibration copy and reran in `r1-red2`.
+- `r2-red` exited **1**: the scratch identity check expected a `command` key
+  from `processes.identity`, which supplies birth identity instead. It failed
+  before SIGKILL. Replaced that check with `daemon/status` PID/birth equality;
+  `r2-red2` performed the actual crash.
+- Initial `r4-red` and `r6-red` each exited **1** after printing their red
+  behavior: cleanup called a nonexistent `Projects.close`. Catalog calls
+  already close their app-server connections. Removed that scratch-only call;
+  fresh `r4-red2` and `r6-red2` exited 0.
+- `r5-red` exited **1** because the scratch driver expected a `mode` field in
+  `run/list`; no such response field is promised. Selected its returned unit
+  directly and reran `r5-red2`. Its finally block had stopped the daemon.
+- The first cleanup inventory mistakenly traversed command **process-baseline**
+  snapshots, which describe pre-existing machine processes, and exited **1**
+  on a protected ancestor lookup. It sent no signals. The corrected inventory
+  uses only owned listener/discovery/custodian identities and recorded command
+  descendants, never process baselines.
+- A subsequent audit exited **1** solely because five lead-owned file hashes
+  differed from the starting snapshot. This is concurrent lead work, not a
+  reason to revert those files. Process cleanup had already passed. The final
+  audit reports those differences separately and exits 0; all lead-owned
+  edits remain in place.
+
+#### Compatibility, validators, cleanup and boundaries
+
+Final compatibility commands (each exit **0**):
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.15 -B /private/tmp/sw-p1-r16/compatibility_run.py
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B /private/tmp/sw-p1-r16/compatibility_run.py
+```
+
+```text
+PY315_PARSE_OK 44 Python 3.15.0 SQLite 3.54.1 grammar=3.11
+PY39_PARSE_AND_IMPORT_OK 3.9.6 16 parsed 10 imported
+```
+
+The first command parses every coordinator module, server, launcher and hook
+using the Python 3.11 grammar. The second parses the ten client-side modules
+and six hooks and imports the ten client modules. Actual Python 3.11 execution
+is not implied.
+
+Both strict validators were run initially and repeated after observing the
+concurrent lead changes. Final exact commands:
+
+```sh
+CLAUDE_CONFIG_DIR=/private/tmp/sw-p1-r16/validator-plugin-final TMPDIR=/private/tmp/sw-p1-r16/validator-tmp claude plugin validate --strict plugins/software-workflows
+CLAUDE_CONFIG_DIR=/private/tmp/sw-p1-r16/validator-marketplace-final TMPDIR=/private/tmp/sw-p1-r16/validator-tmp claude plugin validate --strict .
+```
+
+Each exited **0**, output **`✔ Validation passed`**, in
+`validate-plugin-final.log` / `validate-marketplace-final.log`.
+
+`PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.15 -B
+/private/tmp/sw-p1-r16/cleanup_audit.py` exited **0**. It inspected **47**
+scratch coordinator databases and **119** owned PID/birth identities:
+
+```text
+owned_live: []
+inventory_errors: []
+scoped_processes: []
+metadata_pids_alive: []
+```
+
+Provider contexts and MCP stdio contexts closed; daemon runs returned stopping
+true. No cleanup signal was sent to an unrelated process. The real coordinator
+state already reported in Addendum 2 belongs to another process tree and was
+neither opened nor used by these runs; this addendum does not claim it is absent.
+Real user native homes, credentials and SmartPay repositories were not used.
+
+The lead's `intents.py`, `runtime.py`, `client.py` and plugin manifest still
+match their starting hashes. `server.py` changes are restricted to session
+mailbox/notice wiring and its docstring; the sealed-unit session check remains.
+`daemon.py` changes are restricted to forwarding session IDs; version reporting
+remains. During this run, root README/CHANGELOG, push_gate.py, office.py and
+office.html changed concurrently; this addendum did not write them or undo
+those edits. The verification log was appended without replacing the lead's
+record. All 13 addendum files listed above remain uncommitted.
+
+Still **UNVERIFIED** here: real-model review quality (zero real-model turns),
+real-user project/UI placement, real SmartPay or external-clone latency,
+Python 3.11 execution, other operating systems and arbitrary user configuration,
+every possible crash instruction boundary, and a separately timed native
+`run/resume` delivery of the quarantine race. The race's actual receipt and
+quarantine paths were exercised directly. The lead's push/gate and Office
+acceptance were not rerun by this coordinator addendum; their concurrent
+changes are preserved. The inherited NotebookEdit serializer limitation and
+other explicitly unverified P1 cases above remain unverified.
+
+Final boundary audit, `/private/tmp/sw-p1-r16/boundary_run.py`, exited **0**:
+**13** addendum files, no unexpected changed file outside those and the five
+concurrent lead files, no production pause markers, and no staged files.
+AST comparisons confirmed the lead's complete `code_review` function and
+version-reporting `Daemon.status` function are unchanged from the starting
+export. HEAD remains `108d99651fb7ab9f36320a616eca8dc3d6d195eb`.
+`git diff --check` exited **0** with no output after this evidence was appended.
+
+**Final tree after the turn-16 fixes (the writer's Addendum 3 and the lead's gate, Office, upgrade and
+lead-hook changes).** `regress_240.sh <final snapshot> <calibration copy> r19`: 42 steps, every one
+exit 0. Three steps are new: the gate check paused right after a ref moved, and the upgrade check with
+an idle 2.3.5 daemon and with one whose stop is refused.
+
+| Step | Result |
+|---|---|
+| r15, r14, r13, r11, r12, snapcheck, edgecheck, lead_bash, lead_bash3, lead_hooks_edge | Identical to the r18 run, with times, ids and paths masked |
+| lead_bash2, settle_check, ambiguity, crossrepo, the three fallbacks, gone_checkout | As in r18 |
+| leadtool_timing | 3,507 ms first (registration), then 65, 66, 66, 64 ms |
+| query_cost | Median 0.4 / 0.6 / 1.3 / 2.5 / 3.8 ms at 10 / 100 / 300 / 600 / 1,000 units; gate client 7 of 7 at each |
+| gate_partial, paused after Backend completed | `checkout/query` partially_published. Hook and shim refuse in flight. Every partial and routed case refused (17 PARTIAL refusals). After reopen: lead Edit in Backend denied (`PREFIX_PUBLISHED`), `git status` there runs, lead Edit in Frontend verified and published. Token flow after completion; the remote has the commit |
+| gate_partial, paused right after Backend's ref moved | `checkout/query` reports `publishing` (Backend `ref_updated` with its commit; the fix round's tree said `prepared`). Hook and shim refuse. The rest as above (17 PARTIAL refusals) |
+| upgrade_check idle / busy | Replaced by 2.4.0, migrations [1, 2] → [1, 2, 3], repository kept / `DAEMON_OUTDATED` (NOT_QUIESCENT), the 2.3.5 worker kept serving, migrations stay [1, 2] |
+
+The two gate modes were re-run outside the suite with full logs (`gp/f5cal.log`, `gp/f5calref.log`),
+because the suite keeps only each step's tail.
+
+
+### Addendum 4 — turn-17 coordinator findings (2026-10-19)
+
+Implemented R17-4, R17-5, R17-6 and the daemon/hook half of R17-2/R17-3.
+Read `scratchpad/charter_240_r17.md` completely. The starting tree already
+contained the lead's turn-16 follow-ups. Its full export is
+`/private/tmp/sw-p1-r17/red/software-workflows`; initial file SHA-256 values
+are in `/private/tmp/sw-p1-r17/before.json`. These are reds against that
+**pre-Addendum-4 2.4.0 tree**, not claims about unmodified 2.3.5.
+HEAD remains `108d99651fb7ab9f36320a616eca8dc3d6d195eb`.
+
+All venues below are owned scratch directories under `/private/tmp/sw-p1-r17`.
+Each run used a fresh work directory, scratch Git repositories, private state,
+and disposable native homes. Operational drivers and calibration copies live
+outside the checkout; no test file or pause was added to production. Repository
+setup used explicit paths, `write-tree`, `commit-tree` and `update-ref` in those
+scratch repositories. No commit, push, branch operation, staging or Git-internal
+edit was performed in this checkout.
+
+Runtime evidence, commands each exit **0**:
+
+```text
+/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex --version
+codex-cli 0.163.0
+
+PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.15 -B /private/tmp/sw-p1-r16/compatibility_run.py
+PY315_PARSE_OK 44 Python 3.15.0 SQLite 3.54.1 grammar=3.11
+
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B /private/tmp/sw-p1-r16/compatibility_run.py
+PY39_PARSE_AND_IMPORT_OK 3.9.6 16 parsed 10 imported
+```
+
+Native writer/MCP runs used the existing local fixture provider, with actual
+Codex app-server turns and actual dynamic tools/hooks. They reported approvals
+`never`, sandbox `danger-full-access`, live web configuration and native backend.
+Fixture output is not a real-model judgment. Publication runs used the real
+coordinator RPCs and Git journals; their review prepare/complete records contain
+controlled fixture answers binding the complete vector, without model inference.
+Host hooks ran with `/usr/bin/python3` (3.9.6).
+
+#### Changed files and preserved lead work
+
+This addendum writes these **nine** files:
+
+| File under `plugins/software-workflows/` | Change and reason |
+|---|---|
+| `coordinator/participants.py` | Shared published-participant lookup returns the root and installed commit; writable checks reuse it. |
+| `coordinator/intents.py` | Bash Pre reports published participants; authoritative denied file intents become terminal, including replay; prepared hooks retain checkout/deadline metadata for shutdown. |
+| `coordinator/ledger.py` | Final synchronous receipt application excludes a published participant from Bash attribution. Its changed bytes become UNKNOWN even when another participant is credited. |
+| `coordinator/group_publish.py` | Reseal compares the unit's scoped receipts with its installed prefix vector. Later UNKNOWN heads do not become old-unit work and do not wedge the writable remainder. The own-receipt lookup is linear in returned history. |
+| `coordinator/daemon.py` | Per-start boot identity, draining-stop capability, bound retirement, global pending-work counts, in-flight RPC tracking, admission fence, bounded settlement and immediate readmission on refusal. |
+| `hooks/coordinator_lead.py` | Bounded replacement wait/retry only while `upgrade.lock` is held; reserves Bash-arm time; displays the published-root/commit UNKNOWN notice. |
+| `server.py` | Carries session IDs through the common wrapper, Abraham, run controls and review notices; helper context preserves the calling session. |
+| `coordinator/README.md` | Documents exactly these routing, prefix, refusal, mailbox and shutdown contracts. |
+| `coordinator/VERIFY.md` | This actual-run record. |
+
+The lead-owned `client.py`, `observations.py`, `query.py`, `__main__.py`,
+`push_gate.py`, Office and root documentation were not edited here. Four of those
+files changed concurrently: `client.py`, `observations.py`, `__main__.py`, and
+`push_gate.py`. Their changes remain. Kept the daemon's `git_common` query
+forwarding, the hook's PREFIX_PUBLISHED denial, the `exec_window` tree-identity
+lock, sealed-unit explicit-session refusal, `runtime.plugin_version()` and
+version reporting. The server's existing review refusal changed only to carry
+the session into its notice.
+
+#### Red-then-green commands and calibration
+
+The external driver directory is `/private/tmp/sw-p1-r17`. The tables use:
+
+```text
+PY   = /opt/homebrew/bin/python3.15 -B
+MCP  = /private/tmp/sw-p1-240/plugin-data/venv/91e1e736a04fad0e/bin/python -B
+BASE = /private/tmp/sw-p1-r17
+OLD  = /private/tmp/sw-p1-r16
+```
+
+`red/software-workflows` was captured before modifying the affected behavior.
+`green/software-workflows` is the fixed snapshot. `redcal`/`greencal` add only
+the earlier R16 first-ref and recovery observation pauses via
+`$PY $OLD/calibrate.py <plugin> <new-calibration-plugin>` (each exit **0**).
+The first-ref pause is after the actual Git ref update and before SQLite's
+`ref_updated` checkpoint. `reddrain`/`greendrain` use
+`$PY $BASE/drain_calibrate.py <plugin> <new-calibration-plugin>` (each exit **0**):
+a diagnostic read can wait on a marker, and stop pauses 250 ms at drain entry.
+The old copy pauses at the equivalent pre-listener-stop location. None changes
+the production decision under observation.
+
+Each row was executed red first, then green. Logs retain full requests,
+responses, receipts, native/host identities and journal bindings.
+
+| Finding/run | Exact driver arguments following interpreter | Red exit | Green exit |
+|---|---|---:|---:|
+| R17-4 | `$BASE/prefix_run.py $BASE/redcal/software-workflows $BASE/red-prefix prefix`; then `greencal/software-workflows`, `green-prefix`, `prefix` | 1 | 0 |
+| R17-5 | `$BASE/prefix_run.py $BASE/redcal/software-workflows $BASE/red-denied denied`; then `greencal/software-workflows`, `green-denied`, `denied` | 1 | 0 |
+| R17-6, MCP interpreter | `$BASE/mail_run.py $BASE/red/software-workflows $BASE/red-mail3`; then `green/software-workflows`, `green-mail` | 1 | 0 |
+| R17-2/3, seven stop cases | `$BASE/stop_batch.py red`; then `$BASE/stop_batch.py green` | 1 | 0 |
+| Publication occupancy | `$BASE/publication_stop_run.py $BASE/redcal/software-workflows $BASE/red-publication-stop stop`; then `greencal/software-workflows`, `green-publication-stop`, `stop` | 1 | 0 |
+| Bash hook during drain/replacement | `$BASE/ride_run.py $BASE/reddrain/software-workflows $BASE/red-draining-hook draining-hook`; then `greendrain/software-workflows`, `green-draining-hook`, `draining-hook` | 1 | 0 |
+
+The batches invoke this exact per-case shape, recorded at the top of each log:
+
+```text
+$PY $BASE/stop_run.py <plugin> $BASE/<red|green>-stop-<case> <case>
+cases: edit, bash, expect, gap, drain, timeout, idle
+plugin: <red|green>/software-workflows, except drain/timeout use <red|green>drain/software-workflows
+```
+
+All seven red case processes exited **1**; all seven green processes exited
+**0**. The idle red's stop itself succeeded: that driver's failure was its missing
+boot/capability contract, not an invented idle-stop failure.
+
+After simplifying the prefix receipt query, copied the current tree through
+`$PY $OLD/calibrate.py plugins/software-workflows $BASE/latestcal/software-workflows`
+and repeated these actual runs, both exit **0**:
+
+```text
+$PY $BASE/prefix_run.py $BASE/latestcal/software-workflows $BASE/latest-prefix prefix
+$PY $OLD/publication_run.py $BASE/latestcal/software-workflows $BASE/latest-reopen reopen
+```
+
+Their logs are `latest-prefix.log` and `latest-reopen.log`. Other implementation
+files are unchanged from the already verified green snapshot; lead-owned files
+and documentation are compared separately.
+
+#### R17-4: published prefix and writable remainder
+
+Both runs created a two-repository native project, attached lead session `R17-S`,
+made exact edits to `same.txt` in Backend and Frontend, sealed and recorded a
+bound review. They paused after Backend's actual ref move, advanced Frontend's
+base, released the pause, observed `STALE_BASE`, and explicitly reopened. One
+real Bash invocation then changed both files, surrounded by actual Python 3.9
+Pre/Post hooks.
+
+Red (`red-prefix.log`, exit **1**): Pre omitted the published participant; Backend
+received a `lead-command` receipt under the old unit and no UNKNOWN. Frontend was
+also credited. Reseal refused `PROVENANCE_INCOMPLETE` on `same.txt`.
+
+Green (`green-prefix.log`, exit **0**, repeated in `latest-prefix.log`):
+
+```text
+CHECKS {"prefix_pre_notice":true,"prefix_unknown":true,
+        "writable_attribution":true,"remainder_published":true,
+        "prefix_commit_preserved":true}
+```
+
+The final run's Pre included:
+
+```json
+{"published_participants":[{"checkout":"checkout_d6119e06b1c94935a0856e2b48668d10","root":"/private/tmp/sw-p1-r17/latest-prefix/Backend","commit":"50c6048dedf13920e59f07a3369abc8ba6ba3681"}],"armed":true}
+```
+
+The host note names that root and commit and says its changes are UNKNOWN and
+need a new unit. Pre took **0.086 s**, Post **0.065 s**. Backend's latest revision
+`rev_6aadcaaa595b4e688296819607e0acdf` is `UNKNOWN`, with `unit:null` and
+`operation:null`; its earlier exact receipt remains. Frontend has the command
+receipt and no UNKNOWN. An exact mediated suffix edit, new seal and complete-vector
+review then published group `publication_group_e7387d81f37f482e975c456dc3d824d3`
+to `phase:complete`, `publication_state:complete`. Backend retained the same
+installed commit; its unexplained working bytes were not incorporated.
+
+#### R17-5: denied file intent and replay
+
+Red (`red-denied.log`, exit **1**): first prefix Write was denied, but its durable
+hook stayed `received`; replay was not denied. A Bash Pre in a third registered
+checkout could not arm, and its change became UNKNOWN. The complete sequence
+finished in **0.265 s**, so expiration was not the cause.
+
+Green (`green-denied.log`, exit **0**): both original and replayed Write were
+`permissionDecision:deny`, naming `PREFIX_PUBLISHED`; the durable hook was
+`refused`. The immediate third-checkout Bash armed and its change received
+`lead-command`. Denial through that command's Post took **0.295 s**, far below
+180 seconds. All five checks passed. Terminalization also wraps authoritative
+claim/prefix refusals after asynchronous preparation so those paths cannot leave
+false occupancy. Existing claim replay reevaluates the conflict before preparing.
+
+#### R17-6: session-union unread notices through real MCP tools
+
+`mail_run.py` starts the actual MCP server in the disposable plugin environment,
+then real native Abraham fixture turns leave one writer message unread for
+session `R17-S`. It calls each tool for `R17-S` and `R17-OTHER`.
+
+Red (`red-mail3.log`, exit **1**): Abraham completion, all four run controls,
+ordinary and refused bound review, and the wrapper's early Abraham image error
+omitted S's unread notice. The already-wired claims notice worked. Other-session
+isolation held.
+
+Green (`green-mail.log`, exit **0**): **17/17 checks true**:
+
+- Abraham completion carries S's notice.
+- `codex_runs`, `codex_resume_run`, `codex_run_log`, `codex_cancel_run` carry it
+  for S and omit it for the other session.
+- Ordinary `code_review` returns the fixture answer and S's notice; the bound
+  explicit-thread refusal also includes S's notice before inference.
+- `coordinator_claims(action="invalid")` and the common wrapper's missing-image
+  early return retain the same session isolation.
+
+Each accepted red/green run logged `PROVIDER {"requests":5,"errors":[]}`.
+Ordinary fixture reviews used `infra:true` to retain the controlled disposable
+home configuration. Message IDs/recipients and acknowledgement states were not
+rewritten, and reading notices did not acknowledge them. This verifies transport,
+scoping and actual tool return paths, not review quality.
+
+#### R17-2/3: bound shutdown, pending work, drain and hook replacement
+
+`daemon/status` now returns a unique `boot`, version `2.4.0`,
+`capabilities:["draining-stop"]` and `draining`. The complete pending check is
+across the daemon's registered checkouts, not the request's target checkout.
+
+| Case | Red observation | Green response/evidence |
+|---|---|---|
+| Prepared Edit | Stop succeeded; after restart Post produced UNKNOWN | Immediate `NOT_QUIESCENT`, `pending:{lead_hooks:1,lead_operations:1}`, **0.001 s**; Post exact receipt, no quarantine |
+| Armed Bash | Stop succeeded; recovered window could not attribute | Immediate `NOT_QUIESCENT`, `pending:{lead_hooks:1}`, **0.001 s**; Post `lead-command`, no UNKNOWN |
+| Paused group publication | Stop succeeded while publication RPC was pending | `NOT_QUIESCENT`, `pending:{mutating_rpcs:1,publication_rpcs:1}`; after releasing the first-ref pause the complete group published |
+| Wrong `expect.boot` | Old stop ignored it and stopped the worker | `DAEMON_REPLACED` in **0.001 s**, current `{pid,boot,version}` returned; same worker still served |
+| Claim during drain | Claim was admitted | Retryable `DAEMON_DRAINING` in **0.001 s**; admitted diagnostic reader finished, then stop completed |
+| Drain deadline | No settlement bound/admission fence | `NOT_QUIESCENT`, `pending:{inflight_rpcs:1}`, `wait_seconds:1.0`; admission resumed and a fresh claim succeeded |
+| Idle | Stop worked, status lacked the new binding contract | Stop response **0.001 s**; worker and supervisor locks released by **0.279 s** |
+
+Logs: `red-stop-*.log`, `green-stop-*.log`, `red-publication-stop.log`,
+`green-publication-stop.log`; batch exits/times are preserved in
+`red-stop-exits.json` / `green-stop-exits.json`.
+
+`STOP_DRAIN_S=1.0` bounds waiting for RPC settlement. Its nearby derivation uses
+15 seconds minus three possible 3-second hook calls, the lead's measured 3.5-second
+replacement startup, and 1.5 seconds of polling/transport margin. Occupied
+mutations refuse immediately. Listener detach/lease release retain their existing
+settlement/identity safeguards after RPC settlement. The calibration deliberately
+adds **0.250 s**: observed timeout response was **1.262 s**, followed by successful
+claim admission in **0.003 s**. The waiting reader was released normally, not
+cancelled. Successful drain with the pause took **0.251 s**.
+
+The host hook's own deadline is **14 s** including setup/output margin. Every
+client call remains **3 s**. It probes `upgrade.lock`, waits only when held,
+and reserves retry plus Bash-arm time. The positive replacement runs used a
+separate scratch process holding that flock across old-worker stop, lock release,
+a deliberate **0.8 s** endpoint gap, and replacement start:
+
+- **Gap/Edit:** old hook took unavailable; fixed hook prepared on generation 2,
+  then Post wrote an exact receipt without UNKNOWN. Pre **1.149 s**, Post
+  **0.041 s** (`green-stop-gap.log`).
+- **Drain/Bash:** old hook armed on generation 1 while stop proceeded; recovery
+  invalidated it and Post recorded UNKNOWN. Fixed hook waited through the drain
+  and replacement, then armed on generation 2 with a different boot. Pre
+  **1.657 s**, Post **0.054 s**. Its `lead-command` receipt is
+  `rev_e055f510b5d54df9bd0fbee8ff4557c9`, linked to
+  `lead_hook_771a0ece26d8d98e66283017384c9d4f5f444300c906fd540d533dfac658201b`.
+  Both upgrader processes exited **0** (`green-draining-hook.log`).
+
+A missing/unheld upgrade lock adds no new wait. The turn-13 delayed-Pre runs below
+still returned the unavailable path in about three seconds. The lead's automatic
+upgrade client and old-release deferral policy were not modified here; these
+runs exercise the daemon/hook contract that client uses.
+
+#### Turn-15 and prior regression batch
+
+Command:
+
+```text
+$PY $BASE/regression_run.py
+```
+
+It exports `final/software-workflows`, builds `reg-cal/software-workflows` with
+the supplied `projects/mkcal.py`, and invokes the existing scratchpad drivers in
+fresh venues. `regression.log` and `regression-exits.json` retain every exit and
+time; each `reg-*.log` begins with its full interpreter/arguments. Setup-only
+adaptations preserve the caller's Git contract, replace user-home plugin data
+with the existing disposable MCP environment, and select `HOOK_PY=/usr/bin/python3`.
+The product calls and observations remain the original drivers'.
+
+The batch exited **1**: **25/26 original drivers exited 0**. The one exception is
+explained immediately below; it is not hidden as an all-green batch.
+
+| Existing driver/cases | Exits | Observed behavior |
+|---|---|---|
+| r15 `rpc-overlap`, `exec-overlap`, `rpc-cross` | 0, 0, 0 | Transient same-root/cross-root work and exclusive exec invalidate the window; B is unarmed and its promoted file UNKNOWN |
+| r15 `lost-confirm`, `control` | 0, 0 | Lost confirmation reply preserves the persisted arm; ordinary control attributes `lead-command` |
+| r15 `restart` | 1 | Its orderly stop now correctly refuses an outstanding armed hook with `NOT_QUIESCENT` |
+| r11 `refresh`, `folder`, `submodule`, `uncached`, `stall`, `killed` | six 0 | Mid-scan deletion UNKNOWN; folder transition preserved; submodule PATH_TYPE; ignored/unindexed view preserved; GIT_TIMEOUT in 3.6 s and cat-file gone; interrupted registration resumes |
+| r11_promote, r12_checks | 0, 0 | Existing hidden bytes stay UNKNOWN; new bytes can be attributed; verified file-to-directory transition seals |
+| r13 `pause-after`, `pause-before`, `alias`, `collapsed` | four 0 | Timed-out/unarmed promotions and pre-existing aliases remain UNKNOWN; hidden collapsed paths stay excluded |
+| r14 `reappear`, `overlap`, `pathmagic`, `control` | four 0 | Hidden reappearance/overlap remains UNKNOWN; valid path/control retains attribution |
+| lead_bash3, lead_hooks_edge | 0, 0 | Duplicate/overlapping completion never grants false authorship; NotebookEdit retains its explicit uncalibrated behavior |
+| lead_bash2, settle_check (MCP environment) | 0, 0 | Writer claim blocks lead attribution; unresolved paths UNKNOWN; terminal/background settlement retained. Fixture provider errors `[]` in both |
+
+To keep the restart safety case while respecting the new stop contract, ran:
+
+```text
+PYTHONDONTWRITEBYTECODE=1 HOOK_PY=/usr/bin/python3 $PY $BASE/drivers/r15_restart_crash.py $BASE/reg-cal/software-workflows $BASE/r15-restart-crash restart
+```
+
+Exit **0**, `r15-restart-crash.log`. It first asserts the orderly
+`NOT_QUIESCENT {pending:{lead_hooks:1}}` refusal. It checks the scratch worker's
+PID/birth and supervisor command/state, pauses that supervisor, SIGKILLs only
+the verified worker, sends B's Pre during the gap, then resumes the supervisor.
+Generation 2 was ready after **0.91 s**. A's old armed window and B's unavailable
+window both produced UNKNOWN at Post; no false receipt was granted. This is an
+explicit calibration deviation from the original driver's now-disallowed orderly
+stop, not a weakening of production shutdown.
+
+#### Turn-16 reruns
+
+Command `$PY $BASE/r16_batch.py` ran the previous Addendum-3 scripts against the
+fixed snapshots. It exited **1** only because the first final-checkpoint
+calibration omitted its recovery pause; the corrected fresh run below exited 0.
+
+| Script/case under `$OLD` | Work directory under `$BASE` | Exit | Evidence |
+|---|---|---:|---|
+| `publication_run.py … reopen` | `r16-publication_run-reopen` | 0 | Prefix edit refused PREFIX_PUBLISHED; suffix new-generation review/publication completed; installed prefix retained |
+| `publication_run.py … crash` | `r16-publication_run-crash` | 0 | Kill after actual first ref move before checkpoint; both checkout queries retain publishing evidence during recovery; group completes |
+| `finalgap_run.py … crash`, corrected calibration | `r16-finalgap2` | 0 | Kill after repository completion but before group completion; both queries show `partially_published` with `fresh:false`; then complete |
+| `ledger_run.py … parent` | `r16-ledger_run-parent` | 0 | Parent/parts all quarantined before completion resumes; `OPERATION_STATE`, `UNIT_RECEIPTS []`, both heads UNKNOWN |
+| `ledger_run.py … part` | `r16-ledger_run-part` | 0 | Same result when quarantine starts from a part; no partial success receipts |
+| `ledger_run.py … page` | `r16-ledger_run-page` | 0 | Actual 100,000 heads: limit 1 reads 2 head rows; each default page reads 101; two checkout lookups per page |
+| `mail_run.py` (MCP interpreter) | `r16-mail_run` | 0 | Session inbox sees writer mail; foreign session sees zero and cannot acknowledge (`ACK_ACTOR`) |
+| `mail_two_run.py` (MCP interpreter) | `r16-mail_two_run` | 0 | Two writer units aggregate for their session; identity/acknowledgement isolation retained |
+
+The ordinary publication cases use `greencal/software-workflows`, ledger/mail
+cases use `green/software-workflows`. The corrected final-gap command was:
+
+```text
+$PY $OLD/finalgap_run.py $BASE/finalgap2/software-workflows $BASE/r16-finalgap2 crash
+```
+
+The corrected copy has both the last-repository checkpoint pause and recovery
+observation pause. `r16-finalgap2.log` retains actual query responses before,
+during and after recovery, and final refs/journals.
+
+Pagination measurements (`r16-ledger_run-page.log`): limit 1 **0.203 ms**;
+three 100-row pages **0.397 / 0.356 / 0.383 ms**, each reading only its page plus
+one. `$PY $BASE/pagination_edges.py` also exited **0**: cross-checkout cursor,
+last row, empty EOF, four malformed `PAGE_CURSOR` refusals and
+`SEARCH heads USING INDEX sqlite_autoindex_heads_1 (checkout=? AND path>?)`.
+These are local measurements, not latency promises for real repositories.
+
+#### Failed setup attempts, retained rather than counted as passes
+
+- Initial `red-mail` exited **1** before notice coverage because its driver
+  expected `workflow` in a run-list summary. It now selects the returned run ID.
+- `red-mail2` exited **1**. Two ordinary `code_review` calls used the default
+  `infra:false`; the isolated read-only configuration did not retain the fixture
+  provider. They attempted the default OpenAI endpoint and received **401
+  Unauthorized**, with no model answer. No user native home or credentials were
+  used. Corrected the scratch calls to `infra:true`, then reran fresh red and
+  green with five fixture-provider requests and no provider errors. Therefore
+  this record claims **no successful real-model inference**, not zero attempted
+  outbound requests.
+- `r16-finalgap_run-crash` exited **1** after **123.93 s** waiting for a missing
+  recovery marker. The first scratch copy had only the final-journal pause;
+  recovery itself had already completed. Added the authorized recovery pause to
+  a new copy and reran as `r16-finalgap2`, exit 0.
+- Original r15 restart exited **1** at the required new stop refusal. The
+  identity-checked crash variant above exercises the remaining recovery steps.
+- Initial cleanup audit exited **1** because that refused-stop r15 daemon and
+  its supervisor were still alive. They were identified and stopped as described
+  below; no unrelated process was signalled.
+
+#### Validators, cleanup and boundaries
+
+Both exact strict validation commands exited **0**, output
+**`✔ Validation passed`**:
+
+```sh
+CLAUDE_CONFIG_DIR=/private/tmp/sw-p1-r17/validator-plugin TMPDIR=/private/tmp/sw-p1-r17/validator-tmp claude plugin validate --strict plugins/software-workflows
+CLAUDE_CONFIG_DIR=/private/tmp/sw-p1-r17/validator-marketplace TMPDIR=/private/tmp/sw-p1-r17/validator-tmp claude plugin validate --strict .
+```
+
+Logs are `validate-plugin.log` and `validate-marketplace.log`. The Python
+compatibility commands at this addendum's start also exited 0; Python 3.11
+grammar parsing is not a claim of actual Python 3.11 execution.
+
+Cleanup used only scratch-state listener/discovery/custodian PID/birth records,
+owned command descendants and exact scratch-state process commands. It did not
+treat whole-machine command baselines as owned children. The first inventory
+found only the r15 original restart's worker/supervisor. The worker was verified
+as PID **51117**, birth **1792411390:855322**; its current boot was read and passed
+back in `daemon/stop.expect`. Stop returned `{"stopping":true}` (exit **0**,
+`cleanup-stop.log`). No force signal was needed for cleanup.
+
+```text
+PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3.15 -B /private/tmp/sw-p1-r17/cleanup_audit.py
+exit 0
+64 scratch coordinator databases; 139 owned PID/birth identities
+owned_live: []
+inventory_errors: []
+scoped_processes: []
+metadata_pids_alive: []
+```
+
+All daemon, supervisor, fixture-provider, MCP and native app-server processes
+started for these runs are stopped. Real coordinator state belongs to another
+process tree, was not opened or used, and is not claimed absent. No user native
+home, credential store, real SmartPay repository or external repository was used.
+
+Still **UNVERIFIED** in this addendum: real-model review quality, real-user
+project/UI placement, real SmartPay or external-clone latency, actual Python 3.11
+execution, other operating systems, arbitrary user configurations, every possible
+crash instruction boundary, and replacement timing under resource exhaustion.
+The lead's push-gate, automatic-upgrade-client and Office acceptance are not
+claimed as this coordinator addendum's coverage; their concurrent work is kept.
+The separately listed earlier P1 limitations, including NotebookEdit serialization,
+remain unless explicitly verified above. Fixture review answers establish
+binding/transport behavior only.
+
+Final boundary command, `/opt/homebrew/bin/python3.15 -B
+/private/tmp/sw-p1-r17/boundary_run.py`, exited **0**. It reports nine addendum
+files, only the four separately listed concurrent lead-file differences, no
+production pause markers, no staged files and unchanged HEAD. AST comparisons
+confirm `exec_window` is unchanged and `code_review` is unchanged after removing
+only the added notice-session argument; runtime/version and `git_common`
+forwarding checks pass. The only implementation difference from the green
+snapshot is the final prefix receipt-query simplification, rerun successfully
+in both latest-prefix and latest-reopen. All work remains uncommitted.
+`git diff --check` exited **0**, no output, after this addendum was appended.
+
+### Lead record for the turn-17 fixes — 2026-10-19
+
+The lead changed these paths, disjoint from Addendum 4's writer run:
+
+- `hooks/push_gate.py`: `_routed_repository()` replaces `_routed_root()`.
+  - It asks git, with the command's own routing, for the common git directory and the work tree.
+  - `_publication_block()` queries the coordinator with that directory.
+  - A coordinator before 2.4.0 (no `repository` in its answer) is still matched by folder.
+- `coordinator/observations.py`: `repository_checkouts()` matches registered checkouts by the `repository`
+  identity each recorded at registration (`ledger._metadata`). With `git_common`, `query()` reports
+  publications of those checkouts only, and lists their roots under `repository`.
+  - `coordinator/query.py` passes `git_common`.
+  - `coordinator/daemon.py` passes it through. That one line was written before the writer's run.
+- `coordinator/client.py`:
+  - `ensure()` takes `<state>/upgrade.lock` for any start or replacement, looks again under it, and
+    holds it until the daemon it started reports `ready`.
+  - `retire()` stops only a daemon reporting `draining-stop`, with `expect` from its status, and
+    returns False on `DAEMON_REPLACED`.
+  - A daemon from before 2.4.0 raises `DAEMON_OUTDATED` naming `stop_command()`.
+  - `stop()` (the CLI's `daemon stop`) takes the same lock. For a daemon from before 2.4.0, it first
+    reads that daemon's ledger read-only (`lead_work_in_flight()`).
+- After reading the writer's diff, three more client changes:
+  - `DAEMON_DRAINING` from a stop gives `DAEMON_OUTDATED` at once, instead of waiting out the lock
+    timeout.
+  - A daemon gone before its stop counts as stopped.
+  - `pending` is reported flat.
+
+Gate, red then green. `scratchpad/projects/gate_partial.py` with `GATE_SEPARATE=1` creates Backend
+with `git init --separate-git-dir=<W>/metadata/Backend.git`. Each run pushed from the unregistered
+Other while the unit was partly published. Red ran on the turn-17 tree's calibration copy
+(`f5cal`); green on that tree plus only the lead's files above (`h1cal`). Both exit 0.
+
+| Route (hook and git shim) | Red | Green |
+|---|---|---|
+| `git -C <Backend> push`, `--git-dir=<metadata/Backend.git>`, `--git-dir … --work-tree <Backend>`, `GIT_DIR=<metadata…>` (hook, 4) | token denial ×4 | PARTIAL refusal ×4 |
+| shim: `-C`, `--git-dir=`, `GIT_DIR` (3) | token denial ×3, exit 1 | PARTIAL refusal ×3, exit 1 |
+| `.git` named as a file: `CODEX_PUSH_ACK=0000 git -C Backend push`, `--git-dir=../Backend/.git`, shim `GIT_DIR=../Backend/.git` (3) | token denial ×3 | PARTIAL refusal ×3 |
+
+With volatile values masked, every other line of the two logs is identical, including:
+- the unregistered Other's own pushes, which get the usual token;
+- the reopen, seal, review and publish;
+- the token flow after completion.
+
+The normal mode (no separate directory) on both trees is identical apart from ids. The median
+decision time was 919 ms before and 912 ms after (23 decisions each).
+
+Upgrade from a running 2.3.5 daemon (`scratchpad/projects/upgrade_old.py`, the 2.3.5 export as the
+old plugin; each case ran on a disposable state):
+
+| Case | Result |
+|---|---|
+| red: the turn-17 tree's client, with a lead Edit prepared by the 2.3.5 hook | The client replaced the daemon (537 ms). The Post got "Writer coordinator is unavailable"; `a.txt` is UNKNOWN ("lead operation interrupted before verified completion") |
+| idle | `ensure()` refused `DAEMON_OUTDATED` in 49 ms, naming `cd <plugin> && <python> -B -m coordinator --state <state> daemon stop`. Run as given: exit 0, `stopping`. The next `ensure()` serves 2.4.0, and nothing is UNKNOWN |
+| edit (Pre answered by the 2.3.5 hook, no Post) | `ensure()` refused as above. `stop()` refused `NOT_QUIESCENT {"pending": {"lead lead-edit": 1}}`, and the old daemon kept serving. The Post was `verified` there. `stop()` then stopped it, 2.4.0 started, and nothing is UNKNOWN |
+| bash (Pre armed, no Post) | The same, with `{"lead hook": 1}`. The Post was `lead-command` (`a.txt`) |
+| oldhooks: 2.3.5 hooks against the 2.4.0 daemon | Edit `verified`, Bash `lead-command` (`b.txt`), nothing UNKNOWN |
+
+Suite r20 (`regress_240.sh` on a snapshot of the final tree and its calibration copy): 53 steps,
+each exit 0. `scratchpad/projects/suite_cmp.py` compared it with r19, with volatile values masked.
+Every step that r19 had is identical, apart from:
+- `r15 restart`:
+  - The stop is now refused (`NOT_QUIESCENT {"lead_hooks": 1}`): A's command is in flight.
+  - The case now ends the supervisor and worker instead (a crash cannot be refused).
+  - Its outcome is r19's: A and B are `UNKNOWN-context-only`, and `a.txt` is UNKNOWN.
+- The order of the per-repository list in a cross-repository Bash Post: it follows random checkout
+  ids. The revision histories are identical.
+- Timings and tokens.
+
+New steps:
+- The separate-directory gate run: 20 refusals, and the 2 tokens are Other's own pushes.
+- The four 2.3.5 upgrade cases above.
+- `upgrade_drain.py`: the tree as 2.4.0, and a copy labelled 2.4.1.
+
+| Case | Result |
+|---|---|
+| idle | Replaced in 649 ms: new pid and boot, version 2.4.1 |
+| edit / bash in flight | `DAEMON_OUTDATED` (`NOT_QUIESCENT`, `{"lead_hooks": 1, "lead_operations": 1}` / `{"lead_hooks": 1}`) in 4 ms, with the same pid and boot after. The Post was verified / `lead-command`. Then replaced in 644 / 587 ms, and nothing is UNKNOWN |
+| race: two newer clients at once, two processes | Both are on the same pid and boot, with one worker on the state |
+| stale: B holds the old status while A replaces | `retire(seen)` returns False, and A's daemon keeps serving |
+| reverse: the 2.4.0 client meets a running 2.4.1 | Used as it is (2 ms) |
+| ride: the script holds the lock across a bound stop and a start | The 2.4.0 hook's Edit Pre returned 0.1 s after the lock was released (1.5 s in all), prepared on the new daemon. The Post was `verified`, and nothing is UNKNOWN |
+
+Correction, found while comparing r21: the suite's cleanup did end one scratch daemon process (pid
+93135). r18 and r19 listed one such process too, before the cleanup existed. r22's listing names it:
+the supervisor of the last step (`query_cost.py`), listed while still exiting after its stop. Run
+alone, that supervisor was gone 0.33 s after `stopping`. The user's own coordinator (2.3.5, its
+default state) was not touched by any run.
+
+### Lead record for the turn-18 fixes — 2026-10-19
+
+Review turn 18 found no HIGH. The lead fixed its two MEDIUM findings and the LOW one:
+
+- `participants.published_participant()` also reads the unit's current publication. In the latest
+  group that is neither superseded nor abandoned (as `surface()` picks it), or in its one journal
+  without a group, a journal at `ref_updated`, `index_pending`, `index_updated` or `complete` that
+  has a commit counts. The guards that refuse on it (claims, mediated edits, command custody) run
+  only for an open unit, and a unit being published is sealed, so publication itself never meets
+  them. The Bash attribution fence and the Pre note have no such condition: they apply to sealed
+  units too (corrected after review turn 19 said so).
+- `client.ensure()`: a `DAEMON_DRAINING` answer to the first status takes the caller to the upgrade
+  lock. There `current()` waits until the daemon serves again (its stop refused) or exits; if it
+  exits, `current()` also waits for its locks to be released, before anything starts.
+- `coordinator/README.md` states the read-dependency exception (`UNKNOWN_DEPENDENCY`) and when a
+  participant counts as published.
+
+Red ran on the turn-18 tree (its snapshot and calibration copy); green on that tree plus only these
+changes.
+
+`gate_partial.py` with `GATE_PREBASH=1` runs, while the unit is partly published and before
+`unit/reopen`, a lead Bash `printf 'pre-reopen\n' >> x.txt` in Backend, then a lead Edit of
+`x.txt`. The usual reopen, reseal and publish follow.
+
+| | Red (exit 1) | Green (exit 0) |
+|---|---|---|
+| Pre names Backend as published | no | yes |
+| Post | `lead-command` (`x.txt`) | `UNKNOWN-context-only` |
+| `x.txt` attributions | baseline, exact (unit), lead-command (unit) | baseline, exact (unit), UNKNOWN (no unit) |
+| Lead Edit of `x.txt` | allowed: "Writer coordinator is unavailable" | denied: `PREFIX_PUBLISHED`, naming the checkout and commit |
+| Reseal and publish after the reopen | refused: `PREFIX_PUBLISHED` "Verified work changed in an already published participant" | the publication group completed |
+
+`upgrade_drain.py race2` uses a scratch copy of the older tree whose daemon sleeps 3 s once it is
+closing (`R17PAUSE_CLOSING`). Two newer clients call `ensure()`, the second 1 s after the first.
+
+| | Red | Green |
+|---|---|---|
+| First upgrader | serving the 2.4.1 replacement, 3,601 ms | serving the 2.4.1 replacement, 3,599 ms |
+| Second upgrader, inside the pause | refused `DAEMON_DRAINING` in 3 ms | serving the same pid and boot, 2,600 ms |
+| Workers on the state at the end | 1 | 1 |
+
+### Lead record for the turn-19 fix — 2026-10-19
+
+Review turn 19 found the turn-18 fix one step short. `publish.py` saves `commit_created` with the
+commit, runs the git ref update, and only then saves `ref_updated`. Between the two, and after a
+crash or a refused update until `abandon()` proves the journal unapplied, the participant was not
+counted. `participants.FENCED` now adds `commit_created` to `INSTALLED`, and
+`published_participant()` marks that phase `uncertain`. For it, `require_writable()` refuses with
+`PREFIX_PUBLISHED` "This participant is being published: its branch may already have the unit's
+commit…". The lead hook's Bash note says "already published or being published".
+
+`mkcal.py` adds a calibration-only pause (`R19PAUSE_INSTALLED`) right after
+`gitio.reference_update` returns, before `ref_updated` is saved. `gate_partial.py` with
+`GATE_PAUSE=installed` pauses there in Backend, with `checkout/query` showing Backend
+`commit_created` with its commit. During the pause it runs a lead Bash `printf 'during
+publication\n' >> x.txt` in Backend, then a lead Edit of `x.txt`; the publication then goes on and
+Frontend fails (`STALE_BASE`), then the reopen, reseal and publish. Red ran on the turn-18-fixed tree
+with this pause, green on that tree plus this change.
+
+| | Red (exit 1) | Green (exit 0) |
+|---|---|---|
+| Pre names Backend | no | yes |
+| Post | `lead-command` (`x.txt`) | `UNKNOWN-context-only` |
+| `x.txt` attributions | baseline, exact (unit), lead-command (unit) | baseline, exact (unit), UNKNOWN (no unit) |
+| Lead Edit of `x.txt` | allowed: "Writer coordinator is unavailable" | denied: "This participant is being published…" |
+| Reseal and publish after the reopen | refused: `PREFIX_PUBLISHED` | the publication group completed |
+
+Review turn 20 of that change: "Ship it", no findings, the hypothesis CONFIRMED.
+
+Suite r22 ran on a snapshot of the final tree and its calibration copy. All 56 steps exit 0. Compared
+with r21, with volatile values masked, every step is identical apart from:
+- the order of per-repository lists in Bash Post answers;
+- tokens and timings;
+- the leftovers listing, which now prints state paths;
+- the new step (`GATE_PAUSE=installed`), whose results match the green column above.

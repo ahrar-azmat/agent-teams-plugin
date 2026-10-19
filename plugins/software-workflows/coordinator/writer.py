@@ -11,6 +11,7 @@ import stat
 import time
 
 from .client import CoordinatorError
+from . import participants
 from .locks import KeyedLocks
 from .store import uid, digest
 
@@ -105,7 +106,7 @@ class Writer:
         inputs = [{"type": "text", "text": text}] + [{"type": "localImage", "path": p} for p in workflow["images"]]
         phase_record = {"state": "prepared", "input_id": uid("input"), "input": inputs,
                         "input_digest": digest(inputs), "created": time.time(), "messages": {},
-                        "unknown_baseline": [u["id"] for u in self.store.unresolved(run["checkout"])]}
+                        "unknown_baseline": [u["id"] for u in [u for key in participants.checkout_ids(self.store, run["unit"]) for u in self.store.unresolved(key)]]}
         run.setdefault("phases", {})[phase] = phase_record
         run.update(phase=phase, state="transition_pending")
         with self.store.transaction():
@@ -118,7 +119,13 @@ class Writer:
         if phase["state"] != "prepared":
             raise CoordinatorError("SUBMISSION_UNCERTAIN", "Reconcile the previous input identity before continuing")
         actor = self.store.get(run["root_actor"])
-        await self.daemon.ensure_lease(run["checkout"])
+        for key in participants.checkout_ids(self.store, run["unit"]):
+            await self.daemon.ensure_lease(key)
+        listener = self.store.get(actor["listener"])
+        connection = self.daemon.connections.get(listener["id"])
+        if (self.daemon.recovery_barrier or listener["state"] != "connected" or
+                listener.get("recovery_state") in ("reconciling", "failed") or not connection or connection.closed):
+            return  # Keep the prepared input durable until native bindings are verified again.
         # Validate again after acquiring custody, before persisting a submitting
         # state. A lost RPC after that state remains uncertain, never replayed.
         image_paths([item["path"] for item in phase["input"] if item["type"] == "localImage"])
@@ -126,7 +133,7 @@ class Writer:
         run.update(production_started=True, state="running")
         self.store.save(run)  # Durable before the native RPC, including its uncertain window.
         try:
-            response = await self.daemon.connections[actor["listener"]].call("turn/start", {
+            response = await connection.call("turn/start", {
                 "threadId": actor["thread"], "input": phase["input"], "clientUserMessageId": phase["input_id"]})
         except BaseException as exc:
             run = self.store.get(runid)
@@ -190,6 +197,8 @@ class Writer:
         return "[Codex model: " + run["workflow"]["model"] + " | reasoning: max | tool:abraham | status:" + status + " | tree:" + unit["base"][:12] + "]"
 
     async def advance(self, runid):
+        if self.daemon.recovery_barrier:
+            return
         async with self.locks.hold(runid):
             run = self.store.get(runid)
             if not run.get("workflow") or run["state"] in TERMINAL or run.get("cancel_requested"):
@@ -207,10 +216,10 @@ class Writer:
                 run["settlement_refusal"] = exc.envelope()
                 self.store.save(run)
                 return
-            await self.daemon.ledger.reconcile(self.store.get(run["checkout"]))
+            await asyncio.gather(*(self.daemon.ledger.reconcile(self.store.get(key)) for key in participants.checkout_ids(self.store, run["unit"])))
             run = self.store.get(runid)
             phase = run["phases"][run["phase"]]
-            new_unknown = [u for u in self.store.unresolved(run["checkout"]) if u["id"] not in phase["unknown_baseline"]]
+            new_unknown = [u for u in [u for key in participants.checkout_ids(self.store, run["unit"]) for u in self.store.unresolved(key)] if u["id"] not in phase["unknown_baseline"]]
             success = phase.get("status") == "completed" and phase.get("input_observed") and bool(phase.get("answer", "").strip()) and not new_unknown
             phase.update(state="complete", completed=time.time(), success=success)
             phase["signed_result"] = self.signature(run, "ok" if success else "error") + "\n" + phase.get("answer", "")
@@ -243,13 +252,13 @@ class Writer:
         for row in self.store.db.execute("SELECT * FROM revisions WHERE unit=? ORDER BY created,id", (run["unit"],)):
             operation = self.store.get(row["operation"])
             author = self.store.get(operation["actor"])
-            text += json.dumps({"path": row["path"], "label": row["attribution"], "revision": row["id"],
+            text += json.dumps({"path": row["path"], "checkout": row["checkout"], "root": self.store.get(row["checkout"])["root"], "label": row["attribution"], "revision": row["id"],
                        "operation": operation["id"], "actor": author["id"], "kind": author["kind"], "thread": author.get("thread")}) + "\n"
         for operation in self.store.all("operation", run["unit"]):
             if operation.get("custody"):
                 text += json.dumps({"label": "custody", "operation": operation["id"], "actor": operation["actor"],
                            "native": operation["native"], "meaning": "possible effects; not exact authorship", "state": operation["state"]}) + "\n"
-        for unknown in self.store.unresolved(run["checkout"]):
+        for unknown in [u for key in participants.checkout_ids(self.store, run["unit"]) for u in self.store.unresolved(key)]:
             text += json.dumps(dict(unknown, label="UNKNOWN", meaning="unresolved checkout effects; not credited to this unit")) + "\n"
         return {"run": runid, "unit": run["unit"], "state": run["state"], "phase": run.get("phase"),
                 "text": text[cursor:cursor + limit], "cursor": cursor,

@@ -1145,6 +1145,13 @@ const Panel = (() => {
       t.i ? [`⇅ ${tok(t.i)} in (${tok(t.c)} cached) · ${tok(t.o)} out`, 'tokens across finished turns'] : null,
       w.native ? [`🧩 ${w.native.claims.length} claimed${w.native.unknown ? ` · ${w.native.unknown} UNKNOWN` : ''}${w.native.unread ? ` · ${w.native.unread} unread` : ''}`,
         `On the writer coordinator: unit ${w.native.unit} (${w.native.unit_state})${w.native.claims.length ? ' holds ' + w.native.claims.join(', ') : ''}`] : null,
+      w.native && w.native.project ? [`🗂 ${w.native.project.name || 'project'} · ${(w.native.participants || []).length} repos`,
+        `Codex project ${w.native.project.name || ''} (${w.native.project.id || ''}): ` + (w.native.participants || []).map(q =>
+          `${base(q.root)} — ${q.claims.length} claimed${q.unknown ? `, ${q.unknown} UNKNOWN` : ''}${q.phase ? `, ${q.phase}` : ''}`).join('; ')] : null,
+      w.native && w.native.publication === 'partially_published' ? ['⚠ partly published',
+        'Some of this unit\'s repositories have its commit and others not yet: recover it before pushing'] : null,
+      w.native && w.native.publication === 'publishing' ? ['⚠ being published',
+        'This unit\'s commit may already be in some of its repositories: wait for the publication before pushing'] : null,
       [`📁 ${base(w.cwd)}`, w.cwd],
       [`#${w.run}`, 'run id — click to copy'],
       w.runs.length > 1 ? [`${w.runs.length} runs`, 'runs in this conversation'] : null,

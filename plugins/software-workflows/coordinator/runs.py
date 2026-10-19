@@ -8,7 +8,7 @@ from pathlib import Path
 from .client import CoordinatorError
 from .store import uid, digest
 from .writer import TERMINAL
-from . import processes
+from . import processes, participants
 from .locks import KeyedLocks
 
 
@@ -18,6 +18,10 @@ class Runs:
         self.cancel_locks = KeyedLocks()
 
     def visible(self, run, cwd):
+        from .observations import checkout_at
+        checkout, changed = checkout_at(self.store, cwd)
+        if checkout and not changed and participants.contains(self.store, run["unit"], checkout["id"]):
+            return True
         workspace = os.path.realpath(cwd)
         return any(path and os.path.commonpath((workspace, os.path.realpath(path))) == workspace
                    for path in (run.get("dispatch_cwd"), run.get("target_cwd")))
@@ -30,19 +34,34 @@ class Runs:
 
     def summary(self, run):
         unit = self.store.get(run["unit"])
-        return {"run": run["id"], "revision": run.get("_revision"), "backend": "native", "unit": unit["id"], "unit_state": unit["state"],
+        surface = participants.surface(self.daemon, unit)
+        return {"run": run["id"], "revision": run.get("_revision", 0) + surface["participant_revision"], "backend": "native", "unit": unit["id"], "unit_state": unit["state"],
                 "phase": run.get("phase"), "state": run["state"], "created": run.get("created", 0),
                 "dispatch_cwd": run.get("dispatch_cwd"), "target_cwd": run.get("target_cwd"),
-                "claims": [c for c in self.daemon.custody.claims(run["checkout"]) if c["unit"] == unit["id"]],
+                "claims": [c for p in surface["participants"] if p["checkout"] == run["checkout"] for c in p["claims"]],
                 "custody": [{k: v for k, v in c.items() if k != "process_baseline"}
-                            for c in self.daemon.custody.active(run["checkout"]) if c["unit"] == unit["id"]],
-                "unread_messages": sum(m["state"] != "acknowledged" for m in self.store.all("message") if m.get("unit") == unit["id"]),
+                            for c in self.daemon.custody.unit_active(run["unit"]) if c["unit"] == unit["id"]],
+                "unread_messages": self.store.db.execute("SELECT count(*) FROM records WHERE kind='message' AND "
+                    "json_extract(data,'$.unit')=? AND json_extract(data,'$.state')!='acknowledged'", (unit["id"],)).fetchone()[0],
                 "unknown_count": len(self.store.unresolved(run["checkout"])),
+                **surface,
                 "actors": [{k: a.get(k) for k in ("id", "kind", "thread", "active_turn", "state")} for a in self.store.all("actor", unit["id"])]}
 
     def listing(self, cwd, limit=50):
-        runs = [r for r in self.store.all("run") if r.get("workflow") and self.visible(r, cwd)]
-        return {"data": [self.summary(r) for r in sorted(runs, key=lambda r: r.get("created", 0))[-max(1, min(limit, 100)):]],
+        from .observations import checkout_at
+        checkout, changed = checkout_at(self.store, cwd)
+        workspace = os.path.realpath(cwd)
+        runs = []
+        for run in self.store.selected("SELECT * FROM records WHERE kind='run' AND "
+                "(json_extract(data,'$.workflow') IS NOT NULL OR json_extract(data,'$.project_revision') IS NOT NULL) "
+                "ORDER BY json_extract(data,'$.created') DESC,id DESC"):
+            if (checkout and not changed and participants.contains(self.store, run["unit"], checkout["id"]) or
+                    any(path and os.path.commonpath((workspace, os.path.realpath(path))) == workspace
+                        for path in (run.get("dispatch_cwd"), run.get("target_cwd")))):
+                runs.append(run)
+                if len(runs) >= max(1, min(limit, 100)):
+                    break
+        return {"data": [self.summary(r) for r in reversed(runs)],
                 "generation": self.store.generation}
 
     def events(self, run, cursor=0, limit=100):
@@ -96,7 +115,7 @@ class Runs:
                     raise CoordinatorError("TERMINAL_PAGINATION", "Cancellation terminal inventory is incomplete")
                 for terminal in terminals["data"]:
                     await connection.call("thread/backgroundTerminals/terminate", {"threadId": actor["thread"], "processId": terminal["processId"]})
-                for reservation in self.daemon.custody.active(run["checkout"]):
+                for reservation in self.daemon.custody.unit_active(run["unit"]):
                     if reservation["actor"] == actor["id"]:
                         for process in reservation.get("processes", []):
                             await asyncio.to_thread(processes.terminate, process, actor["session"])
@@ -127,7 +146,7 @@ class Runs:
                     self.store.event("run/cancel_reconcile_refused", runid, {"code": getattr(exc, "code", type(exc).__name__)})
         for actor in list(self.store.all("actor", run["unit"])):
             await self.daemon.settle_actor(actor)
-        if any(a.get("active_turn") for a in self.store.all("actor", run["unit"])) or any(c["unit"] == run["unit"] for c in self.daemon.custody.active(run["checkout"])):
+        if any(a.get("active_turn") for a in self.store.all("actor", run["unit"])) or any(c["unit"] == run["unit"] for c in self.daemon.custody.unit_active(run["unit"])):
             return False
         # A steer the turn never took cannot enter it once no turn is active: say so, rather than wait
         # for an echo that cannot come (a pause after a pending Send now never settled, measured 2.3.0).

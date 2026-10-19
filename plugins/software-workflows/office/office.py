@@ -863,17 +863,49 @@ def native_runs(fresh=False):
             _native["present"] = True
             listing = client.call("run/list", {"cwd": "/", "limit": 100})["data"]
             for s in listing:
+                if native_lead(s):
+                    continue  # a Claude session's own unit: no Codex thread to read
                 rec = _native["records"].get(s["run"])
-                # a run continued between two polls reads the same state twice: its revision moved
+                # a run continued between two polls reads the same state twice: its revision moved (since
+                # 2.4.0 the listed revision also counts the unit's participants: compare it with the one
+                # this record was read at)
                 if (rec is None or not rec.get("rollout") or rec.get("state") != s.get("state")
-                        or ("revision" in s and rec.get("_revision") != s["revision"])):
-                    _native["records"][s["run"]] = client.call("run/status", {"run": s["run"]})
+                        or ("revision" in s and rec.get("_listed", rec.get("_revision")) != s["revision"])):
+                    rec = client.call("run/status", {"run": s["run"]})
+                    rec["_listed"] = s.get("revision")
+                    _native["records"][s["run"]] = rec
             _native.update(listing=listing, error="")
         except (FileNotFoundError, ConnectionRefusedError):
             _native["error"] = "it is not running"
         except Exception as e:  # the coordinator stopped, or its client unreadable: shown, never a crash
             _native["error"] = f"{getattr(e, 'code', '') or type(e).__name__}: {e}"[:200]
         return _native["listing"], _native["records"]
+
+
+def native_lead(s):
+    """A Claude session's own unit (2.4.0 lists those of a Codex project): not a Codex worker."""
+    kinds = {a.get("kind") for a in s.get("actors") or []}
+    return "lead" in kinds and "root" not in kinds
+
+
+def partly_published(listing):
+    """One line per unit whose commit may be in some of its repositories and not yet in others: being
+    published, or partially published."""
+    out = []
+    for s in listing:
+        state = s.get("publication_state")
+        if state not in ("publishing", "partially_published"):
+            continue
+        parts = [f"{os.path.basename(q.get('root') or '') or q.get('root')} "
+                 f"{'has it' if q.get('commit') or q.get('phase') == 'complete' else 'not yet' if q.get('phase') else 'unchanged'}"
+                 for q in s.get("participants") or []]
+        name = (s.get("project") or {}).get("name") or ""
+        who = f"a Claude session's unit {s.get('unit')}" if native_lead(s) else f"run {s.get('run')}"
+        out.append(f"{who}{' in ' + name if name else ''} is "
+                   + ("being published" if state == "publishing" else "partly published")
+                   + f" ({', '.join(parts)}): "
+                   + ("wait for it before pushing" if state == "publishing" else "recover it before pushing"))
+    return out
 
 
 def native_status(s):
@@ -988,6 +1020,8 @@ def native_workers(since, overrides):
     listing, records = native_runs()
     out = []
     for s in listing:
+        if native_lead(s):
+            continue  # partly published ones are named in the coordinator line instead
         rec = records.get(s["run"]) or {}
         st = native_status(s)
         live = st in LIVE
@@ -1023,7 +1057,15 @@ def native_workers(since, overrides):
             "native": {"unit": s.get("unit"), "unit_state": s.get("unit_state"),
                        "claims": sorted(c.get("path") for c in s.get("claims") or []),
                        "custody": len(s.get("custody") or []), "unknown": s.get("unknown_count") or 0,
-                       "unread": s.get("unread_messages") or 0, "coordinator": _native["error"]},
+                       "unread": s.get("unread_messages") or 0, "coordinator": _native["error"],
+                       # 2.4.0: a unit spans the repositories of a Codex project
+                       "project": s.get("project") or None,
+                       "participants": [{"root": q.get("root") or "", "branch": q.get("branch") or "",
+                                         "claims": sorted(c.get("path") if isinstance(c, dict) else str(c)
+                                                          for c in q.get("claims") or []),
+                                         "unknown": q.get("unknown_count") or 0, "phase": q.get("phase") or ""}
+                                        for q in s.get("participants") or []],
+                       "publication": s.get("publication_state") or ""},
         })
     return out
 
@@ -1726,6 +1768,7 @@ class Handler(BaseHTTPRequestHandler):
                 coordinator = ("" if not _native["present"] else
                                f"The writer coordinator does not answer ({_native['error']}); its runs show as last seen."
                                if _native["error"] else "")
+                coordinator = " · ".join([x for x in [coordinator] if x] + partly_published(_native["listing"]))
                 return self._json({"now": time.time(), "workers": ws, "workspaces": spaces, "coordinator": coordinator,
                                    "log_dir": str(LOG_DIR), "version": plugin_version(), "roles": ROLES})
             if u.path == "/api/run":

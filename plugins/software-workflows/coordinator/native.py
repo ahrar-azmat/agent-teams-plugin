@@ -96,6 +96,7 @@ def policy_trace_digest(value):
 
 
 METHODS = {
+    "project/list": "ProjectListParams", "project/read": "ProjectReadParams",
     "initialize": "InitializeParams", "thread/start": "ThreadStartParams",
     "thread/resume": "ThreadResumeParams", "thread/read": "ThreadReadParams",
     "thread/list": "ThreadListParams",
@@ -111,13 +112,17 @@ METHODS = {
     "configRequirements/read": "ConfigRequirementsReadParams", "hooks/list": "HooksListParams",
     "model/list": "ModelListParams", "mcpServerStatus/list": "ListMcpServerStatusParams",
 }
+PROJECT_METHODS = frozenset({"project/list", "project/read"})
+BASELINE_METHODS = frozenset(METHODS) - PROJECT_METHODS
 # Bootstrap contracts are deliberately narrower than the vendor protocol.
 FIELDS = {
+    "project/list": ({"cursor", "limit", "sortKey", "sortDirection"}, set()),
+    "project/read": ({"projectId"}, {"projectId"}),
     "initialize": ({"clientInfo", "capabilities"}, {"clientInfo"}),
     "thread/start": ({"cwd", "model", "modelProvider", "approvalPolicy", "sandbox", "config",
-                      "dynamicTools", "developerInstructions", "ephemeral", "historyMode"}, set()),
+                      "dynamicTools", "developerInstructions", "ephemeral", "historyMode", "projectId", "runtimeWorkspaceRoots"}, set()),
     "thread/resume": ({"threadId", "cwd", "model", "modelProvider", "approvalPolicy", "sandbox",
-                       "config", "developerInstructions"}, {"threadId"}),
+                       "config", "developerInstructions", "runtimeWorkspaceRoots"}, {"threadId"}),
     "thread/read": ({"threadId", "includeTurns"}, {"threadId"}),
     "thread/list": ({"cursor", "limit", "ancestorThreadId", "archived", "sortDirection"}, set()),
     "turn/start": ({"threadId", "input", "clientUserMessageId", "approvalPolicy", "sandboxPolicy"}, {"threadId", "input"}),
@@ -198,6 +203,15 @@ def validate(method, params):
         raise CoordinatorError("OUTBOUND_METHOD", "Unsupported outbound method", {"method": method})
     allowed, required = FIELDS[method]
     object_keys(params, allowed, required)
+    if method == "project/list":
+        if params.get("sortDirection") is not None and params.get("sortKey") is None:
+            raise CoordinatorError("OUTBOUND_FIELDS", "project/list sortDirection requires sortKey")
+        if params.get("sortKey") not in (None, "position", "recencyAt") or params.get("sortDirection") not in (None, "asc", "desc"):
+            raise CoordinatorError("OUTBOUND_FIELDS", "Invalid native project ordering")
+    if "runtimeWorkspaceRoots" in params:
+        roots = params["runtimeWorkspaceRoots"]
+        if not isinstance(roots, list) or not roots or any(not isinstance(p, str) or not os.path.isabs(p) for p in roots):
+            raise CoordinatorError("OUTBOUND_FIELDS", "Runtime workspace roots must be nonempty absolute paths")
     if "clientInfo" in params:
         object_keys(params["clientInfo"], {"name", "title", "version"}, {"name", "version"}, "clientInfo")
     if "capabilities" in params:
@@ -443,3 +457,29 @@ async def page(connection, method, params):
         if cursor in seen:
             raise CoordinatorError("HISTORY_CURSOR", "Native pagination repeated a cursor")
         seen.add(cursor)
+
+
+def coordinator_hooks(listed, roots, command=None, expected=None):
+    """Deduplicate definitions while requiring trusted pre/post coverage per root."""
+    expected = {h["key"]: h for h in expected or []}
+    unique, covered = {}, set()
+    for entry in listed["data"]:
+        own = [h for h in entry["hooks"] if
+               (h.get("command") == command and h.get("source") == "sessionFlags" if command else h.get("key") in expected)]
+        keys = set()
+        for hook in own:
+            key = hook["key"]
+            if key in unique and unique[key] != hook:
+                raise CoordinatorError("HOOK_DEFINITIONS", "A hook identity has inconsistent definitions across roots")
+            if expected and hook.get("currentHash") != expected[key].get("currentHash"):
+                raise CoordinatorError("HOOK_TRUST", "Recovered hook content changed")
+            if hook.get("trustStatus") != "trusted" or hook.get("enabled") is not True:
+                raise CoordinatorError("HOOK_TRUST", "Coordinator hook is not enabled and trusted")
+            unique[key] = hook
+            keys.add(key)
+        if entry.get("errors") or len(keys) != 2:
+            raise CoordinatorError("HOOK_TRUST", "Every root must have both coordinator hooks", {"root": entry.get("cwd")})
+        covered.add(entry.get("cwd"))
+    if set(roots) - covered or len(unique) != 2:
+        raise CoordinatorError("HOOK_TRUST", "Hook inventory does not cover every runtime root", {"roots": roots})
+    return list(unique.values())

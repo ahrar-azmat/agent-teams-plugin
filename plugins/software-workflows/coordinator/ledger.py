@@ -455,11 +455,11 @@ class Ledger:
                 if reason:
                     self.store.event("checkout/ownership_refused", identity, {"reason": reason, "members": [c["id"] for c in members]})
 
-    def mutation_scope(self, unitid):
-        checkout = self.store.get(self.store.get(unitid)["checkout"])
+    def mutation_scope(self, unitid, checkoutid=None):
+        checkout = self.store.get(checkoutid or self.store.get(unitid)["checkout"])
         paths = set()
         for operation in self.store.all("operation", unitid):
-            if operation["kind"] not in ("patch", "lead-edit", "restore"):
+            if operation["checkout"] != checkout["id"] or operation.get("parts") or operation["kind"] not in ("patch", "lead-edit", "restore"):
                 continue
             if operation["state"] == "denied" and operation.get("no_effect") is True:
                 continue
@@ -519,41 +519,79 @@ class Ledger:
                         checkout["quarantine"] = exc.code
                         self.store.save(checkout)
                 raise
-            pending = set()
-            if ignore_pending:
-                for operation in self.store.all("operation"):
-                    if operation["checkout"] == checkout["id"] and operation["state"] in ("prepared", "allowed", "running") and operation["kind"] in ("patch", "lead-edit", "restore"):
-                        pending.update(operation["paths"])
-            context = [r["id"] for r in self.store.all("custody") if r["checkout"] == checkout["id"] and r["state"] != "released"]
-            # The caller's proof is checked again after the scan, with nothing awaited before the writes.
+            return self.apply_observation(checkout, paths, actual, reason, ignore_pending, attribute)
+
+    def apply_observation(self, checkout, paths, actual, reason, ignore_pending=True, attribute=None, transaction=True):
+        pending = set()
+        if ignore_pending:
+            for operation in self.store.all("operation"):
+                if operation["checkout"] == checkout["id"] and operation["state"] in ("prepared", "allowed", "running") and operation["kind"] in ("patch", "lead-edit", "restore"):
+                    pending.update(operation["paths"])
+        context = [r["id"] for r in self.store.all("custody") if r["checkout"] == checkout["id"] and r["state"] != "released"]
+        # The caller's proof is checked again after the scan, with nothing awaited before the writes.
+        if attribute and attribute.get("still_quiet") and not attribute["still_quiet"]():
+            attribute = None
+        if attribute:
+            from .participants import published_participant
+            # Recheck after every asynchronous scan, immediately before receipts.
+            # The installed prefix belongs to the old unit; later bytes do not.
+            if published_participant(self.store, attribute["unit"], checkout["id"]):
+                attribute = None
+        unknowns, attributed = [], []
+        from contextlib import nullcontext
+        with self.store.transaction() if transaction else nullcontext():
+            for path in paths:
+                if path in pending:
+                    continue
+                current = actual.get(path, {"blob": None, "mode": None})
+                head = self.store.head(checkout["id"], path)
+                known = {"blob": head["blob"], "mode": head["mode"]} if head else {"blob": None, "mode": None}
+                if current != known:
+                    why = reason
+                    # A caller that proved nothing else could have changed the tree names the author.
+                    if attribute and not any(overlaps(normalize(checkout, path)["key"], key) for key in attribute["excluded"]):
+                        # A path new to the ledger is the caller's only if nothing existed there when it began:
+                        # content that was outside git's view then (`git add -f`, an ignore rule removed) is older.
+                        if head or (attribute.get("hidden") is not None and not covered(checkout, attribute["hidden"], path)):
+                            self.store.revision(checkout["id"], path, current["blob"], current["mode"], attribute["attribution"],
+                                                attribute["operation"], attribute["unit"])
+                            attributed.append(path)
+                            continue
+                        why = "older content became visible: " + reason
+                    revision = self.store.revision(checkout["id"], path, current["blob"], current["mode"], "UNKNOWN")
+                    unknowns.append(self.store.unknown(checkout["id"], path, why,
+                                                      {"custody": context, "label": "custody" if context else "UNKNOWN"}, revision))
+        result = {"unknowns": unknowns, "paths_scanned": len(paths)}
+        if attribute:
+            result["attributed"] = attributed
+        return result
+
+    async def reconcile_many(self, checkouts, reason, target=None, attribute=None):
+        from contextlib import AsyncExitStack
+        async with AsyncExitStack() as stack:
+            for checkout in sorted(checkouts, key=lambda c: c["id"]):
+                await stack.enter_async_context(self.lock(checkout["id"]))
+            async def collect(checkout):
+                known = {r[0] for r in self.store.db.execute("SELECT path FROM heads WHERE checkout=?", (checkout["id"],))}
+                return await asyncio.to_thread(full_snapshot, self.store, checkout, known)
+            observations = await asyncio.gather(*(collect(c) for c in checkouts))
             if attribute and attribute.get("still_quiet") and not attribute["still_quiet"]():
                 attribute = None
-            unknowns, attributed = [], []
+            results = {}
             with self.store.transaction():
-                for path in paths:
-                    if path in pending:
-                        continue
-                    current = actual.get(path, {"blob": None, "mode": None})
-                    head = self.store.head(checkout["id"], path)
-                    known = {"blob": head["blob"], "mode": head["mode"]} if head else {"blob": None, "mode": None}
-                    if current != known:
-                        why = reason
-                        # A caller that proved nothing else could have changed the tree names the author.
-                        if attribute and not any(overlaps(normalize(checkout, path)["key"], key) for key in attribute["excluded"]):
-                            # A path new to the ledger is the caller's only if nothing existed there when it began:
-                            # content that was outside git's view then (`git add -f`, an ignore rule removed) is older.
-                            if head or (attribute.get("hidden") is not None and not covered(checkout, attribute["hidden"], path)):
-                                self.store.revision(checkout["id"], path, current["blob"], current["mode"], attribute["attribution"],
-                                                    attribute["operation"], attribute["unit"])
-                                attributed.append(path)
-                                continue
-                            why = "older content became visible: " + reason
-                        revision = self.store.revision(checkout["id"], path, current["blob"], current["mode"], "UNKNOWN")
-                        unknowns.append(self.store.unknown(checkout["id"], path, why,
-                                                          {"custody": context, "label": "custody" if context else "UNKNOWN"}, revision))
-            result = {"unknowns": unknowns, "paths_scanned": len(paths)}
-            if attribute:
-                result["attributed"] = attributed
+                for checkout, actual in zip(checkouts, observations):
+                    proof = None
+                    if attribute:
+                        if "checkouts" in attribute:
+                            part = attribute["checkouts"].get(checkout["id"])
+                            if part:
+                                proof = dict(attribute, **part)
+                        elif checkout["id"] == target:
+                            proof = attribute
+                    results[checkout["id"]] = self.apply_observation(checkout, set(actual), actual, reason,
+                        attribute=proof, transaction=False)
+            result = dict(results.get(target, {}))
+            result["participants"] = [{"checkout": c["id"], "root": c["root"], **results[c["id"]]} for c in checkouts]
             return result
 
     async def prepare(self, actor, kind, intended, paths, native=None):
@@ -561,6 +599,9 @@ class Ledger:
         self.require_owned(checkout)
         if unit["state"] != "open" or checkout.get("quarantine"):
             raise CoordinatorError("UNIT_FROZEN", "Unit or checkout is not open for operations")
+        from .participants import require_writable
+        if paths or kind in ("command", "mcp", "lead-command"):
+            require_writable(self.store, unit, checkout["id"])
         paths = sorted({normalize(checkout, path)["path"] for path in paths})
         keys = [normalize(checkout, path)["key"] for path in paths]
         if any(overlaps(left, right) for i, left in enumerate(keys) for right in keys[i + 1:]):
@@ -580,6 +621,8 @@ class Ledger:
             pre = {path: await asyncio.to_thread(read_path, self.store, checkout, path) for path in paths}
             if self.store.get(actor["unit"])["state"] != "open":
                 raise CoordinatorError("UNIT_FROZEN", "Unit froze while operation pre-images were being saved")
+            if paths or kind in ("command", "mcp", "lead-command"):
+                require_writable(self.store, actor["unit"], checkout["id"])
             if paths and interfering(self.store, checkout, paths, since=started):
                 raise CoordinatorError("CUSTODY_CONFLICT", "Command custody changed during pre-image capture")
             bases = {}
@@ -596,18 +639,25 @@ class Ledger:
             if kind in ("command", "mcp", "lead-command"):
                 bases = {row["path"]: row["revision"] for row in self.store.db.execute(
                          "SELECT path,revision FROM heads WHERE checkout=?", (checkout["id"],))}
-            dependencies = [r["revisions"] for r in self.store.all("read", actor["id"])]
+            reads = [r for r in self.store.all("read", actor["id"])
+                     if unit.get("project_revision") or r.get("checkout", actor["checkout"]) == checkout["id"]]
+            dependencies = [r["revisions"] for r in reads]
             operation = {"checkout": checkout["id"], "unit": unit["id"], "actor": actor["id"], "kind": kind,
                          "attempt": actor.get("attempt"), "generation": self.store.generation,
                          "state": "prepared", "paths": paths, "pre": pre, "bases": bases,
                          "intended": intended, "native": native or {}, "dependencies": dependencies,
                          "created": started, "hook_valid": False}
+            if unit.get("project_revision"):
+                operation["qualified_dependencies"] = [{"checkout": r.get("checkout", actor["checkout"]), "revisions": r["revisions"]} for r in reads]
             with self.store.transaction():
                 self.store.put("operation", opid, operation, unit["id"])
                 self.store.event("operation/prepared", opid, {"bases": bases, "native": native or {}})
             return self.store.get(opid)
 
     async def complete_patch(self, operation, item):
+        if operation.get("parts"):
+            from .operations import complete_patch
+            return await complete_patch(self, operation, item)
         checkout = self.store.get(operation["checkout"])
         try:
             if item.get("status") != "completed" or not operation.get("hook_valid") or not operation.get("post_hook"):
@@ -665,52 +715,90 @@ class Ledger:
     async def verify(self, operation, expected, attribution, evidence):
         checkout = self.store.get(operation["checkout"])
         async with self.lock(checkout["id"]):
-            actual = {p: await asyncio.to_thread(read_path, self.store, checkout, p) for p in operation["paths"]}
-            if actual != expected:
-                raise CoordinatorError("POSTIMAGE_MISMATCH", "Observed bytes or modes differ from recorded intended result")
-            for path, base in operation["bases"].items():
-                head = self.store.head(checkout["id"], path)
-                if (head and head["id"]) != base:
-                    raise CoordinatorError("REVISION_CHANGED", "Ledger base changed during operation")
-            from .custody import interfering
-            opaque = interfering(self.store, checkout, operation["paths"], operation["id"], operation["created"])
-            if opaque:
-                raise CoordinatorError("OPAQUE_OVERLAP", "Opaque effects overlap this patch's possible authorship", {"custody": opaque})
-            revisions = {}
-            with self.store.transaction():
-                for path, image in actual.items():
-                    revisions[path] = self.store.revision(checkout["id"], path, image["blob"], image["mode"], attribution,
-                                                          operation["id"], operation["unit"])
-                operation.update(state="verified", result=actual, revisions=revisions, evidence=evidence, completed=time.time())
-                self.store.save(operation)
-                self.store.event("operation/verified", operation["id"], {"revisions": revisions, "attribution": attribution})
-                if operation["kind"] != "restore":
-                    for path in operation["paths"]:
-                        base = self.store.db.execute("SELECT operation,attribution FROM revisions WHERE id=?", (operation["bases"][path],)).fetchone()
-                        if base and base["attribution"] == "restore":
-                            self.store.db.execute("UPDATE resolutions SET edit=? WHERE edit IS NULL AND restore=? AND unknown_id IN "
-                                                  "(SELECT id FROM unknowns WHERE checkout=? AND path=?)",
-                                                  (operation["id"], base["operation"], checkout["id"], path))
-                    for resolution in list(self.store.db.execute("SELECT s.unknown_id,s.restore FROM resolutions s JOIN unknowns u "
-                            "ON u.id=s.unknown_id WHERE u.checkout=? AND u.path='*' AND s.edit IS NULL", (checkout["id"],))):
-                        restore = self.store.get(resolution["restore"])
-                        if not set(restore["paths"]) <= set(operation["paths"]):
-                            continue
-                        bases = [self.store.db.execute("SELECT operation,attribution FROM revisions WHERE id=?",
-                                 (operation["bases"][p],)).fetchone() for p in restore["paths"]]
-                        if all(b and b["attribution"] == "restore" and b["operation"] == restore["id"] for b in bases):
-                            self.store.db.execute("UPDATE resolutions SET edit=? WHERE unknown_id=?", (operation["id"], resolution["unknown_id"]))
-            return operation
+            actual = await self.verify_images(operation, expected)
+            return self.apply_verified(operation, actual, attribution, evidence)
+
+    async def verify_images(self, operation, expected):
+        checkout = self.store.get(operation["checkout"])
+        actual = {p: await asyncio.to_thread(read_path, self.store, checkout, p) for p in operation["paths"]}
+        if actual != expected:
+            raise CoordinatorError("POSTIMAGE_MISMATCH", "Observed bytes or modes differ from recorded intended result")
+        for path, base in operation["bases"].items():
+            head = self.store.head(checkout["id"], path)
+            if (head and head["id"]) != base:
+                raise CoordinatorError("REVISION_CHANGED", "Ledger base changed during operation")
+        from .custody import interfering
+        opaque = interfering(self.store, checkout, operation["paths"], operation["id"], operation["created"])
+        if opaque:
+            raise CoordinatorError("OPAQUE_OVERLAP", "Opaque effects overlap this patch's possible authorship", {"custody": opaque})
+        return actual
+
+    def apply_verified(self, operation, actual, attribution, evidence, transaction=True):
+        checkout = self.store.get(operation["checkout"])
+        revisions = {}
+        from contextlib import nullcontext
+        with self.store.transaction() if transaction else nullcontext():
+            operation.update(self.completable(operation))
+            for path, image in actual.items():
+                revisions[path] = self.store.revision(checkout["id"], path, image["blob"], image["mode"], attribution,
+                                                      operation["id"], operation["unit"])
+            operation.update(state="verified", result=actual, revisions=revisions, evidence=evidence, completed=time.time())
+            self.store.save(operation)
+            self.store.event("operation/verified", operation["id"], {"revisions": revisions, "attribution": attribution})
+            if operation["kind"] != "restore":
+                for path in operation["paths"]:
+                    base = self.store.db.execute("SELECT operation,attribution FROM revisions WHERE id=?", (operation["bases"][path],)).fetchone()
+                    if base and base["attribution"] == "restore":
+                        self.store.db.execute("UPDATE resolutions SET edit=? WHERE edit IS NULL AND restore=? AND unknown_id IN "
+                                              "(SELECT id FROM unknowns WHERE checkout=? AND path=?)",
+                                              (operation["id"], base["operation"], checkout["id"], path))
+                for resolution in list(self.store.db.execute("SELECT s.unknown_id,s.restore FROM resolutions s JOIN unknowns u "
+                        "ON u.id=s.unknown_id WHERE u.checkout=? AND u.path='*' AND s.edit IS NULL", (checkout["id"],))):
+                    restore = self.store.get(resolution["restore"])
+                    if not set(restore["paths"]) <= set(operation["paths"]):
+                        continue
+                    bases = [self.store.db.execute("SELECT operation,attribution FROM revisions WHERE id=?",
+                             (operation["bases"][p],)).fetchone() for p in restore["paths"]]
+                    if all(b and b["attribution"] == "restore" and b["operation"] == restore["id"] for b in bases):
+                        self.store.db.execute("UPDATE resolutions SET edit=? WHERE unknown_id=?", (operation["id"], resolution["unknown_id"]))
+        return operation
+
+    def completable(self, operation):
+        """Read the durable state at the receipt transaction's commit boundary."""
+        current = self.store.get(operation["id"])
+        records = [current]
+        if current.get("parent_operation"):
+            records.append(self.store.get(current["parent_operation"]))
+        for record in records:
+            if record["state"] not in ("prepared", "allowed", "running"):
+                raise CoordinatorError("OPERATION_STATE", "Operation cannot receive receipts after quarantine or completion",
+                                       {"operation": record["id"], "state": record["state"]})
+        return current
 
     async def quarantine(self, operation, reason):
-        checkout = self.store.get(operation["checkout"])
-        operation.update(state="quarantined", refusal=reason)
+        # State changes must win before waiting for filesystem/ledger locks.
+        # Reload rather than saving an object captured before a competing await.
+        operation = self.store.get(operation["id"])
+        if operation.get("parent_operation"):
+            operation = self.store.get(operation["parent_operation"])
+        parts = [self.store.get(key) for key in operation.get("parts", [])]
+        from .participants import checkout_ids
+        scopes = {}
         with self.store.transaction():
-            self.store.save(operation)
-            for path in operation["paths"] or ["*"]:
-                self.store.unknown(checkout["id"], path, reason, {"possible_operation": operation["id"]})
-        try:
-            await self.reconcile(checkout, paths=operation["paths"] or None, reason=reason, ignore_pending=False)
-        except (OSError, CoordinatorError):
-            checkout["quarantine"] = "filesystem reconciliation incomplete"
-            self.store.save(checkout)
+            for record in [operation, *parts]:
+                record.update(state="quarantined", refusal=reason)
+                self.store.save(record)
+            for part in parts or [operation]:
+                ids = checkout_ids(self.store, part["unit"]) if part["kind"] in ("command", "mcp", "lead-command") else [part["checkout"]]
+                for key in ids:
+                    scopes.setdefault(key, set()).update(part["paths"] or ["*"])
+                    for path in part["paths"] or ["*"]:
+                        self.store.unknown(key, path, reason, {"possible_operation": part["id"]})
+        async def reconcile(key, paths):
+            checkout = self.store.get(key)
+            try:
+                await self.reconcile(checkout, paths=None if "*" in paths else sorted(paths), reason=reason, ignore_pending=False)
+            except (OSError, CoordinatorError):
+                checkout["quarantine"] = "filesystem reconciliation incomplete"
+                self.store.save(checkout)
+        await asyncio.gather(*(reconcile(key, paths) for key, paths in scopes.items()))

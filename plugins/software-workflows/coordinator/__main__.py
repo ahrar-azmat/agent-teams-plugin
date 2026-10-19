@@ -25,6 +25,7 @@ def main(argv=None):
     fixture = sub.add_parser("fixture", help="Local product capability fixture; no model/network spend")
     fixture.add_argument("action", choices=["serve"])
     fixture.add_argument("--directory", required=True)
+    fixture.add_argument("--native-home", help="Shared disposable native home inside the fixture directory")
     fixture.add_argument("--plan", default="-", help="JSON fixture plan from stdin or literal JSON")
     args = parser.parse_args(argv)
     state = getattr(args, "daemon_state", None) or args.state
@@ -50,13 +51,15 @@ def main(argv=None):
         if args.command == "fixture":
             from .fixture import serve
             plan = json.load(sys.stdin) if args.plan == "-" else json.loads(args.plan)
-            return serve(args.directory, plan)
+            return serve(args.directory, plan, args.native_home)
         client = Client(state)
         if args.command == "daemon":
             if args.action == "start":
                 value = client.ensure()
+            elif args.action == "status":
+                value = client.call("daemon/status")
             else:
-                value = client.call("daemon/status" if args.action == "status" else "daemon/stop")
+                value = client.stop()
         elif args.command == "admission":
             client.ensure()
             client.timeout = 1800

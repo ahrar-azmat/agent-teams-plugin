@@ -38,7 +38,9 @@ Two properties are enforced by this server rather than left to the caller
 
 import asyncio
 import contextlib
+import contextvars
 import functools
+import inspect
 import itertools
 import hashlib
 import json
@@ -644,9 +646,13 @@ def _get_reasoning_effort() -> str:
     return "max"
 
 
+_DISPATCH_CWD = contextvars.ContextVar("coordinator_dispatch_cwd", default="")
+_LEAD_SESSION = contextvars.ContextVar("coordinator_lead_session", default="")
+
+
 def _get_cwd() -> str:
     """Get the working directory — prefer CLAUDE_CWD if set."""
-    return os.environ.get("CLAUDE_CWD", os.getcwd())
+    return _DISPATCH_CWD.get() or os.environ.get("CLAUDE_CWD", os.getcwd())
 
 
 def _workspace_digest(cwd: str) -> str:
@@ -4206,9 +4212,19 @@ def _lead_tool():
     def register(function):
         if os.environ.get("SOFTWARE_WORKFLOWS_ROLE") == "writer":
             return function
+        signature = inspect.signature(function)
         @functools.wraps(function)
         async def observed(*args, **kwargs):
-            return await _coordinator_notice(await function(*args, **kwargs))
+            arguments = signature.bind_partial(*args, **kwargs).arguments
+            folder = arguments.get("dispatch_cwd", "")
+            token = _DISPATCH_CWD.set(folder if isinstance(folder, str) and os.path.isabs(folder) else "")
+            session_id = arguments.get("session_id", "")
+            session_token = _LEAD_SESSION.set(session_id)
+            try:
+                return await _coordinator_notice(await function(*args, **kwargs), session_id)
+            finally:
+                _LEAD_SESSION.reset(session_token)
+                _DISPATCH_CWD.reset(token)
         return mcp.tool()(observed)
     return register
 
@@ -4343,6 +4359,8 @@ async def code_review(
     sealed_unit: str = "",
     session_id: str = "",
     cwd: str = "",
+    project: str = "",
+    dispatch_cwd: str = "",
     ctx: Context = None,
 ) -> str:
     """
@@ -4388,19 +4406,28 @@ async def code_review(
             an earlier session line (or a run id) continues that session. A
             session another call is using falls back to a fresh one, with a
             note.
+        sealed_unit: A coordinator unit sealed for publication. The review
+            reads its bound Git objects, every repository of the unit, in
+            place of code_or_diff, and always in a fresh session: an explicit
+            thread id in session is refused. cwd, project and dispatch_cwd
+            locate the unit as for the coordinator_* tools.
     """
     job = None
+    if sealed_unit and session not in ("", "new", "continue"):
+        return await _coordinator_notice("[Bound review refused before inference: a sealed_unit review always starts "
+                                         "a fresh session; omit session or pass session=\"new\".]", session_id)
     if sealed_unit:
         try:
             status = await _coordinator_call("unit/status", {"unit": sealed_unit})
-            target = str(Path(cwd or _get_cwd()).resolve())
-            if str(Path(status["run"]["target_cwd"]).resolve()) != target:
-                return await _coordinator_notice("[Bound review refused: supply the sealed unit's checkout as cwd.]")
-            job = await _coordinator_call("review/prepare", {"unit": sealed_unit, "cwd": _get_cwd()})
+            target = str(Path(cwd or dispatch_cwd or _get_cwd()).resolve())
+            if project and (status.get("project") or {}).get("id") != project:
+                return await _coordinator_notice("[Bound review refused: project does not match the pinned unit.]", session_id)
+            job = await _coordinator_call("review/prepare", {"unit": sealed_unit, "cwd": dispatch_cwd or target, "target_cwd": target})
+            session = "new"
             code_or_diff = "IMMUTABLE CANDIDATE BINDING\n" + json.dumps(job["binding"], sort_keys=True) + "\n\nOBJECT DIFF\n" + job["diff"]
             context += "\nReview the bound Git objects and complete object diff. Working-tree contents can belong to other writers. Every finding and verdict must refer to this candidate."
         except Exception as exc:
-            return await _coordinator_notice("[Bound review refused before inference: " + str(getattr(exc, "code", type(exc).__name__)) + "]")
+            return await _coordinator_notice("[Bound review refused before inference: " + str(getattr(exc, "code", type(exc).__name__)) + "]", session_id)
     hits = _detect_anchoring({"context": context, "focus": focus})
 
     prompt_parts = [
@@ -4475,7 +4502,7 @@ async def code_review(
             evidence = "\n[Bound review]\n" + json.dumps(finished, sort_keys=True)
         except Exception as exc:
             evidence = f"\n[Review job {job['job']} requires result collection: {getattr(exc, 'code', type(exc).__name__)}. Passing evidence was not confirmed.]"
-    return await _coordinator_notice(banner + _verdict_missing_notice(caller_hypothesis, result) + result + evidence)
+    return await _coordinator_notice(banner + _verdict_missing_notice(caller_hypothesis, result) + result + evidence, session_id)
 
 
 @mcp.tool()
@@ -4719,12 +4746,17 @@ async def _coordinator_call(method: str, params: dict | None = None, *, start: b
     return await asyncio.to_thread(client.call, method, params, key)
 
 
-async def _coordinator_notice(text: str) -> str:
+async def _coordinator_notice(text: str, session_id: str | None = None) -> str:
+    # Shared resume/native helpers inherit the calling tool's session. An
+    # explicitly empty session still selects legacy lead mail, never another
+    # concurrent request's mailbox union.
+    if session_id is None:
+        session_id = _LEAD_SESSION.get()
     notice = "[Coordinator: unread lead messages; use coordinator_inbox to read and explicitly acknowledge.]"
     if notice in text:
         return text
     try:
-        inbox = await _coordinator_call("message/inbox", {"recipient": "lead", "limit": 1}, timeout=2)
+        inbox = await _coordinator_call("message/inbox", {"recipient": "lead", "limit": 1, "session_id": session_id}, timeout=2)
         if inbox["unread"]:
             return text.rstrip() + "\n" + notice
     except Exception:
@@ -4771,78 +4803,124 @@ async def _native_run_action(method: str, run: str, **params) -> str:
 
 
 async def _lead_request(method: str, params: dict, cwd: str = "", session_id: str = "",
-                        own: bool = False, unit: str = "") -> str:
-    """Typed MCP tools share setup and error notices; no arbitrary RPC is exposed."""
+                        own: bool = False, unit: str = "", project: str = "", dispatch_cwd: str = "") -> str:
+    """Select from the registered native catalog, refreshing on first use.
+
+    Registration/abraham refresh membership; an existing lead unit remains pinned.
+    Paths resolve from the target cwd; selection uses the actual host folder.
+    """
     from coordinator.client import CoordinatorError
     try:
         if os.environ.get("SOFTWARE_WORKFLOWS_ROLE") == "writer":
             raise CoordinatorError("LEAD_ONLY", "Lead controls are unavailable to writer instances")
-        checkout = await _coordinator_call("checkout/register", {"path": cwd or _get_cwd()}, start=True)
-        params = dict(params)
+        target = str(Path(cwd or dispatch_cwd or _get_cwd()).resolve())
+        top = await asyncio.to_thread(subprocess.run, _treedigest.git_argv(target, ("rev-parse", "--show-toplevel")),
+                                      env=_treedigest.git_env(), capture_output=True, text=True, timeout=10)
+        if top.returncode:
+            raise CoordinatorError("CHECKOUT_ROOT", "Target folder is not inside a Git checkout")
+        fixture = os.environ.get("SOFTWARE_WORKFLOWS_FIXTURE")
+        selection = None
+        if not unit:
+            selection = await _coordinator_call("project/resolve", dict(cwd=target, dispatch_cwd=dispatch_cwd,
+                                                project=project, registered=True, **({"fixture": fixture} if fixture else {})), start=True)
+            if selection["project"]:
+                project = selection["project"]["id"]
+                if not selection.get("registered"):
+                    await _coordinator_call("project/register", dict(project=project, **({"fixture": fixture} if fixture else {})))
+        checkout = await _coordinator_call("checkout/register", {"path": str(Path(top.stdout.strip()).resolve())}, start=True)
+        params = dict(params, cwd=target)
         mapping = None
-        if session_id:
-            mapping = await _coordinator_call("lead/session", {"checkout": checkout["id"], "session_id": session_id})
+        if session_id and not unit:
+            mapping = await _coordinator_call("lead/session", dict(checkout=checkout["id"], session_id=session_id,
+                project=project or None, cwd=target, dispatch_cwd=dispatch_cwd, **({"fixture": fixture} if fixture else {})))
+        if unit:
+            status = await _coordinator_call("unit/status", {"unit": unit})
+            if project and (status.get("project") or {}).get("id") != project:
+                raise CoordinatorError("UNIT_SCOPE", "Explicit project does not match the pinned unit")
+            if checkout["id"] not in {p["checkout"] for p in status.get("participants", [{"checkout": status["unit"]["checkout"]}])}:
+                raise CoordinatorError("UNIT_SCOPE", "Target folder belongs to none of this unit's participants")
         if own:
-            if mapping is None:
-                raise CoordinatorError("CLAUDE_SESSION_REQUIRED", "This action needs the actual Claude session_id; the host hook supplies it")
-            params["actor"] = mapping["actor"]
+            if unit:
+                params["actor"] = (await _coordinator_call("lead/attach", {"unit": unit, "cwd": target}))["actor"]
+            elif mapping:
+                params["actor"] = mapping["actor"]
+            else:
+                raise CoordinatorError("CLAUDE_SESSION_REQUIRED", "This action needs the actual host session_id")
+            params["cwd"] = target
         if method.startswith("checkout/") or method in ("claim/list", "unknown/list", "run/status"):
             params["checkout"] = checkout["id"]
+        if method == "claim/list" and unit:
+            params["unit"] = unit
         if method.startswith("unit/") or method == "claim/handback":
             unit = unit or (mapping or {}).get("unit", "")
             if not unit:
-                raise CoordinatorError("UNIT_REQUIRED", "Supply a unit ID or the actual Claude session_id")
-            status = await _coordinator_call("unit/status", {"unit": unit})
-            if status["unit"]["checkout"] != checkout["id"]:
-                raise CoordinatorError("UNIT_SCOPE", "Unit belongs to another checkout; supply its cwd explicitly")
+                raise CoordinatorError("UNIT_REQUIRED", "Supply a unit or the actual Claude session_id")
             params["unit"] = unit
+        if method.startswith("message/") and session_id:
+            box_unit = unit or (mapping or {}).get("unit")
+            if not unit and method in ("message/inbox", "message/ack"):
+                params["session_id"] = session_id
+            elif box_unit:
+                box = (await _coordinator_call("lead/mailbox", {"session_id": session_id, "unit": box_unit}))["mailbox"]
+                if method == "message/send":
+                    params["sender"] = box
+                    if params["recipient"] == "lead":
+                        params["recipient"] = box
+                elif method == "message/ack":
+                    params["actor"] = box
+                elif method == "message/inbox":
+                    params["recipient"] = box
         value = await _coordinator_call(method, params, timeout=180)
-        return await _coordinator_notice(json.dumps(value, ensure_ascii=False, indent=2))
+        return await _coordinator_notice(json.dumps(value, ensure_ascii=False, indent=2), session_id)
     except Exception as exc:
         value = exc.envelope() if hasattr(exc, "envelope") else {"code": type(exc).__name__, "message": "Coordinator operation did not complete; inspect durable status"}
-        return await _coordinator_notice(json.dumps(value, ensure_ascii=False))
+        return await _coordinator_notice(json.dumps(value, ensure_ascii=False), session_id)
 
 
 @_lead_tool()
-async def coordinator_claims(action: str = "list", paths: list[str] | None = None, unit: str = "",
-                             cwd: str = "", session_id: str = "") -> str:
+async def coordinator_claims(action: str = "list", paths: list[str | dict] | None = None, unit: str = "",
+                             cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "") -> str:
     """List claims/custody; acquire paths for this Claude session; request release;
     or authorize handback of an idle unit. Actions: list, acquire, release, handback.
     A conflicting claim names its holder. Reading does not acknowledge messages.
+    Relative paths use cwd; qualified paths use {root_id: checkout_id, path: repo_relative_path}.
+    An explicit project resolves overlapping native projects; dispatch_cwd comes from the host hook.
     """
     methods = {"list": "claim/list", "acquire": "claim/acquire", "release": "claim/release-request", "handback": "claim/handback"}
     if action not in methods:
-        return await _coordinator_notice("[Unknown claims action: use list, acquire, release or handback.]")
+        return await _coordinator_notice("[Unknown claims action: use list, acquire, release or handback.]", session_id)
     if action in ("acquire", "release") and not paths:
-        return await _coordinator_notice("[Supply a nonempty paths list for acquire or release. Handback omission selects all eligible claims; [] selects none.]")
+        return await _coordinator_notice("[Supply a nonempty paths list for acquire or release. Handback omission selects all eligible claims; [] selects none.]", session_id)
     return await _lead_request(methods[action], {"paths": paths} if action != "list" else {}, cwd, session_id,
-                               own=action in ("acquire", "release"), unit=unit)
+                               own=action in ("acquire", "release"), unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
 
 @_lead_tool()
-async def coordinator_send(recipient: str, text: str, wake: str = "none", cwd: str = "", session_id: str = "") -> str:
+async def coordinator_send(recipient: str, text: str, wake: str = "none", cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "", unit: str = "") -> str:
     """Send to a run, unit, actor or lead. none leaves idle recipients idle;
     queue stores a native queued turn; start explicitly wakes an idle recipient.
     Persisted, submitted, entered_context and acknowledged are distinct states.
     """
-    return await _lead_request("message/send", {"recipient": recipient, "text": text, "wake": wake}, cwd, session_id)
+    return await _lead_request("message/send", {"recipient": recipient, "text": text, "wake": wake}, cwd, session_id, unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
 
 @_lead_tool()
 async def coordinator_inbox(acknowledge: list[str] = [], cursor: str = "", limit: int = 100,
-                            cwd: str = "", session_id: str = "") -> str:
+                            cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "", unit: str = "") -> str:
     """Read lead messages with a cursor. Only IDs explicitly supplied in
     acknowledge are marked acknowledged; reading status/inbox never does that.
+    Without unit, session_id reads all of this session's writer and lead mailboxes.
+    An explicit unit restricts the inbox and acknowledgements to that unit.
     """
     for message in acknowledge:
-        answer = await _lead_request("message/ack", {"message": message}, cwd, session_id)
+        answer = await _lead_request("message/ack", {"message": message}, cwd, session_id, unit=unit, project=project, dispatch_cwd=dispatch_cwd)
         if '"code"' in answer:
             return answer
-    return await _lead_request("message/inbox", {"recipient": "lead", "cursor": cursor, "limit": limit}, cwd, session_id)
+    return await _lead_request("message/inbox", {"recipient": "lead", "cursor": cursor, "limit": limit}, cwd, session_id, unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
 
 @_lead_tool()
-async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = "", session_id: str = "",
+async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "",
                            paths: list[str] | None = None, unknown: str = "", revision: str = "",
                            revisions: dict[str, str | None] | None = None, custody: str = "") -> str:
     """Inspect status/object diff/UNKNOWN, reconcile effects or custody, restore a
@@ -4855,7 +4933,7 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
                "unknown": "unknown/list", "reconcile": "custody/reconcile" if custody else "checkout/reconcile",
                "restore": "unknown/restore", "reopen": "unit/reopen", "recover": "unit/recover", "abandon": "unit/recover"}
     if action not in methods:
-        return await _coordinator_notice("[Unsupported unit action.]")
+        return await _coordinator_notice("[Unsupported unit action.]", session_id)
     params = {}
     if action in ("unknown", "reconcile") and paths is not None:
         params["paths"] = paths
@@ -4865,37 +4943,39 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
         params = {"unknown": unknown, "revision": revision, "revisions": revisions or {}}
     if action == "abandon":
         params["action"] = "abandon"
-    return await _lead_request(methods[action], params, cwd, session_id, own=action == "restore", unit=unit)
+    return await _lead_request(methods[action], params, cwd, session_id, own=action == "restore", unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
 
 @_lead_tool()
-async def coordinator_seal(unit: str, validation: list[dict] = [], cwd: str = "", session_id: str = "") -> str:
+async def coordinator_seal(unit: str, validation: list[dict] = [], cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "", publication_order: list[str] | None = None) -> str:
     """Freeze this idle unit's receipt-backed candidate and validation evidence.
     UNKNOWN or unresolved effects refuse. Review the returned immutable candidate
-    with code_review(sealed_unit=unit) before publication.
+    with code_review(sealed_unit=unit, project=project, dispatch_cwd=dispatch_cwd) before publication.
     """
-    return await _lead_request("unit/seal", {"validation": validation}, cwd, session_id, unit=unit)
+    return await _lead_request("unit/seal", {"validation": validation, "publication_order": publication_order}, cwd, session_id, unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
 
 @_lead_tool()
-async def coordinator_publish(unit: str, review: str, metadata: dict, cwd: str = "", session_id: str = "") -> str:
+async def coordinator_publish(unit: str, review: str, metadata: dict, cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "") -> str:
     """Publish the exact sealed/reviewed candidate using explicit metadata:
     message, author_name, author_email, author_date, committer_name,
     committer_email, committer_date. No acknowledgement bypass exists for stale
     parent/seal/provenance, missing review or UNKNOWN. No working-file rewrite.
     """
-    return await _lead_request("unit/publish", {"review": review, "metadata": metadata}, cwd, session_id, unit=unit)
+    return await _lead_request("unit/publish", {"review": review, "metadata": metadata}, cwd, session_id, unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
 
 async def _native_abraham(task: str, context: str, constraints: str, images: list[str], cwd: str,
                           claims: list[str] | None, allow_dirty: bool, session_id: str,
-                          ctx: Any, request_t0: float) -> tuple[str | None, str]:
+                          ctx: Any, request_t0: float, project: str = "", dispatch_cwd: str = "") -> tuple[str | None, str]:
     """Return a durable native result, or a proven pre-dispatch fallback reason."""
     from coordinator.client import CoordinatorError
     import uuid
     model = _get_codex_model()
     runid = "run_" + uuid.uuid4().hex
     phase = "startup"
+    singleton_confirmed = False
+    durable_run = False
     live_path, live_fh, stream_fh, log_tag = _open_live_log("abraham-native")
     def emit(message):
         line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{runid}] {message}\n"
@@ -4908,27 +4988,39 @@ async def _native_abraham(task: str, context: str, constraints: str, images: lis
     emit(activity["activity"])
     heartbeat = asyncio.create_task(_heartbeat_loop(ctx, request_t0, request_t0, activity, model, emit)) if ctx else None
     try:
+        # Availability is independent of native project selection. Preserve the
+        # singleton exec fallback when no coordinator can even answer discovery.
+        await _coordinator_call("daemon/status", start=True)
+        phase = "discovery"
+        selection_params = {"cwd": cwd, "dispatch_cwd": dispatch_cwd, "project": project}
+        if os.environ.get("SOFTWARE_WORKFLOWS_FIXTURE"):
+            selection_params["fixture"] = os.environ["SOFTWARE_WORKFLOWS_FIXTURE"]
+        selection = await _coordinator_call("project/resolve", selection_params)
+        singleton_confirmed = selection["singleton"]
+        project = selection["project"]["id"] if selection["project"] else ""
+        phase = "startup"
         top = await asyncio.to_thread(subprocess.run, _treedigest.git_argv(cwd, ("rev-parse", "--show-toplevel")),
                                       env=_treedigest.git_env(), capture_output=True, text=True, timeout=10)
         if top.returncode:
-            return None, "CHECKOUT_ROOT"
+            raise CoordinatorError("CHECKOUT_ROOT", "Target folder is not inside a Git checkout")
         root = str(Path(top.stdout.strip()).resolve())
         image_paths = [str(Path(p).resolve()) for p in images]
         if any(not Path(p).is_file() for p in image_paths):
             return "[Codex model: " + model + " | tool:abraham | status:error | tree:unknown]\nImage input is missing; nothing was dispatched.", ""
         checkout = await _coordinator_call("checkout/register", {"path": root}, start=True)
         compact, why = _auto_compact_limit(model)
-        workflow = {"kind": "abraham", "request_id": runid, "dispatch_cwd": str(Path(_get_cwd()).resolve()),
+        workflow = {"kind": "abraham", "request_id": runid, "dispatch_cwd": str(Path(dispatch_cwd or cwd).resolve()),
                     "analysis": INFRA_INSTRUCTIONS + _advisor_context() + "\n\n" + _abraham_analysis_prompt(task, context, constraints, native=True),
                     "implementation": IMPLEMENTATION_INSTRUCTIONS + _abraham_implementation_prompt(task, constraints, "<C2_ANALYSIS_BRIEF>"),
                     "images": image_paths, "model": model, "effort": "max", "compact_limit": compact,
                     "allow_dirty": allow_dirty, "deadline": time.time() + MAX_RUNTIME_SECONDS, "session_id": session_id}
-        params = {"checkout": checkout["id"], "mode": "native", "task": task, "paths": claims, "workflow": workflow}
+        params = {"checkout": checkout["id"], "mode": "native", "task": task, "paths": claims, "workflow": workflow, "cwd": cwd, "dispatch_cwd": dispatch_cwd or None, "project": project or None}
         if os.environ.get("SOFTWARE_WORKFLOWS_FIXTURE"):
             params["fixture"] = os.environ["SOFTWARE_WORKFLOWS_FIXTURE"]
         emit(f"admission requested; autocompact={compact or 'vendor-default'} ({why}); log={live_path}")
         phase = "dispatch"
         result = await _coordinator_call("run/start", params, key=runid, timeout=1800)
+        durable_run = result.get("run") == runid
         emit("durable native handle " + json.dumps(result))
         phase = "observing"
         previous = None
@@ -4943,23 +5035,35 @@ async def _native_abraham(task: str, context: str, constraints: str, images: lis
                 text = result["text"]
                 if result.get("next_cursor") is not None:
                     text += f"\n[Result continues: codex_run_log(run='{runid}', cursor={result['next_cursor']}, result=True).]"
-                return await _coordinator_notice(text), ""
+                return await _coordinator_notice(text, session_id), ""
             if time.monotonic() - request_t0 >= MAX_RUNTIME_SECONDS:
-                return await _coordinator_notice(result["text"] + "\n[Observation budget ended. Collect this durable run with codex_resume_run; no phase will be replayed.]"), ""
+                return await _coordinator_notice(result["text"] + "\n[Observation budget ended. Collect this durable run with codex_resume_run; no phase will be replayed.]", session_id), ""
             await asyncio.sleep(1)
     except CoordinatorError as exc:
         emit("coordinator refusal " + exc.code)
         if exc.code in {"DIRTY_UNEXPLAINED", "CLAIM_CONFLICT", "CLAIM_PATHS", "WORKFLOW_IMAGES", "WORKFLOW_FIELDS"}:
-            return await _coordinator_notice(f"[Codex model: {model} | tool:abraham | status:error | tree:unknown]\n" + json.dumps(exc.envelope())), ""
-        if phase == "startup" or exc.details.get("safe_to_fallback"):
+            return await _coordinator_notice(f"[Codex model: {model} | tool:abraham | status:error | tree:unknown]\n" + json.dumps(exc.envelope()), session_id), ""
+        if not project and (phase == "startup" or singleton_confirmed and exc.details.get("safe_to_fallback")):
             return None, exc.code
+        durable_run = durable_run or exc.details.get("run") == runid
+        if not durable_run and phase == "dispatch":
+            with contextlib.suppress(Exception):
+                durable_run = (await _coordinator_call("run/status", {"run": runid}, timeout=2)).get("id") == runid
+        outcome = (f"Durable handle: {runid}. Use codex_runs and codex_resume_run; execution was not replayed through exec."
+                   if durable_run else "Nothing was dispatched." if phase in ("startup", "discovery") or not exc.operational
+                   else "Dispatch could not be confirmed. Reconcile the coordinator before redispatching.")
         return await _coordinator_notice(f"[Codex model: {model} | tool:abraham | status:error | tree:unknown]\n"
-                 f"Native dispatch requires reconciliation ({exc.code}). Durable handle: {runid}. "
-                 "Use codex_runs and codex_resume_run; execution was not replayed through exec."), ""
+                 f"Native dispatch refused ({exc.code}): {json.dumps(exc.envelope())}. {outcome}", session_id), ""
     except (OSError, ValueError) as exc:
-        if phase == "startup":
+        if not project and phase == "startup":
             return None, "COORDINATOR_START_" + type(exc).__name__
-        return f"[Codex model: {model} | tool:abraham | status:error | tree:unknown]\nNative handle {runid}; RPC outcome uncertain ({type(exc).__name__}). Collect or reconcile; do not redispatch.", ""
+        if not durable_run and phase == "dispatch":
+            with contextlib.suppress(Exception):
+                durable_run = (await _coordinator_call("run/status", {"run": runid}, timeout=2)).get("id") == runid
+        outcome = (f"Durable handle: {runid}. Collect with codex_runs or codex_resume_run."
+                   if durable_run else "Nothing was dispatched." if phase in ("startup", "discovery")
+                   else "Dispatch could not be confirmed. Reconcile the coordinator before redispatching.")
+        return f"[Codex model: {model} | tool:abraham | status:error | tree:unknown]\nNative coordinator error ({type(exc).__name__}). {outcome}", ""
     finally:
         if heartbeat:
             heartbeat.cancel()
@@ -5051,6 +5155,8 @@ async def abraham(
     full_access: bool = True,
     claims: list[str] | None = None,
     session_id: str = "",
+    project: str = "",
+    dispatch_cwd: str = "",
     ctx: Context = None,  # type: ignore[assignment]
 ) -> str:
     """
@@ -5181,7 +5287,7 @@ async def abraham(
             "Autonomous writes without version control have no undo.]"
         )
     native_result, fallback = await _native_abraham(task, context, constraints, list(images or []), cwd,
-                                                   claims, allow_dirty, session_id, ctx, request_t0)
+                                                   claims, allow_dirty, session_id, ctx, request_t0, project, dispatch_cwd)
     if native_result is not None:
         return native_result
     fallback_note = f"[Native admission/startup failed: {fallback}. Using the exclusive legacy exec backend.]\n"
@@ -6121,7 +6227,7 @@ async def _collect_detached_claimed(
 
 
 @_lead_tool()
-async def codex_runs(limit: int = 10, session_id: str = "") -> str:
+async def codex_runs(limit: int = 10, session_id: str = "", dispatch_cwd: str = "") -> str:
     """
     Status of this workspace's codex runs, newest last — RUNNING (attached
     to a live call), DETACHED (outlived its MCP call after a server restart
@@ -6171,7 +6277,7 @@ async def codex_runs(limit: int = 10, session_id: str = "") -> str:
         lines.append(_native_unavailable(discovery))
     if native_runs:
         lines.append("Native coordinator runs (durable across MCP restarts):\n" + json.dumps(native_runs, ensure_ascii=False, indent=2))
-    return await _coordinator_notice("\n".join(lines))
+    return await _coordinator_notice("\n".join(lines), session_id)
 
 
 async def _collect_bound_reviews(run: str = "") -> str:
@@ -6200,7 +6306,7 @@ async def _collect_bound_reviews(run: str = "") -> str:
 @_lead_tool()
 async def codex_resume_run(run: str = "", nudge: str = "", infra: bool | None = None,
                            web_search: bool | None = None, images: list[str] = [],
-                           ctx: Context = None, session_id: str = "") -> str:
+                           ctx: Context = None, session_id: str = "", dispatch_cwd: str = "") -> str:
     """Continue a codex run that failed, timed out, or was interrupted —
     WITH ITS ORIGINAL CONTEXT, not a re-ask.
 
@@ -6285,7 +6391,7 @@ async def codex_resume_run(run: str = "", nudge: str = "", infra: bool | None = 
             discovery = await _native_runs()
             if not discovery["available"]:
                 answer += "\n" + _native_unavailable(discovery)
-    return await _coordinator_notice(answer)
+    return await _coordinator_notice(answer, session_id)
 
 
 def _run_log_lines(rec: dict[str, Any], lines: int) -> list[str]:
@@ -6643,7 +6749,7 @@ async def _codex_cancel_run(run: str = "", session_id: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 @_lead_tool()
-async def codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result: bool = False, session_id: str = "") -> str:
+async def codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result: bool = False, session_id: str = "", dispatch_cwd: str = "") -> str:
     """What a codex run is doing RIGHT NOW — its live log (reasoning summaries,
     commands, web searches, errors, retries), in-conversation, instead of
     `tail -F` on ~/.claude/logs/codex-oracle. Works for running, detached and
@@ -6659,11 +6765,11 @@ async def codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result:
         discovery = await _native_runs()
         if not discovery["available"]:
             answer += "\n" + _native_unavailable(discovery)
-    return await _coordinator_notice(answer)
+    return await _coordinator_notice(answer, session_id)
 
 
 @_lead_tool()
-async def codex_cancel_run(run: str = "", session_id: str = "") -> str:
+async def codex_cancel_run(run: str = "", session_id: str = "", dispatch_cwd: str = "") -> str:
     """Stop a RUNNING or DETACHED codex run: SIGKILL its process group (and its
     watchdog) and journal it as cancelled. Omit `run` to stop the most recent
     live run in this workspace. The thread stays on disk, so the run remains
@@ -6681,7 +6787,7 @@ async def codex_cancel_run(run: str = "", session_id: str = "") -> str:
         discovery = await _native_runs()
         if not discovery["available"]:
             answer += "\n" + _native_unavailable(discovery)
-    return await _coordinator_notice(answer)
+    return await _coordinator_notice(answer, session_id)
 
 
 

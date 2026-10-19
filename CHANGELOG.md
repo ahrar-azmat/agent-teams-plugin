@@ -3,6 +3,229 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.0] — 2026-10-19
+
+### Added: a Codex project is the writer coordinator's unit
+- **One writer unit spans a Codex project's repositories.** When the folder `abraham` targets belongs
+  to a Codex project (the Codex app's Projects: `project/list` / `project/read` of `codex app-server`,
+  Codex 0.163), the coordinator registers every root of the project in one step and starts the writer
+  thread under that project (`projectId`, `runtimeWorkspaceRoots`), so it shows there in the Codex
+  app and can edit any of its repositories. The coordinator only reads projects; it never creates,
+  edits, moves or deletes one.
+  - **Selection:** the projects with a root containing the target folder; when several, those that
+    also contain the folder of the Claude session that dispatched; still several → refused
+    (`PROJECT_AMBIGUOUS`, naming each), and `abraham(project=<id>)` picks one. No project → one
+    checkout, exactly as in 2.3.5.
+  - **Revisions:** a unit keeps the project membership it started with; a root added or removed in the
+    app takes effect for the next dispatch. A registration that cannot finish leaves no usable
+    revision and resumes on retry. Refused, naming the roots: a root outside git
+    (`PROJECT_ROOT_NOT_GIT`), two roots that are one folder, an outer repository whose git view holds
+    a path inside an inner one (`PROJECT_OWNERSHIP`). The SmartPay shape (an outer repository that
+    ignores its two nested repositories) registers.
+  - **Paths:** a writer's paths may be absolute or relative to its folder, and are routed to the
+    repository that owns them, the deepest one; a path in a registered repository outside the unit, or
+    in none, is refused, naming it. Claims and conflicts are per repository, also between units of
+    different projects that share one. One patch across repositories gets receipts in all of them or
+    none; interrupted, it leaves UNKNOWN in each.
+  - **Custody:** a writer's command is held in every repository of its unit and reconciled in all.
+  - **Publication:** one seal covers every repository that changed (unchanged ones are recorded as
+    such), one `code_review(sealed_unit=…)` reviews them together, and `coordinator_publish` preflights
+    every repository before it moves any ref, then commits them in order. A unit stopped midway is
+    **partly published**: its committed repositories keep their commits, its claims stay held, and
+    `coordinator_unit(action="recover")` continues it; if a repository's branch moved meanwhile, it
+    stops and asks for a new review (`reopen`, seal, review, publish), never rebasing under the old one.
+  - **Lead tools** (`coordinator_*`, `code_review(sealed_unit=…)`) take a `cwd` in any repository of the
+    unit, or a subfolder, and `project` when the folder is in several.
+  - **Upgrade:** coordinator state migrates in place (schema 3); every 2.3.x unit becomes a
+    one-repository unit with its receipts, UNKNOWN and journals unchanged. 2.3.x refuses migrated state
+    (`SCHEMA_VERSION`).
+  - **A newer release replaces an older coordinator without cutting work off.** `daemon/status`
+    reports the plugin version, a `boot` id for the process and the `draining-stop` capability.
+    The first `abraham` or lead tool call of a newer release:
+    - holds `<state>/upgrade.lock`;
+    - looks at the daemon again;
+    - stops only that process (`daemon/stop` with `expect`: its pid and boot).
+
+    That daemon refuses at once while anything a stop would cut off is pending: a lead edit, hook or
+    command, a publication, a writer's turn, custody, a delivery, any write in progress. Otherwise it
+    admits no new write for at most a second while the calls in progress finish, then stops.
+    - If the stop is refused, the daemon keeps serving and the call is refused (`DAEMON_OUTDATED`).
+      `abraham` then falls back to `codex exec`, as for any coordinator that cannot start.
+    - Two sessions upgrading at once replace it once.
+    - The lock is held until the new daemon admits work, and the lead hooks wait while it is held.
+      So a lead edit or command made during a replacement is recorded by the new daemon.
+
+    A daemon from before 2.4.0 cannot drain, so a newer call never stops it. The call is refused
+    with `DAEMON_OUTDATED`, naming a stop command to run once when no session is editing. That
+    command reads the old daemon's ledger first and refuses while lead work is in flight there.
+    Hooks never replace a daemon. Sessions that still run an older release keep working with the new
+    daemon until they are restarted.
+
+### Push gate and Codex Office (2.4.0 consumers)
+- **The push gate refuses a push of any repository of a unit that is being published or is partly
+  published**, naming which
+  repositories have its commit, and no acknowledgement opens it; plain, `-C`, compound and
+  acknowledgement-prefixed commands alike, and the git shim refuses the real `git push`. A repository
+  nested inside a registered one but not registered itself is not affected. A commit with `git -C`
+  is checked against the repository it records into.
+- **The Codex Office** shows a writer's project (🗂, its repositories with claims, UNKNOWN and
+  publication phase) and ⚠ partly published; a partly published unit of a Claude session is named in
+  the status line. It no longer re-reads every coordinator run on every poll.
+
+### Fixed: from the review of 2.3.5 (session 01a14eac, turn 15)
+- **A finished coordinated change voids a lead Bash window.** A lead-command RPC, or a writer on the
+  older exec backend, that started and ended while a lead Bash call's Pre was waiting left the
+  window's fingerprint unchanged, and the call was credited with its file. Every coordinated change
+  now advances a durable counter in the same SQLite transaction (operations, custody, writer turns,
+  other lead calls), and each registered repository's exec write lock is fingerprinted, in every
+  registered repository. Measured on 2.3.5: `lead-command`; now UNKNOWN (also across repositories).
+- **A coordinator restart voids every open lead Bash window.** An armed window survived recovery and
+  credited a change made after the restart. Windows carry the coordinator generation; recovery
+  invalidates them before it admits hooks.
+- **The hook reports a lost confirmation as `"uncertain"`**, not `false`, since the coordinator may
+  already have armed the window; a repeated confirmation is idempotent.
+
+### Fixed: from the lead's runs of the first 2.4.0 tree
+- **`abraham` falls back to `codex exec` again when the coordinator cannot serve it.** With the
+  coordinator unable to start, the first tree refused and named a "durable handle" that did not
+  exist. With a Codex that has no project API, it refused (`SCHEMA_MISSING`). Now the first falls
+  back as 2.3.5 did, and the second treats the folder as one repository. A refusal names a durable
+  handle only when the run exists. Measured: the coordinator unable to start falls back (`STATE_PERMISSIONS`); a Codex without the project API selects one repository (`singleton: true`); a target outside git still falls back (`CHECKOUT_ROOT`).
+- **Lead tools no longer start Codex to choose a project.** They choose from the project list the
+  coordinator kept at its last registration, and register a project only once. On the SmartPay
+  shape, a lead tool call took 4,525 ms the first time and about 880 ms after (2.3.5: 460 and 62 ms);
+  now 3,494 ms for the first call, which registers the project once, then 65–69 ms.
+- **A session whose folder is in two projects works.** Its hooks were refused ("Writer coordinator is
+  unavailable"), its edits were UNKNOWN, and another session's Bash window was voided. A hook now
+  takes a stored project only when exactly one fits, else the repository alone. Measured: both sessions' Edit calls are exact, their Bash calls `lead-command`, and nothing is UNKNOWN.
+- **`checkout/query` no longer reads unit history.** At 1,000 finished units it took 3.75 s, longer
+  than the push gate's 250 ms client waits, so the gate reported the coordinator unavailable 7 times
+  in 7. Now 0.4, 0.6, 1.2, 3.1 and 3.8 ms at 10, 100, 300, 600 and 1,000 units (2.3.5: 0.4, 0.6, 1.2, 2.1 and 3.4 ms), and the gate's client answered 7 times in 7 at every size.
+- **A lead Bash command run from a folder that holds several registered repositories is credited in
+  each of them.** What it wrote into the nested repositories was UNKNOWN. Measured: from the outer folder, `echo >> Backend/b.txt`, then `echo >> Frontend/f.txt; echo >> Backend/b.txt`, are `lead-command` in each repository, with nothing UNKNOWN.
+- **A deleted or re-created registered repository no longer voids every lead Bash window.** This was
+  found in the fix round's own tree. From the moment one registered repository was deleted, or
+  re-created at the same path, a lead Bash change in any other repository was UNKNOWN (2.3.5 credited
+  it). The quiet check now reads the exec lock of each repository's tree as it is now, and a deleted
+  repository holds none. Measured: a lead Bash change in repository A is `lead-command` with B registered, deleted, then re-created.
+- **`code_review(sealed_unit=…)` refuses an explicit session.** It started a fresh session whatever
+  `session` said. A bound review still always starts fresh, and an explicit thread id is now refused
+  before inference.
+- Writer paths are relative to the writer's folder, or absolute (2.3.5: relative to the repository
+  root). The two differ only when the folder is a subfolder.
+
+### Fixed: from the review of the 2.4.0 tree (session 01a14eac, turn 16)
+- **The push gate refuses a push while a unit is being published, not only once it is partly
+  published.** A repository's ref moves before the unit's state changes. A crash there leaves the unit
+  `prepared` with the commit installed, and a push then got the ordinary token. The gate now refuses
+  while any repository of the unit has the commit or a publication step under way, until the unit is
+  complete. Measured with the publication paused right after Backend's ref moved (`prepared`, Backend
+  `ref_updated` with its commit): before, a token at the hook and in the git shim; now refused at both.
+- **The gate checks the repository git will push.** `git --git-dir=… --work-tree=… push`,
+  `GIT_DIR=… git push` and git named by path were checked against the folder the command ran in. The
+  hook now asks git which repository one plain git command selects, and the shim asks with its exact
+  options and environment. Measured from an unregistered repository, pushing a partly published one:
+  before, five tokens (three at the hook, two in the shim); now five refusals.
+- **Reopening no longer drops new work in an already published repository.** Reopen made every
+  repository of the unit writable again, including those that already had its commit. The next seal
+  reused their old content, and the unit then reported published with the new edit left out. Now an
+  edit or command in such a repository is refused (`PREFIX_PUBLISHED`, naming it and its commit). A lead
+  Edit or Write there is denied with that reason, and a lead Bash call runs with a note that what it
+  changes there is UNKNOWN. A seal whose published part changed is refused too.
+- **`publishing` is recorded before any ref can move,** in every repository of the unit. It is kept
+  through a crash and recovery until the unit is complete or partly published.
+- **A quarantined operation no longer receives receipts.** A patch across repositories that completed
+  while reconciliation quarantined it could record exact receipts over the quarantine. Completion now
+  re-reads the operation's and its parts' state inside the receipt transaction. In the writer's forced
+  races, every part stayed quarantined, the content stayed UNKNOWN, and no receipt was recorded.
+- **A session's inbox includes its writers' messages.** `coordinator_inbox(session_id=…)` without
+  `unit` reads every mailbox of the session, and the unread notice counts them all.
+- **Listing a project's paths is bounded.** A page reads only its own rows, in SQL. With 100,000
+  paths, the pages read 2, 101, 101 and 101 rows, in 0.2 to 0.4 ms each.
+
+### Fixed: from the review of the turn-16 fixes (session 01a14eac, turn 17)
+- **The gate finds the repository by its git directory, wherever that lives.** A repository whose git
+  directory lives outside its folder (`git init --separate-git-dir`) was not recognized when a push
+  reached it with `-C`, `--git-dir` or `GIT_DIR`: the gate took the folder above the git directory to
+  be the repository. Now git resolves the pushed repository's common git directory. The coordinator
+  matches it against what each registered repository recorded at registration, so a linked worktree
+  and a `--git-dir` push without a work tree are matched too. Measured with Backend's git directory
+  kept apart, pushing from an unregistered repository: before, 10 tokens (7 new routes, plus 3 that
+  name `Backend/.git`, which is now a file); now 10 refusals.
+- **An upgrade no longer cuts off work in progress, and it stops only the daemon it looked at.** A
+  newer release stopped an older daemon whenever that daemon's own guard allowed it, and that guard
+  did not wait for lead edits, lead hooks or publications. A lead edit in flight then became UNKNOWN
+  (measured on a real 2.3.5 daemon). The stop was also not tied to the process whose version was
+  checked: of two sessions upgrading together, the second could stop the first's new daemon. See
+  "A newer release replaces an older coordinator" above.
+- **A lead Bash command does not credit a change in an already published repository.** That holds
+  from the moment the unit's publication moves the repository's ref, before any reopen. Its changes
+  there are UNKNOWN. The Pre names those repositories, and the hook tells the lead before the
+  command runs. A lead Edit or Write there is denied. Changes the command makes in the unit's other
+  repositories are credited as before. That remainder can still be sealed and published, unless a
+  writer of the unit recorded a read of a path that became UNKNOWN (`UNKNOWN_DEPENDENCY`).
+- **A denied edit leaves nothing behind.** An Edit or Write refused because its repository is
+  already published stayed `received`. It counted as possibly writing for 180 s, and every other
+  Bash call's changes were UNKNOWN meanwhile. It is now recorded as refused before the denial
+  returns, and a replay is decided again.
+- **Every lead tool's unread notice reads the calling session's mailboxes,** including `abraham`, the
+  run tools and the reviews.
+
+### Fixed: from the review of the turn-17 fixes (session 01a14eac, turn 18)
+- **A repository counts as published as soon as the unit's commit is recorded for it, not only
+  after a reopen.** That record precedes the ref update; it stops counting only when the coordinator
+  proves the ref was not moved (or a reopen keeps it as published). Before, a lead Bash command in
+  such a repository was still credited to the unit: before a reopen, and in the window between the
+  ref update and its checkpoint (review turn 19). The reseal after the reopen then refused
+  (`PREFIX_PUBLISHED`). Measured, both before a reopen and inside that window: before,
+  `lead-command`, a lead Edit there let through as "coordinator unavailable", and the reseal stuck;
+  now the change is UNKNOWN, the Edit is denied ("already published", or "being published" inside
+  the window), and the remainder publishes after the reopen.
+- **An upgrader that arrives while the old daemon is closing waits for the replacement.** It got
+  `DAEMON_DRAINING` from its first status call and failed. Measured with the closing step paused for
+  3 s: before, refused in 3 ms; now it waits 2.6 s and ends on the same daemon as the first upgrader.
+- The coordinator README states when UNKNOWN content blocks publishing the remainder: a writer of
+  the unit recorded a read of it.
+
+### Measured
+The lead's suite ran on a snapshot of the final tree. The pause points ran in a scratch calibration
+copy. Every check used a disposable coordinator state, Codex home and log folder.
+
+| Check | 2.4.0 |
+|---|---|
+| Turn-15 cases | A quiet lead Bash call is `lead-command`. When a lead RPC overlaps the window (in the same repository or another one), or an exec writer does, the change is UNKNOWN. A stop is refused while the call is in flight; after a coordinator crash its change is UNKNOWN. A lost confirmation reports `"uncertain"`, and the change is then `lead-command`. |
+| The 2.3.x checks (r11–r14, snapcheck, edgecheck, lead_bash, lead_bash2, lead_bash3, lead_hooks_edge, settle_check) | Identical to the 2.3.5 records |
+| A partly published unit | Every push form of each of its repositories is refused, at the hook and in the git shim, with or without a token. A nested repository that is not registered gets the usual token. The Office names the unit. After `reopen`, seal, review and publish, the token flow pushes to the remote. |
+| One folder in two projects | Both sessions: Edit exact, Bash `lead-command`, nothing UNKNOWN |
+| Bash from the outer folder | `lead-command` in Backend and in Frontend, nothing UNKNOWN |
+| No coordinator / no project API / target outside git | Falls back (`STATE_PERMISSIONS`) / one repository / falls back (`CHECKOUT_ROOT`) |
+| A registered repository deleted, then re-created | `lead-command` throughout (the fix round's tree: UNKNOWN) |
+| Lead tool call, SmartPay shape | 3,494 ms first (registers the project), then 65–69 ms. 2.3.5: 460, then 62 ms |
+| `checkout/query` at 10 / 100 / 300 / 600 / 1,000 units | 0.4 / 0.6 / 1.2 / 3.1 / 3.8 ms, gate client 7 of 7 each. 2.3.5: 0.4 / 0.6 / 1.2 / 2.1 / 3.4 ms |
+| A push while a ref has just moved (publication paused there) | `checkout/query` reports `publishing` (Backend `ref_updated` with its commit). The hook and the shim refuse. Before: `prepared`, and a token at both. |
+| A push naming another repository (`--git-dir`/`--work-tree`, `GIT_DIR=`, git by path) | Refused at the hook and in the shim, 5 of 5. Before: 5 tokens. |
+| Lead tools after reopen | A lead Edit in the published Backend is denied (`PREFIX_PUBLISHED`). `git status` there runs. A lead Edit in Frontend is recorded exactly and published. |
+| A push of a repository whose git directory lives apart (`--separate-git-dir`) | Refused at the hook and in the shim, 10 of 10 (`-C`, `--git-dir`, `--work-tree`, `GIT_DIR`, and `.git` named as a file). Before: 10 tokens. The unregistered repository's own pushes get the usual token. |
+| A running 2.3.5 daemon, then a 2.4.0 call | Never stopped by the call: `DAEMON_OUTDATED` in 44 ms, naming the stop command. Run as given, that command stops it, and the next call starts 2.4.0 (migrations 1, 2 → 1, 2, 3). With a lead Edit or Bash in flight, the stop is refused (`NOT_QUIESCENT`, naming it). After its Post the stop goes through, and nothing is UNKNOWN. Before: the 2.4.0 call stopped it with the edit in flight, and the edit became UNKNOWN. 2.3.5 hooks work with the 2.4.0 daemon: Edit exact, Bash `lead-command`. A 2.4.0 daemon is used as it is. |
+| A draining daemon replaced by a newer release (the tree, and a copy labelled 2.4.1) | Idle: replaced in 587–649 ms (new process and boot). With a lead Edit or Bash in flight: refused in 4 ms, the old daemon keeps serving (same pid and boot), the Post is recorded there, then it is replaced, and nothing is UNKNOWN. Two upgraders at once: one replacement, both on the same daemon, one worker, also when the second arrives while the old daemon is closing. A stale status: refused (`DAEMON_REPLACED`), and the replacement keeps serving. An older client uses a newer daemon as it is. A lead Edit sent while the lock was held across a stop and a start waited 1.5 s and was recorded by the new daemon. |
+| Bash in a reopened unit's published repository (the writer's runs) | Its change there is UNKNOWN, the Pre names the repository and its commit, and the Frontend change is `lead-command`. The remainder published. A denied Write's replay is denied again, and a Bash call in a third repository right after it is `lead-command`. |
+| Bash in the published repository of a partly published unit, before any reopen | The Pre names Backend as published, and the change is UNKNOWN. A lead Edit there is denied (`PREFIX_PUBLISHED`). After the reopen, the reseal and publish complete. Before: `lead-command`, the Edit let through, and the reseal refused. |
+| The same while Backend's ref has moved and its journal still says `commit_created` (publication paused there) | The same outcome, the Edit denied as "being published". Before: the same failure. |
+
+### Known limits
+- Quiet means quiet in every registered repository. When two sessions' Bash calls overlap anywhere,
+  both calls' changes are UNKNOWN.
+- Not run: a project list from a real user's Codex app and where its threads appear there, a real
+  model (the writer used a scripted provider throughout), SmartPay's own clones, and other platforms.
+- The stop command for a daemon from before 2.4.0 reads that daemon's ledger, then stops it. A lead
+  call admitted in the milliseconds between the two is cut off, and its change is UNKNOWN.
+- A lead hook waits for a replacement for up to 8 s (Bash) or 11 s (file tools) of its 15 s. If
+  the new daemon takes longer to admit work (a large state to recover), calls made meanwhile go
+  unrecorded, and their changes are UNKNOWN.
+- Seen once in a test, not yet investigated: when the coordinator's socket folder is forced onto a
+  path longer than macOS allows (104 bytes), `abraham`'s fallback to `codex exec` hung past its
+  runtime limit. The default socket folder is short.
+
 ## [software-workflows 2.3.5] — 2026-10-19
 
 ### Fixed: from the review of 2.3.4's lead-Bash rule (session 01a14eac, turn 14)

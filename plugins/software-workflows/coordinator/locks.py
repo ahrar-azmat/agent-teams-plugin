@@ -1,6 +1,6 @@
 """Event-loop keyed locks with cancellation-safe holder/waiter accounting."""
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 
 class KeyedLocks:
@@ -9,6 +9,15 @@ class KeyedLocks:
 
     def __len__(self):
         return len(self.entries)
+
+    @asynccontextmanager
+    async def hold_many(self, keys):
+        # Lifecycle checkout locks precede unit locks, which precede ledger
+        # locks. Publication order is independent of this acquisition order.
+        async with AsyncExitStack() as stack:
+            for key in sorted(set(keys)):
+                await stack.enter_async_context(self.hold(key))
+            yield
 
     @asynccontextmanager
     async def hold(self, key):

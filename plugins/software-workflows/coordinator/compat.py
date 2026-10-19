@@ -202,8 +202,10 @@ def _tree_identity(cwd: str) -> str:
         return hashlib.sha1(os.path.realpath(root).encode("utf-8", "replace")).hexdigest()[:16]
 
 
-def _write_lock_path(cwd: str) -> Path:
-    return LIVE_LOG_DIR / "write-locks" / f"tree-{_tree_identity(cwd)}.lock"
+def _write_lock_path(cwd: str, identity=None) -> Path:
+    # The coordinator already has a verified canonical worktree identity.
+    # Ordinary callers still resolve arbitrary aliases through Git.
+    return LIVE_LOG_DIR / "write-locks" / f"tree-{identity or _tree_identity(cwd)}.lock"
 
 
 def _legacy_write_lock_holder(cwd: str) -> str:

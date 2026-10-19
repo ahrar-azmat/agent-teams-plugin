@@ -21,6 +21,8 @@ class Messages:
         if recipient == "lead":
             return "lead", None
         record = self.store.get(recipient)
+        if record["_kind"] == "lead_mailbox":
+            return record["id"], None
         if record["_kind"] == "unit":
             record = self.store.get(record["run"])
         if record["_kind"] == "run":
@@ -42,9 +44,14 @@ class Messages:
     async def send(self, sender, recipient, text, wake):
         if wake not in ("none", "queue", "start") or not isinstance(text, str) or not text:
             raise CoordinatorError("MESSAGE_ARGUMENTS", "Message needs text and explicit wake policy: none, queue or start")
+        if recipient == "lead" and sender != "lead":
+            origin = self.store.get(sender, required=False)
+            if origin and origin.get("unit"):
+                unit = self.store.get(origin["unit"])
+                recipient = unit.get("lead_mailbox", recipient)
         actorid, actor = self.recipient(recipient)
         ident = uid("msg")
-        self.store.put("message", ident, {"sender": sender, "recipient": actorid, "unit": actor and actor["unit"],
+        self.store.put("message", ident, {"sender": sender, "recipient": actorid, "unit": actor["unit"] if actor else self.store.get(actorid)["unit"] if actorid.startswith("lead_mailbox_") else None,
                        "text": text, "wake": wake, "state": "persisted", "created": time.time(),
                        "attempts": [], "native_id": ident, "delivery": "pending"})
         self.store.event("message/persisted", ident, {"sender": sender, "recipient": actorid})
@@ -53,9 +60,11 @@ class Messages:
         return self.store.get(ident)
 
     async def deliver(self, ident):
+        if self.daemon.recovery_barrier:
+            return
         async with self.locks.hold(ident):
             message = self.store.get(ident)
-            if message["state"] in ("entered_context", "acknowledged") or message["recipient"] == "lead" or message["delivery"] in ("cancelled", "turn_ended"):
+            if message["state"] in ("entered_context", "acknowledged") or (message["recipient"] == "lead" or message["recipient"].startswith("lead_mailbox_")) or message["delivery"] in ("cancelled", "turn_ended"):
                 return
             actor = self.store.get(message["recipient"])
             if not actor.get("listener"):
@@ -85,7 +94,15 @@ class Messages:
                 return
             if not active and message["wake"] == "none":
                 return
-            await self.daemon.ensure_lease(target["checkout"])
+            from .participants import checkout_ids
+            for key in checkout_ids(self.store, target["unit"]):
+                await self.daemon.ensure_lease(key)
+            current = self.store.get(target["id"])
+            listener = self.store.get(current["listener"])
+            if (self.daemon.recovery_barrier or current["listener"] != target["listener"] or
+                    listener["state"] != "connected" or listener.get("recovery_state") in ("reconciling", "failed") or
+                    self.daemon.connections.get(listener["id"]) is not connection or connection.closed):
+                return  # A reconnect during lease restoration must verify its pinned bindings first.
             method = "turn/steer" if active else ("thread/queue/add" if message["wake"] == "queue" else "turn/start")
             params = {"threadId": target["thread"], "input": [{"type": "text", "text": text}], "clientUserMessageId": native_id}
             if active:
@@ -148,13 +165,18 @@ class Messages:
             raise CoordinatorError("MESSAGE_ORIGIN", "Context echo came from another actor")
         self.transition(message, "entered_context", evidence)
 
-    def ack(self, actorid, ident):
+    def ack(self, actorid, ident, session_id=""):
         message = self.store.get(ident)
+        if session_id:
+            mailbox = self.store.get(message["recipient"], required=False)
+            if not mailbox or mailbox["_kind"] != "lead_mailbox" or mailbox["session_id"] != session_id:
+                raise CoordinatorError("ACK_ACTOR", "Only the owning lead session can acknowledge this message")
+            actorid = mailbox["id"]
         if message["recipient"] != actorid:
             raise CoordinatorError("ACK_ACTOR", "Only the actual recipient can acknowledge this message")
         if message["state"] == "acknowledged":
             return {"message": ident, "state": "acknowledged", "duplicate": True}
-        if actorid != "lead" and message["state"] != "entered_context":
+        if actorid != "lead" and not actorid.startswith("lead_mailbox_") and message["state"] != "entered_context":
             actor = self.store.get(actorid)
             if actor["kind"] != "child":
                 raise CoordinatorError("ACK_CONTEXT", "Native context echo has not yet been reconciled")
@@ -167,10 +189,21 @@ class Messages:
         for ident in re.findall(r"(?m)^C1_ACK (msg_[0-9a-f]{32})\s*$", item.get("text", "")):
             self.ack(actor["id"], ident)
 
-    def inbox(self, recipient="lead", cursor="", limit=100):
-        recipient, _ = self.recipient(recipient)
+    def inbox(self, recipient="lead", cursor="", limit=100, session_id=""):
         if type(limit) is not int or limit < 1:
             raise CoordinatorError("PAGE_SIZE", "Page size must be positive")
+        if session_id:
+            # Session mail is the union of its durable unit mailboxes. Keep the
+            # original recipients, message IDs and acknowledgement history.
+            scope = ("kind='message' AND json_extract(data,'$.recipient') IN "
+                     "(SELECT id FROM records WHERE kind='lead_mailbox' AND json_extract(data,'$.session_id')=?)")
+            records = list(self.store.selected("SELECT * FROM records WHERE " + scope + " AND id>? ORDER BY id LIMIT ?",
+                                              (session_id, cursor, limit + 1)))
+            unread = self.store.db.execute("SELECT count(*) FROM records WHERE " + scope +
+                                           " AND json_extract(data,'$.state')!='acknowledged'", (session_id,)).fetchone()[0]
+            return {"data": records[:limit], "next_cursor": records[limit - 1]["id"] if len(records) > limit else None,
+                    "unread": unread}
+        recipient, _ = self.recipient(recipient)
         inbox = [m for m in self.store.all("message") if m["recipient"] == recipient]
         records = [m for m in inbox if m["id"] > cursor]
         return {"data": records[:limit], "next_cursor": records[limit - 1]["id"] if len(records) > limit else None,
@@ -209,7 +242,7 @@ class Messages:
 
     async def retry(self):
         for message in list(self.store.all("message")):
-            if message["state"] not in ("entered_context", "acknowledged") and message["recipient"] != "lead":
+            if message["state"] not in ("entered_context", "acknowledged") and message["recipient"] != "lead" and not message["recipient"].startswith("lead_mailbox_"):
                 try:
                     await self.deliver(message["id"])
                 except (CoordinatorError, OSError):

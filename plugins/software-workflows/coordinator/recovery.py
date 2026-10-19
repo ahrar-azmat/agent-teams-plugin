@@ -7,7 +7,7 @@ import signal
 import time
 
 from .client import CoordinatorError
-from . import native, processes
+from . import native, processes, participants
 from .store import uid
 
 
@@ -20,8 +20,16 @@ async def reconcile_listener(daemon, listener, advance=True):
     alive = current and current["birth"] == listener["birth"] and not current["zombie"]
     actor = store.get(listener["actor"])
     run = store.get(actor["run"])
+    for operation in list(store.all("operation", actor["unit"])):
+        if operation.get("parts") and operation["state"] in ("prepared", "allowed", "running"):
+            await daemon.ledger.quarantine(operation, "cross-checkout operation interrupted by native reconnect")
     unsubmitted = not run.get("workflow") and not run.get("task") and not run.get("production_started") and not run.get("phases")
-    await daemon.ensure_lease(actor["checkout"])
+    for checkoutid in participants.checkout_ids(store, actor["unit"]):
+        await daemon.ensure_lease(checkoutid)
+    unit = store.get(actor["unit"])
+    roots = participants.roots(store, unit)
+    cwd = run.get("thread_cwd", store.get(actor["checkout"])["root"])
+    from .projects import verify_thread
     if not listener.get("root_thread"):
         # A threadless bootstrap can be stopped without inventing a writer identity.
         if alive:
@@ -29,7 +37,7 @@ async def reconcile_listener(daemon, listener, advance=True):
         return
     if not alive:
         await daemon.detach_listener(listener["id"])
-        for reservation in daemon.custody.active(actor["checkout"]):
+        for reservation in daemon.custody.unit_active(actor["unit"]):
             if reservation["unit"] != actor["unit"]:
                 continue
             for process in reservation.get("processes", []):
@@ -38,7 +46,7 @@ async def reconcile_listener(daemon, listener, advance=True):
                 except CoordinatorError as exc:
                     reservation.update(state="quarantined", reason=exc.code)
                     store.save(reservation)
-            store.unknown(actor["checkout"], "*", "listener died with potentially escaped effects", {"listener": listener["id"]})
+            store.unknown(reservation["checkout"], "*", "listener died with potentially escaped effects", {"listener": listener["id"]})
         listener["state"] = "dead"
         store.save(listener)
         replacement = await daemon.spawn_listener(actor, listener["config"], listener.get("home"))
@@ -57,12 +65,25 @@ async def reconcile_listener(daemon, listener, advance=True):
     connection = daemon.connections.get(listener["id"])
     attached = bool(connection and not connection.closed)
     if not connection or connection.closed:
-        connection = await daemon.attach(listener)
+        try:
+            connection = await daemon.attach(listener)
+        except (OSError, CoordinatorError):
+            # A dying app-server can remove its socket after the initial birth
+            # check but before attach. Recheck that exact process before choosing
+            # live reconnect versus replacement; never advance on a failed bind.
+            for _ in range(20):
+                current = await asyncio.to_thread(processes.identity, listener["pid"])
+                if not current or current["birth"] != listener["birth"] or current["zombie"]:
+                    return await reconcile_listener(daemon, store.get(listener["id"]), advance)
+                await asyncio.sleep(0.05)
+            raise
     readmit = not alive or listener.get("admission_fingerprint", {}).get("adapter_digest") != native.adapter_digest()
     if not attached or readmit:
         response = await connection.call("thread/resume", {"threadId": listener["root_thread"],
-                                          "approvalPolicy": "never", "sandbox": "danger-full-access"})
+                                          "approvalPolicy": "never", "sandbox": "danger-full-access",
+                                          **({"cwd": cwd, "runtimeWorkspaceRoots": roots} if unit.get("project_revision") else {})})
         native.policy_echo(response)
+        verify_thread(response, unit, cwd, roots)
     if not alive:
         # A replacement has not executed a turn. Its own infrastructure is a
         # fresh service baseline; prior command survivors retain their separate
@@ -74,13 +95,8 @@ async def reconcile_listener(daemon, listener, advance=True):
         from .admission import Admission
         await Admission(store).writer_gate(daemon, listener["id"], response, fixture=bool(listener.get("home")))
         listener = store.get(listener["id"])
-    listed = await connection.call("hooks/list", {"cwds": [store.get(actor["checkout"])["root"]]})
-    observed = {hook["key"]: hook for entry in listed["data"] for hook in entry["hooks"]}
-    if len(listener.get("hooks", [])) != 2 or any(
-        h["key"] not in observed or observed[h["key"]].get("currentHash") != h["currentHash"] or
-        observed[h["key"]].get("trustStatus") != "trusted" or not observed[h["key"]].get("enabled")
-        for h in listener.get("hooks", [])):
-        raise CoordinatorError("RECOVERY_HOOK_TRUST", "Recovered listener no longer has its admitted hook definitions and precise trust")
+    listed = await connection.call("hooks/list", {"cwds": roots})
+    native.coordinator_hooks(listed, roots, expected=listener.get("hooks", []))
     # The receive loop fsynced these notifications before scheduling processing.
     # Recover evidence that was received durably but not yet applied to an intent.
     incarnation = listener
@@ -114,8 +130,12 @@ async def reconcile_listener(daemon, listener, advance=True):
             # A new app-server connection must subscribe to each live child too.
             # Resuming history does not start a turn or repeat its input.
             child_response = await connection.call("thread/resume", {"threadId": child["thread"],
-                "approvalPolicy": "never", "sandbox": "danger-full-access"})
+                "approvalPolicy": "never", "sandbox": "danger-full-access",
+                **({"cwd": child.get("cwd", cwd), "runtimeWorkspaceRoots": roots} if unit.get("project_revision") else {})})
             native.policy_echo(child_response)
+            # Native 0.163.0 children inherit roots and ancestry, but their own
+            # project_id is null. Preserve that observed association on resume.
+            verify_thread(child_response, dict(unit, project=child.get("native_project")), child.get("cwd", cwd), roots)
         turns = []
         async for result in native.page(connection, "thread/turns/list", {"threadId": child["thread"], "itemsView": "full", "sortDirection": "asc"}):
             for turn in result["data"]:
@@ -141,7 +161,8 @@ async def reconcile_listener(daemon, listener, advance=True):
                         operation["completed_item"] = item
                         store.save(operation)
                     elif not operation:
-                        store.unknown(child["checkout"], "*", "history contains an unaccounted effect-capable item", {"item": item["id"], "listener": listener["id"]})
+                        for checkoutid in participants.checkout_ids(store, child["unit"]):
+                            store.unknown(checkoutid, "*", "history contains an unaccounted effect-capable item", {"item": item["id"], "listener": listener["id"]})
         metadata = await connection.call("thread/read", {"threadId": child["thread"], "includeTurns": False})
         if metadata["thread"].get("status", {}).get("type") == "idle":
             child["active_turn"] = None
@@ -152,6 +173,8 @@ async def reconcile_listener(daemon, listener, advance=True):
                 daemon.writer.observe(child, "turn/completed", {"threadId": child["thread"], "turn": turn})
     for operation in list(store.all("operation", actor["unit"])):
         if operation["state"] in ("prepared", "allowed", "running"):
+            if operation.get("parent_operation"):
+                continue
             if operation["kind"] == "patch" and operation.get("hook_valid") and operation.get("post_hook") and operation.get("completed_item"):
                 try:
                     await daemon.ledger.complete_patch(operation, operation["completed_item"])
@@ -164,7 +187,8 @@ async def reconcile_listener(daemon, listener, advance=True):
                     await daemon.settle_actor(store.get(operation["actor"]))
             else:
                 await daemon.ledger.quarantine(operation, "crash gap: intent is not proof of execution or no effect")
-    await daemon.ledger.reconcile(store.get(actor["checkout"]), ignore_pending=False, reason="recovery snapshot")
+    await asyncio.gather(*(daemon.ledger.reconcile(store.get(key), ignore_pending=False, reason="recovery snapshot")
+                           for key in participants.checkout_ids(store, actor["unit"])))
     listener = store.get(listener["id"])
     listener.update(recovery_state="reconciled", state="connected")
     store.save(listener)
@@ -181,6 +205,8 @@ async def reconcile_listener(daemon, listener, advance=True):
 async def recover(daemon):
     store = daemon.store
     store.event("recovery/start", "daemon", {"generation": store.generation})
+    from .intents import invalidate_windows
+    invalidate_windows(daemon)
     await daemon.ledger.recover_ownership()
     for request in list(store.all("custody_request")):
         if request["state"] == "waiting":
@@ -191,17 +217,39 @@ async def recover(daemon):
         attempt["generation"] += 1
         attempt["daemon_generation"] = store.generation
         store.save(attempt)
+    # All units regain coverage before any listener reconnects or input advances.
+    recoverable = [l for l in store.all("listener") if l["state"] != "dead" and not (l["state"] == "stopped" and not l.get("root_thread"))]
+    for checkoutid in sorted({key for l in recoverable for key in participants.checkout_ids(store, l["unit"])}):
+        await daemon.ensure_lease(checkoutid)
+    for listener in recoverable:
+        listener["recovery_state"] = "reconciling"
+        store.save(listener)
+    # A multi-checkout invocation commits receipts only at its original atomic
+    # completion boundary. History cannot retrospectively complete one whose
+    # transaction did not commit, even if every post-image now matches.
+    # Fence it before reconnecting: queued native events may arrive immediately.
+    for operation in list(store.all("operation")):
+        if operation.get("parts") and operation["state"] in ("prepared", "allowed", "running"):
+            await daemon.ledger.quarantine(operation, "cross-checkout operation interrupted before atomic receipt completion")
+    for discovery in list(store.all("project_discovery")):
+        if discovery["state"] == "running":
+            current = await asyncio.to_thread(processes.identity, discovery["pid"])
+            if current and current["birth"] == discovery["birth"]:
+                os.kill(current["pid"], signal.SIGTERM)
+            discovery["state"] = "interrupted"
+            store.save(discovery)
     for listener in list(store.all("listener")):
         if listener["state"] == "dead" or listener["state"] == "stopped" and not listener.get("root_thread"):
             continue
         try:
-            await reconcile_listener(daemon, listener)
+            await reconcile_listener(daemon, listener, advance=False)
         except Exception as exc:
             actor = store.get(listener["actor"])
             current_listener = store.get(store.get(actor["id"]).get("listener", listener["id"]))
             current_listener.update(state="quarantined", recovery_state="failed", recovery_error=getattr(exc, "code", type(exc).__name__))
             store.save(current_listener)
-            store.unknown(actor["checkout"], "*", "listener recovery incomplete", {"listener": listener["id"], "code": getattr(exc, "code", type(exc).__name__)})
+            for checkoutid in participants.checkout_ids(store, actor["unit"]):
+                store.unknown(checkoutid, "*", "listener recovery incomplete", {"listener": listener["id"], "code": getattr(exc, "code", type(exc).__name__)})
     # Lead operations have no native history to fill the crash gap.
     for operation in list(store.all("operation")):
         if operation["kind"] in ("lead-edit", "restore", "lead-command") and operation["state"] in ("prepared", "allowed", "running"):
@@ -224,7 +272,7 @@ async def recover(daemon):
         if unit["state"] == "sealing" or attempt and attempt["state"] == "started":
             publisher.interrupt_seal(unit["id"], "worker interrupted sealing")
     for publication in list(store.all("publication")):
-        if publication["phase"] not in ("complete", "abandoned"):
+        if not publication.get("group") and publication["phase"] not in ("complete", "abandoned"):
             try:
                 unit = store.get(publication["unit"])
                 async with daemon.ledger.lifecycle.hold(unit["checkout"]):
@@ -232,6 +280,19 @@ async def recover(daemon):
                         await publisher.reconcile(publication)
             except CoordinatorError as exc:
                 store.event("publication/recovery_refused", publication["id"], {"code": exc.code})
+    from .group_publish import GroupPublisher
+    for group in list(store.all("publication_group")):
+        if group["phase"] not in ("complete", "abandoned", "superseded"):
+            try:
+                async with daemon.ledger.lifecycle.hold_many(participants.checkout_ids(store, group["unit"])):
+                    async with daemon.unit_locks.hold(group["unit"]):
+                        await GroupPublisher(daemon).reconcile(group)
+            except CoordinatorError as exc:
+                store.event("publication/recovery_refused", group["id"], exc.envelope())
+    daemon.recovery_barrier = False
+    for listener in store.all("listener"):
+        if listener.get("recovery_state") == "reconciled" and store.get(listener["run"]).get("workflow"):
+            await daemon.writer.advance(listener["run"])
     await daemon.messages.retry()
     store.event("recovery/complete", "daemon", {"generation": store.generation})
 
@@ -252,14 +313,21 @@ async def lead_command(daemon, params):
         daemon.store.save(operation)
         raise
     try:
-        process = await asyncio.create_subprocess_exec(*argv, cwd=daemon.store.get(actor["checkout"])["root"],
+        cwd = params.get("cwd") or actor.get("cwd") or daemon.store.get(actor["checkout"])["root"]
+        from .routing import route
+        route(daemon.store, actor, ".", cwd, directory=True)
+        process = await asyncio.create_subprocess_exec(*argv, cwd=cwd,
                                                        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
                                                        stderr=asyncio.subprocess.PIPE, start_new_session=True,
                                                        env=dict(os.environ, SOFTWARE_WORKFLOWS_OPERATION=operation["id"]), close_fds=True)
         birth = await asyncio.to_thread(processes.identity, process.pid)
-        reservation["processes"] = [birth] if birth else []
-        reservation["lead_root"] = birth or {"pid": process.pid, "birth": None, "exited_before_identity": True}
-        daemon.store.save(reservation)
+        with daemon.store.transaction():
+            for key in reservation.get("members", [reservation["id"]]):
+                member = daemon.store.get(key)
+                member["processes"] = [birth] if birth else []
+                member["lead_root"] = birth or {"pid": process.pid, "birth": None, "exited_before_identity": True}
+                daemon.store.save(member)
+        reservation = daemon.store.get(reservation["id"])
         stdout, stderr = await process.communicate()
         # Record output digests, not arbitrary secrets printed by a command.
         import hashlib
@@ -275,6 +343,10 @@ async def lead_command(daemon, params):
 
 
 async def settle_lead_command(daemon, reservation, resolve_quarantine=False):
+    reservation = daemon.store.get(reservation.get("group", reservation["id"]))
+    members = [daemon.store.get(key) for key in reservation.get("members", [reservation["id"]])]
+    if all(r["state"] == "released" for r in members):
+        return
     operation = daemon.store.get(reservation["operation"])
     try:
         root = reservation.get("lead_root", {"pid": None, "birth": None})
@@ -282,31 +354,44 @@ async def settle_lead_command(daemon, reservation, resolve_quarantine=False):
         survivors = await asyncio.to_thread(processes.inventory, root, operation["id"], reservation.get("processes", []),
                                            None, services, reservation.get("ambiguous_processes", []), reservation.get("process_baseline", []))
         reservation = daemon.store.get(reservation["id"])
-        reservation["processes"] = survivors
-        reservation["ambiguous_processes"] = []
+        for member in members:
+            member["processes"] = survivors
+            member["ambiguous_processes"] = []
+            daemon.store.save(member)
         process_uncertainty = reservation.get("reason") in ("PROCESS_AMBIGUOUS", "PROCESS_UNREADABLE", "PROCESS_KERNEL_IDENTITY", "PROCESS_SCAN", "PROCESS_REUSED", "PROCESS_ENV")
         if process_uncertainty and not survivors:
             resolve_quarantine = True
-        daemon.store.save(reservation)
         if reservation["state"] == "quarantined" and not resolve_quarantine:
             return
         if not survivors and resolve_quarantine and not operation.get("completed_item"):
             operation["completed_item"] = {"exitCode": None, "observedGone": True, "missingExitStatus": True}
             daemon.store.save(operation)
-            daemon.store.unknown(operation["checkout"], "*", "lead reconciled command absence without exit status", {"operation": operation["id"]})
+            for member in members:
+                daemon.store.unknown(member["checkout"], "*", "lead reconciled command absence without exit status", {"operation": operation["id"]})
         if survivors or not operation.get("completed_item"):
             return
-        await daemon.ledger.reconcile(daemon.store.get(operation["checkout"]), reason="lead command opaque effects")
+        await asyncio.gather(*(daemon.ledger.reconcile(daemon.store.get(member["checkout"]), reason="lead command opaque effects")
+                               for member in members))
         operation.update(state="reconciled", attribution="UNKNOWN-context-only")
         daemon.store.save(operation)
-        await daemon.custody.relinquish(reservation)
+        for member in members:
+            await daemon.custody.relinquish(daemon.store.get(member["id"]))
     except CoordinatorError as exc:
         if exc.details.get("processes"):
             previous = {(p["pid"], p["birth"]): p for p in reservation.get("ambiguous_processes", [])}
             previous.update({(p["pid"], p["birth"]): p for p in exc.details["processes"]})
             reservation["ambiguous_processes"] = list(previous.values())
-        reservation.update(state="quarantined", reason=exc.code)
-        daemon.store.save(reservation)
+        for member in members:
+            member.update(state="quarantined", reason=exc.code, ambiguous_processes=reservation.get("ambiguous_processes", []))
+            daemon.store.save(member)
+
+
+def resolve_restored_parents(store):
+    for operation in list(store.all("operation")):
+        if operation.get("parts") and operation["state"] == "quarantined" and all(
+                store.get(key)["state"] == "resolved" for key in operation["parts"]):
+            operation.update(state="resolved", restoration={key: store.get(key).get("restored_by") for key in operation["parts"]})
+            store.save(operation)
 
 
 async def restore_unknown(daemon, params):
@@ -315,33 +400,36 @@ async def restore_unknown(daemon, params):
     if actor["kind"] != "lead":
         raise CoordinatorError("LEAD_ONLY", "Only a lead can restore a known revision")
     row = store.db.execute("SELECT * FROM unknowns WHERE id=?", (params["unknown"],)).fetchone()
+    if not row or not participants.contains(store, actor["unit"], row["checkout"]):
+        raise CoordinatorError("RESTORE_SCOPE", "UNKNOWN must belong to a participant")
     if row and row["path"] == "*":
-        return await restore_checkout(daemon, actor, row, params.get("revisions", {}))
+        return await restore_checkout(daemon, dict(actor, checkout=row["checkout"]), row, params.get("revisions", {}))
     known = store.db.execute("SELECT * FROM revisions WHERE id=?", (params["revision"],)).fetchone()
-    if not row or not known or row["checkout"] != actor["checkout"] or row["path"] != known["path"] or known["checkout"] != row["checkout"]:
+    if not row or not known or not participants.contains(store, actor["unit"], row["checkout"]) or row["path"] != known["path"] or known["checkout"] != row["checkout"]:
         raise CoordinatorError("RESTORE_SCOPE", "UNKNOWN and known revision must name the same checkout path")
     if known["attribution"] not in ("baseline", "exact", "restore"):
         raise CoordinatorError("RESTORE_UNKNOWN", "An unexplained revision cannot be adopted")
-    if any(a.get("active_turn") for a in store.all("actor") if a["checkout"] == actor["checkout"]):
+    if any(a.get("active_turn") for a in store.all("actor") if participants.contains(store, a["unit"], row["checkout"])):
         raise CoordinatorError("RESTORE_ACTIVE", "Interrupt active writers before restoring UNKNOWN")
-    if daemon.custody.active(actor["checkout"]):
+    if daemon.custody.active(row["checkout"]):
         raise CoordinatorError("RESTORE_CUSTODY", "Uncertain command survivors must be reconciled before restoration")
-    await daemon.ledger.reconcile(store.get(actor["checkout"]), [row["path"]], ignore_pending=False)
+    await daemon.ledger.reconcile(store.get(row["checkout"]), [row["path"]], ignore_pending=False)
     change = {"mode": known["mode"]}
     if known["blob"]:
         change["bytes_base64"] = base64.b64encode(store.read_blob(known["blob"])).decode()
-    result = await daemon.lead_edit({"actor": actor["id"], "changes": {row["path"]: change}}, restore=True)
+    result = await daemon.lead_edit({"actor": actor["id"], "changes": {str(__import__("pathlib").Path(store.get(row["checkout"])["root"]) / row["path"]): change}}, restore=True)
     with store.transaction():
-        for unknown in store.unresolved(actor["checkout"], [row["path"]]):
+        for unknown in store.unresolved(row["checkout"], [row["path"]]):
             if unknown["path"] != row["path"]:
                 continue
             store.db.execute("INSERT INTO resolutions(unknown_id,restore) VALUES(?,?) ON CONFLICT(unknown_id) "
                              "DO UPDATE SET restore=excluded.restore WHERE resolutions.edit IS NULL", (unknown["id"], result["id"]))
         for operation in list(store.all("operation")):
-            if operation["checkout"] == actor["checkout"] and operation["state"] == "quarantined" and set(operation["paths"]) <= {row["path"]}:
+            if not operation.get("parts") and operation["checkout"] == row["checkout"] and operation["state"] == "quarantined" and operation["paths"] and set(operation["paths"]) <= {row["path"]}:
                 operation["state"] = "resolved"
                 operation["restored_by"] = result["id"]
                 store.save(operation)
+        resolve_restored_parents(store)
         store.event("unknown/restored", row["id"], {"restore": result["id"], "known_revision": known["id"]})
     return {"restore": result["id"], "state": "restored_requires_new_edit", "unknown": row["id"]}
 
@@ -353,7 +441,7 @@ async def restore_checkout(daemon, actor, unknown, revisions):
     checkout = store.get(actor["checkout"])
     if unknown["checkout"] != checkout["id"]:
         raise CoordinatorError("RESTORE_SCOPE", "UNKNOWN belongs to another checkout")
-    if any(a.get("active_turn") for a in store.all("actor") if a["checkout"] == checkout["id"]):
+    if any(a.get("active_turn") for a in store.all("actor") if participants.contains(store, a["unit"], checkout["id"])):
         raise CoordinatorError("RESTORE_ACTIVE", "Interrupt every writer before restoring a notification gap")
     if daemon.custody.active(checkout["id"]):
         raise CoordinatorError("RESTORE_CUSTODY", "Reconcile all terminals and descendants first")
@@ -376,15 +464,16 @@ async def restore_checkout(daemon, actor, unknown, revisions):
         changes[path] = {"mode": known["mode"]}
         if known["blob"]:
             changes[path]["bytes_base64"] = base64.b64encode(store.read_blob(known["blob"])).decode()
-    result = await daemon.lead_edit({"actor": actor["id"], "changes": changes}, restore=True)
+    result = await daemon.lead_edit({"actor": actor["id"], "changes": changes, "cwd": checkout["root"]}, restore=True)
     with store.transaction():
         for item in store.unresolved(checkout["id"]):
             store.db.execute("INSERT INTO resolutions(unknown_id,restore) VALUES(?,?) ON CONFLICT(unknown_id) "
                              "DO UPDATE SET restore=excluded.restore WHERE resolutions.edit IS NULL", (item["id"], result["id"]))
         for operation in list(store.all("operation")):
-            if operation["checkout"] == checkout["id"] and operation["state"] == "quarantined" and set(operation["paths"]) <= paths:
+            if not operation.get("parts") and operation["checkout"] == checkout["id"] and operation["state"] == "quarantined" and set(operation["paths"]) <= paths:
                 operation.update(state="resolved", restored_by=result["id"])
                 store.save(operation)
+        resolve_restored_parents(store)
         store.event("unknown/checkout_restored", unknown["id"], {"restore": result["id"], "known_revisions": revisions})
     return {"restore": result["id"], "state": "restored_requires_new_edit", "unknown": unknown["id"],
             "required_new_edit_scope": sorted(paths)}
