@@ -1,6 +1,7 @@
 """Event-loop keyed locks with cancellation-safe holder/waiter accounting."""
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
+import time
 
 
 class KeyedLocks:
@@ -20,7 +21,7 @@ class KeyedLocks:
             yield
 
     @asynccontextmanager
-    async def hold(self, key):
+    async def hold(self, key, deadline=None):
         if key is None:
             yield
             return
@@ -28,12 +29,37 @@ class KeyedLocks:
         # No await between lookup and registration, including waiting callers.
         entry[1] += 1
         try:
-            async with entry[0]:
+            async with held(entry[0], deadline):
                 yield
         finally:
             entry[1] -= 1
             if not entry[1]:
                 del self.entries[key]
+
+
+@asynccontextmanager
+async def held(lock, deadline=None):
+    """Hold an asyncio lock; with a deadline (time.time() seconds), refuse once it passes instead of
+    queueing on. A native hook has stopped waiting by then, so work admitted after it is for nobody."""
+    if deadline is None:
+        async with lock:
+            yield
+        return
+    try:
+        await asyncio.wait_for(lock.acquire(), max(0.0, deadline - time.time()))
+    except TimeoutError:
+        raise busy() from None
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def busy():
+    from .client import CoordinatorError
+    return CoordinatorError("COORDINATOR_BUSY", "The coordinator could not admit this call before the native hook "
+                            "deadline, so nothing ran. Retry it; batching read-only commands into one call queues less.",
+                            {"retryable": True}, True)
 
 
 async def finish_thread(function, *args):

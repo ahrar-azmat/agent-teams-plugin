@@ -31,16 +31,41 @@ class ProcUniqueInfo(ctypes.Structure):
                 ("reserved3", ctypes.c_uint64)]
 
 
+class ProcBSDShortInfo(ctypes.Structure):
+    # XNU PROC_PIDT_SHORTBSDINFO (13), 64 bytes. Unlike PROC_PIDTBSDINFO it answers for a
+    # process of another user too (measured on macOS 26: every one of 216 such processes).
+    _fields_ = [(name, ctypes.c_uint32) for name in ("pid", "ppid", "pgid", "status")]
+    _fields_ += [("comm", ctypes.c_char * 16)]
+    _fields_ += [(name, ctypes.c_uint32) for name in ("flags", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "rfu")]
+
+
+def _gone(lib, pid):
+    """After a failed kernel read: whether no process of this user holds the PID. The kernel refuses
+    both the read and a signal for a process of another user, such as a root daemon that took the PID
+    of one that exited. None of its user ids is this user's, so it is no writer's process, hook or
+    service: those run as this user, and keep its real uid across a set-user-ID program."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        short = ProcBSDShortInfo()
+        if (lib.proc_pidinfo(pid, 13, 0, ctypes.byref(short), ctypes.sizeof(short)) == ctypes.sizeof(short)
+                and os.getuid() not in (short.uid, short.ruid, short.svuid)):
+            return True
+        raise CoordinatorError("PROCESS_UNREADABLE", "Cannot verify process birth identity", {"pid": pid})
+    return False
+
+
 def identity(pid, _attempt=0):
+    """The process's birth identity, or None when no process of this user holds the PID."""
     pid = int(pid)
     if sys.platform == "darwin":
         lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
         info = ProcBSDInfo()
         size = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
         if size != ctypes.sizeof(info):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if _gone(lib, pid):
                 return None
             if _attempt < 3:
                 time.sleep(0.002)
@@ -49,9 +74,7 @@ def identity(pid, _attempt=0):
         unique = ProcUniqueInfo()
         size = lib.proc_pidinfo(pid, 17, 0, ctypes.byref(unique), ctypes.sizeof(unique))
         if size != 56:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if _gone(lib, pid):
                 return None
             if _attempt < 3:
                 time.sleep(0.002)
@@ -60,9 +83,7 @@ def identity(pid, _attempt=0):
         # Check the PID did not change between the two kernel reads.
         after = ProcBSDInfo()
         if lib.proc_pidinfo(pid, 3, 0, ctypes.byref(after), ctypes.sizeof(after)) != ctypes.sizeof(after):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if _gone(lib, pid):
                 return None
             if _attempt < 3:
                 time.sleep(0.002)
@@ -74,13 +95,18 @@ def identity(pid, _attempt=0):
                 "ppid": info.ppid, "uid": info.uid, "zombie": info.status == 5,
                 "kernel_id": unique.unique, "parent_kernel_id": unique.parent_unique}
     if sys.platform.startswith("linux"):
+        directory = Path("/proc") / str(pid)
         try:
-            directory = Path("/proc") / str(pid)
             parts = (directory / "stat").read_text().rsplit(")", 1)[1].split()
             return {"pid": pid, "birth": parts[19], "ppid": int(parts[1]),
                     "uid": directory.stat().st_uid, "zombie": parts[0] == "Z"}
         except FileNotFoundError:
             return None
+        except PermissionError:
+            # /proc mounted with hidepid=1 refuses another user's process. The directory's owner is only its
+            # effective uid: a set-user-ID child of a writer keeps the writer's real uid, so nothing here shows
+            # the PID is no writer's (not run on Linux).
+            raise CoordinatorError("PROCESS_UNREADABLE", "Cannot verify process birth identity", {"pid": pid})
     raise CoordinatorError("PROCESS_PLATFORM", "No reliable process identity backend")
 
 
@@ -141,7 +167,10 @@ def terminal_root(listener, operation, terminal, known=()):
 
 def baseline():
     """Complete birth identities before authorizing an opaque command."""
-    result = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,uid=,stat="], capture_output=True, text=True, timeout=15)
+    try:
+        result = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,uid=,stat="], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:  # a fork refused under load, a ps that hangs
+        raise CoordinatorError("PROCESS_SCAN", "Cannot establish a command's process baseline", {"error": type(exc).__name__})
     if result.returncode:
         raise CoordinatorError("PROCESS_SCAN", "Cannot establish a command's process baseline")
     records = []
@@ -162,7 +191,10 @@ def inventory(listener, root_thread, known=(), operation=None, services=(), ambi
     particular overlapping command. Domain survivors retain EVERY potentially
     responsible reservation. Only native call markers identify exact roots.
     """
-    result = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,ppid=,uid=,stat="], capture_output=True, text=True, timeout=15)
+    try:
+        result = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,ppid=,uid=,stat="], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CoordinatorError("PROCESS_SCAN", "OS process inventory failed", {"error": type(exc).__name__}, operational=True)
     if result.returncode:
         raise CoordinatorError("PROCESS_SCAN", "OS process inventory failed", operational=True)
     candidates = {}

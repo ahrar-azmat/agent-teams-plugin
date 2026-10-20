@@ -3,6 +3,280 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.1] — 2026-10-20
+
+### Fixed: a busy coordinator let native calls run unadmitted (reported from a seven-writer session)
+- **A native call is decided before Codex stops waiting for its hook.** Codex 0.163 ends a hook at
+  120 s and then runs the call anyway. The hook client counted its 115 s from its own request, so a
+  Pre queued behind others outlived Codex's limit. The command then ran without admission, and the
+  coordinator recorded an UNMEDIATED `*` UNKNOWN on the checkout, which stops every writer there until
+  a restore. Now:
+  - the client counts from its own start and answers 8 s before Codex's limit. That is one deadline
+    across connecting, sending and every receive: a socket timeout bounds only one operation;
+  - the coordinator refuses with `COORDINATOR_BUSY` ("nothing ran; retry it") once a lock or custody
+    wait would pass 4 s before that;
+  - a call it admitted too late is withdrawn.
+- **A call that native refuses, or that is withdrawn, holds nothing.** When native reports a Pre hook
+  `blocked`, ours or another, the call's admission is withdrawn and its custody given back. That
+  includes the parts of a patch across a project's repositories. In 2.4.0 an admission completed
+  after the client gave up stayed allowed and held exclusive custody. Later commands waited on it,
+  and the daemon refused to stop.
+- **A call that Codex refuses after admitting it holds nothing.** Codex 0.163 can refuse a call
+  inside its handler, after an allowed Pre hook. Examples are `tty` on the TTY-disabled runtime the
+  coordinator configures, a patch whose context is not in the file, or an unusable `workdir`. It
+  runs no Post hook for such a call, and for the first two it sends no item either. Writers on
+  gpt-6-astra make every call from inside a code-mode cell, because the model catalog sets
+  `code_mode_only` (all 778 calls in the reporting session's ledger). A cell's calls are not joined
+  by the end of their turn.
+  - In 2.4.0 such a command kept exclusive custody for the rest of the run. Every later command in
+    the checkout waited out its deadline and was refused, and the daemon refused to stop
+    (`NOT_QUIESCENT`).
+  - Such a patch kept its paths until turn end and was then quarantined. Every retry in that turn
+    was refused (`OPERATION_BUSY`), and the turn left an UNKNOWN that only a restore with every
+    writer idle cleared.
+
+  Now:
+  - **The writer's log is a file.** A writer's Codex app-server writes its log to a private file
+    that it holds open itself (`listeners/<id>/native.log` in the coordinator's state), with
+    Codex's trace-safe target on.
+  - **Codex's own result line is the evidence.** Once a call's handler has returned, Codex 0.163
+    writes `codex.tool_result` there, for direct and nested calls alike, with `success=false` for a
+    failure. That target carries identifiers, names and lengths, never arguments or output.
+  - **The daemon reads the file from a durable offset.** It reads at each Pre hook, at turn end,
+    every 50 ms, and in recovery, so a result written while the daemon restarts is still read.
+    Codex writes a call's result before it hands the failure to the model or the cell, so the retry
+    of a refused call finds that call settled.
+  - **A failed result proves the call ended, not that it changed nothing.**
+    - A patch is settled as having no effect when every endpoint still holds its pre-image, and its
+      paths are released. Any other bytes quarantine it. A `failed` or `declined` item settles a
+      patch the same way.
+    - A command's checkouts are reconciled, as after any command, once no process or terminal of it
+      remains. Its custody is released in the same transaction that records it reconciled.
+  - **Results never cross app-server incarnations.** A result settles only the call that its own
+    listener incarnation admitted, by thread and call. The results a dead app-server wrote settle
+    its calls before its replacement starts.
+  - **Late items never reopen a settled call.** Items that arrive after a failed result complete
+    the call's record; they are not unmediated. A patch settled as having no effect that Codex then
+    reports applied is quarantined. A refused or withdrawn call that native runs after all is still
+    recorded as unmediated, and its custody is held again.
+  - **A call Codex gives up on is settled by what it can still do.** Codex 0.163 writes
+    `codex.tool_result_ready` once a call's dispatch has ended. For a call it aborts, it writes that
+    line and no result: an interrupted turn, or a cell that completes with the call still pending.
+    - A call aborted while its Pre hook waits never runs. Its admission is withdrawn
+      (`NATIVE_ABANDONED`) and its custody given back. The hook reads the log once more before it
+      allows. A hook still queued behind others when Codex gives up has no record yet. The end of
+      its dispatch is kept for Codex's 120 s hook limit, and the hook refuses the call when its
+      turn comes.
+    - An aborted command is settled as any command, whether Codex dropped it before or while its
+      handler ran. Its checkouts are reconciled once no process or terminal of it remains, and its
+      custody is released. Codex starts a local command's process before its handler can be
+      dropped, so the coordinator sees any process the command started.
+    - An aborted patch can still finish a write it began, since 0.163 runs local writes on their own
+      thread. It is quarantined, and its paths stay held until Codex reports that its handler ended
+      (its result, its completed item or its Post hook) or its app-server exits. Until then, no
+      command is admitted over those paths, a restore of them is refused (`RESTORE_EXECUTING`), and
+      none of your Bash commands counts as quiet. The unit is not published either, and the
+      checkout's compatibility lease stays held, so a `codex exec` writer outside the coordinator
+      cannot start over it. 2.4.0 released that lease once the run ended, live patches or not. A
+      call still in its Pre hook when its run ends takes the lease back before it is admitted, and
+      is refused (`EXCLUSIVE_WRITER`) if such a writer took the checkout meanwhile.
+    - A patch whose handler finished, but whose Post hook outcome had not arrived when its dispatch
+      ended, waits for it, also after its turn. Codex sent that outcome first, but over the app-server
+      connection, which the log is not ordered against. When it arrives, the patch is verified or
+      quarantined. With no Post hook of the coordinator's run for it, it is quarantined at once.
+  - **Turn end keeps that barrier, for its own calls.** Codex can start a thread's next turn before
+    the coordinator reads the end of the last one, so a turn's end judges only that turn's calls, as
+    in 2.4.0. A patch whose handler may still run is quarantined if the turn was interrupted or
+    failed, and its paths stay held as above. After a completed turn it stays admitted, because a
+    cell can outlive its turn, and its own result settles it.
+    - A direct call's patch whose handler ended without a complete lifecycle is quarantined, as in
+      2.4.0. A turn ends only after its direct calls, and Codex sends a thread's notifications in
+      order, so nothing more comes for it.
+    - A cell's patch waits for its outcome or its app-server's exit, since its Post hook can end
+      after its turn. That holds after an interrupted turn too: Codex reports every abort reason as
+      `interrupted`, and only an interrupt with `code_mode_interrupt` on terminates the turn's cells.
+      The coordinator tells direct and cell calls apart from the line Codex writes on receiving each
+      call.
+    - A stop, or an app-server's death, ends execution for every call of that app-server, and
+      quarantines a patch the app-server never reported ending. A stop does not wait for a patch whose
+      handler and dispatch have both ended, nor for an Abraham workflow whose settlement waits only on
+      such patches, since stopping their app-server settles them. A drain waits for the workflow
+      advances under way, and each stops at its next step: no phase completes and no turn starts
+      while the daemon drains.
+  - **Recovery reads the log before it quarantines.** On restart and on reconnect, the coordinator
+    applies each writer's log before it quarantines interrupted cross-repository patches. A refusal
+    written or recorded before a crash is settled at its pre-images in every repository it spans,
+    and the corrected retry is admitted. A result now applies to its call in any state, so a
+    quarantine never discards it.
+  - **Admission checks both lines on the installed binary.** A new probe requires, under the
+    writer's log filter, a failed result for each of two refused nested calls and one refused direct
+    call, each followed by the end of its dispatch. Under the filter 2.4.0 used, it requires neither.
+  - The log is deleted when its listener stops.
+- One UNMEDIATED UNKNOWN per native item, not one per notification.
+
+### Fixed: the coordinator's cost grew with its history
+- **Hot paths no longer decode finished records.** In 2.4.0 every command's record copied every head
+  of the checkout (365 KB on a 3,679-file checkout), and its custody record kept a table of the
+  user's processes (about 80 KB). Admission, reconcile, `daemon/status` and every native notification
+  decoded all of them again, on the event loop. On the reporting session's ledger (730 MB),
+  `daemon/status` took 3.3 s, a reconcile's scan 2.9 s and a patch admission's custody check 1.4 s.
+  Every lead tool call asks for status at least four times, and one `coordinator_inbox` acknowledgement
+  took 996 s. Now:
+  - A command records a fingerprint of the heads (count and SHA-256) instead of a copy. Publication
+    never read the copy.
+  - Released custody drops its process table.
+  - Finding an operation by native call, the checkout's live operations, held custody, and custody
+    released since a time all go through indexes.
+  - A readiness check asks for a brief `daemon/status`, without the writers listing. An older daemon
+    ignores the parameter.
+  - Records from before 2.4.1 are compacted in the background after start. There is no schema
+    change: 2.4.0 can still open the ledger.
+  - Maintenance, each second, selects only held custody, runs still in flight and pending lead
+    hooks, and message retry only undelivered messages, instead of decoding every record.
+- **The office's run view no longer reads the whole ledger on each poll.** `run/events` found a
+  run's records by decoding every actor, operation, custody, claim and message record. It now reads
+  their ids through indexes.
+
+### Fixed: another user's process marked a checkout UNKNOWN, and nothing practical cleared it (reported from SmartPay)
+- **A process id that another user's process now holds no longer fails the coordinator.** The
+  coordinator checks again every process id it recorded for a writer: hook processes, services, a
+  command's survivors. When one of them exits and a root process takes its id, macOS refuses to
+  describe that process, and 2.4.0 let the refusal escape as a `PermissionError`. On the reporting
+  Mac, two background tasks failed at 14:33, then the settlement of a writer's `git status`. That
+  recorded a checkout-wide UNKNOWN, which stopped every seal, publish, resume and new writer run in
+  Smartpay_Backend.
+  - Now such a process id counts as gone on macOS, since none of a writer's processes runs as
+    another user: macOS still gives every process's user ids. On Linux with `/proc` mounted
+    `hidepid=1`, which shows only the effective user, an unreadable process keeps custody held.
+  - A process of yours that cannot be read keeps its custody held (`PROCESS_UNREADABLE`), as before.
+  - Measured over every live process on the Mac: 2.4.0's lookup raised for 225 of the 226 processes
+    of other users; now none raises, and the result for each of your 675 processes is unchanged.
+- **A failed process scan holds custody instead of marking the checkout.** A refused fork or a `ps`
+  that hangs while the coordinator lists processes now keeps the command's custody held until a
+  later scan succeeds (`PROCESS_SCAN`), as a failing `ps` already did.
+- **A checkout-wide UNKNOWN can be cleared without touching the checkout.**
+  `coordinator_unit(action="narrow", unknown=<its id>)` reads the whole checkout again. Each file
+  whose bytes differ from what the coordinator knows becomes its own UNKNOWN, and every checkout-wide
+  UNKNOWN recorded before the read is resolved.
+  - Nothing is written, and writers keep working. It is refused while a command holds custody in
+    the checkout; call it again once that command is reconciled.
+  - Seal and publish read their paths again before they freeze them, so a change made after the
+    read is still caught.
+  - In 2.4.0 the only way was a restore naming a known revision for every path of the checkout
+    (about 1,300 in Smartpay_Backend), with every writer idle, and then one exact edit covering
+    all of them.
+
+### Fixed: a start right after a stop failed
+- `daemon stop` returned when the daemon answered, before its processes had released their locks.
+  A call made at once found no daemon and started one. That daemon lost the lock and exited, so the
+  call failed `DAEMON_START` after 30 s. 2.4.0 does the same (2 of 2 runs). The client now waits
+  while a daemon holds its locks without answering: 4 of 4 runs started in 0.56 s.
+- A daemon that keeps its locks without answering for the whole wait, for example one paused while
+  exiting, is refused `DAEMON_UNRESPONSIVE`, naming the locks. The client no longer starts a daemon
+  that loses them. `abraham` falls back to `codex exec`, as for any coordinator that cannot start.
+
+### Measured (2.4.0 as calibration, then 2.4.1)
+All runs used the real Codex 0.163 engine with the loopback fixture model, on a 3,700-file checkout.
+The ledger timings used a SQLite backup copy of the reporting session's live ledger, opened
+read-only.
+- **Twelve parallel commands in one response**, with command admission slowed to 11 s each:
+  - 2.4.0: nine ran. Three hooks were refused at 115 s, reporting the coordinator "unavailable".
+    One allow then came after the client had given up and kept exclusive custody for a command that
+    never ran, so the daemon refused to stop.
+  - 2.4.1: seven ran. Four were refused `COORDINATOR_BUSY` at 108 s and one `CUSTODY_WAIT` at
+    112 s, all before Codex's 120 s. No custody held, no UNKNOWN, a clean stop.
+- **A patch whose context is not in the file:**
+  - Then the turn ends: 2.4.0 quarantines it, leaving an UNKNOWN on the unchanged file. 2.4.1
+    settles it as no effect, with no UNKNOWN.
+  - Then a corrected patch and a `cat` in the same turn:
+    - 2.4.0 refuses the patch ("An overlapping operation is unreconciled"). The `cat` waits out its
+      custody deadline and is refused. The turn leaves an UNKNOWN. The run took 161 s.
+    - 2.4.1 settles the failed patch at the corrected patch's hook. The corrected patch is verified
+      with an exact receipt and the `cat` prints the new value, with no UNKNOWN. The run took 38 s.
+- **A correct patch of a read-only file** (Codex reports "Failed to write file"):
+  - 2.4.0 quarantines it with an UNKNOWN on the file, plus a checkout-wide `*` UNKNOWN when the error
+    escaped notification processing.
+  - 2.4.1 settles it as no effect, with no UNKNOWN.
+- **The live ledger** (730 MB, 11 runs, 890 held claims):
+
+  | Call | 2.4.0 | 2.4.1 |
+  |---|---|---|
+  | Readiness `daemon/status` | 3.3 s | under 1 ms |
+  | Full `daemon/status` | 3.3 s | 0.24 s |
+  | Drain readiness | 4.2 s | 12 ms |
+  | A reconcile's scans | 2.9 s | under 1 ms |
+  | A patch admission's custody check | 1.4 s | under 1 ms (3 ms with released custody) |
+  | `run/events` record lookup (same 857 ids) | 5.1 s | 2 ms |
+
+  The compaction took 9.3 s. It covered 712 command records and 676 custody records, and custody went
+  from 49 MB to 1.3 MB.
+- **A call interrupted while its Pre hook runs** (a 20 s command, then a `cat` whose hook is still
+  deciding when the turn is interrupted):
+  - 2.4.0 allowed the `cat` after the interrupt. It held exclusive custody for a call that never
+    ran, and the daemon refused to stop.
+  - 2.4.1 withdraws it (`NATIVE_ABANDONED`), also when twelve hooks are still queued behind each
+    other (twelve parallel commands, direct or in one cell). Nothing is held, and the stop is clean.
+- **An interrupted patch of a 300 MB file:** 2.4.0 quarantined it at turn end and let a restore of
+  the file go ahead while the patch could still be writing. Once the run was cancelled, a legacy
+  `codex exec` writer could take the checkout too. 2.4.1 refuses the restore (`RESTORE_EXECUTING`)
+  and keeps the checkout's lease until the app-server stops, then restores the file.
+- **The daemon killed after a refusal, before settling it:**
+  - A refused command: 2.4.0 still held its custody 90 s after the restart, and refused to stop.
+    2.4.1's recovery settles it.
+  - A project patch refused in Backend and Frontend: 2.4.0 quarantined both parts, left an UNKNOWN
+    on each file and refused the corrected retry. 2.4.1 settles it at its pre-images, 0.7 s after
+    recovery begins, and verifies the retry.
+- **The SmartPay incident**, reproduced by giving each writer record a helper whose process id
+  launchd (root) holds. With 2.4.0's process lookup, the next command's settlement failed with
+  `PermissionError` twice and recorded two checkout-wide UNKNOWNs, and the command kept custody. With
+  2.4.1, the command was reconciled and released, with no UNKNOWN.
+- **Narrowing** on the 3,700-file checkout read every path in 0.9 s. It resolved the checkout-wide
+  UNKNOWN and found the one file changed outside the coordinator, which became its own UNKNOWN. The
+  seal it had blocked then succeeded.
+- **A patch whose Pre hook was still deciding when its run ended**, with a legacy `codex exec` writer
+  taking the checkout as soon as the run ended: 2.4.0 allowed the patch 6 s later and the file
+  changed while that writer held the checkout, and the coordinator verified it as if nothing was
+  wrong. 2.4.1 refuses it (`EXCLUSIVE_WRITER`) and the file is unchanged. A later run on the
+  checkout then takes the lease and releases it as usual.
+
+### Known limits
+- A writer's undeclared shell commands still run one at a time in a checkout. Each holds the
+  checkout exclusively, and its reconcile takes about 1 s on 3,700 files. Calls that cannot be
+  admitted before their hook's deadline are refused as busy, and Codex shows the writer the reason.
+- An aborted patch keeps its paths until its app-server exits, unless Codex reports its handler
+  ended. A run interrupt does not end that. Stopping the coordinator does, and the next daemon
+  resumes the run's writer. In an Abraham workflow, the quarantined patch also keeps the phase from
+  settling, so the stop is refused (`NOT_QUIESCENT`, `workflows`), as in 2.4.0: cancel the run
+  (`codex_cancel_run`), wait until it reports cancelled, then stop.
+- A cell's patch whose Post hook Codex cancels (an interrupt while it runs, or its cell closing)
+  sends no outcome. It keeps its paths the same way, until its app-server exits. A stop does not
+  wait for it, nor for a workflow whose settlement waits only on such patches.
+- A command whose writer's app-server dies keeps its custody, with a checkout-wide UNKNOWN, until the
+  lead reconciles that custody (`coordinator_unit` action `reconcile`), as in 2.4.0. The coordinator
+  ends the processes it recorded, but it cannot tell whether one escaped. Narrowing then clears the
+  UNKNOWN.
+- A command's child that starts its own session (`setsid`) and is an Apple platform binary is not
+  held once its command ends, as in 2.4.0: macOS hides such a process's environment, where the
+  coordinator's markers are.
+- An MCP call that Codex aborts after admitting it keeps its custody until the lead reconciles it,
+  as in 2.4.0. The end of its dispatch does not show that the server stopped working on it.
+- An aborted command is settled on Codex's macOS spawn path, read in the 0.163 source and run on
+  macOS. Other platforms were not run.
+- Narrowing a checkout-wide UNKNOWN cannot see a change that was made and undone before its read.
+- A process that a writer's command turns into another user's (through `sudo`, say) is not held, as
+  in 2.4.0.
+- An upgrade stops the 2.4.0 daemon, which stops every writer's app-server, and 2.4.1 starts each
+  again with its log. If a 2.4.0 daemon dies without stopping instead, 2.4.1 adopts its live
+  app-servers, which log to a pipe 2.4.1 cannot read. Their refused calls hold what they held in
+  2.4.0 until those app-servers are replaced.
+- The log grows by about 2 KB per call.
+- A hook that spans a system sleep is refused when the machine wakes, because its deadline counts
+  wall-clock time. Nothing runs, and Codex shows the writer the reason.
+- A command's admission is refused (`PROCESS_UNREADABLE`) when one of the user's processes ends while
+  the coordinator takes its baseline: `ps` listed it, then the kernel read failed while the process
+  still existed. 2.4.0 does the same. This was seen once in 300 commands and once in 13 runs, both
+  while other test runs were starting processes. Nothing is held, and the writer retries.
+
 ## [software-workflows 2.4.0] — 2026-10-19
 
 ### Added: a Codex project is the writer coordinator's unit

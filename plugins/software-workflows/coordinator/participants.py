@@ -108,7 +108,7 @@ def surface(daemon, unit, publication_only=False):
             (p for p in journals if p.get("checkout", unit["checkout"]) == member["checkout"]), None)
         data.append(dict(root=member["root"], checkout=member["checkout"], branch=member["branch"], base=member["base"],
                          **({} if publication_only else dict(
-                             claims=[c for c in store.all("claim", unit["id"]) if c["checkout"] == member["checkout"] and c["state"] == "held"],
+                             claims=daemon.custody.claims(member["checkout"], unit["id"]),
                              unknown_count=len(store.unresolved(member["checkout"])))), phase=journal["phase"] if journal else "",
                          **({"commit": journal["commit"]} if journal and journal.get("commit") else {})))
     state = group["publication_state"] if group else unit.get("publication_state", "")
@@ -117,8 +117,10 @@ def surface(daemon, unit, publication_only=False):
     if publication_only:
         return {"participants": data, "publication_state": state}
     # Pollers must observe changes in member progress even when run metadata is idle.
-    revision = sum(r.get("_revision", 0) for r in [unit, *membership, *groups, *journals,
-                   *store.all("claim", unit["id"]), *store.all("custody", unit["id"])])
+    revision = sum(r.get("_revision", 0) for r in [unit, *membership, *groups, *journals])
+    # Every command leaves a custody record: sum their revisions without decoding them.
+    revision += store.db.execute("SELECT coalesce(sum(revision),0) FROM records WHERE parent=? AND kind IN ('claim','custody')",
+                                 (unit["id"],)).fetchone()[0]
     for member in membership:
         revision += store.db.execute("SELECT count(*) + coalesce(sum(s.restore IS NOT NULL),0) + "
             "coalesce(sum(s.edit IS NOT NULL),0) FROM unknowns u LEFT JOIN resolutions s ON s.unknown_id=u.id "

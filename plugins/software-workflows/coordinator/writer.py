@@ -93,6 +93,7 @@ class Writer:
     def __init__(self, daemon):
         self.daemon, self.store = daemon, daemon.store
         self.locks = KeyedLocks()
+        self.advancing = 0  # advances under way: a drain waits for them
 
     def prepare(self, runid, phase):
         run = self.store.get(runid)
@@ -123,9 +124,9 @@ class Writer:
             await self.daemon.ensure_lease(key)
         listener = self.store.get(actor["listener"])
         connection = self.daemon.connections.get(listener["id"])
-        if (self.daemon.recovery_barrier or listener["state"] != "connected" or
+        if (self.daemon.recovery_barrier or self.daemon.draining or listener["state"] != "connected" or
                 listener.get("recovery_state") in ("reconciling", "failed") or not connection or connection.closed):
-            return  # Keep the prepared input durable until native bindings are verified again.
+            return  # Keep the prepared input durable until native bindings are verified again, or the next daemon.
         # Validate again after acquiring custody, before persisting a submitting
         # state. A lost RPC after that state remains uncertain, never replayed.
         image_paths([item["path"] for item in phase["input"] if item["type"] == "localImage"])
@@ -197,8 +198,17 @@ class Writer:
         return "[Codex model: " + run["workflow"]["model"] + " | reasoning: max | tool:abraham | status:" + status + " | tree:" + unit["base"][:12] + "]"
 
     async def advance(self, runid):
-        if self.daemon.recovery_barrier:
+        # A drain may stop a workflow settling on patches awaiting their outcome. It waits for the advances under way,
+        # and each stops at its next step: no phase completes and no turn starts while the daemon drains.
+        if self.daemon.recovery_barrier or self.daemon.draining:
             return
+        self.advancing += 1
+        try:
+            await self.advance_locked(runid)
+        finally:
+            self.advancing -= 1
+
+    async def advance_locked(self, runid):
         async with self.locks.hold(runid):
             run = self.store.get(runid)
             if not run.get("workflow") or run["state"] in TERMINAL or run.get("cancel_requested"):
@@ -217,6 +227,8 @@ class Writer:
                 self.store.save(run)
                 return
             await asyncio.gather(*(self.daemon.ledger.reconcile(self.store.get(key)) for key in participants.checkout_ids(self.store, run["unit"])))
+            if self.daemon.draining:
+                return
             run = self.store.get(runid)
             phase = run["phases"][run["phase"]]
             new_unknown = [u for u in [u for key in participants.checkout_ids(self.store, run["unit"]) for u in self.store.unresolved(key)] if u["id"] not in phase["unknown_baseline"]]
@@ -228,6 +240,8 @@ class Writer:
             run["unknown_blockers"] = [u["id"] for u in new_unknown]
             root = self.store.get(run["root_actor"])
             run["rollout_readback"] = await asyncio.to_thread(rollout_policy, run.get("rollout"), root.get("thread"))
+            if self.daemon.draining:
+                return  # the phase stays settling; the next daemon judges it again
             self.store.save(run)
             self.store.event("workflow/phase_completed", runid, {"phase": run["phase"], "success": success, "unknown": run["unknown_blockers"]})
             if success and run["phase"] == "analysis":

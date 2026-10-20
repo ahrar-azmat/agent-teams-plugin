@@ -53,7 +53,7 @@ class Publisher:
         if self.daemon.custody.unit_active(unit["id"]):
             raise CoordinatorError("CUSTODY_HELD", "Command custody has not been reconciled")
         for operation in self.store.all("operation", unit["id"]):
-            if allow_quarantined and operation["state"] == "quarantined":
+            if allow_quarantined and operation["state"] == "quarantined" and not operation.get("executing"):
                 continue  # Reopening permits restoration, never sealing or publication.
             if operation["state"] not in ("verified", "reconciled", "resolved", "denied"):
                 raise CoordinatorError("UNVERIFIED_OPERATION", "Unit has a pending or quarantined operation", {"operation": operation["id"]})

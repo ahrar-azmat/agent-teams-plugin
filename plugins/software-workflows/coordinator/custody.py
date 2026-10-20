@@ -293,9 +293,11 @@ def path_effect(checkout, paths, operation=None):
 
 def interfering(store, checkout, paths, operation=None, since=None):
     effect = path_effect(checkout, paths, operation)
-    return [r["id"] for r in store.all("custody")
-            if (r["state"] != "released" or since is not None and r.get("completed", float("inf")) >= since)
-            and effect_conflict(r, effect)]
+    # Only this checkout's custody can conflict: held, or released since `since`.
+    found = {r["id"]: r for r in store.held_custody(checkout["id"])}
+    if since is not None:
+        found.update((r["id"], r) for r in store.released_custody(checkout["id"], since))
+    return [ident for ident, r in sorted(found.items()) if effect_conflict(r, effect)]
 
 
 class Custody:
@@ -304,12 +306,13 @@ class Custody:
         self.ledger = ledger
         self.condition = asyncio.Condition()
 
-    def claims(self, checkout):
-        return list(self.store.selected("SELECT * FROM records WHERE kind='claim' AND "
-                    "json_extract(data,'$.state')='held' AND json_extract(data,'$.checkout')=? ORDER BY id", (checkout,)))
+    def claims(self, checkout, unit=None):
+        return list(self.store.selected("SELECT * FROM records WHERE kind='claim' AND json_extract(data,'$.state')='held' AND "
+                    "json_extract(data,'$.checkout')=?" + (" AND parent=?" if unit else "") + " ORDER BY id",
+                    (checkout, unit) if unit else (checkout,)))
 
     def active(self, checkout):
-        return [r for r in self.store.all("custody") if r["checkout"] == checkout and r["state"] != "released"]
+        return list(self.store.held_custody(checkout))
 
     def conflicts(self, checkout, unit, paths):
         conflicts = []
@@ -324,7 +327,7 @@ class Custody:
         return conflicts
 
     def unit_active(self, unitid):
-        return [r for r in self.store.all("custody", unitid) if r["state"] != "released"]
+        return list(self.store.held_custody(unit=unitid))
 
     async def acquire(self, actor, paths, cwd=None):
         from .routing import grouped
@@ -445,9 +448,8 @@ class Custody:
                                  "excludes": [claim["key"] for claim in self.claims(c["id"]) if claim["unit"] != actor["unit"]]}
                                 for c in checkouts]
                     conflicts = [r for item in proposed for r in self.active(item["checkout"]) if effect_conflict(item, r)]
-                    pending = [o for item in proposed for o in self.store.all("operation")
-                               if o["checkout"] == item["checkout"] and o["kind"] in ("patch", "lead-edit", "restore")
-                               and o["state"] in ("prepared", "allowed", "running")
+                    pending = [o for item in proposed for o in self.store.live_operations(item["checkout"])
+                               if o["kind"] in ("patch", "lead-edit", "restore") and (o["state"] in ("prepared", "allowed", "running") or o.get("executing"))
                                and effect_conflict(item, path_effect(self.store.get(item["checkout"]), o["paths"], o["id"]))]
                     if not conflicts and not pending:
                         if process_baseline is None:
@@ -493,8 +495,15 @@ class Custody:
 
     async def relinquish(self, reservation):
         async with self.condition:
-            reservation["state"] = "released"
-            reservation["completed"] = time.time()
-            self.store.save(reservation)
-            self.store.event("custody/released", reservation["id"], {})
+            self.release_held(reservation)
             self.condition.notify_all()
+
+    def release_held(self, reservation):
+        """Under self.condition, inside the caller's transaction when it has one."""
+        reservation["state"] = "released"
+        reservation["completed"] = time.time()
+        # Only a held window is checked against its baseline; kept, every command's process table
+        # (80 KB on a busy machine) is decoded again by each later custody scan.
+        reservation.pop("process_baseline", None)
+        self.store.save(reservation)
+        self.store.event("custody/released", reservation["id"], {})

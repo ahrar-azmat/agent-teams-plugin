@@ -16,7 +16,7 @@ import sys
 import time
 
 from .client import CoordinatorError, validate_state, venv_fds, launch_environment
-from .store import Store, uid, digest, encoded
+from .store import Store, uid, digest, encoded, WINDOW_ACTIVE
 from .ledger import Ledger, normalize, patch_scope, read_path
 from .custody import Custody
 from . import native, tools, processes, runtime, participants, routing
@@ -34,6 +34,29 @@ READ_RPC = {"daemon/status", "checkout/query", "checkout/revisions", "project/st
 COMPLETION_RPC = {"operation/complete", "custody/reconcile", "run/interrupt", "run/terminate-terminal", "review/complete"}
 
 
+NATIVE_LOG_POLL_S = 0.05  # a refused call's custody, waited on by the writer's next call, is released this much later
+
+
+def returned_failure(operation):
+    """Native wrote a failed result for the call and nothing it sent contradicts that: no Post hook (0.163 runs
+    none after a failed handler) and no successful item."""
+    return ((operation.get("returned") or {}).get("success") is False and not operation.get("post_received")
+            and (operation.get("completed_item") or {}).get("status") != "completed")
+
+
+def handler_ended(operation):
+    """Native has shown the call's handler finished: its result, its completed item, or its Post hook. Each comes
+    after the handler's last write. A dispatch that ended without a result (0.163 aborts it on cancellation) is not
+    this: one write it began can still finish."""
+    return bool(operation.get("returned") or operation.get("completed_item") or operation.get("post_received"))
+
+
+def call_source(operation):
+    """"direct" when native dispatched the call from the model's response, "code_mode" from a cell: from the end
+    of its dispatch, else from the line native wrote on receiving it. None when neither was read."""
+    return (operation.get("result_ready") or {}).get("source") or operation.get("native", {}).get("source")
+
+
 class Daemon:
     def __init__(self, root):
         self.store = Store(root)
@@ -41,8 +64,11 @@ class Daemon:
         self.custody = Custody(self.store, self.ledger)
         self.connections, self.queues, self.workers, self.tasks = {}, {}, {}, set()
         self.listener_requests = {}
+        # Listener id -> the task following that listener's own log, and how far it was read.
+        self.log_tails, self.log_offsets = {}, {}
         self.request_locks, self.actor_locks, self.unit_locks = KeyedLocks(), KeyedLocks(), KeyedLocks()
         self.lease_locks = KeyedLocks()
+        self.admitting = {}  # checkout -> effect-capable Pre hooks admitting, before their operation is recorded
         self.ready = False
         self.recovery_barrier = True
         self.boot = uid("boot")
@@ -82,6 +108,11 @@ class Daemon:
             return
         if any(a.get("active_turn") for a in self.store.all("actor") if participants.contains(self.store, a["unit"], checkoutid)) or self.custody.active(checkoutid):
             return
+        if self.admitting.get(checkoutid) or not stopping and any(o["state"] in ("prepared", "allowed", "running") or o.get("executing")
+                                                                  for o in self.store.live_operations(checkoutid)):
+            # Native may still write for it (a project's parts included): legacy writers stay excluded until it
+            # ends. A stop releases after every app-server has exited.
+            return
         for message in self.store.all("message"):
             if message["recipient"] == "lead" or message["recipient"].startswith("lead_mailbox_") or message["state"] in ("entered_context", "acknowledged"):
                 continue
@@ -92,6 +123,25 @@ class Daemon:
         await self.leases.call("release", checkout["root"])
         checkout.pop("compatibility_lease", None)
         self.store.save(checkout)
+
+    async def admission_lease(self, actor):
+        """Hold every checkout of the call's unit against lease release (under the lock release takes), and find
+        its compatibility lease held: refused (EXCLUSIVE_WRITER) while a writer outside the coordinator holds it."""
+        keys = []
+        try:
+            for key in participants.checkout_ids(self.store, actor["unit"]):
+                async with self.lease_locks.hold(key):
+                    self.admitting[key] = self.admitting.get(key, 0) + 1
+                    keys.append(key)
+                    checkout = self.store.get(key)
+                    if not checkout.get("compatibility_lease"):
+                        checkout["compatibility_lease"] = await self.leases.call("acquire", checkout["root"])
+                        self.store.save(checkout)
+        except BaseException:
+            for key in keys:
+                self.admitting[key] -= 1
+            raise
+        return keys
 
     def background(self, awaitable):
         task = asyncio.create_task(awaitable)
@@ -105,15 +155,17 @@ class Daemon:
             exception = task.exception()
             self.store.event("background/failure", None, {"code": getattr(exception, "code", type(exception).__name__)})
 
-    def status(self, checkout=None):
+    def status(self, checkout=None, brief=False):
+        """The daemon's identity and readiness; unless brief, every run's writers too. A client checking
+        readiness asks for brief: the full answer decodes each run's claims and custody."""
         writers = []
-        for run in self.store.all("run"):
+        for run in [] if brief else self.store.all("run"):
             if checkout and not participants.contains(self.store, run["unit"], checkout):
                 continue
             unit = self.store.get(run["unit"])
             writers.append({"run": run["id"], "unit": unit["id"], "task": run["task"], "state": run["state"],
                             "actors": [a for a in self.store.all("actor", unit["id"])],
-                            "claims": [c for c in self.custody.claims(run["checkout"]) if c["unit"] == unit["id"]],
+                            "claims": self.custody.claims(run["checkout"], unit["id"]),
                             "custody": self.custody.unit_active(unit["id"]),
                             **participants.surface(self, unit),
                             "pending_requests": [r for kind in ("claim_request", "release_request", "custody_request")
@@ -126,7 +178,7 @@ class Daemon:
                 "locks": {"rpc": len(self.request_locks), "actor": len(self.actor_locks),
                           "message": len(self.messages.locks), "unit": len(self.unit_locks),
                           "checkout": len(self.ledger.lifecycle)},
-                "sqlite": sqlite3.sqlite_version, "version": VERSION, "writers": writers}
+                "sqlite": sqlite3.sqlite_version, "version": VERSION, **({} if brief else {"writers": writers})}
 
     async def create_run(self, params, revision=None):
         if set(params) - {"checkout", "project", "cwd", "dispatch_cwd", "mode", "task", "paths", "model", "fixture", "workflow"} or params.get("mode", "native") not in ("lead", "native"):
@@ -258,7 +310,8 @@ class Daemon:
 
     def hook_config(self):
         command = shlex.join([sys.executable, "-B", str(Path(__file__).with_name("hooks.py")), "--state", str(self.store.root)])
-        hook = {"matcher": ".*", "hooks": [{"type": "command", "command": command, "timeout": 120, "async": False}]}
+        from .hooks import NATIVE_HOOK_SECONDS
+        hook = {"matcher": ".*", "hooks": [{"type": "command", "command": command, "timeout": NATIVE_HOOK_SECONDS, "async": False}]}
         return command, {"features.hooks": True, "hooks.PreToolUse": [hook], "hooks.PostToolUse": [hook]}
 
     async def spawn_listener(self, actor, config, home=None, incarnation=None):
@@ -270,14 +323,22 @@ class Daemon:
         binary = native.native_codex()
         environment = native.environment(SOFTWARE_WORKFLOWS_ROLE="writer")
         environment["LOG_FORMAT"] = "json"
-        environment["RUST_LOG"] = "codex_core::exec_policy=trace"
+        environment["RUST_LOG"] = native.WRITER_LOG
         if home:
             environment["CODEX_HOME"] = str(home)
-        process = await asyncio.create_subprocess_exec(binary, "app-server", "--listen", "unix://" + str(socket),
-                                                       *native.override_args(config), cwd=actor.get("cwd", self.store.get(actor["checkout"])["root"]),
-                                                       env=environment, stdin=asyncio.subprocess.DEVNULL,
-                                                       stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-                                                       start_new_session=True, close_fds=True)
+        # Native's log goes to a file the listener itself holds open, not to a pipe from this daemon: what it
+        # writes while the daemon restarts is read afterwards, from the listener's durable offset.
+        log = directory / "native.log"
+        descriptor = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        try:
+            offset = os.fstat(descriptor).st_size
+            process = await asyncio.create_subprocess_exec(binary, "app-server", "--listen", "unix://" + str(socket),
+                                                           *native.override_args(config), cwd=actor.get("cwd", self.store.get(actor["checkout"])["root"]),
+                                                           env=environment, stdin=asyncio.subprocess.DEVNULL,
+                                                           stdout=asyncio.subprocess.DEVNULL, stderr=descriptor,
+                                                           start_new_session=True, close_fds=True)
+        finally:
+            os.close(descriptor)
         birth = await asyncio.to_thread(processes.identity, process.pid)
         if birth is None:
             code = await process.wait()
@@ -290,15 +351,17 @@ class Daemon:
                                   "kernel_id": birth.get("kernel_id"),
                                   "home": str(home) if home else None, "config": config,
                                   "hook_digest": native.file_digest(Path(__file__).with_name("hooks.py")),
-                                  "generation": self.store.generation}, actor["run"])
-        self.background(self.collect_policy_trace(ident, process.stderr))
+                                  "log": str(log), "generation": self.store.generation}, actor["run"])
+        # Only read_native_log writes this record: a listener record saved from a stale copy cannot undo it.
+        self.store.put("native_log", ident + ":log", {"offset": offset}, ident)
         deadline = asyncio.get_running_loop().time() + 30
         while not socket.exists():
             if process.returncode is not None or asyncio.get_running_loop().time() >= deadline:
+                self.read_native_log(ident)
                 raise CoordinatorError("LISTENER_START", "Native listener failed to start",
                                        {"exit_code": process.returncode, "path": str(socket),
                                         "bytes": len(os.fsencode(socket)), "measured_limit": runtime.capacity(),
-                                        "diagnostic": self.store.get(ident).get("startup_diagnostic")}, True)
+                                        "diagnostic": self.native_log(self.store.get(ident)).get("startup_diagnostic")}, True)
             await asyncio.sleep(0.02)
         try:
             await self.attach(self.store.get(ident))
@@ -307,25 +370,225 @@ class Daemon:
             raise
         return self.store.get(ident)
 
-    async def collect_policy_trace(self, listenerid, stream):
-        async for line in stream:
-            listener = self.store.get(listenerid)
-            if listener["state"] == "starting":
-                listener["startup_diagnostic"] = (listener.get("startup_diagnostic", []) + [native.startup_diagnostic(line)])[-8:]
-                self.store.save(listener)
+    def read_native_log(self, listenerid):
+        """Apply the listener's log past its offset: startup diagnostics, policy traces, and for each admitted call
+        the result native writes once its handler returned (`codex.tool_result`, success or failure) and the mark
+        it writes once its dispatch ended (`codex.tool_result_ready`, aborted dispatches included), on the call's
+        record whatever its state. Synchronous, and what it applies commits with the offset that passes those
+        lines, so a line is applied once. Lines with nothing to apply advance only the offset in memory: after a
+        restart they are read again, to no effect. Returns the operations given a receipt."""
+        listener = self.store.get(listenerid)
+        if not listener.get("log"):
+            return []  # started before 2.4.1, logging to a pipe
+        offset = max(self.store.get(listenerid + ":log")["offset"], self.log_offsets.get(listenerid, 0))
+        try:
+            with open(listener["log"], "rb") as stream:
+                if os.fstat(stream.fileno()).st_size <= offset:
+                    return []
+                stream.seek(offset)
+                data = stream.read()
+        except FileNotFoundError:
+            return []
+        end = data.rfind(b"\n") + 1  # a line still being written waits for its newline
+        if not end:
+            return []
+        lines, policies, receipts = data[:end].splitlines(), [], []
+        for line in lines:
             try:
-                fields = json.loads(line).get("fields", {})
-                if fields.get("message") == "exec policy rules loaded":
-                    listener = self.store.get(listenerid)
-                    listener.setdefault("policy_traces", []).append(native.policy_trace_digest(fields.get("rules")))
-                    listener.setdefault("policy_trace_observations", []).append(digest(fields.get("rules")))
-                    self.store.save(listener)
+                entry = json.loads(line)
             except (ValueError, UnicodeError):
                 continue
+            fields = entry.get("fields") if isinstance(entry, dict) else None
+            if not isinstance(fields, dict):
+                continue
+            if fields.get("message") == "exec policy rules loaded":
+                policies.append(fields.get("rules"))
+            elif (entry.get("target") == "codex_otel.trace_safe" and (fields.get("event.name") in ("codex.tool_result_ready", "codex.tool_call_received") or
+                    fields.get("event.name") == "codex.tool_result" and fields.get("success") in ("true", "false"))):
+                receipts.append(fields)
+        given = []
+        if listener["state"] == "starting" or policies or receipts:
+            with self.store.transaction():
+                record = self.store.get(listenerid + ":log")
+                if listener["state"] == "starting":
+                    record["startup_diagnostic"] = (record.get("startup_diagnostic", []) + [native.startup_diagnostic(line) for line in lines])[-8:]
+                for rules in policies:
+                    record.setdefault("policy_traces", []).append(native.policy_trace_digest(rules))
+                    record.setdefault("policy_trace_observations", []).append(digest(rules))
+                marks, received = record.get("abandoned", {}), record.get("received", {})
+                for fields in receipts:
+                    thread, call = fields.get("conversation.id"), fields.get("call_id")
+                    if fields["event.name"] == "codex.tool_call_received":
+                        if isinstance(thread, str) and isinstance(call, str):
+                            # Native writes it before the call's Pre hook starts, which reads it (received_source).
+                            received[thread + "\n" + call] = [fields.get("tool_source"), time.time()]
+                        continue
+                    key = "returned" if fields["event.name"] == "codex.tool_result" else "result_ready"
+                    operation = self.receipt_operation(listener, thread, call, key)
+                    if not operation:
+                        if key == "result_ready" and isinstance(thread, str) and isinstance(call, str):
+                            # The dispatch ended before any record of the call existed: native gave up on it while
+                            # its Pre hook still queued, and that hook must not allow it (abandoned_early).
+                            marks[thread + "\n" + call] = time.time()
+                        continue
+                    if key == "returned":
+                        # Native writes the result after the handler's last write: no write can follow it.
+                        operation["returned"] = {"success": fields["success"] == "true", "tool": fields.get("tool_name"), "seq": fields.get("tool_result_seq")}
+                        self.store.save(operation)
+                        self.ledger.end_execution(operation, transaction=False)
+                        if operation["returned"]["success"]:
+                            continue
+                        self.store.event("native/returned", operation["id"], operation["returned"])
+                    else:
+                        # The dispatch is over, its Post hook included: settlement can stop waiting for the call.
+                        # `source` is "direct" for a call of the model's response, "code_mode" for one a cell made.
+                        operation["result_ready"] = {"tool": fields.get("tool_name"), "source": fields.get("tool_source"),
+                                                     "turn": fields.get("turn_id")}
+                        self.store.save(operation)
+                        if not operation.get("returned"):
+                            self.store.event("native/ended_without_result", operation["id"], operation["result_ready"])
+                    given.append(operation["id"])
+                from .hooks import NATIVE_HOOK_SECONDS
+                # An abandoned mark serves only a Pre hook native began before it wrote the mark, and Codex ends
+                # every hook within its timeout of the hook's start. A received line serves the Pre hook native
+                # starts after it; one read later finds none, and its call's source stays unknown.
+                horizon = time.time() - NATIVE_HOOK_SECONDS
+                marks = {mark: seen for mark, seen in marks.items() if seen >= horizon}
+                received = {mark: seen for mark, seen in received.items() if seen[1] >= horizon}
+                for name, kept in (("abandoned", marks), ("received", received)):
+                    if kept:
+                        record[name] = kept
+                    else:
+                        record.pop(name, None)
+                record["offset"] = offset + end
+                self.store.save(record)
+        self.log_offsets[listenerid] = offset + end
+        return given
+
+    def native_log(self, listener):
+        """What a listener's log has shown: its offset, policy traces and startup diagnostics. A listener
+        started before 2.4.1 keeps the traces its pipe delivered on its own record."""
+        return self.store.get(listener["id"] + ":log", required=False) or listener
+
+    def receipt_operation(self, listener, thread, call, key):
+        """The admitted call a receipt names, in any state, not yet given that receipt. Only this listener
+        incarnation's: a replacement's receipts never apply to a call its predecessor admitted."""
+        if not isinstance(thread, str) or not isinstance(call, str):
+            return None
+        found = [op for op in self.store.call_operations(listener["unit"], call)
+                 if op["native"].get("listener") == listener["id"] and op["native"].get("thread") == thread]
+        if len(found) != 1 or found[0].get(key):
+            return None
+        return found[0]
+
+    def abandoned_early(self, listener, thread, call):
+        """Whether native ended this call's dispatch before any record of it existed (read_native_log keeps that
+        mark, durably): it gave up on a call whose Pre hook had not prepared it yet, a hook queued behind others."""
+        record = self.store.get(listener["id"] + ":log", required=False) or {}
+        return isinstance(thread, str) and isinstance(call, str) and thread + "\n" + call in record.get("abandoned", {})
+
+    def received_source(self, listener, thread, call):
+        """How native received this call, from the line it writes before the call's Pre hook starts
+        (`codex.tool_call_received`): "direct" from the model's response, "code_mode" from a cell. None when no
+        such line was read (a listener without a log)."""
+        record = self.store.get(listener["id"] + ":log", required=False) or {}
+        if not isinstance(thread, str) or not isinstance(call, str):
+            return None
+        return (record.get("received", {}).get(thread + "\n" + call) or [None])[0]
+
+    async def settle_native_log(self, listenerid):
+        """Read the listener's log to its end, then settle each unsettled call it gave a receipt: also one whose
+        settlement a restart interrupted after its receipt was recorded."""
+        self.read_native_log(listenerid)
+        for operation in list(self.store.selected("SELECT * FROM records INDEXED BY window_operation WHERE " + WINDOW_ACTIVE["operation"] +
+                                                  " AND (json_extract(data,'$.returned') IS NOT NULL OR json_extract(data,'$.result_ready') IS NOT NULL)"
+                                                  " AND json_extract(data,'$.native.listener')=? ORDER BY id", (listenerid,))):
+            await self.settle_returned(operation)
+
+    async def settle_returned(self, operation):
+        """Native wrote a failed result for this call (Codex 0.163 `codex.tool_result`, success=false), direct or
+        nested in a code-mode cell: its handler returned, refusing it (`tty` on a TTY-disabled runtime, an unusable
+        `workdir`, a patch whose context is not in the file) or failing. That proves the call ended, not that it
+        changed nothing. A patch is settled as no effect only with every endpoint at its pre-image; other bytes
+        quarantine it. A command's checkouts are reconciled, as after any command, once no process or terminal of it
+        remains; its custody is released then.
+
+        A dispatch that ended without a result (`codex.tool_result_ready` alone) never finished its handler. One
+        still waiting for its Pre hook never runs: native gave up on it (an interrupted turn, a cell that closed) and
+        it is withdrawn. An admitted patch was aborted: 0.163 drops the handler, and a write it had begun still
+        finishes on its own thread. It is quarantined, holding its paths while its app-server runs (`executing`).
+        An admitted command was aborted too, whether before or while its handler ran: once no process or terminal of
+        it remains, its checkouts are reconciled and its custody released (_settle_actor).
+
+        A patch whose dispatch ended after its handler did, with no Post hook of ours received, never completes its
+        lifecycle and is quarantined. With its Post hook received, native sent the item and the hook's outcome before
+        it wrote the mark, over the app-server connection, which the log is not ordered against: they settle it
+        when they arrive (maybe_verify). Its handler wrote all it will, so it only waits: for those, for its turn's
+        end when the call was direct (the turn ends after its direct calls' dispatches, and native sends in order),
+        or for its app-server's exit, whichever comes first (a Post hook native cancelled sends no outcome)."""
+        operation = self.store.get(operation["id"])
+        aborted = operation.get("result_ready") and not operation.get("returned")
+        if operation["state"] == "prepared" and aborted:
+            await self.withdraw(operation["id"], operation.get("custody"), "NATIVE_ABANDONED")
+        elif operation["state"] not in ("allowed", "running"):
+            return
+        elif returned_failure(operation):
+            if operation["kind"] == "patch":
+                await self.ledger.settle_unapplied(operation, "NATIVE_CALL_FAILED", returned_failure)
+            else:
+                await self.settle_actor(self.store.get(operation["actor"]))
+        elif operation["kind"] == "patch" and not handler_ended(operation):
+            await self.ledger.quarantine(operation, "native ended the call without a result", executing=True)
+        elif operation["kind"] == "patch" and operation.get("result_ready") and not operation.get("post_received"):
+            # Native ran no Post hook of ours for it: its lifecycle can never complete.
+            await self.ledger.quarantine(operation, "native ended the call without its Post hook")
+        elif operation["kind"] == "command" and aborted:
+            await self.settle_actor(self.store.get(operation["actor"]))
+
+    async def executor_exited(self, listener, unfinished=None):
+        """Its app-server has exited: nothing it admitted can still write. Quarantines stop holding the paths they
+        kept for a write that might still finish. With `unfinished`, a patch it never reported ending is
+        quarantined for that reason, as a crash gap is."""
+        query = "SELECT * FROM records INDEXED BY window_{} WHERE {} AND json_extract(data,'$.native.listener')=? ORDER BY id"
+        if unfinished:
+            for operation in list(self.store.selected(query.format("operation", WINDOW_ACTIVE["operation"]), (listener["id"],))):
+                if operation["kind"] == "patch" and operation["state"] in ("allowed", "running"):
+                    await self.ledger.quarantine(operation, unfinished)
+        for operation in list(self.store.selected(query.format("executing", WINDOW_ACTIVE["executing"]), (listener["id"],))):
+            self.ledger.end_execution(operation)
+
+    async def tail_native_log(self, listenerid):
+        """Follow a live listener's log. A failure to read it is recorded, never fatal: a result read late only
+        delays a release."""
+        failure = None
+        while True:
+            listener = self.store.get(listenerid, required=False)
+            if not listener or not listener.get("log") or listener["state"] in ("stopped", "dead"):
+                if self.log_tails.get(listenerid) is asyncio.current_task():
+                    del self.log_tails[listenerid]
+                return
+            if listener.get("recovery_state") == "reconciling":
+                # Recovery reads the log itself, once the journaled items it replays are applied.
+                await asyncio.sleep(NATIVE_LOG_POLL_S)
+                continue
+            try:
+                for ident in self.read_native_log(listenerid):
+                    self.background(self.settle_returned(self.store.get(ident)))
+                failure = None
+            except Exception as exc:
+                code = getattr(exc, "code", type(exc).__name__)
+                if code != failure:
+                    self.store.event("native/log_failure", listenerid, {"code": code})
+                failure = code
+                await asyncio.sleep(1)
+            await asyncio.sleep(NATIVE_LOG_POLL_S)
 
     async def attach(self, listener):
         ident = listener["id"]
         await self.detach_listener(ident)
+        tail = self.log_tails.get(ident)
+        if not tail or tail.done():
+            self.log_tails[ident] = self.background(self.tail_native_log(ident))
         queue = asyncio.Queue()
         self.queues[ident] = queue
         self.listener_requests[ident] = set()
@@ -485,9 +748,15 @@ class Daemon:
         if listener.get("endpoint_allocation"):
             if Path(listener["endpoint_allocation"]["directory"]).exists():
                 runtime.cleanup(listener["endpoint_allocation"])
+        await self.settle_native_log(listener["id"])  # what it wrote before it exited
+        await self.executor_exited(listener, "app-server stopped before the patch ended")
         listener = self.store.get(listener["id"])
         listener.update(state="stopped", allocation_cleaned=True)
         self.store.save(listener)
+        if listener.get("log"):
+            # Applied to its operations; the log also holds policy text, which C1 does not keep.
+            Path(listener["log"]).unlink(missing_ok=True)
+            self.log_offsets.pop(listener["id"], None)
 
     async def resolve_actor(self, listener, thread, session=None):
         async with self.actor_locks.hold((listener["id"], thread)):
@@ -543,7 +812,7 @@ class Daemon:
         while history and prior.get("replaces"):
             prior = self.store.get(prior["replaces"])
             incarnations.add(prior["id"])
-        return next((op for op in self.store.all("operation", listener["unit"])
+        return next((op for op in self.store.call_operations(listener["unit"], call)
                      if op["native"].get("listener") in incarnations and
                      all(op["native"].get(key) == value for key, value in (("thread", thread), ("turn", turn), ("call", call)))), None)
 
@@ -567,7 +836,7 @@ class Daemon:
         self.store.save(listener)
         self.store.event("listener/service_boundary", listener["id"], listener["service_boundary"])
 
-    async def hook(self, payload, hook_process=None):
+    async def hook(self, payload, hook_process=None, deadline=None):
         session, thread = payload.get("session_id"), payload.get("agent_id") or payload.get("session_id")
         listener = next((l for l in self.store.all("listener") if l.get("root_thread") == session and l["state"] == "connected"), None)
         if not listener:
@@ -598,6 +867,7 @@ class Daemon:
                 operation["post_payload"] = payload.get("tool_input")
                 operation["post_received"] = True
                 self.store.save(operation)
+                self.ledger.end_execution(operation)  # native runs the Post hook after the handler returned
             return {}
         if event != "PreToolUse":
             return {}
@@ -608,62 +878,116 @@ class Daemon:
             return {}
         identity = {"listener": listener["id"], "thread": thread, "turn": turn, "call": call}
         command = payload.get("tool_input", {}).get("command", "")
-        if tool == "apply_patch":
-            run = self.store.get(actor["run"])
-            if run.get("workflow") and run.get("phase") == "analysis":
-                self.store.event("workflow/analysis_patch_denied", run["id"], {"actor": actor["id"], "native": identity})
-                raise CoordinatorError("ANALYSIS_READ_ONLY", "Analysis cannot apply patches. Finish the implementation brief; the coordinator starts the writing turn after settlement.")
-            cwd = payload.get("cwd") or actor.get("cwd") or self.store.get(actor["checkout"])["root"]
-            if self.store.get(actor["unit"]).get("project_revision"):
-                from .operations import prepare_patch
-                # Completion notifications can still be settling a previous
-                # command when the next native hook arrives. Prove the whole
-                # command group settled before attempting any path claims.
-                await self.settle_actor(actor)
-                operation = await prepare_patch(self, actor, command, identity, cwd)
+        from .hooks import ANSWER_MARGIN_S
+        # Decide while the hook client still listens. An older client sends no deadline and
+        # counts 115 s from its call.
+        cutoff = (deadline if isinstance(deadline, (int, float)) else time.time() + 115) - ANSWER_MARGIN_S
+        # Native writes a call's result before it hands the failure to the model or the cell: a retry of a
+        # refused call finds that call settled, not still holding its paths.
+        await self.settle_native_log(listener["id"])
+        if self.abandoned_early(listener, thread, call):
+            raise CoordinatorError("NATIVE_ABANDONED", "Native stopped waiting for this call; it does not run")
+        identity["source"] = self.received_source(listener, thread, call)
+        # Until its operation is recorded, an effect-capable call keeps its checkouts' compatibility lease, taken
+        # again if a run's end released it meanwhile (a cell's call can still wait here after its turn).
+        effect = tool == "apply_patch" or tool in ("Bash", "exec_command") or str(tool).startswith("mcp")
+        guarded = await self.admission_lease(actor) if effect else []
+        try:
+            if tool == "apply_patch":
+                run = self.store.get(actor["run"])
+                if run.get("workflow") and run.get("phase") == "analysis":
+                    self.store.event("workflow/analysis_patch_denied", run["id"], {"actor": actor["id"], "native": identity})
+                    raise CoordinatorError("ANALYSIS_READ_ONLY", "Analysis cannot apply patches. Finish the implementation brief; the coordinator starts the writing turn after settlement.")
+                cwd = payload.get("cwd") or actor.get("cwd") or self.store.get(actor["checkout"])["root"]
+                if self.store.get(actor["unit"]).get("project_revision"):
+                    from .operations import prepare_patch
+                    # Completion notifications can still be settling a previous
+                    # command when the next native hook arrives. Prove the whole
+                    # command group settled before attempting any path claims.
+                    await self.settle_actor(actor)
+                    operation = await prepare_patch(self, actor, command, identity, cwd, cutoff)
+                else:
+                    scope = patch_scope(command)
+                    for entry in scope:
+                        entry["path"] = routing.route(self.store, actor, entry["path"], cwd)["path"]
+                        if "move" in entry:
+                            entry["move"] = routing.route(self.store, actor, entry["move"], cwd)["path"]
+                    paths = [p for entry in scope for p in (entry["path"], entry.get("move")) if p]
+                    await self.custody.acquire(actor, [routing.qualified(actor["checkout"], p) for p in paths])
+                    operation = await self.ledger.prepare(actor, "patch", {"patch": command, "scope": scope}, paths, identity, cutoff)
+            elif tool in ("Bash", "exec_command") or str(tool).startswith("mcp"):
+                # A hook's command omits workdir and tty. Never infer them. Full-checkout
+                # reconciliation and process identity supply the conservative context.
+                async with self.actor_locks.hold("services:" + listener["id"], cutoff):
+                    await self.services_before_first_command(listener)
+                    operation = await self.ledger.prepare(actor, "command" if tool in ("Bash", "exec_command") else "mcp",
+                                                          {"tool_input": payload.get("tool_input"), "tool": tool}, [], identity, cutoff)
+                try:
+                    reservation = await self.custody.reserve(actor, command or "opaque MCP " + str(tool), operation["id"],
+                                                             timeout=max(0.0, cutoff - time.time()))
+                except CoordinatorError as exc:
+                    operation = self.store.get(operation["id"])
+                    if operation["state"] == "prepared":  # not withdrawn meanwhile
+                        operation.update(state="quarantined" if operation.get("started_item") else "denied", decision="deny", refusal=exc.code)
+                        self.store.save(operation)
+                    raise
+                reservation["operation"] = operation["id"]
+                self.store.save(reservation)
+                operation["custody"] = reservation["id"]
             else:
-                scope = patch_scope(command)
-                for entry in scope:
-                    entry["path"] = routing.route(self.store, actor, entry["path"], cwd)["path"]
-                    if "move" in entry:
-                        entry["move"] = routing.route(self.store, actor, entry["move"], cwd)["path"]
-                paths = [p for entry in scope for p in (entry["path"], entry.get("move")) if p]
-                await self.custody.acquire(actor, [routing.qualified(actor["checkout"], p) for p in paths])
-                operation = await self.ledger.prepare(actor, "patch", {"patch": command, "scope": scope}, paths, identity)
-        elif tool in ("Bash", "exec_command") or str(tool).startswith("mcp"):
-            # A hook's command omits workdir and tty. Never infer them. Full-checkout
-            # reconciliation and process identity supply the conservative context.
-            async with self.actor_locks.hold("services:" + listener["id"]):
-                await self.services_before_first_command(listener)
-                operation = await self.ledger.prepare(actor, "command" if tool in ("Bash", "exec_command") else "mcp",
-                                                      {"tool_input": payload.get("tool_input"), "tool": tool}, [], identity)
-            try:
-                reservation = await self.custody.reserve(actor, command or "opaque MCP " + str(tool), operation["id"])
-            except CoordinatorError as exc:
-                operation = self.store.get(operation["id"])
-                operation.update(state="quarantined" if operation.get("started_item") else "denied", decision="deny", refusal=exc.code)
-                self.store.save(operation)
-                raise
-            reservation["operation"] = operation["id"]
-            self.store.save(reservation)
-            operation["custody"] = reservation["id"]
-        else:
-            # Collaboration and coordinator dynamic tools have their own contracts.
-            cooperation = {"collaboration" + name for name in
-                           ("spawn_agent", "send_message", "followup_task", "wait_agent", "list_agents", "interrupt_agent")}
-            readers = {"web_search", "websearch", "web.run", "view_image", "update_plan", "request_user_input", "sleep"}
-            if tool not in set(tools.CONTRACTS) | cooperation | readers:
-                raise CoordinatorError("HOOK_TOOL_UNSUPPORTED", "No complete custody/effect contract for this native tool", {"tool": tool})
-            self.store.event("hook/nonmutator", actor["id"], {"tool": tool, "native": identity})
+                # Collaboration and coordinator dynamic tools have their own contracts.
+                cooperation = {"collaboration" + name for name in
+                               ("spawn_agent", "send_message", "followup_task", "wait_agent", "list_agents", "interrupt_agent")}
+                readers = {"web_search", "websearch", "web.run", "view_image", "update_plan", "request_user_input", "sleep"}
+                if tool not in set(tools.CONTRACTS) | cooperation | readers:
+                    raise CoordinatorError("HOOK_TOOL_UNSUPPORTED", "No complete custody/effect contract for this native tool", {"tool": tool})
+                self.store.event("hook/nonmutator", actor["id"], {"tool": tool, "native": identity})
+                return {}
+            # Native can stop waiting for this hook (an interrupted turn, a cell that closed): it then marks the call's
+            # dispatch ended and never runs it, and the call is withdrawn, also when that mark came before the call
+            # had a record.
+            await self.settle_native_log(listener["id"])
+            if self.store.get(operation["id"])["state"] != "prepared" or self.abandoned_early(listener, thread, call):
+                await self.withdraw(operation["id"], operation.get("custody"), "NATIVE_ABANDONED")  # custody granted since
+                raise CoordinatorError("NATIVE_ABANDONED", "Native stopped waiting for this call; it does not run")
+            if time.time() >= cutoff:
+                # The hook client has stopped waiting and denies at its deadline: an allow now would
+                # hold custody for a call native never runs.
+                from .locks import busy
+                await self.withdraw(operation["id"], operation.get("custody"), "COORDINATOR_BUSY")
+                raise busy()
+            operation["state"] = "allowed"
+            operation["decision"] = "allow"
+            self.store.save(operation)
+            self.store.event("hook/decision", operation["id"], {"decision": "allow", "native": identity})
+            # Native 0.163 treats permissionDecision=allow without updatedInput as a
+            # hook failure. Empty successful output means continue, after our durable
+            # allow decision; the matching completed lifecycle proves delivery.
             return {}
-        operation["state"] = "allowed"
-        operation["decision"] = "allow"
-        self.store.save(operation)
-        self.store.event("hook/decision", operation["id"], {"decision": "allow", "native": identity})
-        # Native 0.163 treats permissionDecision=allow without updatedInput as a
-        # hook failure. Empty successful output means continue, after our durable
-        # allow decision; the matching completed lifecycle proves delivery.
-        return {}
+        finally:
+            for key in guarded:
+                self.admitting[key] -= 1
+
+    async def withdraw(self, operationid, custodyid, refusal):
+        """An admitted call that native never runs: refuse it, with the parts it prepared in other
+        checkouts, and give back the custody it holds."""
+        # One transaction: a denial committed apart from its custody release would leave a denied
+        # call holding custody, which no later pass releases.
+        async with self.custody.condition:
+            operation = self.store.get(operationid)
+            root = self.store.get(custodyid) if custodyid else None
+            with self.store.transaction():
+                if operation["state"] in ("prepared", "allowed"):
+                    for record in [operation] + [self.store.get(key) for key in operation.get("parts", [])]:
+                        if record["state"] in ("prepared", "allowed"):
+                            record.update(state="denied", decision="deny", no_effect=True, refusal=record.get("refusal") or refusal)
+                            self.store.save(record)
+                    self.store.event("operation/withdrawn", operationid, {"refusal": refusal})
+                for key in (root.get("members", [root["id"]]) if root else []):
+                    member = self.store.get(key)
+                    if member["state"] != "released":
+                        self.custody.release_held(member)
+            self.custody.condition.notify_all()
 
     async def native_worker(self, initial, queue):
         while True:
@@ -746,12 +1070,33 @@ class Daemon:
             if actor["kind"] == "root" and not run.get("workflow"):
                 run["state"] = params["turn"]["status"]
                 self.store.save(run)
-            for operation in list(self.store.all("operation", actor["unit"])):
-                if (operation["actor"] == actor["id"] and operation["kind"] == "patch" and
-                        operation["native"].get("turn") == turn and operation["state"] in ("prepared", "allowed", "running")):
-                    await self.maybe_verify(operation)
-                    if self.store.get(operation["id"])["state"] in ("prepared", "allowed", "running"):
-                        await self.ledger.quarantine(self.store.get(operation["id"]), "turn ended without complete patch lifecycle evidence")
+            # Native writes a direct call's receipts, and those of each nested call its cell awaited, before the turn
+            # can end, on the thread that ran the call: they are applied before turn end is judged.
+            await self.settle_native_log(listener["id"])
+            ended_early = params["turn"]["status"] != "completed" or not listener.get("log")
+            for operation in list(self.store.live_operations(actor["checkout"])):
+                if (operation["actor"] != actor["id"] or operation["kind"] != "patch" or operation["native"].get("turn") != turn
+                        or operation["state"] not in ("allowed", "running")):
+                    # Native can start the thread's next turn before this end is read, and that turn's calls reach
+                    # their hooks first: only this turn's are judged. One still prepared is its Pre hook's to decide.
+                    continue
+                await self.maybe_verify(operation)
+                operation = self.store.get(operation["id"])
+                if operation["state"] not in ("allowed", "running"):
+                    continue
+                if not handler_ended(operation):
+                    if ended_early:
+                        # An interrupted or failed turn, or an app-server that writes no receipts: no receipt will
+                        # tell when a write it began finishes, so its paths stay held while its app-server runs.
+                        await self.ledger.quarantine(operation, "turn ended without complete patch lifecycle evidence", executing=True)
+                    # Otherwise its dispatch is still running (a cell can outlive its turn): its own receipts settle it.
+                elif not listener.get("log") or call_source(operation) == "direct":
+                    # A direct call's dispatch, its Post hook included, ended before its turn could, and native sends
+                    # a thread's notifications in order: what it sent for the call came before this turn's end.
+                    await self.ledger.quarantine(operation, "turn ended without complete patch lifecycle evidence")
+                # Otherwise a cell's call, whose Post hook can end after its turn, also an interrupted one (the turn's
+                # status does not say whether its cells were terminated): its outcome, or its app-server's exit,
+                # settles it. Its handler is done, so nothing more is written for it.
             await self.settle_actor(actor)
             await asyncio.gather(*(self.ledger.reconcile(self.store.get(key)) for key in participants.checkout_ids(self.store, actor["unit"])))
             if run.get("workflow"):
@@ -760,6 +1105,13 @@ class Daemon:
             operation = self.record_hook_evidence(listener, params)
             if operation:
                 await self.maybe_verify(operation)
+            run = params["run"]
+            if run.get("eventName") == "preToolUse" and run.get("status") == "blocked":
+                # Native refused the call at a Pre hook, ours or another: it never runs (measured on
+                # 0.163: no item follows a blocked Pre), so nothing admitted for it may stay held.
+                blocked = self.find_operation(listener, thread, turn, run["id"].rsplit(":", 1)[-1])
+                if blocked and blocked["state"] in ("prepared", "allowed") and not blocked.get("started_item"):
+                    await self.withdraw(blocked["id"], blocked.get("custody"), "NATIVE_BLOCKED")
         elif method in ("item/started", "item/completed"):
             item = params["item"]
             kind = item["type"]
@@ -776,9 +1128,31 @@ class Daemon:
                 self.messages.child_ack(actor, item)
             elif kind in ("fileChange", "commandExecution", "mcpToolCall"):
                 operation = self.find_operation(listener, thread, turn, item["id"])
-                if not operation or not operation.get("hook_valid"):
-                    for key in participants.checkout_ids(self.store, actor["unit"]):
-                        self.store.unknown(key, "*", "UNMEDIATED effect-capable native item", {"listener": listener["id"], "thread": thread, "item": item["id"]})
+                if operation and operation.get("decision") == "allow" and operation["state"] in ("denied", "reconciled"):
+                    # Admitted, then settled on native's own end of it: no effect, or a reconciled command. Its
+                    # items travel apart from a failed result and can arrive after the settlement: they complete
+                    # its record, admitted, never unmediated, and never reopen it. A patch settled as no effect
+                    # that native then reports applied is quarantined.
+                    key = "started_item" if method == "item/started" else "completed_item"
+                    if key == "completed_item" or not operation.get(key):
+                        operation[key] = item
+                        self.store.save(operation)
+                    self.store.event("native/late_item", operation["id"], {"method": method, "status": item.get("status")})
+                    if (kind == "fileChange" and operation["state"] == "denied" and method == "item/completed"
+                            and item.get("status") == "completed"):
+                        with self.store.transaction():
+                            for record in [operation] + [self.store.get(part) for part in operation.get("parts", [])]:
+                                record.pop("no_effect", None)
+                                self.store.save(record)
+                        await self.ledger.quarantine(operation, "native reported a patch applied after reporting it failed")
+                    return
+                # A denied call (refused or withdrawn) that native runs anyway is unmediated.
+                if not operation or not operation.get("hook_valid") or operation["state"] == "denied":
+                    if operation and operation["state"] == "denied":
+                        operation.update(state="quarantined", attribution="UNKNOWN")
+                    if not (operation and operation.get("unmediated")):  # once per item, not per notification
+                        for key in participants.checkout_ids(self.store, actor["unit"]):
+                            self.store.unknown(key, "*", "UNMEDIATED effect-capable native item", {"listener": listener["id"], "thread": thread, "item": item["id"]})
                     if not operation:
                         # A failed-open hook still opens an opaque effect window.
                         # Record it even if a conflicting reservation already exists:
@@ -790,7 +1164,8 @@ class Daemon:
                             "native": {"listener": listener["id"], "thread": thread, "turn": turn, "call": item["id"]},
                             "generation": self.store.generation, "unmediated": True}, actor["unit"])
                         operation = self.store.get(operationid)
-                    if not operation.get("custody"):
+                    operation["unmediated"] = True
+                    if not operation.get("custody") or self.store.get(operation["custody"])["state"] == "released":
                         custodyid = uid("custody")
                         operation.update(custody=custodyid, unmediated=True)
                         self.store.save(operation)
@@ -810,6 +1185,8 @@ class Daemon:
                 if operation["state"] not in ("verified", "quarantined", "resolved"):
                     operation["state"] = "running"
                 self.store.save(operation)
+                if method == "item/completed":
+                    self.ledger.end_execution(operation)  # native completes the item after the handler's writes
                 if item.get("processId") and operation.get("custody"):
                     reservation = self.store.get(operation["custody"])
                     reservation["terminals"] = sorted(set(reservation["terminals"] + [item["processId"]]))
@@ -845,11 +1222,20 @@ class Daemon:
         return operation
 
     async def maybe_verify(self, operation):
-        if operation["state"] in ("verified", "quarantined"):
+        if operation["state"] not in ("prepared", "allowed", "running"):
             return
-        if (operation["kind"] == "patch" and operation.get("completed_item") and
+        if (operation["kind"] == "patch" and operation.get("completed_item")
+                and operation["completed_item"].get("status") in ("failed", "declined")):
+            # Native ended the patch without success and runs no Post hook for it.
+            await self.ledger.settle_unapplied(operation, "NATIVE_PATCH_" + operation["completed_item"]["status"].upper(),
+                                               lambda o: (o.get("completed_item") or {}).get("status") in ("failed", "declined"))
+        elif (operation["kind"] == "patch" and operation.get("completed_item") and
                 (operation.get("post_hook") or operation["completed_item"].get("status") != "completed")):
             await self.ledger.complete_patch(operation, operation["completed_item"])
+        elif (operation["kind"] == "patch" and operation.get("completed_item")
+                and any(run.get("eventName") == "postToolUse" for run in operation.get("hook_evidence", []))):
+            # Native reports its Post hook ended without success: its lifecycle can never complete.
+            await self.ledger.quarantine(operation, "PATCH_EVIDENCE: its Post hook did not complete")
         elif operation["kind"] in ("command", "mcp") and operation.get("completed_item") and operation.get("post_hook"):
             await self.settle_actor(self.store.get(operation["actor"]))
 
@@ -966,22 +1352,38 @@ class Daemon:
                 continue  # no inference that an interrupted hook intent had no effects
             own_terminals = [t for t in terminals["data"] if t.get("itemId") == operation["native"].get("call") or
                              t.get("processId") in reservation["terminals"]]
-            if resolve_quarantine and not reservation["processes"] and not own_terminals and not operation.get("completed_item"):
+            # Native's own end of the call: its completed item, or a failed result it wrote for it, which
+            # 0.163 follows with no item when its handler refused the call. Either can leave a process behind.
+            # So can the end of a local command's dispatch that native aborted (no result): on macOS 0.163
+            # spawns the process synchronously inside the handler, which it drops only at an await, so any
+            # process the call started already exists and is held by lineage. An MCP server can still be
+            # running a call native stopped waiting for.
+            ended = (operation.get("completed_item") or returned_failure(operation) or
+                     operation["kind"] == "command" and operation.get("result_ready") and not operation.get("returned"))
+            if resolve_quarantine and not reservation["processes"] and not own_terminals and not ended:
                 metadata = await connection.call("thread/read", {"threadId": actor["thread"], "includeTurns": False})
                 if metadata["thread"].get("status", {}).get("type") in ("idle", "notLoaded") and not actor.get("active_turn"):
                     operation["completed_item"] = {"exitCode": None, "observedGone": True, "missingNativeCompletion": True}
                     self.store.save(operation)
+                    ended = True
                     for key in members:
                         self.store.unknown(self.store.get(key)["checkout"], "*", "lead reconciled absence of survivors without native completion", {"custody": key})
-            if reservation["state"] == "quarantined" or reservation["processes"] or own_terminals or not operation.get("completed_item"):
+            if reservation["state"] == "quarantined" or reservation["processes"] or own_terminals or not ended:
                 continue
             await asyncio.gather(*(self.ledger.reconcile(self.store.get(self.store.get(key)["checkout"]),
                                                         reason="opaque command effects") for key in members))
-            operation["state"] = "reconciled"
-            operation["attribution"] = "UNKNOWN-context-only"
-            self.store.save(operation)
-            for key in members:
-                await self.custody.relinquish(self.store.get(key))
+            # One transaction: an operation recorded reconciled apart from its custody's release would leave
+            # that custody held, in every repository it spans, for a command that has ended.
+            async with self.custody.condition:
+                with self.store.transaction():
+                    operation = self.store.get(operation["id"])
+                    operation.update(state="reconciled", attribution="UNKNOWN-context-only")
+                    self.store.save(operation)
+                    for key in members:
+                        member = self.store.get(key)
+                        if member["state"] != "released":
+                            self.custody.release_held(member)
+                self.custody.condition.notify_all()
 
     async def lead_edit(self, params, restore=False):
         actor = self.store.get(params["actor"])
@@ -1073,6 +1475,24 @@ class Daemon:
             raise CoordinatorError("DAEMON_DRAINING", "Coordinator is draining; retry on the serving daemon",
                                    {"retryable": True, "pid": os.getpid(), "boot": self.boot}, True)
 
+    def awaiting_outcome(self, operation):
+        """A patch whose handler and dispatch both ended, waiting only for the outcome native sent before its
+        dispatch's end, or never sends (a Post hook it cancelled): nothing more is written for it, and stopping its
+        app-server settles it (stop_listener), so a stop need not wait for it."""
+        if operation.get("parent_operation"):
+            operation = self.store.get(operation["parent_operation"])
+        return (operation["kind"] == "patch" and operation["state"] in ("allowed", "running")
+                and bool(operation.get("result_ready")) and handler_ended(operation))
+
+    def settling_on_outcomes(self, run):
+        """A workflow whose turn ended and whose settlement waits only on patches awaiting their outcome: the stop
+        settles those, and the next daemon judges the workflow again. Workflows do not advance while draining."""
+        if run["state"] != "settling":
+            return False
+        waiting = list(self.store.selected("SELECT * FROM records WHERE kind='operation' AND parent=? AND json_extract(data,'$.state') "
+                                           "NOT IN ('verified','reconciled','resolved','denied')", (run["unit"],)))
+        return bool(waiting) and all(self.awaiting_outcome(o) for o in waiting)
+
     def stop_pending(self):
         from .writer import TERMINAL
         from .intents import FILE_HOOK_S
@@ -1085,15 +1505,16 @@ class Daemon:
             deadline = record.get("deadline", (operation or {}).get("created", now) + FILE_HOOK_S)
             if now <= deadline:
                 hooks.append(record)
-        operations = [o for o in self.store.all("operation") if o["state"] in ("prepared", "allowed", "running")]
+        operations = [o for o in self.store.selected("SELECT * FROM records INDEXED BY window_operation WHERE " + WINDOW_ACTIVE["operation"])
+                      if not self.awaiting_outcome(o)]
         lead_operations = [o for o in operations if o["kind"] in ("lead-edit", "restore", "lead-command")]
         methods = [method for task, method in self.inflight.items() if task is not asyncio.current_task()]
         counts = {
             "recovery": int(not self.ready),
-            "workflows": sum(r["state"] not in TERMINAL | {"idle"} for r in self.store.all("run")
+            "workflows": sum(r["state"] not in TERMINAL | {"idle"} and not self.settling_on_outcomes(r) for r in self.store.all("run")
                              if r.get("workflow") or r["state"] == "admitting"),
             "writers": sum(bool(a.get("active_turn")) for a in self.store.all("actor")),
-            "custody": sum(c["state"] != "released" for c in self.store.all("custody")),
+            "custody": self.store.db.execute("SELECT count(*) FROM records INDEXED BY window_custody WHERE " + WINDOW_ACTIVE["custody"]).fetchone()[0],
             "deliveries": sum(m["recipient"] != "lead" and not m["recipient"].startswith("lead_mailbox_")
                 and m["state"] not in ("entered_context", "acknowledged")
                 and (m["delivery"] in ("submitting", "submitted", "uncertain") or
@@ -1120,11 +1541,13 @@ class Daemon:
             while True:
                 pending = self.stop_pending()
                 tasks = (self.rpc_tasks | set(self.inflight)) - {asyncio.current_task()}
-                if not pending and not tasks:
+                # An advance that began before the drain sees it at its next step and ends without a turn.
+                if not pending and not tasks and not self.writer.advancing:
                     break
                 if time.monotonic() >= deadline:
                     raise CoordinatorError("NOT_QUIESCENT", "RPC drain did not settle; admission resumed",
-                                           {"pending": dict(pending, inflight_rpcs=len(tasks)), "wait_seconds": STOP_DRAIN_S})
+                                           {"pending": dict(pending, inflight_rpcs=len(tasks), workflow_advances=self.writer.advancing),
+                                            "wait_seconds": STOP_DRAIN_S})
                 await asyncio.sleep(0.01)
             # No pending completion remains. Fence even new observational RPCs
             # before detaching listeners or releasing leases/closing SQLite.
@@ -1154,7 +1577,7 @@ class Daemon:
 
     async def dispatch_admitted(self, method, params):
         if method == "daemon/status":
-            return self.status(params.get("checkout"))
+            return self.status(params.get("checkout"), bool(params.get("brief")))
         if method == "checkout/query":
             from .observations import query
             return query(self, params["cwd"], params.get("session_id", ""), params.get("git_common"))
@@ -1252,7 +1675,7 @@ class Daemon:
         if method == "hook/dispatch":
             from .hooks import deny
             try:
-                return await self.hook(params["payload"], params.get("process"))
+                return await self.hook(params["payload"], params.get("process"), params.get("deadline"))
             except CoordinatorError as exc:
                 self.store.event("hook/denied", None, {"code": exc.code, "details": exc.details})
                 return deny(str(exc) + " " + encoded(exc.details))
@@ -1326,6 +1749,9 @@ class Daemon:
         if method == "unknown/restore":
             from .recovery import restore_unknown
             return await restore_unknown(self, params)
+        if method == "unknown/narrow":
+            from .recovery import narrow_unknown
+            return await narrow_unknown(self, params)
         if method == "lead/mailbox":
             from .lead import mailbox
             return {"mailbox": mailbox(self.store, params["session_id"], params["unit"])}
@@ -1470,6 +1896,37 @@ class Daemon:
             writer.close()
             await writer.wait_closed()
 
+    async def compact_history(self):
+        """Before 2.4.1 an opaque operation copied every head into its record, and released custody kept the
+        process table its command was checked against: every scan decoded both again. Neither is read once
+        the record is finished (publish skips opaque bases), so keep a fingerprint of the bases and drop the table."""
+        from .store import fingerprint
+        def operation(record):
+            if (record["kind"] in ("command", "mcp", "lead-command") and record.get("bases")
+                    and record["state"] in ("reconciled", "denied", "resolved")):
+                record.update(bases={}, heads=fingerprint(record["bases"].items()))
+                return True
+            return False
+        def custody(record):
+            return record["state"] == "released" and record.pop("process_baseline", None) is not None
+        compacted = {}
+        for kind, where, compact in (
+                ("operation", "json_extract(data,'$.kind') IN ('command','mcp','lead-command') AND length(data)>65536", operation),
+                ("custody", "json_extract(data,'$.state')='released' AND json_extract(data,'$.process_baseline') IS NOT NULL", custody)):
+            candidates = [row["id"] for row in self.store.db.execute("SELECT id FROM records WHERE kind=? AND " + where, (kind,))]
+            for start in range(0, len(candidates), 20):
+                if self.stop.is_set() or self.draining:
+                    return
+                with self.store.transaction():
+                    for ident in candidates[start:start + 20]:
+                        record = self.store.get(ident)
+                        if compact(record):
+                            self.store.save(record)
+                            compacted[kind] = compacted.get(kind, 0) + 1
+                await asyncio.sleep(0)
+        if compacted:
+            self.store.event("ledger/compacted", None, compacted)
+
     async def maintenance(self):
         while not self.stop.is_set():
             await asyncio.sleep(1)
@@ -1480,18 +1937,22 @@ class Daemon:
             except CoordinatorError as exc:
                 self.store.event("lease/redundancy_unavailable", None, exc.envelope())
                 continue
+            held = list(self.store.held_custody())
             for actor in list(self.store.all("actor")):
-                if actor.get("listener") and any(c["actor"] == actor["id"] for c in self.custody.unit_active(actor["unit"])):
+                if actor.get("listener") and any(c["actor"] == actor["id"] for c in held):
                     try:
                         await self.settle_actor(actor)
                     except (CoordinatorError, OSError):
                         pass  # custody remains held; no optimistic release
             from .recovery import settle_lead_command
-            for reservation in list(self.store.all("custody")):
-                if reservation.get("lead_root") and reservation["state"] != "released":
+            for reservation in held:
+                if reservation.get("lead_root") and self.store.get(reservation["id"])["state"] != "released":
                     await settle_lead_command(self, reservation)
             await self.messages.retry()
-            for run in list(self.store.all("run")):
+            # Only runs this loop can act on: every finished run is history.
+            for run in list(self.store.selected("SELECT * FROM records WHERE kind='run' AND ((json_extract(data,'$.cancel_requested') "
+                    "AND json_extract(data,'$.state')!='cancelled') OR (json_extract(data,'$.workflow') IS NOT NULL AND "
+                    "json_extract(data,'$.state') NOT IN ('completed','failed','interrupted','blocked','refused','cancelled'))) ORDER BY id")):
                 if run.get("cancel_requested") and run["state"] != "cancelled":
                     await self.runs.settle_cancel(run["id"])
                     continue
@@ -1505,7 +1966,8 @@ class Daemon:
                         self.store.event("workflow/advance_refused", run["id"], exc.envelope())
             for checkout in list(self.store.all("checkout")):
                 await self.release_lease(checkout["id"])
-            for record in list(self.store.all("lead_hook")):
+            for record in list(self.store.selected("SELECT * FROM records WHERE kind='lead_hook' AND "
+                                                   "json_extract(data,'$.state')='prepared' ORDER BY id")):
                 if record["state"] == "prepared":
                     operation = self.store.get(record["operation"])
                     if time.time() - operation["created"] > 120:
@@ -1535,6 +1997,7 @@ class Daemon:
             publish(self.store)
             self.ready = True
             self.background(self.maintenance())
+            self.background(self.compact_history())
             await self.stop.wait()
         for task in list(self.tasks):
             task.cancel()

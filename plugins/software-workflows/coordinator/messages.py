@@ -241,7 +241,10 @@ class Messages:
         return message
 
     async def retry(self):
-        for message in list(self.store.all("message")):
+        # Every second: decode only messages still to be delivered, not every message ever sent.
+        for message in list(self.store.selected("SELECT * FROM records WHERE kind='message' AND "
+                "json_extract(data,'$.state') NOT IN ('entered_context','acknowledged') AND "
+                "json_extract(data,'$.recipient')!='lead' AND substr(json_extract(data,'$.recipient'),1,13)!='lead_mailbox_' ORDER BY id")):
             if message["state"] not in ("entered_context", "acknowledged") and message["recipient"] != "lead" and not message["recipient"].startswith("lead_mailbox_"):
                 try:
                     await self.deliver(message["id"])

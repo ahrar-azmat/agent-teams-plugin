@@ -192,9 +192,20 @@ def lead_work_in_flight(state):
 
 
 class Client:
-    def __init__(self, state=None, timeout=30):
+    def __init__(self, state=None, timeout=30, deadline=None):
         self.state = validate_state(state_root(state))
         self.timeout = timeout
+        # time.time() by which a call must end, whatever it waits on: a socket timeout bounds only
+        # one operation, and connect, send and each receive would otherwise get the whole budget.
+        self.deadline = deadline
+
+    def remaining(self):
+        if self.deadline is None:
+            return self.timeout
+        left = self.deadline - time.time()
+        if left <= 0:
+            raise socket.timeout("coordinator call deadline passed")
+        return min(self.timeout, left)
 
     def call(self, method, params=None, key=None):
         request_id = uuid.uuid4().hex
@@ -204,11 +215,19 @@ class Client:
         from .runtime import discover
         address = discover(self.state)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(self.timeout)
+            connection.settimeout(self.remaining())
             connection.connect(str(address))
+            connection.settimeout(self.remaining())
             connection.sendall((json.dumps(request, ensure_ascii=True) + "\n").encode())
-            with connection.makefile("rb") as stream:
-                line = stream.readline()
+            chunks = []
+            while True:
+                connection.settimeout(self.remaining())
+                chunk = connection.recv(65536)
+                chunks.append(chunk)
+                if not chunk or b"\n" in chunk:
+                    break
+            line = b"".join(chunks)
+            line = line[:line.index(b"\n") + 1] if b"\n" in line else line
             if not line:
                 raise CoordinatorError("RPC_UNCERTAIN", "Connection ended without a result; reconcile before retrying",
                                        {"id": request_id, "key": key}, True)
@@ -229,28 +248,32 @@ class Client:
         """The running daemon's daemon/status, or None when none answers. A daemon on its way out
         answers DAEMON_DRAINING, which is raised."""
         try:
-            return self.call("daemon/status")
+            return self.call("daemon/status", {"brief": True})
         except (FileNotFoundError, ConnectionRefusedError):
             return None
 
     def current(self, timeout):
         """daemon/status, or None when none answers, waiting out a daemon that is stopping: it either
-        exits (then its locks are waited for too, so a new one can start) or, its stop refused, serves on."""
+        exits (then its locks are waited for too, so a new one can start) or, its stop refused, serves on.
+        No answer while its locks are held is a daemon still exiting after its stop answered, or one not
+        yet listening: either is waited for, since a new one started then loses the lock and exits. None
+        means no daemon holds them."""
         deadline = time.monotonic() + timeout
-        stopping = False
         while True:
             try:
                 status = self.status()
             except CoordinatorError as exc:
                 if exc.code != "DAEMON_DRAINING" or time.monotonic() >= deadline:
                     raise
-                stopping = True
                 time.sleep(0.05)
                 continue
-            if status is None and stopping:
-                while time.monotonic() < deadline and any(_held(self.state / name) for name in ("supervisor.lock", "worker.lock")):
-                    time.sleep(0.05)
-            return status
+            held = [name for name in ("supervisor.lock", "worker.lock") if _held(self.state / name)]
+            if status is not None or not held:
+                return status
+            if time.monotonic() >= deadline:
+                raise CoordinatorError("DAEMON_UNRESPONSIVE", "A coordinator process holds the daemon's locks but does "
+                                       "not answer; retry once it exits", {"locks": held, "waited_seconds": timeout}, True)
+            time.sleep(0.05)
 
     @contextlib.contextmanager
     def upgrading(self, timeout):
@@ -314,7 +337,7 @@ class Client:
         itself; for one from before 2.4.0 its ledger is read first, and the stop is refused while lead
         work is in flight there."""
         with self.upgrading(timeout):
-            status = self.call("daemon/status")
+            status = self.call("daemon/status", {"brief": True})
             if "draining-stop" in (status.get("capabilities") or []) and status.get("boot"):
                 return self.call("daemon/stop", {"expect": {"pid": status.get("pid"), "boot": status["boot"]}})
             pending = lead_work_in_flight(self.state)
@@ -353,7 +376,7 @@ class Client:
         while not status.get("ready") and time.monotonic() < deadline:
             time.sleep(0.05)
             try:
-                status = self.call("daemon/status")
+                status = self.call("daemon/status", {"brief": True})
             except (FileNotFoundError, ConnectionRefusedError):
                 break
         return status
@@ -374,7 +397,7 @@ class Client:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
-                return self.call("daemon/status")
+                return self.call("daemon/status", {"brief": True})
             except (FileNotFoundError, ConnectionRefusedError):
                 from .runtime import private_json
                 try:

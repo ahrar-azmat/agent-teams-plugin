@@ -41,8 +41,15 @@ def message(text="done"):
 def action(step):
     if "delay" in step:
         time.sleep(step["delay"])
+    if "parallel" in step:
+        # One response carrying several tool calls, as a model's parallel calls arrive.
+        return [action(s) for s in step["parallel"]]
     if "patch" in step:
         return patch(step["patch"])
+    if "exec" in step:
+        # A code-mode cell: its JavaScript calls nested tools, as models whose catalog tool_mode is
+        # code_mode_only do (0.163: gpt-6-astra).
+        return {"type": "custom_tool_call", "name": "exec", "input": step["exec"], "call_id": "fx-" + uuid.uuid4().hex}
     if "command" in step:
         return function("exec_command", {"cmd": step["command"], "login": False, **step.get("arguments", {})})
     if "tool" in step:

@@ -8,7 +8,7 @@ from .ledger import patch_scope, unified_post
 from .routing import route, qualified
 
 
-async def prepare_patch(daemon, actor, command, identity, cwd):
+async def prepare_patch(daemon, actor, command, identity, cwd, deadline=None):
     scope, groups = [], {}
     for entry in patch_scope(command):
         source = route(daemon.store, actor, entry["path"], cwd)
@@ -17,18 +17,18 @@ async def prepare_patch(daemon, actor, command, identity, cwd):
         for endpoint in (source, target):
             groups.setdefault(endpoint["checkout"], set()).add(endpoint["path"])
     await daemon.custody.acquire(actor, [qualified(key, path) for key, paths in groups.items() for path in paths])
-    return await prepare(daemon.ledger, actor, "patch", {"patch": command, "routed_scope": scope, "cwd": cwd}, groups, identity)
+    return await prepare(daemon.ledger, actor, "patch", {"patch": command, "routed_scope": scope, "cwd": cwd}, groups, identity, deadline)
 
 
-async def prepare(ledger, actor, kind, intended, groups, identity=None):
+async def prepare(ledger, actor, kind, intended, groups, identity=None, deadline=None):
     parts = []
     try:
         # Persist parts before allowing execution. Pending parts exclude every
         # competing operation while subsequent pre-images are being collected.
         for checkout, paths in sorted(groups.items()):
-            part = await ledger.prepare(dict(actor, checkout=checkout), kind, {}, list(paths))
+            part = await ledger.prepare(dict(actor, checkout=checkout), kind, {}, list(paths), deadline=deadline)
             parts.append(part)
-        parent = await ledger.prepare(actor, kind, intended, [], identity)
+        parent = await ledger.prepare(actor, kind, intended, [], identity, deadline)
         with ledger.store.transaction():
             parent["parts"] = [part["id"] for part in parts]
             ledger.store.save(parent)

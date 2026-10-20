@@ -20,17 +20,17 @@ from types import SimpleNamespace
 
 from .client import CoordinatorError
 from . import native, gitio, processes, runtime
-from .fixture import Provider, function, patch, message, scratch_directory
+from .fixture import Provider, action, function, patch, message, scratch_directory
 from .ledger import case_sensitive
 from .store import digest, uid, encoded, fsync_dir
 from .locks import KeyedLocks
 
 
-PROBES = ("hooks", "evidence", "dynamic", "delivery", "tty", "reconnect", "terminals", "ownership", "policy", "validation")
+PROBES = ("hooks", "evidence", "dynamic", "delivery", "tty", "receipts", "reconnect", "terminals", "ownership", "policy", "validation")
 
 
 class ProbeListener:
-    def __init__(self, directory, provider, config=None, experimental=True, hook=None, trusted=True, trace=False):
+    def __init__(self, directory, provider, config=None, experimental=True, hook=None, trusted=True, trace=False, log=None):
         self.directory = directory
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.home, self.repo = directory / "home", directory / "repo"
@@ -41,8 +41,8 @@ class ProbeListener:
         self.config.update({"approval_policy": "never", "sandbox_mode": "danger-full-access", "agents.enabled": True,
                             "features.multi_agent_v2": True, "web_search": "live"})
         self.config.update(config or {})
-        self.events, self.trace_rules = [], []
-        self.experimental, self.hook, self.trusted, self.trace = experimental, hook, trusted, trace
+        self.events, self.trace_rules, self.traces = [], [], []
+        self.experimental, self.hook, self.trusted, self.trace, self.log = experimental, hook, trusted, trace, log
         self.connection, self.process = None, None
         self.startup_diagnostics = []
         self.thread = None
@@ -69,6 +69,8 @@ class ProbeListener:
         environment = native.environment(CODEX_HOME=str(self.home), LOG_FORMAT="json")
         if self.trace:
             environment["RUST_LOG"] = "codex_core::exec_policy=trace"
+        if self.log:
+            environment["RUST_LOG"] = self.log
         self.allocation = runtime.allocate("probe")
         self.socket = Path(self.allocation["path"])
         self.process = await asyncio.create_subprocess_exec(native.native_codex(), "app-server", "--listen", "unix://" + str(self.socket),
@@ -95,7 +97,7 @@ class ProbeListener:
         runtime.atomic_json(self.directory / "endpoint.json", self.endpoint)
 
     async def consume_stderr(self):
-        # No native log text is copied. Only the requested trace's digest survives.
+        # No native log text is copied. Only the requested trace's digest, and call identities, survive.
         async for line in self.process.stderr:
             if not self.connection:
                 self.startup_diagnostics = (self.startup_diagnostics + [native.startup_diagnostic(line)])[-8:]
@@ -104,7 +106,10 @@ class ProbeListener:
                 fields = entry.get("fields", {})
                 if fields.get("message") == "exec policy rules loaded":
                     self.trace_rules.append(native.policy_trace_digest(fields.get("rules")))
-            except (ValueError, UnicodeError):
+                elif entry.get("target") == "codex_otel.trace_safe" and fields.get("event.name") in ("codex.tool_call_received", "codex.tool_result", "codex.tool_result_ready"):
+                    self.traces.append({key: fields.get(key) for key in
+                                        ("event.name", "conversation.id", "call_id", "tool_name", "tool_source", "success")})
+            except (ValueError, UnicodeError, AttributeError):
                 continue
 
     async def start_thread(self, **overrides):
@@ -249,8 +254,9 @@ class Admission:
         # A thread start loads rules without starting inference. Drain its trace
         # before collecting the full admission binding; no user files are read.
         for _ in range(100):
+            daemon.read_native_log(listenerid)
             listener = self.store.get(listenerid)
-            if listener.get("policy_traces"):
+            if daemon.native_log(listener).get("policy_traces"):
                 break
             await asyncio.sleep(0.01)
         from . import participants
@@ -260,7 +266,7 @@ class Admission:
         cwd = self.store.get(actor["run"]).get("thread_cwd", checkout["root"])
         adapter = SimpleNamespace(connection=daemon.connections[listenerid], repo=Path(cwd),
                                   roots=roots, project_revision=unit.get("project_revision"),
-                                  initialized={"userAgent": listener["user_agent"]}, trace_rules=listener.get("policy_traces", []),
+                                  initialized={"userAgent": listener["user_agent"]}, trace_rules=daemon.native_log(listener).get("policy_traces", []),
                                   endpoint=listener["endpoint"],
                                   case_sensitive=checkout["case_sensitive"])
         fingerprint = await self.fingerprint(adapter, schema_digest)
@@ -433,6 +439,47 @@ class Admission:
                     items = [e for e in listener.events if e.get("method") == "item/completed" and e["params"]["item"]["type"] == "commandExecution"]
                     results.append({"enabled": enabled, "commands": len(items), "refused": "TTY execution is disabled" in outputs})
         return {"negative_observed": results[0]["commands"] == 1, "positive_observed": results[1]["refused"] and results[1]["commands"] == 0, "cases": results}
+
+    async def probe_receipts(self, directory):
+        """The result native writes once a call's handler has returned (0.163 `codex.tool_result`), which the daemon
+        settles refused calls by, and the mark it writes after it once the call's dispatch ended
+        (`codex.tool_result_ready`), which tells a call native gave up on: for calls nested in a code-mode cell, as
+        writers on gpt-6-astra (tool_mode code_mode_only) make every call, and for a direct one. Each is refused
+        inside its handler: `tty` on the TTY-disabled runtime, a patch to a file that does not exist. Red: the log
+        filter 2.4.0 started writers with."""
+        cell = ('await tools.exec_command({cmd: "printf tty", tty: true}).catch(e => text("refused " + String(e))); '
+                'await tools.apply_patch("*** Begin Patch\\n*** Update File: absent.txt\\n@@\\n-absent\\n+present\\n*** End Patch\\n")'
+                '.catch(e => text("refused " + String(e)));')
+        results = []
+        for log in ("codex_core::exec_policy=trace", native.WRITER_LOG):
+            steps = [action({"exec": cell}), function("exec_command", {"cmd": "printf tty", "tty": True, "login": False}), message()]
+            with Provider(steps_router(steps)) as provider:
+                async with listening(directory / str(len(results)), provider, config={"features.unified_exec_tty": False}, log=log) as listener:
+                    await listener.start_thread()
+                    await listener.turn()
+                    final = provider.requests[-1]["input"]
+            # Native's own account of each refusal: the outputs the model received.
+            cell_output = json.dumps([i for i in final if i.get("type") == "custom_tool_call_output"])
+            direct_output = json.dumps([i for i in final if i.get("type") == "function_call_output"])
+            received = {t["call_id"]: t for t in listener.traces if t["event.name"] == "codex.tool_call_received"}
+            failed = {t["call_id"] for t in listener.traces if t["event.name"] == "codex.tool_result"
+                      and t["success"] == "false" and t["conversation.id"] == listener.thread}
+            nested = {call for call, t in received.items() if t["tool_source"] == "code_mode"}
+            direct = {call for call, t in received.items() if t["tool_source"] == "direct" and t["tool_name"] == "exec_command"}
+            position = {(t["event.name"], t["call_id"]): index for index, t in enumerate(listener.traces)
+                        if t["conversation.id"] == listener.thread}
+            ended = {call for call in failed if position.get(("codex.tool_result_ready", call), -1) > position[("codex.tool_result", call)]}
+            results.append({"log": log, "refused": cell_output.count("refused ") == 2 and "TTY execution is disabled" in direct_output,
+                            "results": sum(t["event.name"] == "codex.tool_result" for t in listener.traces),
+                            "ready": sum(t["event.name"] == "codex.tool_result_ready" for t in listener.traces),
+                            "nested": len(nested), "direct": len(direct),
+                            "failed_nested": len(nested & failed), "failed_direct": len(direct & failed),
+                            "ended_after_result": len((nested | direct) & ended)})
+        red, green = results
+        return {"negative_observed": red["refused"] and red["results"] == 0 and red["ready"] == 0,
+                "positive_observed": green["refused"] and green["nested"] == 2 and green["failed_nested"] == 2
+                                     and green["direct"] == 1 and green["failed_direct"] == 1 and green["ended_after_result"] == 3,
+                "cases": results}
 
     async def probe_reconnect(self, directory):
         with Provider() as provider:

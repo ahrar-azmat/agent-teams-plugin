@@ -24,6 +24,13 @@ def environment(**overrides):
     return result
 
 
+# A writer's log filter. The policy trace is admission's view of the effective execution policy. Codex 0.163
+# writes `codex.tool_result` to the trace-safe target once a call's handler has returned, direct or nested in a
+# code-mode cell, with success=false when it returned a failure; that target carries identifiers, names and
+# lengths, never arguments or output.
+WRITER_LOG = "codex_core::exec_policy=trace,codex_otel.trace_safe=info"
+
+
 def startup_diagnostic(line):
     """Keep actionable error classes and fingerprints, never arbitrary log text."""
     lowered = line.lower()

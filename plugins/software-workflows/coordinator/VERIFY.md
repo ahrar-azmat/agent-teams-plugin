@@ -10976,3 +10976,626 @@ with r21, with volatile values masked, every step is identical apart from:
 - tokens and timings;
 - the leftovers listing, which now prints state paths;
 - the new step (`GATE_PAUSE=installed`), whose results match the green column above.
+
+## 2.4.1
+
+### Lead record for 2.4.1 — 2026-10-20
+
+**What prompted it.** Two reports came from the Sales_Profiler lead session. It runs seven abraham
+writers in one checkout (`checkout_ffa59063…`) with 3,679 files in git's view. Both were checked
+against its live ledger, read-only.
+
+1. One writer's turn started 12 Pre hooks in the same millisecond (12 parallel `exec_command`
+   calls).
+   - Admission is serialized per listener. The hooks finished at 8, 15, 23, 32, 43, 52, 64, 72, 87,
+     98 and 110 s.
+   - The twelfth reported `failed` ("hook timed out after 120s"), and Codex ran the call. The
+     coordinator prepared it 0.2 s before that timeout and allowed it 3.3 s after.
+   - Its `item/started` and `item/completed` each recorded an UNMEDIATED `*` UNKNOWN on the checkout.
+   - The 2.4.0 client's 115 s is a per-socket timeout that starts at its request, and that request
+     came about 5 s after Codex started the hook.
+   - The ledger held 546 operation records totalling 199.5 MB. Each command record carried a bases
+     map of all 3,679 heads, about 365 KB, repeated in its `operation/prepared` event.
+2. Two `apply_patch` calls failed with "Failed to find expected lines" and wrote nothing
+   (`op_7d272b27…`, `op_09e4e00c…`). Each stayed `allowed`, and every later patch of their paths
+   got `OPERATION_BUSY` until the turn ended and quarantined it. The daemon worker sat at about
+   108% CPU with the ledger at 640 MB, and one `coordinator_inbox` acknowledgement took 996 s.
+
+**Codex 0.163.0 behaviour this relies on** (read in the source export of that tag, `codex-rs`):
+- `core/src/tools/handlers/apply_patch.rs`: the handler verifies the patch
+  (`verify_apply_patch_args`). A `CorrectnessError` returns "apply_patch verification failed: …" to
+  the model before `execute_verified_patch`, the only place a `PatchApplyBegin`, and so a
+  `fileChange` item, is emitted.
+- `core/src/tools/registry.rs`: the Pre hook runs inside the dispatch, before the handler. The Post
+  hook payload exists only when the handler succeeded, so a failed patch gets no Post hook.
+- `models-manager/models.json`: every gpt-6 and gpt-5.6 entry, gpt-6-astra included, sets
+  `tool_mode: code_mode_only`. The model then sees only the code-mode tools (`core/src/tools/router.rs`),
+  so a writer makes every call from inside an `exec` cell. All 778 calls in the reporting session's
+  ledger have `exec-` call ids.
+- `core/src/tools/code_mode/mod.rs`: a nested call is dispatched through the same
+  `ToolCallRuntime` (`handle_tool_call_with_source`, source `CodeMode`) as a direct one, so through
+  the same Pre hook and registry. A cell can outlive its turn ("A cell can outlive a turn").
+- `core/src/tools/registry.rs`: the handler runs inside
+  `otel.log_tool_result_with_tags(…, || handle_any_tool(…))`. A Pre hook that blocks returns
+  before it.
+  - `otel/src/events/session_telemetry.rs` awaits the handler, then emits `codex.tool_result`
+    (`otel/src/tool_result.rs`) with `success` from the handler's `success_for_logging`, or `false`
+    when the handler returned an error.
+  - `ExecCommandToolOutput` and `ApplyPatchToolOutput` always report `true`
+    (`core/src/tools/context.rs`). So `false` from either means its handler returned an error.
+  - `log_and_trace_event!` (`otel/src/events/shared.rs`) splits the event. Arguments and output go to
+    `codex_otel.log_only`. The call id, `success`, `tool_result_seq`, the tool name, lengths and
+    `conversation.id` (the session's own thread) go to `codex_otel.trace_safe` (`otel/src/targets.rs`).
+- `core/src/tools/parallel.rs`: a cancelled call's dispatch task is aborted, and its
+  `AbortedToolOutput` is made outside the registry, so it writes no `codex.tool_result`. It writes
+  `codex.tool_result_ready` (`core/src/tools/call_trace.rs`), which every dispatch that is not a
+  fatal error also writes.
+- `app-server/src/lib.rs`: with `LOG_FORMAT=json`, the stderr layer is
+  `fmt::layer().json().with_writer(std::io::stderr)`, filtered by `RUST_LOG`
+  (`EnvFilter::from_default_env`). The line is written on the calling thread, before the handler's
+  result is returned to the model or the cell.
+
+**Real-engine runs.** All runs used the loopback fixture model, a 3,700-file checkout (74 folders
+of 50 files), and disposable state, `CODEX_HOME` and log folders. The scripts are `burst_check.py`
+and `patch_check.py` in the lead's scratchpad.
+- The red runs used `git archive 5332c01` (2.4.0).
+- The calibration-only pause in the burst is an `asyncio.sleep` inside `ledger.prepare`'s checkout
+  lock, on a copy of the plugin.
+
+Twelve parallel commands in one response, with each command admission paused 11 s:
+
+| | 2.4.0 | 2.4.1 |
+|---|---|---|
+| Pre hook durations | 11.2, 23.8, 36.0, 48.6, 60.9, 73.1, 85.7, 98.2, 110.3, 115.1 ×3 s | 11.2, 23.8, 36.4, 48.8, 66.6, 83.8, 101.0, 108.0 ×4, 111.9 s |
+| Commands run | 9 | 7 |
+| Refused | 3, by the client at 115 s: "Coordinator unavailable or refused (TimeoutError)" | 4 `COORDINATOR_BUSY` at 108 s, 1 `CUSTODY_WAIT` at 111.9 s |
+| Left behind | one operation allowed after its client gave up; exclusive custody held for a command that never ran | nothing held |
+| UNKNOWN | 0 | 0 |
+| Stop | refused `NOT_QUIESCENT` (custody 1, other operations 1) | stopped |
+
+Without the pause, 2.4.1 ran all twelve, each about 1 s after the one before. That is the
+exclusive-custody reconcile per command. The command records totalled 0.0 MB.
+
+A patch Codex ends without applying (`TARGET` is `pkg00/m00.py`, holding `VALUE = 0`):
+
+| Case | 2.4.0 | 2.4.1 |
+|---|---|---|
+| `-WRONG = 1` patch, then the turn ends | quarantined ("turn ended without complete patch lifecycle evidence"); UNKNOWN on the unchanged file | `denied`, `no_effect`, `NATIVE_NOT_STARTED`; no UNKNOWN |
+| The same, then a corrected patch and `cat` in one turn | patch: "An overlapping operation is unreconciled"; `cat`: "Custody wait reached the safe hook deadline"; UNKNOWN; 161 s | failed patch settled at the corrected patch's Pre; corrected patch `verified` (`exact`); `cat` printed `VALUE = 100`; no UNKNOWN; 38 s |
+| A correct patch of a read-only file ("Failed to write file", item `failed`) | quarantined `PATCH_EVIDENCE`; UNKNOWN on the file plus `*` "native evidence processing failed" | `denied`, `no_effect`, `NATIVE_PATCH_FAILED`; no UNKNOWN |
+
+**The live ledger's costs.** These were measured on SQLite backup copies (`q5_hot.py`,
+`q6_runs.py`), taken through a read-only connection to the live file. The copy is 730 MB: 781
+operation records (268 MB), 676 custody records (49 MB, almost all of it `process_baseline`), 11
+runs, 14 listeners, and 890 held claims on the checkout.
+
+| Call | 2.4.0 code | 2.4.1 |
+|---|---|---|
+| `daemon/status` | 3,300 ms | 264 ms; brief (readiness checks) 0 ms |
+| `stop_pending` (drain readiness) | 4,183 ms | 12 ms |
+| `apply_observation`'s scans | 2,895 ms | 0 ms |
+| `interfering` (one path) | 1,375 ms | 0 ms; with `since` an hour back, 95 ms, then 3 ms after compaction |
+| `run/events` record ids (857, the same set) | 5,115 ms | 2 ms |
+| `hook()`'s listener scan | 10 ms | 10 ms (unchanged) |
+
+The compaction ran in 9.3 s. It covered 712 operation records and 676 custody records, and custody
+went from 49.2 MB to 1.3 MB. After it the full `daemon/status` takes 235 ms. Of that, 175 ms is
+decoding held claims, which the answer itself carries.
+
+**History.** These runs used 300 sequential commands with no pause.
+- 2.4.0: the Pre hook median rose from 1.92 s (commands 0–49) to 8.46 s (250–299), with a 49.8 s
+  maximum. The command records totalled 60.7 MB.
+- The first 2.4.1 draft (fingerprint and operation indexes only): the median still rose from 1.83 s
+  to 10.41 s, although the command records were 0.8 MB. The growth was every reconcile, custody check
+  and process observation decoding each released custody record's process table. That led to the
+  held-custody queries and to dropping the table at release. That draft also refused one command with
+  `PROCESS_UNREADABLE`: a process of the user's could not be read while its baseline was taken.
+
+
+### Review turns 21–23: settlement from Codex's own result line
+
+The first draft settled a refused call from what followed it: the next Pre hook of the same thread,
+or an unchanged file. The same review session (`01a14eac…`) answered three times before the design
+changed.
+- **Turn 21, "Do not ship".**
+  - HIGH: next-hook settlement can release a patch that can still execute. A code-mode cell's
+    nested calls run on their own runtime (`core/src/tools/code_mode/delegate.rs`), so a direct
+    call's hook proves nothing about them.
+  - HIGH: the client's deadline was one socket timeout, reused by `connect`, `sendall` and every
+    `readline`, so it bounded each operation and not their sum.
+  - HIGH: a command Codex refuses inside its handler (`tty` on the TTY-disabled runtime) kept
+    exclusive custody.
+  - MEDIUM: maintenance decoded every released custody record each second.
+- **Turn 22, "Do not ship".** The deadline and the maintenance scan were fixed: the client keeps
+  one deadline across connecting, sending and every receive, and maintenance selects held custody
+  only. Still open: feature flags do not prove code mode is off, since the model catalog's
+  `tool_mode` takes precedence (`core/src/tools/mod.rs`), and recovery did not replay the recorded
+  outputs. New: a withdrawal committed `denied` before it released custody, so a crash between them
+  left a denied call holding it. Withdrawal and release are now one transaction.
+- **Turn 23, an architecture review, "REJECT".** Unchanged files and missing notifications cannot
+  tell a refused call from one that runs later. Codex recommended qualifying Codex's per-call
+  telemetry instead: `codex.tool_result` is written after the handler returns, with
+  `success=false` for a failure, on a target that carries no arguments or output. It also noted
+  that `codex.tool_result_ready` alone proves nothing about completion, because an aborted dispatch
+  writes it too.
+
+2.4.1 adopted that design: the writer's log file, read from a durable offset, and each admitted
+call's `codex.tool_result` and `codex.tool_result_ready` recorded on its record.
+
+**The admission probe (`receipts`).** It ran in every 2.4.1 writer's admission on the installed
+0.163, in each run below.
+- Red, under the filter 2.4.0 starts writers with (`codex_core::exec_policy=trace`): the two
+  nested refusals and the direct one happened, and the log held neither line.
+- Green, under the writer's filter: a failed result for each of the three refused calls, each
+  followed by its `tool_result_ready`.
+
+### Calls Codex refuses after admitting them
+
+`case_check.py`, real engine, loopback fixture model, the 3,700-file checkout. The 2.4.1 column is
+snapshot `s241f` (the turn-25 fixes); the 2.4.0 column is `git archive 5332c01`. "Nested" cases run
+as a code-mode cell, the way writers on gpt-6-astra make every call; "direct" cases are function
+calls. Each `tty` call is refused ("TTY execution is disabled by config"), and every `cat` reads
+`pkg00/m00.py`. Times are seconds from the run's start; the writer's first call came at about +27 s.
+
+| Case | 2.4.0 | 2.4.1 |
+|---|---|---|
+| nested `tty`, then `cat`, in one cell | the `tty` call kept exclusive custody; the `cat` still waited at turn end; stop refused `NOT_QUIESCENT` | result +28.09; released +29.64; the `cat` ran |
+| nested `exec_command` with an unusable `workdir`, then `cat` | settled by its `failed` item; the `cat` ran | result +27.88; released +29.42; the `cat` ran |
+| nested patch whose context is not in the file, the corrected patch, then `cat` | corrected patch `OPERATION_BUSY`, so the cell failed; the bad patch quarantined at turn end, with an UNKNOWN on the unchanged file | bad patch `denied`, `no_effect`, `NATIVE_CALL_FAILED` at its result (+28.26); corrected patch `verified`; `cat` printed `VALUE = 100` |
+| nested `tty` alone; then the turn ends | custody held after the turn; stop refused | result +27.80; released +29.37 |
+| nested `tty` in one cell, `cat` in the next | the `cat` still waited at turn end; stop refused | result +27.85; released +29.52; the `cat` ran |
+| a 35 s command: the cell yields at 30 s and the turn ends while it runs | custody held until the command ended | custody held until the command ended (released +64.60) |
+| a 32 s command, then `tty` and `cat`; the turn ends during the first | the `tty` call, allowed after the turn ended, kept custody; stop refused | the `tty` call's result +62.39, after the turn ended at +58.69; released +63.30 |
+| a command that exits at once, leaving a 4 s `&` child | released at once | released at once (+28.78) |
+| the same with a 15.37 s child in its own session (`perl`, `setsid`) | released about 2 s after the command, the child still alive | the same (+29.71) |
+| a sub-agent's cell: `tty`, then `cat` | the `tty` call kept custody; the `cat` stayed `prepared`; stop refused | settled from the sub-agent's own result (its thread, +29.73); released +30.95; the `cat` ran |
+| direct `tty`, then (next response) `cat` | `cat` refused `CUSTODY_WAIT` at the hook deadline, 110 s later; stop refused | result +28.67; released +30.47; the `cat` ran |
+| direct `tty` and `cat` in one response | `cat` refused `CUSTODY_WAIT` at the hook deadline; stop refused | result +28.00; released +29.80; the `cat` ran |
+| direct bad patch, then the corrected patch, then `cat` | corrected patch `OPERATION_BUSY`; `cat` `CUSTODY_WAIT` at the hook deadline; the bad patch quarantined, with an UNKNOWN | bad patch no effect at its result (+28.46); corrected patch `verified`; `cat` printed `VALUE = 100` |
+
+Every 2.4.1 run ended with no custody held, no UNKNOWN, a clean stop and the log deleted.
+
+In both versions, the `cat` that the 32 s case's cell calls after its turn ended never reached a
+Pre hook. Code mode queues a cell's nested calls to its turn's dispatch worker
+(`start_turn_worker`), and that worker stops with the turn. A call dispatched before the turn ended,
+like that case's `tty` call, still runs after it.
+
+**A correction to the turn-24 context.** It said a command leaving a 4 s background child kept
+custody until the child exited. That delay was settle latency. Re-measured, custody was released at
+once in 2.4.0 and in 2.4.1, because Codex's process-group kill ends a `cmd &` child with its
+command. A child that starts its own session (`setsid`) escapes that kill. When it is an Apple
+platform binary, the coordinator cannot see its markers either: on macOS, `KERN_PROCARGS2` returns
+argv without the environment for platform binaries (`/bin/sleep` gave 33 bytes and no `CODEX_*`
+variables; `/usr/bin/python3` gave 6,020 bytes with them). Both versions released custody about 2 s
+after the command while such a child lived on. This is a known limit, not a 2.4.1 change.
+
+### Recovery
+
+`recovery_check.py`. Two fault copies of the snapshot isolate recovery's part:
+- "nolog": the tailer returns at once, and the Pre-hook and turn-end reads are removed, so only
+  recovery (and a stop) reads the log;
+- "noset": the tailer records results but settles none, and the same two reads are removed.
+
+**`restart`.** A refused nested `tty` call is followed by a `cat` that waits for its custody. The
+daemon (supervisor and worker) is then killed with SIGKILL and started again, while the writer's
+app-server lives on.
+
+| Plugin | Kill | Outcome |
+|---|---|---|
+| `s241f` | +31.1, after the refused call had been settled | the recovered daemon adopted the live app-server; both commands reconciled; the run completed (36.3 s) |
+| `s241f` nolog | +29.3, the result written and unread | recovery settled it; the `cat`, whose hook client lost the daemon, withdrawn `NATIVE_ABANDONED`; no UNKNOWN |
+| `s241f` noset | +29.4, the result recorded and unsettled | the same |
+| turn-24 tree (`s241c`) nolog and noset | +29.4, +28.8 | the refused call settled; the `cat` quarantined "crash gap before a durable custody decision", with a `*` UNKNOWN |
+| 2.4.0 | +27.8 | the refused call still held custody 90 s later; the `cat` quarantined as above; stop refused `NOT_QUIESCENT` |
+
+The turn-24 tree's `*` was 2.4.0's rule for a command with no custody decision. With the turn-25
+fixes, Codex's dispatch end for that `cat` (its hook client had denied it) withdraws it instead.
+
+**`replace`.** A patch whose context is not in the file (caught), then a 20 s command. The
+writer's app-server is killed with SIGKILL once the command's operation exists, and the daemon
+replaces it.
+- `s241f`: the bad patch was settled at its result before the kill (`NATIVE_CALL_FAILED`,
+  `no_effect`). The replacement got its own log, and the dead incarnation's log was deleted.
+- The fault copies: the command's admission waited on the unsettled patch's paths, so the kill
+  found it with no custody decision. Recovery read the dead incarnation's log and settled the
+  patch, and quarantined the command (crash gap), releasing its custody.
+- 2.4.0: the bad patch was quarantined at turn end, with UNKNOWNs.
+- In `s241f`, 2.4.0 and the turn-24 tree, the killed command kept its custody, with a `*` UNKNOWN
+  ("listener died with potentially escaped effects"), and stop was refused `NOT_QUIESCENT`. The
+  coordinator terminates the processes it recorded, but it cannot tell whether one escaped. The
+  lead reconciles that custody (`coordinator_unit` action `reconcile` with the custody id), as in
+  2.4.0.
+
+### Turn 24: the execution barrier, and recovery that stranded recorded refusals
+
+**Turn 24, "Needs changes".**
+- HIGH: a quarantine cleared the barrier of a patch that could still write. Command admission,
+  restoration and the lead's quiet windows all skipped quarantined patches, so a restore could be
+  overwritten by the patch still running.
+- HIGH: recovery quarantined every interrupted project patch before it read the results, and a
+  result for a quarantined operation was then discarded, even one recorded before the crash.
+
+The fixes are an `executing` flag that command admission, attribution, restoration
+(`RESTORE_EXECUTING`), quiet windows and publication respect until Codex reports that the handler
+ended or the app-server exits, and recovery that applies each log before its quarantine.
+
+`barrier_check.py midpatch`: a patch of a 300 MB file; the harness interrupts the turn as the patch
+is admitted.
+
+| | 2.4.0 | turn-24 tree (`s241c`) | `s241e`, `s241f` |
+|---|---|---|---|
+| The patch at turn end | quarantined "turn ended without complete patch lifecycle evidence" | the same | quarantined `executing` ("native ended the call without a result") |
+| A lead restore of the file after the turn | done (+31.54) | done (+32.69) | refused `RESTORE_EXECUTING` |
+| After the app-server stopped | | | restore done; the file at its baseline |
+
+The 2.4.0 and `s241c` runs then failed their second `ensure` with `DAEMON_START`: the restart bug
+below, which those clients have.
+
+`barrier_check.py abandon`: a 20 s command, then a `cat` whose Pre hook is still running when the
+harness interrupts the turn.
+
+| | 2.4.0, `s241c` | `s241e`, `s241f` |
+|---|---|---|
+| The `cat` | `allowed` after the interrupt, holding custody for a call that never ran | withdrawn `NATIVE_ABANDONED` |
+| Stop | refused `NOT_QUIESCENT` (custody 1, other operations 1) | clean; custody released when the `sleep` ended (+50.15) |
+
+`parts_check.py restart`: a project patch across Backend and Frontend whose context is not in one of
+the files, then the corrected patch and a command. The daemon is killed (SIGKILL) after the failed
+result and before its settlement.
+
+| Plugin | Outcome |
+|---|---|
+| `s241f`, no kill (control) | the bad patch `denied` `NATIVE_CALL_FAILED` in both parts; corrected patch `verified`; `b2`, `f2`; no UNKNOWN |
+| `s241f` noset (result recorded before the kill) | settled at its pre-images 0.7 s after recovery began; corrected patch `verified`; `b2`, `f2`; no UNKNOWN |
+| turn-24 tree noset (`s241c`) | both parts quarantined "cross-checkout operation interrupted before atomic receipt completion"; UNKNOWN on `b.txt` and `f.txt`; the retry refused "An overlapping operation is unreconciled" |
+| 2.4.0 (no result recorded) | the same as the turn-24 tree |
+
+**The restart bug.** The turn-24 run's stop, then an immediate restart, failed `DAEMON_START` with
+no diagnostic. `Client.stop` returns when `daemon/stop` answers, before the processes release their
+locks; an `ensure` at once found no answer, started a supervisor that lost the lock, and that
+supervisor exited without a word. Stop, then an immediate `ensure`: 2.4.0's client failed 2 of 2
+(`DAEMON_START` after 30 s), the client before the fix 4 of 4, and the 2.4.1 client started 4 of 4,
+each in 0.56 s.
+
+### Turn 25: receipts that arrive early, cancellation after the allow, a failed Post hook
+
+**Turn 25, "Needs changes".**
+- HIGH A: a `tool_result_ready` read before its call had a record was discarded with the offset
+  past it, so a hook still queued when Codex gave up on its call later allowed it.
+- HIGH B: a cancellation between the saved `allow` and Codex reading it gave `tool_result_ready`
+  with no result, and nothing settled the command, so it kept custody.
+- HIGH C: a patch whose handler succeeded but whose Post hook failed after a completed turn stayed
+  live: nothing settled a successful result.
+- MEDIUM: the client's `current()` returned "no daemon" at its deadline while the locks were held,
+  so `ensure()` started a supervisor that lost them.
+
+Snapshot `s241e` is the tree turn 25 read; `s241f` has the fixes. Each red was required before the
+green counted.
+
+`queued_check.py`: twelve parallel `exec_command` calls in one response (direct), and the same
+nested in one cell; each command admission paused 11 s inside `prepare`'s checkout lock; the turn
+interrupted 5 s after the first Pre hook started, so Codex ends their dispatches while the hooks
+still queue.
+
+| | `s241e` | `s241f` |
+|---|---|---|
+| direct | 1 `allowed` after the interrupt, holding custody; 9 `CUSTODY_WAIT`; stop refused `NOT_QUIESCENT` | 10 withdrawn `NATIVE_ABANDONED`; nothing held; clean stop |
+| nested | the same | the same as direct |
+
+`lifecycle_check.py`, with a calibrated copy of `hooks.py` beside the plugin under test: a rule
+pauses after the coordinator's answer, or exits with a code after the RPC; a deny answer is never
+paused.
+- `allowcancel`: the `cat`'s Pre hook holds the coordinator's allow 8 s before printing it, and
+  the harness interrupts the turn as soon as the call is allowed.
+  - `s241e`: allowed +27.76; `native/ended_without_result` +27.77; the operation stayed `allowed`
+    and custody stayed held 45 s later.
+  - `s241f`: allowed +28.23; `ended_without_result` +28.24; reconciled and custody released
+    +29.86; no UNKNOWN; clean stop.
+  - The first `s241e` run was void: it ran beside another run, one of whose processes exited during
+    the baseline scan, and the command was refused `PROCESS_UNREADABLE` before it was allowed. It
+    was run again alone.
+- `postfail`: a cell whose first line is `// @exec: {"yield_time_ms": 1000}` awaits one patch. Its
+  Pre hook holds the allow 6 s, so the turn completes first; its Post hook exits 3 after its RPC.
+  - `s241e`: turn completed +29.01; the file changed +34.06; Post hook failed ("hook exited with
+    code 3") +34.11; the operation stayed `running`, with a successful result, `result_ready` and
+    the Post RPC received.
+  - `s241f`: turn completed +29.14; the file changed +34.20; Post hook failed +34.24; quarantined
+    "PATCH_EVIDENCE: its Post hook did not complete" +34.25, with an UNKNOWN on the file; clean stop.
+
+`unresponsive_check.py`: stop, then SIGSTOP the exiting supervisor while it holds
+`supervisor.lock`, then `ensure(timeout=3)`.
+- `s241e`: `DAEMON_START` after 6.0 s (a new supervisor started and lost the lock).
+- `s241f`: `DAEMON_UNRESPONSIVE` after 3.0 s, `{"locks": ["supervisor.lock"], "waited_seconds": 3}`.
+- After SIGCONT, both started in 0.27 s.
+
+### SmartPay: a root process's id, and a checkout-wide UNKNOWN nothing cleared
+
+**The report.** At 14:33:20 a `PermissionError` in the coordinator's processing of a writer's
+command events recorded a checkout-wide UNKNOWN on `Smartpay_Backend`. It blocked every seal,
+publish, resume and implementation phase there. The live 2.4.0 ledger (1.3 GB), read through a
+read-only connection, shows:
+- two `background/failure` events, `PermissionError`, at 14:33:19;
+- then `native/reconcile_failure`, `PermissionError`, during the settlement of a writer's
+  read-only `git status --short`, and the `*` UNKNOWN "native evidence processing failed" on
+  `checkout_b37d140b…`;
+- the two commands reconciled, and their custody released, at 14:34:01.
+
+Backend also holds two UNMEDIATED `*` UNKNOWNs at 17:50:13 and 17:50:16. A Pre hook timed out
+after 120 s and `nl -ba .github/workflows/ci.yml` ran unadmitted: the first report's defect (a
+hook outliving Codex's limit behind a slow ledger), fixed above. A narrowing resolves those too, since
+it resolves every checkout-wide UNKNOWN recorded before its read.
+
+**The cause.** The coordinator checks every process id it recorded for a writer again, for example
+a hook process. When that process exits, the id can go to a root process. On macOS,
+`PROC_PIDTBSDINFO` fails for another user's process and `os.kill(pid, 0)` raises
+`PermissionError`, which 2.4.0's `processes.identity()` let escape. `PROC_PIDT_SHORTBSDINFO`
+(flavor 13, 64 bytes) answers for every process, with the uids `ps` shows; it fails (`ESRCH`) for
+zombies.
+
+**`identity_probe.py`**, loading each tree's `processes.py`, over every live process on this Mac
+(901):
+- `s241f`: `PermissionError` for 225 of the 226 processes of other users (one had exited: `None`);
+- `s241g`: `None` for all 226;
+- for the 675 processes of this user, both return the same result: 668 identities and 7
+  `PROCESS_UNREADABLE` (zombies).
+
+Again at 23:05 against the released tree, `s241l`, whose `processes.py` differs from `s241g`'s only
+in a Linux branch (788 processes): `s241f` raised `PermissionError` for 174 of the 175 processes of
+other users (one `None`); `s241l` returned `None` for all 175; this user's 613 got the same result in
+both (606 identities, 7 `PROCESS_UNREADABLE`).
+
+**`foreign_check.py stale`.** Run 1 makes one `cat`. Once it settles, each listener record gets a
+helper `{"pid": 1, "birth": "1:1"}` (launchd, root), as a hook process whose id a root daemon took.
+Run 2, same checkout, makes one `cat`.
+- `s241f`: two `background/failure` `PermissionError`, then `native/reconcile_failure`
+  `PermissionError` twice, each recording a `*` UNKNOWN "native evidence processing failed" (the
+  live pattern); run 2's command stayed `running` with custody held; stop refused `NOT_QUIESCENT`.
+- `s241g`: both commands reconciled, custody released, no UNKNOWN, clean stop.
+
+**`foreign_check.py narrow`, on `s241g`.** The writer patches `pkg01/m01.py` (verified, exact),
+then runs a 15 s command. While it holds custody, a checkout-wide UNKNOWN row is added to the
+scratch ledger, as a failure records one.
+- Narrow while the command runs: refused `RESTORE_CUSTODY`.
+- After the command settled, `pkg02/m02.py` was changed directly, with nothing in custody. Seal:
+  `UNKNOWN_BLOCKS_SEAL`, naming the checkout-wide UNKNOWN.
+- Narrow: 3,700 paths read in 0.9 s; the checkout-wide UNKNOWN resolved; one new UNKNOWN,
+  `pkg02/m02.py` ("unexplained bytes, found narrowing a checkout-wide UNKNOWN").
+- Narrow again: nothing resolved, nothing found. Narrow of the path's UNKNOWN: `NARROW_SCOPE`.
+- Seal: sealed (scope `pkg01/m01.py`). Clean stop.
+
+### Turns 26–32: late Post hook outcomes, the next turn, and the compatibility lease
+
+**Turn 26, "Needs changes".** The turn-25 findings A, B and the MEDIUM were resolved, and C in
+part. A patch whose dispatch ended after its handler was settled once a `thread/read` answer,
+then a marker through the notification queue, had passed.
+- HIGH: that barrier proves nothing. The app-server answers a request on its own path, so a Post
+  hook's completion that Codex sent before the dispatch end can still be on its way, and a patch
+  that succeeded was quarantined.
+- HIGH: any error of that request dropped the settlement, and nothing retried it.
+- MEDIUM: on Linux, `/proc/<pid>` is owned by the effective user only, so a live set-user-ID
+  child of a writer could count as gone.
+
+The barrier was removed. A patch whose Post hook RPC the coordinator received now waits for that
+outcome, holding its paths, and the outcome verifies or quarantines it when it arrives. On Linux,
+an unreadable process now holds custody (`PROCESS_UNREADABLE`).
+
+`lifecycle_check.py postlate` (turn 26's first HIGH): a nested patch whose Post hook succeeds. A
+calibration of the plugin copy's `native.py` holds the first postToolUse `hook/completed`, and
+every notification after it, for 3 s, in order, while request answers pass.
+- `s241g` (the tree turn 26 read): quarantined at +28.08, "native ended the call without complete
+  patch lifecycle evidence", with an UNKNOWN on the file. Its Post hook's completion arrived at
+  +31.03.
+- `s241h`: verified (exact) at +30.92, when the held completion arrived; no UNKNOWN.
+- `s241j`: verified at +31.06; no UNKNOWN.
+
+`lifecycle_check.py postcancel` (turn 26's second HIGH): a nested patch whose Post hook pauses 8 s
+after its RPC. The harness interrupts the turn then, and Codex cancels the hook: no outcome came in
+45 s. The `s241g` copy fails its barrier request once.
+- `s241g`: `native/barrier_failed` (`NATIVE_UNCERTAIN`) at +27.99. The interrupted turn's end
+  quarantined the patch at +28.00, with an UNKNOWN; clean stop. The lead had predicted a live patch
+  and a refused stop. That was wrong: the turn's end settled it.
+- `s241h`: the patch stayed `running`, holding its paths, for 45 s. The stop was not refused, and
+  it quarantined the patch, "app-server stopped before the patch ended", with an UNKNOWN.
+- `s241i` (turn 28's tree): quarantined at the interrupted turn's end (+28.04), with an UNKNOWN.
+  Turn 28 refuted that rule (below), and it was removed.
+- `s241j`: as `s241h`. The patch stayed `running` for 45 s with no UNKNOWN; the stop was not
+  refused, and quarantined it.
+
+**Turn 27, "Needs changes".** Turn 26's findings were resolved. Two new HIGHs:
+- The turn-end sweep had lost 2.4.0's same-turn condition. Codex can start a thread's next turn
+  before the coordinator reads the end of the last one, and that turn's patch reaches its hooks and
+  receipts first. The earlier turn's end then quarantined it.
+- A stop did not reach an Abraham workflow whose settlement waited on such a patch: the run stayed
+  `settling`, which counts as pending, so the stop was refused before it could settle the patch.
+
+The fixes: the same-turn condition is restored, and a settling workflow whose unit's every
+unsettled operation awaits its outcome no longer blocks a stop. The first fix also quarantined a
+cell's incomplete patch at an interrupted turn's end: in the 0.163 source, an interrupt terminates
+every active cell before the turn ends (`code_mode_interrupt`, stable and on by default), which
+cancels a cell's Post hook still running.
+
+`nextturn_check.py` (turn 27's first HIGH): the first turn answers with text only. A calibration of
+the plugin copy's `native.py` holds the run's first `turn/completed`, and every notification after
+it, for 6 s, and at once starts the thread's next turn on the same connection, as Codex does for
+pending input. That turn makes one direct patch, whose hooks and receipts reach the coordinator
+before the first turn's end.
+- `s241h` (the tree turn 27 read): the patch was allowed at +28.18 and wrote at +28.20. When the
+  first turn's end was read, at +34.13, it was quarantined, "turn ended without complete patch
+  lifecycle evidence", with an UNKNOWN on the file, although its Post hook had completed.
+- `s241j`: verified (exact) at +36.15; no UNKNOWN.
+- The first version of this harness armed its hold on the admission probe's turn, and both runs
+  failed at `run/start`. It now arms on the run's first answer.
+
+**Turn 28, "Needs changes".** The same-turn condition was confirmed. Three HIGHs:
+- An advance already past its entry check could still submit a turn during a drain, and
+  `settling_on_outcomes` read its query as a generator, so every settling workflow counted as
+  waiting only on outcomes.
+- An `interrupted` status is not evidence that a cell's Post hook was cancelled: Codex reports every
+  abort reason (interrupt, replacement, budget, review end) as `interrupted`, and only an interrupt
+  with `code_mode_interrupt` on terminates the turn's cells.
+- That quarantine also made the interrupted Abraham workflow block the stop again.
+
+The interrupted-status quarantine was removed: a cell's patch waits for its outcome or its
+app-server's exit, whatever the turn's status. The query is a list, and must be nonempty. A drain
+waits for the workflow advances under way, and each stops at its next step, so no phase completes
+and no turn starts while the daemon drains; `submit` refuses while draining, keeping the prepared
+input for the next daemon.
+
+**Turn 29, "Needs changes".** Turn 28's three HIGHs were resolved, with no new CRITICAL or HIGH.
+One MEDIUM: the CHANGELOG and README gave a coordinator stop as the recovery for an aborted patch,
+but in an Abraham workflow the quarantined `executing` patch keeps the phase settling, and the stop
+is refused (`workflows`), as in 2.4.0. Both now say to cancel the run first, wait until it reports
+cancelled, then stop.
+
+**Turn 30, "Needs changes".** The MEDIUM was resolved. One new HIGH, missed in the earlier turns:
+a run's end released the checkout's compatibility lease while a patch could still be writing. The
+release checked runs, turns, custody and deliveries, never operations. A `codex exec` writer
+outside the coordinator could then take the checkout and overlap that write. The lease is now kept
+while any operation of the checkout is live or `executing`, a project's parts included, and the
+maintenance pass releases it within a second of the last one ending. A stop releases it after every
+app-server has exited.
+
+`lease_check.py`, a copy of the `midpatch` harness (the 300 MB patch whose handler the interrupt
+aborts; the run is cancelled): 5 s after the turn, and again after the stop, it takes the
+checkout's write lock the way a legacy writer does (`flock(LOCK_EX | LOCK_NB)` on
+`write-locks/tree-<dev>-<ino>.lock`).
+
+| | 5 s after the turn | after the stop |
+|---|---|---|
+| 2.4.0 | acquired; the lead's restore had already run (+33.15) | acquired |
+| `s241j` (turn 30's tree) | acquired, with the patch still `executing`; the restore refused `RESTORE_EXECUTING` | acquired |
+| `s241k` | refused: the lease held, the patch `executing` | acquired; the restore done |
+
+The 2.4.0 harness then exited 1 at its second `ensure`, the restart bug of turn 24 (above).
+
+**Turn 31, "Needs changes".** Turn 30's case was resolved. One HIGH, older than this release: the
+release of the lease and the admission of a call were not ordered. A cell's call can still wait in
+its Pre hook, with no operation recorded, after its run's turn completed; the lease was then
+released, and the delayed hook prepared and allowed the patch with no lease while a legacy writer
+could hold the checkout. An effect-capable Pre hook now counts itself on each of its unit's
+checkouts under the lock the release takes, takes the lease back if it was released, and stays
+counted until its operation is recorded or its admission ends. A release waits while any hook is
+counted. While another holder has the checkout's write lock, the call is refused
+(`EXCLUSIVE_WRITER`).
+
+`lease2_check.py prehold`: a cell that yields after 1 s; its patch's Pre hook pauses 8 s before its
+coordinator RPC, so the turn completes and the run ends with no operation recorded. Once the
+coordinator records its lease released, the harness takes the checkout's legacy write lock and holds
+it 20 s; the hook asks the coordinator meanwhile.
+- `s241k` (calibration, before the fix): the run completed at +30.67 s and the legacy writer took
+  the lock at +31.14 s. The hook asked at +37.72 s; the patch was allowed at +37.73 s and
+  `pkg00/m00.py` became `VALUE = 100` at +37.74 s, while the legacy writer held the lock (released at
+  +51.15 s). Verified, exact: the coordinator saw nothing wrong.
+- `s241l`: the run completed at +31.59 s and the legacy writer took the lock at +32.01 s. The hook
+  asked and was refused `EXCLUSIVE_WRITER` at +38.75 s (Codex reported `preToolUse blocked`).
+  `pkg00/m00.py` stayed `VALUE = 0`; no custody, no UNKNOWN, clean stop.
+
+**Turn 32, "Ship it".** Turn 31's HIGH resolved and turn 30's protection intact; no new finding.
+Codex checked both orders. If admission wins, its count is taken under the lock a release takes, and
+the release waits. If the release wins, admission finds the lease field cleared and takes the lease
+again before preparing; a competing holder gets `EXCLUSIVE_WRITER`. A failed acquisition unwinds
+every count it took; after a successful one, the admission's `finally` does. Its verdict on the
+caller's hypothesis was UNPROVEN only for the real-engine result: the `s241l` run above, and no
+admission count left after a refusal.
+
+`lease3_check.py prehold` is the same run followed by a second run on the checkout once the legacy
+writer has let go. That run's patch is admitted after its run ends, taking the lease back. 5 s after
+the patch settles, the harness tries the legacy write lock.
+- `s241m_leak` (calibration: `s241l` whose refused admission keeps its count): the first patch
+  refused `EXCLUSIVE_WRITER`, the second verified, exact; 5 s later the legacy lock was refused,
+  the lease still recorded. Its stop answered `stopping`, but its worker then restarted and
+  recovered (generation 2) with the lease still held; that daemon was ended by hand.
+- `s241l`: the same two patches; 5 s after the second settled, the legacy lock was acquired and
+  the lease recorded released. Clean stop, no process left.
+- 2.4.0 (`git archive 5332c01`, its hook given the same pause): the run completed at +29.57 s
+  and the legacy writer took the lock at +30.47 s. The hook asked at +36.57 s; the patch was
+  allowed at +36.58 s and the file became `VALUE = 100` at +36.59 s, while the legacy writer held
+  the lock (released at +50.48 s). Verified; no UNKNOWN. Its second-run probe ran before that
+  run's patch had asked, so it shows nothing.
+
+### The released tree (`s241l`)
+
+The final batch ran on `s241l`, a snapshot equal to the released tree, with its two fault copies
+(`s241l_nolog`, `s241l_noset`). The runs the full disk spoiled were run again on the same tree
+(below); each result here is from a run that completed with room to spare.
+- `case_check.py`, all 13 cases: no custody held, no UNKNOWN, a clean stop and the log deleted,
+  with the outcomes of the 2.4.1 column above but one. In the sub-agent case, its first call was
+  refused `PROCESS_UNREADABLE`: `ps` had listed pid 63043, a process of this user, and the kernel
+  read then failed while it still existed, as other lanes were starting processes. 2.4.0's
+  baseline is the same code. The `cat` after it ran.
+- `lifecycle_check.py` `postcancel`, `postlate`, `allowcancel`, `postfail`: the outcomes of `s241j`
+  (above).
+- `queued_check.py` `direct` and `nested`: ten commands each `denied` `NATIVE_ABANDONED`; no UNKNOWN;
+  clean stops.
+- `patch_check.py` `turnend`, `retry`, `failed`; `parts_check.py` `control` and the `noset` restart;
+  `recovery_check.py` `restart` and `replace` on the tree and both fault copies;
+  `barrier_check.py` `abandon` and `midpatch` (the 300 MB patch: the restore refused
+  `RESTORE_EXECUTING` after the turn, then done once the app-server stopped, the file at its
+  baseline): each the same as on `s241j`, run ids and times apart. In `replace`, the 20 s
+  command whose app-server the harness kills was `running` here and `allowed` on `s241j`, by
+  whether its start reached the coordinator before the kill. Both kept its custody, with two
+  UNKNOWNs ("listener died with potentially escaped effects", "native notification gap"), and
+  refused the stop: the known limit for a writer whose app-server dies.
+- `nextturn_check.py`: verified, exact, at +36.31 s; no UNKNOWN.
+- `lease_check.py`: as `s241k` above. 5 s after the turn the legacy lock was refused, the patch
+  `executing`; after the stop, acquired, and the restore done.
+- The regression suite (`regress_241.sh`, 89 sections), compared with r27 (`s241f`): the same in
+  every section but four. A push gate's ACK code differs (it is random). "Lead tools after
+  reopen" showed an empty `attributed` list on one participant. That list comes and goes between
+  runs (present in r20, r22, r24 to r26 and r33; absent in r19, r21, r27 and r32), the code that
+  adds it is unchanged since r27's tree, and the answer's attribution was the same. The leftovers were listed in another order. "Checkout/query vs unit
+  history" failed at its 1,000-unit step when the disk filled; run again, every step answered, 7
+  of 7 gate clients included, with medians of 0.7, 0.7, 1.5, 3.1 and 4.3 ms for 10 to 1,000 units
+  (r27: 0.4, 0.8, 1.4, 2.6 and 4.8 ms). Compared with r22, the other differences are the version
+  numbers the upgrade sections print.
+- `identity_probe.py` and `lease3_check.py`: above.
+
+### Runs that did not count
+
+- The Mac's battery reached 1% during the `s241e` batch, and it slept from 18:18:53 to 19:59:43
+  (`pmset -g log`). The runs in flight were void: `e_case_dtty`, `f_pt_241e_noset_restart` and
+  `f_pt_240_restart` (each harness failed reading a run that never finished). Their scratch daemons
+  and app-servers were ended, and the `s241f` batch ran every case again.
+- The first `s241f` batch's patch, burst and history runs found work folders from earlier runs and
+  exited at once. They were run on `s241g` instead.
+- An endpoint-security scanner used about 75% of a core during the later runs, and the user's own
+  coordinator worker about 20%, so absolute timings are inflated.
+- Lanes were stopped when a review turn changed the code under them: lane C on `s241h` and on
+  `s241j`, and every lane on `s241i` and `s241k`. Their unfinished runs were not counted.
+- The first `nextturn_check.py` runs (`nt_s241h_void1`, `nt_s241i_void1`) armed their hold on the
+  admission probe's turn and failed at `run/start` (above).
+- The first 2.4.0 `lease3_check.py prehold` (`p3_240`): the calibration's pause calls `time`, which
+  2.4.0's `hooks.py` does not import, so each hook failed at once ("Coordinator unavailable or
+  refused (NameError)") and blocked its patch. The harness now imports it.
+- **The disk filled.** At 23:12:35 the volume this Mac shares with the user's own work reached 0
+  bytes free: the lead's 458 run folders of the day, several holding the 300 MB file three times
+  (the checkout, its git object, the coordinator's pre-image). Void: `barrier midpatch`'s last
+  restore (refused `OPERATIONAL_FAILURE`, `OSError`), `barrier abandon`, both `parts` runs, the six
+  `recovery` runs, `queued nested`, the three `patch` runs, the suite's last section and the second
+  2.4.0 `prehold` (`p3_240b`). The lead stopped lane B, deleted the finished run folders (keeping
+  their logs) and ran each again on the same tree, deleting each green run's folder as it ended.
+  The user's live 2.4.0 coordinator failed two settlements with `OSError` meanwhile (23:12:36 and
+  23:13:23), each recording a checkout-wide `*` UNKNOWN on the Sales_Profiler checkout ("native
+  evidence processing failed"), and one of its writers could not save its transcript once (Codex
+  retried). Nothing failed there after 23:13:23.
+
+### Commands for the final batch
+
+From the lead's scratchpad (`projects/`), with `S=s241l/software-workflows` and a new work folder
+`<w>` for each run, all with `python3.15 -B`. Each run recorded above exited 0 (for a run the full
+disk spoiled, its re-run):
+- `case_check.py $S $S <w> <case>`, for `tty`, `workdir`, `patch`, `last`, `next`, `late`,
+  `afterturn`, `descendant`, `descendant15`, `child`, `dtty`, `dpar` and `dpatch`;
+- `lifecycle_check.py $S $S <w>` with `postcancel`, `postlate`, `allowcancel` and `postfail`;
+- `queued_check.py $S <w>` with `direct` and `nested`; `patch_check.py $S <w>` with `turnend`,
+  `retry` and `failed`;
+- `barrier_check.py $S $S <w>` with `midpatch` and `abandon`; `parts_check.py $S $S <w> control`;
+  `parts_check.py s241l_noset/software-workflows $S <w> restart`;
+- `recovery_check.py <tree> $S <w>` with `restart` and `replace`, for `s241l`, `s241l_nolog` and
+  `s241l_noset`;
+- `lease_check.py $S $S <w> midpatch`; `nextturn_check.py $S $S <w> nextturn`;
+- `lease2_check.py <tree> $S <w> prehold` for `s241k` and `s241l`; `lease3_check.py <tree> $S <w>
+  prehold` for `s241m_leak`, `s241l` and 2.4.0 (`export240`);
+- `identity_probe.py s241f/software-workflows s241l/software-workflows`;
+- `regress_241.sh $S s241lcal r33`, then `query_cost.py $S <w> 10,100,300,600,1000` again;
+  `suite_cmp.py` against `r27_full.log` and `r22_full.log`.

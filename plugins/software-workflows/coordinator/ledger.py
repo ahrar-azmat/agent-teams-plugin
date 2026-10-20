@@ -524,10 +524,10 @@ class Ledger:
     def apply_observation(self, checkout, paths, actual, reason, ignore_pending=True, attribute=None, transaction=True):
         pending = set()
         if ignore_pending:
-            for operation in self.store.all("operation"):
-                if operation["checkout"] == checkout["id"] and operation["state"] in ("prepared", "allowed", "running") and operation["kind"] in ("patch", "lead-edit", "restore"):
+            for operation in self.store.live_operations(checkout["id"]):
+                if (operation["state"] in ("prepared", "allowed", "running") or operation.get("executing")) and operation["kind"] in ("patch", "lead-edit", "restore"):
                     pending.update(operation["paths"])
-        context = [r["id"] for r in self.store.all("custody") if r["checkout"] == checkout["id"] and r["state"] != "released"]
+        context = [r["id"] for r in self.store.held_custody(checkout["id"])]
         # The caller's proof is checked again after the scan, with nothing awaited before the writes.
         if attribute and attribute.get("still_quiet") and not attribute["still_quiet"]():
             attribute = None
@@ -594,7 +594,7 @@ class Ledger:
             result["participants"] = [{"checkout": c["id"], "root": c["root"], **results[c["id"]]} for c in checkouts]
             return result
 
-    async def prepare(self, actor, kind, intended, paths, native=None):
+    async def prepare(self, actor, kind, intended, paths, native=None, deadline=None):
         unit, checkout = self.store.get(actor["unit"]), self.store.get(actor["checkout"])
         self.require_owned(checkout)
         if unit["state"] != "open" or checkout.get("quarantine"):
@@ -606,18 +606,19 @@ class Ledger:
         keys = [normalize(checkout, path)["key"] for path in paths]
         if any(overlaps(left, right) for i, left in enumerate(keys) for right in keys[i + 1:]):
             raise CoordinatorError("OPERATION_SCOPE", "A single mutation cannot contain aliased or ancestor/descendant endpoints")
-        async with self.lock(checkout["id"]):
+        from .locks import held
+        async with held(self.lock(checkout["id"]), deadline):
             from .custody import interfering
             started = time.time()
             if paths and interfering(self.store, checkout, paths):
                 raise CoordinatorError("CUSTODY_CONFLICT", "Command custody overlaps the intended mutation")
-            for operation in self.store.all("operation"):
-                if operation["checkout"] == checkout["id"] and operation["state"] in ("prepared", "allowed", "running", "quarantined"):
-                    if kind == "restore" and operation["state"] == "quarantined" and operation["paths"] and set(operation["paths"]) <= set(paths):
-                        continue
-                    existing = [normalize(checkout, path)["key"] for path in operation["paths"]]
-                    if any(overlaps(a, b) for a in keys for b in existing):
-                        raise CoordinatorError("OPERATION_BUSY", "An overlapping operation is unreconciled", {"operation": operation["id"]})
+            for operation in self.store.live_operations(checkout["id"]):
+                if (kind == "restore" and operation["state"] == "quarantined" and not operation.get("executing")
+                        and operation["paths"] and set(operation["paths"]) <= set(paths)):
+                    continue  # a restore replaces what a quarantined operation left, once native cannot still write it
+                existing = [normalize(checkout, path)["key"] for path in operation["paths"]]
+                if any(overlaps(a, b) for a in keys for b in existing):
+                    raise CoordinatorError("OPERATION_BUSY", "An overlapping operation is unreconciled", {"operation": operation["id"]})
             pre = {path: await asyncio.to_thread(read_path, self.store, checkout, path) for path in paths}
             if self.store.get(actor["unit"])["state"] != "open":
                 raise CoordinatorError("UNIT_FROZEN", "Unit froze while operation pre-images were being saved")
@@ -636,9 +637,10 @@ class Ledger:
                     raise CoordinatorError("STALE_BASE", "Path changed outside a verified operation", {"path": path})
                 bases[path] = head and head["id"]
             opid = uid("op")
-            if kind in ("command", "mcp", "lead-command"):
-                bases = {row["path"]: row["revision"] for row in self.store.db.execute(
-                         "SELECT path,revision FROM heads WHERE checkout=?", (checkout["id"],))}
+            # An opaque operation reads no base of its own (publish skips it as a dependency): a
+            # fingerprint pins the heads it was admitted against. A copy of every head cost 365 KB
+            # a command on a 3,679-file checkout, decoded again by every later scan.
+            heads = self.store.heads_fingerprint(checkout["id"]) if kind in ("command", "mcp", "lead-command") else None
             reads = [r for r in self.store.all("read", actor["id"])
                      if unit.get("project_revision") or r.get("checkout", actor["checkout"]) == checkout["id"]]
             dependencies = [r["revisions"] for r in reads]
@@ -646,12 +648,12 @@ class Ledger:
                          "attempt": actor.get("attempt"), "generation": self.store.generation,
                          "state": "prepared", "paths": paths, "pre": pre, "bases": bases,
                          "intended": intended, "native": native or {}, "dependencies": dependencies,
-                         "created": started, "hook_valid": False}
+                         "created": started, "hook_valid": False, **({"heads": heads} if heads else {})}
             if unit.get("project_revision"):
                 operation["qualified_dependencies"] = [{"checkout": r.get("checkout", actor["checkout"]), "revisions": r["revisions"]} for r in reads]
             with self.store.transaction():
                 self.store.put("operation", opid, operation, unit["id"])
-                self.store.event("operation/prepared", opid, {"bases": bases, "native": native or {}})
+                self.store.event("operation/prepared", opid, {"bases": bases, **({"heads": heads} if heads else {}), "native": native or {}})
             return self.store.get(opid)
 
     async def complete_patch(self, operation, item):
@@ -775,7 +777,54 @@ class Ledger:
                                        {"operation": record["id"], "state": record["state"]})
         return current
 
-    async def quarantine(self, operation, reason):
+    async def settle_unapplied(self, operation, reason, still):
+        """A patch native ended without applying it (it never began, or reported failure). With every endpoint
+        still at its pre-image it changed nothing: it is settled as no effect and stops excluding its paths.
+        Any other bytes may be its effect, so it is quarantined. `still(operation)` is the caller's evidence
+        that native is done with it; evidence arriving while the endpoints are read (an item, a Post hook)
+        wins, so it is checked again in the transaction that settles it and before any quarantine."""
+        operation = self.store.get(operation["id"])
+        if operation.get("parent_operation"):
+            operation = self.store.get(operation["parent_operation"])
+        parts = [self.store.get(key) for key in operation.get("parts", [])] or [operation]
+        def current():
+            fresh = self.store.get(operation["id"])
+            return fresh if fresh["state"] in ("prepared", "allowed", "running") and still(fresh) else None
+        from contextlib import AsyncExitStack
+        try:
+            async with AsyncExitStack() as stack:
+                for key in sorted({part["checkout"] for part in parts}):
+                    await stack.enter_async_context(self.lock(key))
+                if not current():
+                    return  # Settled meanwhile, or its own lifecycle evidence arrived: that decides.
+                parts = [self.store.get(key) for key in operation.get("parts", [])] or [self.store.get(operation["id"])]
+                for part in parts:
+                    checkout = self.store.get(part["checkout"])
+                    for path in part["paths"]:
+                        if await asyncio.to_thread(read_path, self.store, checkout, path) != part["pre"][path]:
+                            raise CoordinatorError("PATCH_EFFECT", "An endpoint differs from its pre-image", {"path": path})
+                with self.store.transaction():
+                    fresh = current()
+                    if not fresh:
+                        return
+                    # Check every record before any changes: a part's check reads its parent's state.
+                    records = [self.completable(record) for record in [fresh] + [part for part in parts if part["id"] != fresh["id"]]]
+                    for record in records:
+                        record.update(state="denied", no_effect=True, refusal=reason, completed=time.time())
+                        self.store.save(record)
+                    self.store.event("operation/no_effect", operation["id"], {"reason": reason})
+        except CoordinatorError as exc:
+            if exc.code == "OPERATION_STATE" or not current():
+                return
+            await self.quarantine(operation, reason + ": " + exc.code)
+        except OSError as exc:
+            if not current():
+                return
+            await self.quarantine(operation, reason + ": " + type(exc).__name__)
+
+    async def quarantine(self, operation, reason, executing=False):
+        """Its effects are unknown. With `executing`, native may still be writing for it: admission, restoration
+        and quiet windows keep treating its paths as busy until `end_execution`."""
         # State changes must win before waiting for filesystem/ledger locks.
         # Reload rather than saving an object captured before a competing await.
         operation = self.store.get(operation["id"])
@@ -787,6 +836,8 @@ class Ledger:
         with self.store.transaction():
             for record in [operation, *parts]:
                 record.update(state="quarantined", refusal=reason)
+                if executing:
+                    record["executing"] = True
                 self.store.save(record)
             for part in parts or [operation]:
                 ids = checkout_ids(self.store, part["unit"]) if part["kind"] in ("command", "mcp", "lead-command") else [part["checkout"]]
@@ -802,3 +853,19 @@ class Ledger:
                 checkout["quarantine"] = "filesystem reconciliation incomplete"
                 self.store.save(checkout)
         await asyncio.gather(*(reconcile(key, paths) for key, paths in scopes.items()))
+
+    def end_execution(self, operation, transaction=True):
+        """Native can no longer write for this operation: its handler ended, or its app-server exited. A quarantine
+        stops holding the paths it kept busy. Its parts carry the flag with it."""
+        operation = self.store.get(operation["id"])
+        if operation.get("parent_operation"):
+            operation = self.store.get(operation["parent_operation"])
+        records = [r for r in [operation] + [self.store.get(key) for key in operation.get("parts", [])] if r.get("executing")]
+        if not records:
+            return
+        from contextlib import nullcontext
+        with self.store.transaction() if transaction else nullcontext():
+            for record in records:
+                record.pop("executing")
+                self.store.save(record)
+            self.store.event("operation/execution_ended", operation["id"], {})

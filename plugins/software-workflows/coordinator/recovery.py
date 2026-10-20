@@ -3,12 +3,26 @@ import asyncio
 import base64
 import json
 import os
+from pathlib import Path
 import signal
 import time
 
 from .client import CoordinatorError
 from . import native, processes, participants
 from .store import uid
+
+
+async def may_execute(daemon, operation):
+    """Whether native may still write for this admitted patch: allowed, with no sign its handler ended, and its
+    app-server still running. A quarantine then keeps its paths busy (`executing`)."""
+    from .daemon import handler_ended
+    if operation["kind"] != "patch" or operation["state"] not in ("allowed", "running") or handler_ended(operation):
+        return False
+    listener = daemon.store.get(operation["native"].get("listener") or "", required=False)
+    if not listener:
+        return False
+    current = await asyncio.to_thread(processes.identity, listener["pid"])
+    return bool(current and current["birth"] == listener["birth"] and not current["zombie"])
 
 
 async def reconcile_listener(daemon, listener, advance=True):
@@ -20,9 +34,13 @@ async def reconcile_listener(daemon, listener, advance=True):
     alive = current and current["birth"] == listener["birth"] and not current["zombie"]
     actor = store.get(listener["actor"])
     run = store.get(actor["run"])
+    # The receipts its log holds settle the calls they name before any crash quarantine: a refused patch is no
+    # effect at its pre-images, in every checkout it spans.
+    await daemon.settle_native_log(listener["id"])
     for operation in list(store.all("operation", actor["unit"])):
         if operation.get("parts") and operation["state"] in ("prepared", "allowed", "running"):
-            await daemon.ledger.quarantine(operation, "cross-checkout operation interrupted by native reconnect")
+            await daemon.ledger.quarantine(operation, "cross-checkout operation interrupted by native reconnect",
+                                           executing=await may_execute(daemon, operation))
     unsubmitted = not run.get("workflow") and not run.get("task") and not run.get("production_started") and not run.get("phases")
     for checkoutid in participants.checkout_ids(store, actor["unit"]):
         await daemon.ensure_lease(checkoutid)
@@ -47,8 +65,15 @@ async def reconcile_listener(daemon, listener, advance=True):
                     reservation.update(state="quarantined", reason=exc.code)
                     store.save(reservation)
             store.unknown(reservation["checkout"], "*", "listener died with potentially escaped effects", {"listener": listener["id"]})
+        # The receipts it wrote before it died apply to the calls it admitted; never its replacement's.
+        await daemon.settle_native_log(listener["id"])
+        await daemon.executor_exited(listener)
+        listener = store.get(listener["id"])
         listener["state"] = "dead"
         store.save(listener)
+        if listener.get("log"):
+            Path(listener["log"]).unlink(missing_ok=True)
+            daemon.log_offsets.pop(listener["id"], None)
         replacement = await daemon.spawn_listener(actor, listener["config"], listener.get("home"))
         replacement["root_thread"] = listener["root_thread"]
         replacement["replaces"] = listener["id"]
@@ -103,17 +128,23 @@ async def reconcile_listener(daemon, listener, advance=True):
     while True:
         for row in store.db.execute("SELECT data FROM events WHERE kind='native' AND subject=? ORDER BY seq", (incarnation["id"],)):
             notification = json.loads(row[0])
-            params = notification.get("params", {})
-            if notification.get("method") == "hook/completed":
+            params, method = notification.get("params", {}), notification.get("method")
+            if method == "hook/completed":
                 daemon.record_hook_evidence(listener, params, history=True)
-            elif notification.get("method") == "item/completed" and params.get("item", {}).get("type") in ("fileChange", "commandExecution", "mcpToolCall"):
+            elif method in ("item/started", "item/completed") and params.get("item", {}).get("type") in ("fileChange", "commandExecution", "mcpToolCall"):
                 operation = daemon.find_operation(listener, params["threadId"], params["turnId"], params["item"]["id"], history=True)
-                if operation:
-                    operation["completed_item"] = params["item"]
+                key = "completed_item" if method == "item/completed" else "started_item"
+                if operation and (key == "completed_item" or not operation.get(key)):
+                    operation[key] = params["item"]
                     store.save(operation)
+                    if key == "completed_item":
+                        daemon.ledger.end_execution(operation)
         if not incarnation.get("replaces"):
             break
         incarnation = store.get(incarnation["replaces"])
+    # Failed results it wrote while no daemon read its log, judged with every item replayed above
+    # (its log is not followed while it reconciles).
+    await daemon.settle_native_log(listener["id"])
     # Discover every loaded descendant before reconciling its items. Parent events
     # may have been missed; thread/read supplies the native ancestry.
     await daemon.discover_descendants(listener)
@@ -160,6 +191,7 @@ async def reconcile_listener(daemon, listener, advance=True):
                     if operation and entry.get("completedAtMs"):
                         operation["completed_item"] = item
                         store.save(operation)
+                        daemon.ledger.end_execution(operation)
                     elif not operation:
                         for checkoutid in participants.checkout_ids(store, child["unit"]):
                             store.unknown(checkoutid, "*", "history contains an unaccounted effect-capable item", {"item": item["id"], "listener": listener["id"]})
@@ -186,7 +218,8 @@ async def reconcile_listener(daemon, listener, advance=True):
                 else:
                     await daemon.settle_actor(store.get(operation["actor"]))
             else:
-                await daemon.ledger.quarantine(operation, "crash gap: intent is not proof of execution or no effect")
+                await daemon.ledger.quarantine(operation, "crash gap: intent is not proof of execution or no effect",
+                                               executing=await may_execute(daemon, operation))
     await asyncio.gather(*(daemon.ledger.reconcile(store.get(key), ignore_pending=False, reason="recovery snapshot")
                            for key in participants.checkout_ids(store, actor["unit"])))
     listener = store.get(listener["id"])
@@ -228,9 +261,14 @@ async def recover(daemon):
     # completion boundary. History cannot retrospectively complete one whose
     # transaction did not commit, even if every post-image now matches.
     # Fence it before reconnecting: queued native events may arrive immediately.
+    # The receipts each listener's log holds come first: a patch native refused before the crash is settled at
+    # its pre-images, and one it may still be writing keeps its paths (`executing`).
+    for listener in recoverable:
+        await daemon.settle_native_log(listener["id"])
     for operation in list(store.all("operation")):
         if operation.get("parts") and operation["state"] in ("prepared", "allowed", "running"):
-            await daemon.ledger.quarantine(operation, "cross-checkout operation interrupted before atomic receipt completion")
+            await daemon.ledger.quarantine(operation, "cross-checkout operation interrupted before atomic receipt completion",
+                                           executing=await may_execute(daemon, operation))
     for discovery in list(store.all("project_discovery")):
         if discovery["state"] == "running":
             current = await asyncio.to_thread(processes.identity, discovery["pid"])
@@ -394,6 +432,14 @@ def resolve_restored_parents(store):
             store.save(operation)
 
 
+def refuse_executing(store, checkout):
+    """A restore would race a write native may still finish for a quarantined patch."""
+    executing = [o["id"] for o in store.live_operations(checkout) if o.get("executing")]
+    if executing:
+        raise CoordinatorError("RESTORE_EXECUTING", "A quarantined patch may still be writing; its paths stay held "
+                               "until its handler's end is reported or its app-server stops", {"operations": executing})
+
+
 async def restore_unknown(daemon, params):
     store = daemon.store
     actor = store.get(params["actor"])
@@ -413,6 +459,7 @@ async def restore_unknown(daemon, params):
         raise CoordinatorError("RESTORE_ACTIVE", "Interrupt active writers before restoring UNKNOWN")
     if daemon.custody.active(row["checkout"]):
         raise CoordinatorError("RESTORE_CUSTODY", "Uncertain command survivors must be reconciled before restoration")
+    refuse_executing(store, row["checkout"])
     await daemon.ledger.reconcile(store.get(row["checkout"]), [row["path"]], ignore_pending=False)
     change = {"mode": known["mode"]}
     if known["blob"]:
@@ -445,10 +492,12 @@ async def restore_checkout(daemon, actor, unknown, revisions):
         raise CoordinatorError("RESTORE_ACTIVE", "Interrupt every writer before restoring a notification gap")
     if daemon.custody.active(checkout["id"]):
         raise CoordinatorError("RESTORE_CUSTODY", "Reconcile all terminals and descendants first")
+    refuse_executing(store, checkout["id"])
     await daemon.ledger.reconcile(checkout, ignore_pending=False)
     paths = {r[0] for r in store.db.execute("SELECT path FROM heads WHERE checkout=?", (checkout["id"],))}
     if not paths or not isinstance(revisions, dict) or set(revisions) != paths:
-        raise CoordinatorError("RESTORE_FULL_SCOPE", "A checkout-wide UNKNOWN requires an explicit known revision for every ledger path",
+        raise CoordinatorError("RESTORE_FULL_SCOPE", "A checkout-wide UNKNOWN requires an explicit known revision for every ledger path; "
+                               "to keep the checkout as it is, narrow it instead (coordinator_unit action \"narrow\")",
                                {"paths": sorted(paths), "null_revision": "allowed only for a path absent from the recorded baseline tree"})
     baseline = await asyncio.to_thread(gitio.entries, checkout["root"], checkout["base"])
     changes = {}
@@ -477,3 +526,53 @@ async def restore_checkout(daemon, actor, unknown, revisions):
         store.event("unknown/checkout_restored", unknown["id"], {"restore": result["id"], "known_revisions": revisions})
     return {"restore": result["id"], "state": "restored_requires_new_edit", "unknown": unknown["id"],
             "required_new_edit_scope": sorted(paths)}
+
+
+async def narrow_unknown(daemon, params):
+    """A checkout-wide UNKNOWN says the coordinator lost track of the checkout for a while, so an effect it
+    could not attribute may be anywhere in it. Reading every path again shows what that left: each path whose
+    bytes differ from the revision the ledger knows becomes its own UNKNOWN, as in any reconcile, and every
+    checkout-wide UNKNOWN recorded before the read is resolved by it. Nothing is written and no bytes are
+    adopted, so no writer needs to be idle: a patch or edit still in flight keeps its own lifecycle, and seal
+    and publish read their paths again before they freeze them. Not seen: a change the gap made and undid
+    before the read."""
+    from .ledger import full_snapshot
+    store = daemon.store
+    actor = store.get(params["actor"])
+    if actor["kind"] != "lead":
+        raise CoordinatorError("LEAD_ONLY", "Only a lead can narrow a checkout-wide UNKNOWN")
+    row = store.db.execute("SELECT * FROM unknowns WHERE id=?", (params.get("unknown"),)).fetchone()
+    if not row or not participants.contains(store, actor["unit"], row["checkout"]):
+        raise CoordinatorError("RESTORE_SCOPE", "UNKNOWN must belong to a participant")
+    if row["path"] != "*":
+        raise CoordinatorError("NARROW_SCOPE", "Only a checkout-wide UNKNOWN is narrowed; restore a path's UNKNOWN to a known revision")
+    checkout = store.get(row["checkout"])
+
+    def quiet():
+        # A command's effects are opaque until it is reconciled: read while one runs, they would be UNKNOWN.
+        if daemon.custody.active(checkout["id"]):
+            raise CoordinatorError("RESTORE_CUSTODY", "A command holds custody in this checkout; narrow once it is reconciled", {}, True)
+        refuse_executing(store, checkout["id"])
+
+    async with daemon.ledger.lock(checkout["id"]):  # no operation is admitted here while the checkout is read
+        quiet()
+        began = time.time()
+        known = {r[0] for r in store.db.execute("SELECT path FROM heads WHERE checkout=?", (checkout["id"],))}
+        actual = await asyncio.to_thread(full_snapshot, store, checkout, known)
+        quiet()  # a command whose custody was granted before the lock may have started meanwhile
+        ident = uid("narrowing")
+        with store.transaction():
+            result = daemon.ledger.apply_observation(checkout, set(actual), actual,
+                                                     "unexplained bytes, found narrowing a checkout-wide UNKNOWN", transaction=False)
+            resolved = [u["id"] for u in store.unresolved(checkout["id"]) if u["path"] == "*" and u["created"] < began]
+            found = [{"id": r["id"], "path": r["path"]} for unknown in result["unknowns"]
+                     for r in store.db.execute("SELECT id, path FROM unknowns WHERE id=?", (unknown,))]
+            store.put("narrowing", ident, {"checkout": checkout["id"], "actor": actor["id"], "unknowns": resolved,
+                                           "paths_scanned": result["paths_scanned"], "found": found, "created": time.time()}, checkout["id"])
+            for unknown in resolved:
+                store.db.execute("INSERT INTO resolutions(unknown_id,restore,edit) VALUES(?,?,?) ON CONFLICT(unknown_id) "
+                                 "DO UPDATE SET restore=excluded.restore,edit=excluded.edit WHERE resolutions.edit IS NULL",
+                                 (unknown, ident, ident))
+            store.event("unknown/narrowed", ident, {"checkout": checkout["id"], "unknowns": resolved,
+                                                    "paths_scanned": result["paths_scanned"], "found": found})
+    return {"narrowing": ident, "state": "narrowed", "resolved": resolved, "paths_scanned": result["paths_scanned"], "unknown": found}

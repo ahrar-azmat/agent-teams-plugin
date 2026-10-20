@@ -243,7 +243,9 @@ creates, changes or deletes one.
   refuses a plain `git commit` that would take another writer's paths or UNKNOWN content (see Push
   gate).
 - **UNKNOWN content.** `coordinator_unit(action="unknown")` lists it; `action="restore"` puts the last
-  known content back, and you then make the change again with Edit or Write.
+  known content back, and you then make the change again with Edit or Write. An UNKNOWN for the whole
+  checkout (path `*`) is cleared with `action="narrow"`: the checkout is read again, and only the
+  files whose content the coordinator cannot explain stay UNKNOWN.
 - **Watching.** The Codex Office shows these writers, and Send now puts a note into a running turn.
 - **Updating.** The first `abraham` or lead tool call of a newer release replaces an older
   release's coordinator, which migrates the state. It stops only the daemon it checked, and only
@@ -276,6 +278,18 @@ Known limits, measured on macOS:
   is UNKNOWN, even if the command rewrote it, and so is a new file the command creates inside an
   ignored folder and force-adds: the coordinator never saw who wrote it. To publish such a file,
   make the change with Edit or Write.
+- A writer's undeclared shell commands run one at a time in a checkout: each can change anything,
+  so each is reconciled before the next starts, about 1 s each on a 3,700-file checkout. When a
+  burst of them outlasts the hook's deadline (112 s), the rest are refused as busy and the writer
+  retries them; nothing runs unchecked. Declared commands share custody and do not wait for each
+  other.
+- When a writer's turn is interrupted while Codex is applying one of its patches, the patch's files
+  stay held until Codex reports the patch ended or the writer's app-server exits. Codex writes no
+  result for a call it aborts, and a write it began can still finish. Meanwhile no command runs over
+  those files, a restore of them is refused (`RESTORE_EXECUTING`), and the unit is not published.
+  Stopping the coordinator ends the hold, and the next daemon resumes the run's writer. In an
+  `abraham` workflow the held patch also keeps the phase from settling, so the stop is refused:
+  cancel the run (`codex_cancel_run`), wait until it reports cancelled, then stop.
 - What one of your Bash commands changes is credited to you only when the coordinator answered
   before the command ran (within the hook's 3 s) and nothing else ran in any registered repository
   meanwhile, another session's command included.

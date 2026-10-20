@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.0 / P1
+# Writer coordinator — software-workflows 2.4.1 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -416,6 +416,7 @@ Bash window that belonged to the retired generation.
 | `lead-command` | `actor`, explicit `argv` array; opaque command with custody, actual exit code and output digests. |
 | `unknown/list` | `checkout`, optional `paths`; unresolved UNKNOWNs, context and restoration links. |
 | `unknown/restore` | `actor`, `unknown`, `revision`; restore a known receipt for a path. For checkout-wide `*`, use `revisions:{path:revision_id_or_null}` covering every ledger path. Null is accepted only for baseline absence. |
+| `unknown/narrow` | `actor`, `unknown` (a checkout-wide `*`); read the whole checkout again, record each path whose bytes differ from its ledger head as its own UNKNOWN, and resolve every checkout-wide UNKNOWN recorded before the read. Writes nothing; refused (`RESTORE_CUSTODY`) while custody is active in the checkout, `RESTORE_EXECUTING` while a patch may still be writing, `NARROW_SCOPE` for a path's UNKNOWN. |
 | `message/send` | `recipient`, `text`, required `wake:"none|queue|start"`, optional lead `sender`; durable message record. |
 | `message/inbox` | Optional `recipient` (default lead), `cursor`, `limit`, `session_id`; a nonempty session selects all its unit mailboxes. Includes total unread count independently of pagination. Reading does not acknowledge or claim context entry. |
 | `message/ack` | `message`, optional lead `actor` or `session_id`; a session may acknowledge only messages in its own mailboxes. Writers acknowledge through native-bound tools. |
@@ -527,11 +528,116 @@ are not Git invocations. Passing this check does not grant shared custody or a
 fixed-reader exemption. Exclusions are directional: excluding `dir/file` cannot
 authorize an operation over all of `dir`. Unknown-scope effects remain checkout-wide.
 
-Hook waits are asynchronous: custody waits end before the 120-second native hook
-timeout. Hook crashes/timeouts can still fail open in Codex. C1 compares native
-effect items with successful recorded decisions, creates UNMEDIATED context and
-UNKNOWNs, and retains the opaque operation window. Nonempty `write_stdin` remains
-part of its existing command window; it has no native PreToolUse hook.
+Hook waits are asynchronous and end at the hook's own deadline. Codex ends a native
+hook 120 s after spawning it and then runs the call anyway (measured on 0.163). The
+hook client counts from its own birth and denies 8 s before that, one deadline across
+connecting, sending and every receive; the coordinator decides 4 s before the client. A call it cannot admit in time, waiting for the
+writer's admission lock, the checkout lock or custody, is refused `COORDINATOR_BUSY`
+(nothing ran; retry), and one admitted after that point is withdrawn instead of
+allowed. A call that a Pre hook blocked, ours or another, never runs: its admission
+is withdrawn and its custody released, in every repository it spans. A hook that
+still dies or times out fails open in Codex.
+
+Codex 0.163 can refuse a call inside its handler, after an allowed Pre hook. Examples
+are `tty` on the TTY-disabled runtime C1 configures, a patch whose context is not in
+the file, and an unusable `workdir`. It runs no Post hook for such a call, and for the
+first two it sends no item. Writers on gpt-6-astra make every call from inside a
+code-mode cell: the model catalog sets `code_mode_only`, whatever the feature flags
+say. A cell's nested calls are not joined by its turn's end, so a turn end proves
+nothing about them.
+
+The evidence C1 settles such a call by is Codex's own result line. A writer's
+app-server writes its log (JSON, Codex's stderr) to `listeners/<id>/native.log` in the
+state root, a private file it holds open itself, with the filter
+`codex_core::exec_policy=trace,codex_otel.trace_safe=info`. Once a call's handler has
+returned, direct or nested, Codex writes `codex.tool_result` to the trace-safe target,
+with `success=false` for a failure. That target carries identifiers, names and lengths,
+never arguments or output.
+
+The daemon reads the log from an offset in a record only the reader writes. It reads
+at each Pre hook, at turn end, every 50 ms, at a stop, and in recovery, so a result
+written while the daemon restarts is still read. Codex writes a call's result before
+it hands the failure to the model or the cell, so a retry finds the refused call settled.
+A result settles only a call that its own listener incarnation admitted, matched by
+thread and call; the results of an app-server that died settle its calls before its
+replacement starts.
+
+A failed result proves that the call ended, not that it changed nothing. A patch is
+settled as no effect, releasing its paths, when every endpoint still holds its
+pre-image; other bytes quarantine it. A `failed` or `declined` item settles a patch the
+same way. A command or MCP call is reconciled, as after any command, once no process
+or terminal of it remains, and its custody is released in the same transaction. Items
+that arrive after such a settlement complete the call's record and never reopen it. A
+patch settled as no effect that Codex then reports applied is quarantined.
+
+Codex also writes `codex.tool_result_ready` once a call's dispatch has ended: after
+its result and Post hook, or alone for a call it aborted (an interrupted turn, a cell
+that completed with the call pending). A call aborted while its Pre hook waits never
+runs: its admission is withdrawn (`NATIVE_ABANDONED`) and its custody released, and the
+hook reads the log once more before it allows. A dispatch end read before the call has
+any record (its Pre hook still queued behind others) is kept on the reader's record
+for Codex's 120 s hook limit, and that hook refuses the call. An aborted command is
+reconciled, as after any command, once no process or terminal of it remains, and its
+custody released: 0.163 spawns a local command's process synchronously in the handler,
+which is dropped only at an await, so a process it started exists when the dispatch
+end is read. An aborted MCP call keeps its custody until the lead reconciles it, since
+its server may still be working on it. An aborted patch can still finish a write it
+began, since 0.163 runs local writes on their own thread. It is quarantined
+`executing`. Until Codex reports that its handler ended (its result, its completed
+item or its Post hook) or its app-server exits, its paths stay busy for command
+admission, attribution, restoration (`RESTORE_EXECUTING`), quiet windows and
+publication, and the checkout's compatibility lease is kept (below).
+
+A patch whose dispatch ended after its handler with no Post hook RPC of ours is
+quarantined: its lifecycle can never complete. With the RPC received, Codex sent the
+patch's completed item and its Post hook's outcome before it wrote the dispatch end,
+but over the app-server connection, which the log is not ordered against, and no
+request answer is ordered against them either. The patch then waits for them, holding
+its paths, and they verify or quarantine it as they arrive. Its handler is done, so
+nothing more is written for it. A Post hook that Codex cancels sends no outcome, and
+such a patch waits for its app-server's exit (below).
+
+A turn's end judges only that turn's calls: Codex can start the thread's next turn
+before the coordinator reads the end, and that turn's calls reach their hooks first. At
+a turn's end, a patch of a direct call whose handler ended without a complete
+lifecycle is quarantined: the turn ends only after its direct calls' dispatches, and
+Codex sends a thread's notifications in order, so nothing more comes for it. A call's
+source is in the line Codex writes when it receives the call (`codex.tool_call_received`,
+`direct` or `code_mode`), which its Pre hook reads. A cell's call can end after its
+turn, so its patch waits for its own outcome or its app-server's exit, after an
+interrupted turn too: Codex reports every abort reason as `interrupted`, and only an
+interrupt with `code_mode_interrupt` on terminates the turn's cells. One whose handler
+may still run is quarantined `executing` when the turn was interrupted or failed, or
+when its app-server writes no log; otherwise it is left to its own receipts. A stop, or
+an app-server's death, ends execution for every call of that app-server, and
+quarantines a patch it never reported ending. A stop does not wait for a patch whose
+handler and dispatch both ended, nor for an Abraham workflow whose settlement waits
+only on such patches, since stopping their app-server settles them. A drain waits for
+the workflow advances under way, and each stops at its next step: no phase completes
+and no turn starts while the daemon drains.
+
+Recovery and reconnect apply each log before they quarantine interrupted
+cross-repository operations, and a receipt applies to its call in any state.
+Admission probes both lines on the installed binary, with its red under the filter
+2.4.0 used. The log is deleted when its listener stops; it also holds the policy trace
+text.
+
+A refused or withdrawn call that native runs after all is unmediated: UNKNOWN, and its
+custody is held again. C1 compares native effect items with successful recorded
+decisions, creates UNMEDIATED context and one UNKNOWN per item, and retains the opaque
+operation window. Nonempty `write_stdin` remains part of its existing command window;
+it has no native PreToolUse hook.
+
+An opaque operation (a writer's command or MCP call, a lead Bash command) records a
+fingerprint, the count and SHA-256 of the heads it was admitted against, not a copy
+of them; publish never reads it as a dependency. Records from before 2.4.1 are
+compacted to the fingerprint in batches once the daemon is ready. Released custody
+drops the process table its command was checked against, and older records lose it
+in the same compaction. Hooks find their operation by call id; admission, reconcile,
+custody and drain read only unreconciled operations and held custody, or custody
+released since a time, through indexes. So does maintenance, each second: held
+custody, runs still in flight, pending lead hooks, and undelivered messages to
+retry. A readiness check asks for a brief `daemon/status` without the writers listing.
 
 Custody lasts beyond a completed turn. Command roots bind the listener, thread and
 tool-call identity to PID plus birth identity. Observed descendants remain recorded
@@ -687,6 +793,25 @@ entire restored scope. No `adopt`, risk acknowledgement or publication bypass is
 provided. Missing/corrupt receipt data refuses verification or publication and
 does not release claims.
 
+A checkout-wide gap is narrowed instead with `unknown/narrow`, without restoring
+anything or stopping writers. What C1 tracks of a checkout, and so what a gap can
+have left unexplained, is its bytes. C1 compares every path with its head under the
+checkout lock, while no command holds custody there. Each path that differs becomes its own UNKNOWN, as in any
+reconcile, so no unexplained byte is adopted. Every checkout-wide UNKNOWN recorded
+before the read is then resolved. A patch or edit still in flight keeps its own
+lifecycle. Seal reads its scope again and publish the whole checkout before they
+freeze anything, so a change made after the read is still found. Not found: a change
+made and undone before the read.
+
+A recorded process id that another user's process now holds (a root daemon that
+took the id of one that exited) counts as gone. macOS refuses both the process's
+description and a signal to it. Its short description (`PROC_PIDT_SHORTBSDINFO`)
+still answers, and none of its user ids is this user's, while every writer process,
+hook and service runs as this user. A process of this user that cannot be read keeps
+its custody held (`PROCESS_UNREADABLE`). On Linux with `/proc` mounted `hidepid=1`, a
+process that cannot be read keeps custody held whoever owns it: the directory shows only
+its effective user, and a set-user-ID child of a writer keeps the writer's real one.
+
 Common refusal codes include `CLAIM_CONFLICT`, `OPERATION_BUSY`, `CUSTODY_WAIT`,
 `LEAD_RECORDS`, `UNIT_FROZEN`, `STALE_BASE`, `REVIEW_BINDING`,
 `UNKNOWN_BLOCKS_SEAL`, `UNKNOWN_BLOCKS_PUBLICATION`, `UNPUBLISHED_DEPENDENCY`,
@@ -771,8 +896,13 @@ The supervisor holds one compatibility lease per checkout writer group, using
 the existing filesystem-identity lock, legacy bridges and mixed-version barrier.
 Multiple native units share that lease. The MCP server and replacement workers
 do not own its lifetime. An inherited, inode-verified venv `.in-use` descriptor
-also survives worker replacement. Queued/uncertain deliveries and process custody
-retain exclusion. Pre-production startup/admission failures clean up and name
+also survives worker replacement. Queued/uncertain deliveries, process custody, a
+live operation and a patch native may still be writing (`executing`) retain
+exclusion, whatever the run's state; a stop releases it after every app-server has
+exited. An effect-capable Pre hook holds it, under the lock its release takes, until
+its operation is recorded, and takes it back if a run's end released it: a cell's call
+can still wait in its hook after its turn. While a writer outside the coordinator holds
+the checkout, the call is refused (`EXCLUSIVE_WRITER`). Pre-production startup/admission failures clean up and name
 the failed check before selecting exclusive exec fallback. Started or uncertain
 native work returns its durable handle instead. Windows retains the existing
 explicit write-mode refusal; its lock lifetime has not been implemented.
@@ -804,7 +934,7 @@ terminal events and verified process disappearance establish settlement.
 | `coordinator_claims` | list, acquire for this Claude session, release request, lead-authorized handback |
 | `coordinator_send` | durable send to run/unit/actor/lead; explicit none/queue/start wake policy |
 | `coordinator_inbox` | cursor read; acknowledge only explicitly supplied IDs |
-| `coordinator_unit` | status, object diff, UNKNOWN, reconcile, restore, reopen, recover, abandon |
+| `coordinator_unit` | status, object diff, UNKNOWN, reconcile, restore, narrow, reopen, recover, abandon |
 | `coordinator_seal` | freeze exact receipt-backed candidate and explicit validation evidence |
 | `coordinator_publish` | exact review binding plus all seven explicit commit metadata fields |
 

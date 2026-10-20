@@ -68,8 +68,12 @@ class Runs:
         if type(cursor) is not int or cursor < 0 or type(limit) is not int or not 1 <= limit <= 400:
             raise CoordinatorError("EVENT_CURSOR", "Use a nonnegative sequence cursor and limit 1..400")
         subjects = {run["id"], run["unit"], run["attempt"]}
-        for kind in ("actor", "operation", "custody", "claim", "message"):
-            subjects.update(r["id"] for r in self.store.all(kind) if r.get("unit") == run["unit"])
+        # Ids only, through indexes: decoding every record of these kinds made each poll cost the
+        # whole ledger. Actors, operations, custody and claims are stored under their unit.
+        for kind in ("actor", "operation", "custody", "claim"):
+            subjects.update(row["id"] for row in self.store.db.execute("SELECT id FROM records WHERE parent=? AND kind=?", (run["unit"], kind)))
+        subjects.update(row["id"] for row in self.store.db.execute(
+            "SELECT id FROM records WHERE kind='message' AND json_extract(data,'$.unit')=?", (run["unit"],)))
         subjects.update(r["id"] for r in self.store.all("listener", run["id"]))
         placeholders = ",".join("?" for _ in subjects)
         rows = list(self.store.db.execute("SELECT * FROM events WHERE seq>? AND subject IN (" + placeholders + ") ORDER BY seq LIMIT ?",

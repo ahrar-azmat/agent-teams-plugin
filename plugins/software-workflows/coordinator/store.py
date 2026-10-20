@@ -16,12 +16,25 @@ import uuid
 from .client import CoordinatorError, validate_state
 
 
+# Unreconciled operations: admission and custody look only at these, per checkout.
+LIVE_OPERATION = "kind='operation' AND json_extract(data,'$.state') IN ('prepared','allowed','running','quarantined')"
+
+
+def fingerprint(pairs):
+    """Count and digest of (path, revision) heads: what an opaque operation was admitted against."""
+    pairs = sorted(pairs)
+    text = "".join(path + "\0" + revision + "\n" for path, revision in pairs)
+    return {"count": len(pairs), "sha256": hashlib.sha256(text.encode()).hexdigest()}
+
+
 # Partial indexes contain only live occupancy. Finished history advances the
 # durable clock instead of being reread for every lead Bash fingerprint.
 WINDOW_ACTIVE = {
     "actor": "kind='actor' AND (json_extract(data,'$.active_turn') IS NOT NULL OR json_extract(data,'$.state')='running')",
     "operation": "kind='operation' AND json_extract(data,'$.state') IN ('prepared','allowed','running')",
     "custody": "kind='custody' AND json_extract(data,'$.state')!='released'",
+    # A quarantined patch native may still be writing (ledger.quarantine executing=True).
+    "executing": "kind='operation' AND json_extract(data,'$.executing') IS NOT NULL",
     "lead_hook": "kind='lead_hook' AND ((json_extract(data,'$.tool')='Bash' AND json_extract(data,'$.state')='observed') OR "
                  "(json_extract(data,'$.tool') IN ('Write','Edit','MultiEdit','NotebookEdit') AND json_extract(data,'$.state')='received'))",
 }
@@ -160,6 +173,12 @@ class Store:
                 ("message_recipient", "json_extract(data,'$.recipient'),id", "kind='message'"),
                 ("mailbox_session", "json_extract(data,'$.session_id'),id", "kind='lead_mailbox'"),
                 ("claim_checkout", "json_extract(data,'$.checkout'),id", "kind='claim' AND json_extract(data,'$.state')='held'"),
+                # Every native notification and hook finds its operation by call id; every admission
+                # checks the checkout's unreconciled operations.
+                ("operation_call", "json_extract(data,'$.native.call'),id", "kind='operation'"),
+                ("live_operation", "json_extract(data,'$.checkout'),id", LIVE_OPERATION),
+                # A patch's admission and receipt look for custody released since it began.
+                ("custody_completed", "json_extract(data,'$.checkout'),json_extract(data,'$.completed')", "kind='custody'"),
                 ("visible_run", "json_extract(data,'$.created') DESC,id DESC", "kind='run' AND "
                  "(json_extract(data,'$.workflow') IS NOT NULL OR json_extract(data,'$.project_revision') IS NOT NULL)"),
             ):
@@ -215,6 +234,33 @@ class Store:
         for row in self.db.execute(query, args):
             yield dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
 
+    def live_operations(self, checkout):
+        return self.selected("SELECT * FROM records WHERE " + LIVE_OPERATION +
+                             " AND json_extract(data,'$.checkout')=? ORDER BY id", (checkout,))
+
+    def call_operations(self, unit, call):
+        return self.selected("SELECT * FROM records WHERE kind='operation' AND "
+                             "json_extract(data,'$.native.call')=? AND parent=? ORDER BY id", (call, unit))
+
+    def heads_fingerprint(self, checkout):
+        return fingerprint((row["path"], row["revision"]) for row in
+                           self.db.execute("SELECT path,revision FROM heads WHERE checkout=?", (checkout,)))
+
+    def held_custody(self, checkout=None, unit=None):
+        """Unreleased custody, of one checkout, one unit or all. Released custody is history: every command leaves one."""
+        if checkout is None and unit is None:
+            return self.selected("SELECT * FROM records INDEXED BY window_custody WHERE " + WINDOW_ACTIVE["custody"] + " ORDER BY id")
+        column, value = ("json_extract(data,'$.checkout')", checkout) if unit is None else ("parent", unit)
+        return self.selected("SELECT * FROM records INDEXED BY window_custody WHERE " + WINDOW_ACTIVE["custody"] +
+                             " AND " + column + "=? ORDER BY id", (value,))
+
+    def released_custody(self, checkout, since):
+        """Custody of a checkout released at or after `since`; one released without a time counts too."""
+        query = ("SELECT * FROM records INDEXED BY custody_completed WHERE kind='custody' AND "
+                 "json_extract(data,'$.checkout')=? AND json_extract(data,'$.state')='released' AND ")
+        yield from self.selected(query + "json_extract(data,'$.completed')>=? ORDER BY id", (checkout, since))
+        yield from self.selected(query + "json_extract(data,'$.completed') IS NULL ORDER BY id", (checkout,))
+
     def lead_sessions(self, session_id):
         return self.selected("SELECT * FROM records WHERE kind='lead_session' AND "
                              "json_extract(data,'$.session_id')=? ORDER BY id", (session_id,))
@@ -225,7 +271,7 @@ class Store:
         SQL triggers advance counters in the same transaction as every record
         transition. Subtracting this hook's revision excludes only its own saves.
         """
-        for kind in ("lead_hook", "actor", "operation", "custody"):
+        for kind in ("lead_hook", "actor", "operation", "custody", "executing"):
             query = "SELECT id FROM records INDEXED BY window_" + kind + " WHERE " + WINDOW_ACTIVE[kind]
             args = []
             if kind == "lead_hook":

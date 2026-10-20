@@ -4738,7 +4738,7 @@ async def _coordinator_call(method: str, params: dict | None = None, *, start: b
     if start:
         await asyncio.to_thread(client.ensure, python=sys.executable, inherited_fds=_VENV_LOCK_FDS)
         deadline = time.monotonic() + 90
-        while not (await asyncio.to_thread(client.call, "daemon/status"))["ready"]:
+        while not (await asyncio.to_thread(client.call, "daemon/status", {"brief": True}))["ready"]:
             if time.monotonic() >= deadline:
                 from coordinator.client import CoordinatorError
                 raise CoordinatorError("COORDINATOR_RECOVERING", "Coordinator recovery is still in progress")
@@ -4924,14 +4924,21 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
                            paths: list[str] | None = None, unknown: str = "", revision: str = "",
                            revisions: dict[str, str | None] | None = None, custody: str = "") -> str:
     """Inspect status/object diff/UNKNOWN, reconcile effects or custody, restore a
-    known revision, reopen a seal, recover publication, or abandon an unapplied
-    publication. Actions: status, diff, unknown, reconcile, restore, reopen,
-    recover, abandon. Restoration writes the chosen known bytes and grants no
-    authorship to unexplained bytes. A new exact edit is still required.
+    known revision, narrow a checkout-wide UNKNOWN, reopen a seal, recover
+    publication, or abandon an unapplied publication. Actions: status, diff,
+    unknown, reconcile, restore, narrow, reopen, recover, abandon. Restoration
+    writes the chosen known bytes and grants no authorship to unexplained bytes.
+    A new exact edit is still required. narrow takes the id of a checkout-wide
+    UNKNOWN (path "*"): the whole checkout is read again, each path whose bytes
+    the coordinator cannot explain becomes its own UNKNOWN, and every
+    checkout-wide UNKNOWN recorded before the read is resolved. It writes
+    nothing, and writers may keep working; it waits for no command, and is
+    refused while one holds custody in the checkout.
     """
     methods = {"status": "unit/status" if unit or session_id else "run/status", "diff": "unit/diff",
                "unknown": "unknown/list", "reconcile": "custody/reconcile" if custody else "checkout/reconcile",
-               "restore": "unknown/restore", "reopen": "unit/reopen", "recover": "unit/recover", "abandon": "unit/recover"}
+               "restore": "unknown/restore", "narrow": "unknown/narrow", "reopen": "unit/reopen",
+               "recover": "unit/recover", "abandon": "unit/recover"}
     if action not in methods:
         return await _coordinator_notice("[Unsupported unit action.]", session_id)
     params = {}
@@ -4941,9 +4948,11 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
         params = {"custody": custody}
     if action == "restore":
         params = {"unknown": unknown, "revision": revision, "revisions": revisions or {}}
+    if action == "narrow":
+        params = {"unknown": unknown}
     if action == "abandon":
         params["action"] = "abandon"
-    return await _lead_request(methods[action], params, cwd, session_id, own=action == "restore", unit=unit, project=project, dispatch_cwd=dispatch_cwd)
+    return await _lead_request(methods[action], params, cwd, session_id, own=action in ("restore", "narrow"), unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
 
 @_lead_tool()
@@ -4990,7 +4999,7 @@ async def _native_abraham(task: str, context: str, constraints: str, images: lis
     try:
         # Availability is independent of native project selection. Preserve the
         # singleton exec fallback when no coordinator can even answer discovery.
-        await _coordinator_call("daemon/status", start=True)
+        await _coordinator_call("daemon/status", {"brief": True}, start=True)
         phase = "discovery"
         selection_params = {"cwd": cwd, "dispatch_cwd": dispatch_cwd, "project": project}
         if os.environ.get("SOFTWARE_WORKFLOWS_FIXTURE"):
