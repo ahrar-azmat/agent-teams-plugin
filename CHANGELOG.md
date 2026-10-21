@@ -3,6 +3,111 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.2] — 2026-10-21
+
+### Fixed: after an upgrade, writers admitted by the earlier release were refused every call
+- A writer's app-server keeps the hook command it was admitted with: the path of that release's
+  `hooks.py`, and the trust Codex holds for it. The daemon refuses every hook from a writer whose
+  hook program is not its own (`HOOK_PROGRAM_CHANGED`).
+  - On 10-21 a 2.4.0 daemon was replaced by force, and 2.4.1 adopted its 13 live app-servers. Every
+    tool call they made was refused.
+  - A draining stop stops every app-server, and 2.4.1 started each again from its stored config. So
+    it ran the earlier release's `hooks.py` while the daemon recorded its own.
+- The coordinator now re-admits such a writer when nothing of its unit is in flight. It checks for
+  turns, custody, admissions, operations, workflow inputs and deliveries.
+  - This happens at the end of its reconcile, once its native turns are read, and while no hook,
+    delivery or submission can start work.
+  - Its app-server is stopped. A new one is admitted with this release's hooks and resumes the same
+    thread and each of its sub-agent threads.
+- A writer that is busy at that moment is replaced before its next turn: a resume, a message that
+  wakes it, or a workflow's next phase. The message or the phase waits until then.
+- An app-server that has not exited 45 s after its SIGTERM is killed, since it has nothing in flight.
+  - The bound is Codex 0.163's own (10 s for its threads' shutdown, 30 s for a connection's RPC
+    drain), plus 5 s.
+  - Each stop records how long the app-server took to exit (`listener/exit`).
+- A call that was being admitted when its app-server began to be reconciled or replaced is
+  withdrawn (`LISTENER_RECOVERING`) instead of allowed.
+- A failed admission no longer leaves its app-servers running.
+- A writer whose recovery failed could not be resumed: `run/resume` looked up its connection first
+  and failed `OPERATIONAL_FAILURE` (`KeyError`), as in 2.4.1. A resume now reconciles it, as for any
+  writer. An interrupt of such a run is refused `LISTENER_RECOVERING`.
+
+### Fixed: a writer's sub-agents were not reloaded after its app-server was replaced
+- A replacement resumed only the root thread. Its first resume or seal then failed `NATIVE_RPC`
+  ("thread not found") on a sub-agent's thread, as in 2.4.1 after an app-server died. Each sub-agent
+  thread is now resumed on the replacement too.
+
+### Fixed: unread mail to a lead blocked every stop and upgrade
+- Writers can address a lead-mode run's actor. Codex never delivers that mail as a turn: the lead
+  reads it through its inbox.
+- 2.4.1 counted each unread message of that kind that had a wake as a delivery in flight, so:
+  - a draining stop was refused `NOT_QUIESCENT` (`deliveries`) for as long as one stayed unread;
+  - the checkout's compatibility lease was never released.
+- On 10-21, 23 such messages blocked the upgrade to 2.4.1, which then had to be forced. Mail to a
+  lead no longer counts.
+
+### Corrected: 2.4.1's notes on adopted app-servers
+- 2.4.1 said that app-servers adopted from a 2.4.0 daemon that died "hold what they held in 2.4.0
+  until those app-servers are replaced". In fact every call they made was refused
+  (`HOOK_PROGRAM_CHANGED`), and nothing replaced them. 2.4.2 replaces them.
+
+### Measured (2.4.1 as calibration, then 2.4.2)
+- **How these runs were made.** All used the real Codex 0.163 engine with the loopback fixture
+  model, on a 3,700-file checkout. A forced switch sent SIGTERM to the supervisor and then the
+  worker, as on 10-21, and the writer's app-server kept running.
+- **A forced switch from 2.4.0, then a resume for a patch.** 2.4.1 refused the patch
+  (`HOOK_PROGRAM_CHANGED`), and the file was unchanged. 2.4.2 replaced the app-server, which exited
+  0.05 s after its SIGTERM. The patch was verified on the same thread, with no UNKNOWN. A switch from
+  2.4.1 gave the same result.
+- **An MCP server that ignores SIGTERM and takes 60 s to exit.** The app-server still exited in
+  0.05 s.
+- **A sub-agent whose turn had ended.** The first 2.4.2 candidate's resume failed "thread not found"
+  on the sub-agent's thread. 2.4.2 resumed it and verified the patch.
+- **A switch while a 90 s command still holds custody.** 2.4.2 kept the app-server at recovery. It
+  replaced it once the custody was released and the lead resumed the run, or sent the writer a
+  message instead. The patch was verified each time, with no UNKNOWN.
+  - Without the wait for a message, the message's turn ran on the old hooks and its patch was
+    refused.
+  - Without the in-flight check at recovery, a switch during a running command left a
+    checkout-wide UNKNOWN, and the run stayed running.
+- **An app-server that could not act on its SIGTERM** (stopped with SIGSTOP as it was stopped).
+  2.4.2 killed it after 45.0 s and replaced it, with no UNKNOWN.
+- **A re-admission that fails at its first app-server.** The first candidate left that app-server
+  running. 2.4.2 leaves none.
+- **An unread message to a lead-mode run's actor, then a native run on the same checkout.** 2.4.1 kept
+  the lease and refused the stop (`deliveries: 1`). 2.4.2 released the lease and stopped.
+- **The live ledger, read-only.** Each of the 13 adopted writers reads as admitted by another
+  release, and its replacement config carries this release's hooks in both events. The ledger showed
+  no sub-agent, turn, custody, live operation or in-flight delivery for them.
+
+### Known limits
+- A replaced writer is first reconciled as it is, then replaced, so recovery takes about 1 min for
+  each writer it replaces on the fixture (two admissions), one after another.
+- An app-server that does not answer the new daemon cannot be read, so it is not replaced. Its
+  recovery fails with an UNKNOWN, as in 2.4.1.
+- A message that the earlier release had already put in a writer's native queue starts its turn
+  there without the coordinator, so it runs on the earlier release's hooks. The writer is replaced
+  before its next turn after that.
+- Mail to a lead-mode run's actor still cannot be acknowledged (`ACK_ACTOR` / `NATIVE_BOUND`), as in
+  2.4.1. It no longer blocks anything.
+- Open from review turn 34 (session 01a14eac), released on the user's decision, to be fixed in 2.4.3.
+  Every writer an upgrade finds idle is replaced in recovery, before the daemon serves. The findings
+  concern a replacement made later, or a writer with sub-agents.
+  - A replacement made after recovery is admitted before its reconcile has finished, so a hook or a
+    message could start work on it meanwhile. A patch started then could be quarantined as a crash
+    gap.
+  - Two callers can replace the same writer at once: a cancel's reconcile and a message's or
+    workflow's re-admission.
+  - A resume of a plain native run can be left `transition_pending`, with no turn started, if its
+    writer is still waiting to be replaced. That happens when another unit's call is being admitted
+    in the same checkout.
+  - Sub-agent threads are resumed in record order, not parent first, so a sub-agent of a sub-agent
+    can be refused. 2.4.1 does the same when an app-server dies.
+  - A re-admission that fails after recovery leaves its writer reconciling, and nothing retries
+    it. A resume then admits it again.
+  - An app-server whose socket never appears is left running when its start times out, as in
+    2.4.1.
+
 ## [software-workflows 2.4.1] — 2026-10-20
 
 ### Fixed: a busy coordinator let native calls run unadmitted (reported from a seven-writer session)
@@ -268,7 +373,8 @@ read-only.
 - An upgrade stops the 2.4.0 daemon, which stops every writer's app-server, and 2.4.1 starts each
   again with its log. If a 2.4.0 daemon dies without stopping instead, 2.4.1 adopts its live
   app-servers, which log to a pipe 2.4.1 cannot read. Their refused calls hold what they held in
-  2.4.0 until those app-servers are replaced.
+  2.4.0 until those app-servers are replaced. (Corrected in 2.4.2: every call they made was
+  refused, and nothing replaced them.)
 - The log grows by about 2 KB per call.
 - A hook that spans a system sleep is refused when the machine wakes, because its deadline counts
   wall-clock time. Nothing runs, and Codex shows the writer the reason.

@@ -377,7 +377,9 @@ boot and version before entering a drain. The CLI may omit `expect`.
 Stop first refuses `NOT_QUIESCENT` with counts under `details.pending` when
 recovery, workflows, writer turns, custody, deliveries, live lead hooks,
 pending operations or mutating RPCs would be interrupted. Publication RPCs are
-also counted separately. This refusal leaves admission unchanged. Otherwise,
+also counted separately. Mail to a lead-mode run's actor is no delivery: the lead
+reads it through its inbox, and no native turn starts for it. This refusal leaves
+admission unchanged. Otherwise,
 new mutations receive retryable `DAEMON_DRAINING` while admitted requests and
 completion calls finish. RPC settlement has a one-second bound; a timeout returns
 `NOT_QUIESCENT` and immediately resumes admission without cancelling the requests.
@@ -401,7 +403,7 @@ Bash window that belonged to the retired generation.
 | `run/start` | `checkout`, optional `mode`, `task`, `paths`, `model`, `fixture`; returns separate run, attempt, unit and actor IDs plus native policy echoes. `fixture` is only for an owned disposable provider manifest. |
 | `run/status` | `run`, or optional `checkout`; persisted run or detailed checkout status. |
 | `run/interrupt` | `run`; cancel the selected run's root/child turns and queued work, then verify process/terminal settlement. Custody and claims remain until reconciled. |
-| `run/resume` | `run`, `text`; reconcile first, refuse unresolved recovery UNKNOWN, then explicitly start a new turn. |
+| `run/resume` | `run`, `text`; reconcile first (replacing an app-server that is gone, not connected or admitted by another release), refuse unresolved recovery UNKNOWN, then explicitly start a new turn. |
 | `run/terminals` | `run`; native terminal inventory. |
 | `run/terminate-terminal` | `run`, `process_id`; native termination, followed by custody reconciliation. This ID is not an OS PID. |
 | `lead/attach` | `unit`; create a lead actor in an existing unit, useful for recovery and C2 editor integration. |
@@ -621,6 +623,18 @@ cross-repository operations, and a receipt applies to its call in any state.
 Admission probes both lines on the installed binary, with its red under the filter
 2.4.0 used. The log is deleted when its listener stops; it also holds the policy trace
 text.
+
+A writer admitted by another release runs that release's `hooks.py`, so the daemon
+refuses its calls (`HOOK_PROGRAM_CHANGED`). Its reconcile replaces it at the end, once
+its native turns are read and nothing of its unit is in flight: no turn, custody,
+admission, live operation, workflow input or delivery. A busy one is replaced before
+its next turn instead: a resume, a message that wakes it, a workflow phase. Its
+app-server is stopped, and killed if it has not exited 45 s after its SIGTERM (Codex
+0.163's own bounds, 10 s for its threads and 30 s for a connection, plus 5 s). A new
+one is admitted with this release's hooks and resumes the same thread and each
+sub-agent thread. A call still being admitted when its app-server begins to be
+reconciled is withdrawn (`LISTENER_RECOVERING`). Each stop records the app-server's
+exit time (`listener/exit`).
 
 A refused or withdrawn call that native runs after all is unmediated: UNKNOWN, and its
 custody is held again. C1 compares native effect items with successful recorded

@@ -11599,3 +11599,118 @@ disk spoiled, its re-run):
 - `identity_probe.py s241f/software-workflows s241l/software-workflows`;
 - `regress_241.sh $S s241lcal r33`, then `query_cost.py $S <w> 10,100,300,600,1000` again;
   `suite_cmp.py` against `r27_full.log` and `r22_full.log`.
+
+## 2.4.2
+
+### Lead record for 2.4.2 — 2026-10-21
+
+**What prompted it.** At 23:55 IST on 10-20 the user's 2.4.0 daemon was replaced by 2.4.1 by force.
+A draining stop was refused `NOT_QUIESCENT` for as long as 23 unread messages stayed addressed to a
+lead-mode run's actor (`actor_f1f5715b…`, in Sales_Profiler):
+- 14 came from unit `unit_38c1e96b…` and 9 from `unit_aebe4fa0…`.
+- `stop_pending` counted them as deliveries.
+- `messages.deliver` never delivers to an actor without a listener.
+- `message/ack` refuses a writer's acknowledgement (`NATIVE_BOUND`) and a lead session's for an
+  actor (`ACK_ACTOR`).
+
+The forced switch took `upgrade.lock`, sent SIGTERM to the supervisor and then the worker, and
+started 2.4.1. Its recovery took 4 min 40 s. It adopted 13 live app-servers admitted by 2.4.0,
+which record `hook_digest` 8368fed7… and the hook command
+`…/software-workflows/2.4.0/coordinator/hooks.py`. Six hooks were refused `HOOK_PROGRAM_CHANGED`
+between 00:02:39 and 00:03:17.
+
+**What changed.**
+- **`daemon.py`:**
+  - `hook_stale`, `unit_quiet`, `readmission_config`, `readmit` and `admit_listener`. The last is
+    launch_writer's two-spawn trust flow, factored out, and it stops what it spawned when it fails.
+  - `stop_listener` gained `drain_s` and `kill`, and records `listener/exit`.
+  - `hook()` re-checks its listener before an allow.
+  - Mail to a lead-kind recipient is left out of `stop_pending` and `_release_lease`.
+  - `run/resume` no longer needs a connection before it reconciles.
+- **`recovery.py`:** `reconcile_listener` replaces a stale listener at its end, when the unit is
+  quiet, and resumes sub-agent threads on a replacement.
+- **`messages.py` and `writer.py`:** they replace a stale listener before starting a turn on it.
+
+**Review.** Session 01a14eac, turn 33, said "Needs changes": three HIGH findings and one MEDIUM.
+1. **HIGH:** the quiet test missed admissions under way and workflow inputs in flight, and recovery
+   decided before reading native turn history.
+2. **HIGH:** a replacement did not reload sub-agent threads.
+3. **HIGH:** a writer busy at recovery was replaced only by a manual resume, never before a message
+   wake or a workflow phase.
+4. **MEDIUM:** a failed admission leaked its app-servers.
+
+Each is fixed as described in the CHANGELOG, and its distinguishing run is in the table below.
+
+Turn 34 also said "Needs changes": the premature decision, the missing admission count and the
+missing gates were fixed. It found four HIGH and two MEDIUM defects, none of which applies to a
+recovery that finds every writer idle:
+1. **HIGH:** a replacement made after recovery is usable before its reconcile ends.
+2. **HIGH:** replacements are not serialized across their callers. The cancel path uses another lock.
+3. **HIGH:** a plain resume can be stranded `transition_pending` when submission waits for a
+   replacement.
+4. **HIGH:** sub-agents are resumed in record order, not parent first.
+5. **MEDIUM:** a failed re-admission after recovery is not retried.
+6. **MEDIUM:** `spawn_listener` can leave a process behind when its start times out.
+
+On the user's decision of 10-21 ("Switch now, fixes in 2.4.3"), 2.4.2 ships with these as known
+limits.
+
+The live switch's conditions were read from the live ledger (read-only):
+- 13 idle writers, with no sub-agents.
+- No turn, custody, live operation or in-flight delivery.
+- A fresh daemon, whose recovery runs before it serves.
+
+**Offline check (`readmit_offline.py`, read-only ledger).** It ran the live listeners' stored
+configs through the tree's `hook_stale`, `readmission_config` and `roles.apply`:
+- 13 of 13 read stale.
+- Each replacement config names this tree's hook command in PreToolUse and PostToolUse, and keeps
+  every other key, the other feature flags and the trust state.
+- `apply` parses each one, because stored configs are TOML tables.
+- A config as this tree admits it reads not stale, and a digest-only difference reads stale.
+
+**Runs (`readmit_check.py`).** These used real Codex 0.163.0 app-servers, the loopback fixture
+model, a 3,700-file checkout, and disposable state and CODEX_HOME:
+- **OLD:** 2.4.0 is `export240`. 2.4.1 is `export241`, the tag, which equals the installed cache.
+- **Snapshots:** `s242c` is the tree reviewed in turn 33, and `s242d` is the tree after its fixes.
+  Each was compared with `diff -r`.
+- **Fault copies:** `*_noquiet` has no quiet check, `*_nokill` uses a 5 s stop with no kill, and
+  `s242a` is the first snapshot (5 s stop, no resume fix).
+- **Calibration copies:** `*_af` makes the re-admission's discovery `hooks/list` raise when
+  `R242_ADMITFAIL` is set. `s242d_wedge` SIGSTOPs the re-admitted app-server just before its
+  SIGTERM when `R242_WEDGE` is set.
+
+| Case | OLD → NEW | Result |
+|---|---|---|
+| force (switch, resume for a patch) | 2.4.0 → 2.4.1 | patch refused `HOOK_PROGRAM_CHANGED`, file unchanged, listener not replaced |
+| force | 2.4.0 → s242d | adopted, then replaced (old exit 0.05 s, new hook command, log, same root thread); patch verified; 0 UNKNOWN, custody 0; NEW ready 58 s after the old daemon stopped |
+| force | 2.4.1 → s242d | the same (same digest, another release directory) |
+| force, `SLOW_MCP=60` (an MCP server that ignores SIGTERM and sleeps 60 s after EOF) | 2.4.0 → s242b | exit 0.05 s; patch verified |
+| children (a sub-agent whose turn ended before the switch) | 2.4.0 → s242c | resume `NATIVE_RPC` "thread not found: <sub-agent thread>" (`thread/backgroundTerminals/list`) |
+| children | 2.4.0 → s242d | sub-agent resumed on the replacement; resume passes; patch verified; 0 UNKNOWN |
+| busy (switch during a 90 s command whose cell yields at 30 s; resume once custody is released) | 2.4.0 → s242d | kept at recovery (custody held); replaced at resume; patch verified; 0 UNKNOWN |
+| busymsg (as busy, then a message wake=start instead of a resume) | 2.4.0 → s242c | the message's turn ran on the old listener: `HOOK_PROGRAM_CHANGED`, file unchanged |
+| busymsg | 2.4.0 → s242d | replaced once custody was released (exit 0.05 s); message delivered about 28 s later; patch verified; 0 UNKNOWN |
+| busy (switch during a 20 s command) | 2.4.0 → s242c_noquiet | exit 19.43 s (Codex drains the running turn); `*` UNKNOWN "listener died with potentially escaped effects"; run stays running |
+| admitfail | 2.4.0 → s242c_af | the discovery app-server is left running (connected, threadless) |
+| admitfail | 2.4.0 → s242d_af | none left running; old listener quarantined, UNKNOWN "listener recovery incomplete" |
+| wedgestop | 2.4.0 → s242d_wedge | `listener/exit` 45.01 s killed; replaced; patch verified; 0 UNKNOWN |
+| wedged (app-server SIGSTOPped before NEW starts) | 2.4.0 → s242d | recovery fails at attach: quarantined, UNKNOWN "listener recovery incomplete", resume `OPERATIONAL_FAILURE` `TimeoutError`, as 2.4.1 does for an unresponsive app-server |
+| wedged | 2.4.0 → s242c / s242c_nokill / s242a | s242c (decided before attaching) killed it after 45.01 s and replaced it. With no kill, quarantined, and the resume reached reconcile (`LISTENER_DRAIN`). s242a: resume `KeyError` |
+| leadmail | 2.4.1 | lease HELD 3 s after the native run ended; stop `NOT_QUIESCENT` `{deliveries: 1}` |
+| leadmail | s242d | lease released; stop answered |
+
+**Codex 0.163.0 source read** (`codex-rs/app-server/src/lib.rs`, `message_processor.rs`,
+`request_processors/thread_processor.rs`):
+- SIGTERM is a forceable shutdown signal. The first one starts a graceful drain that rejects new
+  turns and waits for running assistant turns and admissions.
+- It then closes connections, each bounded by `CONNECTION_RPC_DRAIN_TIMEOUT` (30 s).
+- It drains background tasks and runs `shutdown_all_threads_bounded(10 s)`.
+- `READMIT_DRAIN_S = 45` is 10 + 30 + 5.
+
+### Commands for the final batch
+From the lead's scratchpad (`projects/`), with `python3.15 -B` and a new work folder `<w>` for each
+run:
+- `readmit_check.py <OLD> <NEW> s242d/plugins/software-workflows <w> <case>`, for the table above.
+  OLD is `export240` or `export241`. NEW is a snapshot, a fault copy or a calibration copy.
+- `SLOW_MCP=60` for the slow MCP server (`slow_mcp.py`).
+- `readmit_offline.py <coordinator dir> <state dir>` against the live state, read-only.

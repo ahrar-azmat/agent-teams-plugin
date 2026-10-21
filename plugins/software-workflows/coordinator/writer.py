@@ -127,6 +127,23 @@ class Writer:
         if (self.daemon.recovery_barrier or self.daemon.draining or listener["state"] != "connected" or
                 listener.get("recovery_state") in ("reconciling", "failed") or not connection or connection.closed):
             return  # Keep the prepared input durable until native bindings are verified again, or the next daemon.
+        if self.daemon.hook_stale(listener):
+            # Admitted by another release, its calls would be refused: replace it first, once its unit is quiet. The
+            # input stays prepared until then, and maintenance submits it again.
+            if not self.daemon.unit_quiet(run["unit"]):
+                return
+            from .recovery import reconcile_listener
+            await reconcile_listener(self.daemon, listener, advance=False)
+            actor = self.store.get(actor["id"])
+            listener = self.store.get(actor["listener"])
+            connection = self.daemon.connections.get(listener["id"])
+            if (self.daemon.hook_stale(listener) or listener["state"] != "connected" or
+                    listener.get("recovery_state") in ("reconciling", "failed") or not connection or connection.closed):
+                return
+            run = self.store.get(runid)
+            phase = run["phases"][run["phase"]]
+            if phase["state"] != "prepared":
+                return
         # Validate again after acquiring custody, before persisting a submitting
         # state. A lost RPC after that state remains uncertain, never replayed.
         image_paths([item["path"] for item in phase["input"] if item["type"] == "localImage"])

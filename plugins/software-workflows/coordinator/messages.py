@@ -103,6 +103,11 @@ class Messages:
                     listener["state"] != "connected" or listener.get("recovery_state") in ("reconciling", "failed") or
                     self.daemon.connections.get(listener["id"]) is not connection or connection.closed):
                 return  # A reconnect during lease restoration must verify its pinned bindings first.
+            if not active and self.daemon.hook_stale(listener):
+                # Admitted by another release, its calls would be refused: it is replaced first, once its unit is
+                # quiet, and this message stays pending until then.
+                self.daemon.readmit(target["run"])
+                return
             method = "turn/steer" if active else ("thread/queue/add" if message["wake"] == "queue" else "turn/start")
             params = {"threadId": target["thread"], "input": [{"type": "text", "text": text}], "clientUserMessageId": native_id}
             if active:

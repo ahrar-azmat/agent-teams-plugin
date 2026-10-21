@@ -69,6 +69,7 @@ class Daemon:
         self.request_locks, self.actor_locks, self.unit_locks = KeyedLocks(), KeyedLocks(), KeyedLocks()
         self.lease_locks = KeyedLocks()
         self.admitting = {}  # checkout -> effect-capable Pre hooks admitting, before their operation is recorded
+        self.readmitting = set()  # runs whose writer app-server, admitted by another release, is being replaced
         self.ready = False
         self.recovery_barrier = True
         self.boot = uid("boot")
@@ -117,6 +118,8 @@ class Daemon:
             if message["recipient"] == "lead" or message["recipient"].startswith("lead_mailbox_") or message["state"] in ("entered_context", "acknowledged"):
                 continue
             recipient = self.store.get(message["recipient"])
+            if recipient.get("kind") == "lead":
+                continue  # a lead reads its mail through its inbox: no native turn starts for it
             if participants.contains(self.store, recipient["unit"], checkoutid) and (message["delivery"] in ("submitting", "submitted", "uncertain")
                     or message["delivery"] == "pending" and message["wake"] != "none"):
                 return  # A queued or uncertain native turn can start without another RPC.
@@ -313,6 +316,99 @@ class Daemon:
         from .hooks import NATIVE_HOOK_SECONDS
         hook = {"matcher": ".*", "hooks": [{"type": "command", "command": command, "timeout": NATIVE_HOOK_SECONDS, "async": False}]}
         return command, {"features.hooks": True, "hooks.PreToolUse": [hook], "hooks.PostToolUse": [hook]}
+
+    def hook_stale(self, listener):
+        """Whether a listener runs another release's hook program: admitted by an older daemon, its config names
+        that release's hooks.py, and hook() refuses every call it makes (HOOK_PROGRAM_CHANGED)."""
+        command, _ = self.hook_config()
+        table = (listener.get("config") or {}).get("hooks") or {}  # admission stores the config as TOML tables
+        configured = {h.get("command") for event in ("PreToolUse", "PostToolUse") for entry in table.get(event) or []
+                      for h in entry.get("hooks", [])}
+        return configured != {command} or listener.get("hook_digest") != native.file_digest(Path(__file__).with_name("hooks.py"))
+
+    def unit_quiet(self, unitid):
+        """No turn, custody, admission, live operation, workflow input or native delivery of the unit in flight: its
+        app-server can be replaced without cutting work."""
+        run = self.store.get(self.store.get(unitid)["run"])
+        return not (any(a.get("active_turn") for a in self.store.all("actor", unitid)) or self.custody.unit_active(unitid)
+                    or any(self.admitting.get(key) for key in participants.checkout_ids(self.store, unitid))
+                    or any(o["state"] in ("prepared", "allowed", "running") or o.get("executing") for o in self.store.all("operation", unitid))
+                    or any(p.get("state") in ("submitting", "uncertain") for p in (run.get("phases") or {}).values())
+                    or any(m.get("unit") == unitid and m["state"] not in ("entered_context", "acknowledged")
+                           and m["delivery"] in ("submitting", "submitted", "uncertain") for m in self.store.all("message")))
+
+    def readmit(self, runid):
+        """In the background, once its unit is quiet, replace a run's writer app-server that another release admitted.
+        A message waiting for it stays pending, and messages.retry delivers it after."""
+        if runid in self.readmitting:
+            return
+        self.readmitting.add(runid)
+        async def replace():
+            try:
+                async with self.writer.locks.hold(runid):
+                    run = self.store.get(runid)
+                    listener = self.store.get(self.store.get(run["root_actor"])["listener"])
+                    if listener["state"] == "connected" and self.hook_stale(listener) and self.unit_quiet(run["unit"]):
+                        from .recovery import reconcile_listener
+                        await reconcile_listener(self, listener, advance=False)
+            except (CoordinatorError, OSError) as exc:
+                self.store.event("listener/readmit_refused", runid, {"code": getattr(exc, "code", type(exc).__name__)})
+            finally:
+                self.readmitting.discard(runid)
+        self.background(replace())
+
+    def readmission_config(self, config):
+        """A listener's stored config with this release's coordinator hooks in place of those it was admitted with.
+        Its trust entries for them stay keyed by position: admit_listener replaces their hashes."""
+        _, hooks = self.hook_config()
+        return dict(config, features=dict(config.get("features") or {}, hooks=True),
+                    hooks=dict(config.get("hooks") or {}, PreToolUse=hooks["hooks.PreToolUse"], PostToolUse=hooks["hooks.PostToolUse"]))
+
+    async def admit_listener(self, actor, config, home, roots, cwd):
+        """A writer's app-server with exactly the coordinator's hooks trusted: a first, threadless one reports their
+        hashes, and the one kept starts with that trust."""
+        command, _ = self.hook_config()
+        spawned = []
+        try:
+            listener = await self.spawn_listener(actor, config, home)
+            spawned.append(listener["id"])
+            connection = self.connections[listener["id"]]
+            listed = await connection.call("hooks/list", {"cwds": roots})
+            trust = {}
+            for entry in listed["data"]:
+                if entry.get("errors"):
+                    raise CoordinatorError("HOOK_CONFIG", "Native hooks/list reports errors")
+                for hook in entry["hooks"]:
+                    if hook.get("source") == "sessionFlags" and hook.get("command") == command:
+                        trust[hook["key"]] = {"trusted_hash": hook["currentHash"]}
+            if len(trust) != 2:
+                raise CoordinatorError("HOOK_DEFINITIONS", "Cannot identify exactly the coordinator's pre/post hook definitions")
+            # Restart only the idle, threadless discovery listener. Unrelated hook state is
+            # merged from the native config API, never read from CODEX_HOME files.
+            effective = await connection.call("config/read", {"cwd": cwd, "includeLayers": False})
+            from .roles import overlay, apply
+            config = apply(config, overlay(effective.get("config", {})))
+            prior_trust = effective.get("config", {}).get("hooks", {}).get("state", {})
+            config.setdefault("hooks", {})["state"] = dict(prior_trust, **trust)
+            await self.stop_listener(listener)
+            listener = await self.spawn_listener(actor, config, home)
+            spawned.append(listener["id"])
+            connection = self.connections[listener["id"]]
+            listed = await connection.call("hooks/list", {"cwds": roots})
+            own = native.coordinator_hooks(listed, roots, command=command)
+            if len(own) != 2 or any(h["trustStatus"] != "trusted" or not h["enabled"] for h in own):
+                raise CoordinatorError("HOOK_TRUST", "Precise native hook trust was not honored")
+            listener.update(hooks=own, config_digest=digest(effective))
+            self.store.save(listener)
+            return listener
+        except Exception:
+            # No app-server of a failed admission outlives it; the caller keeps its binding and can admit again.
+            for ident in spawned:
+                try:
+                    await self.stop_listener(self.store.get(ident))
+                except (CoordinatorError, OSError) as exc:
+                    self.store.event("listener/stop_refused", ident, {"code": getattr(exc, "code", type(exc).__name__)})
+            raise
 
     async def spawn_listener(self, actor, config, home=None, incarnation=None):
         ident = incarnation or uid("listener")
@@ -653,7 +749,7 @@ class Daemon:
         if fixture:
             from .fixture import runtime_configuration
             home, config = runtime_configuration(fixture, actor["run"])
-        command, hooks = self.hook_config()
+        _, hooks = self.hook_config()
         config.update(hooks)
         config.update({"web_search": "live", "agents.enabled": True, "features.multi_agent_v2": True,
                        "features.multi_agent_v2_dynamic_tools": True, "features.unified_exec_tty": False,
@@ -662,34 +758,8 @@ class Daemon:
         workflow = params.get("workflow")
         if workflow and workflow["compact_limit"]:
             config["model_auto_compact_token_limit"] = workflow["compact_limit"]
-        listener = await self.spawn_listener(actor, config, home)
+        listener = await self.admit_listener(actor, config, home, roots, cwd)
         connection = self.connections[listener["id"]]
-        listed = await connection.call("hooks/list", {"cwds": roots})
-        trust = {}
-        for entry in listed["data"]:
-            if entry.get("errors"):
-                raise CoordinatorError("HOOK_CONFIG", "Native hooks/list reports errors")
-            for hook in entry["hooks"]:
-                if hook.get("source") == "sessionFlags" and hook.get("command") == command:
-                    trust[hook["key"]] = {"trusted_hash": hook["currentHash"]}
-        if len(trust) != 2:
-            raise CoordinatorError("HOOK_DEFINITIONS", "Cannot identify exactly the coordinator's pre/post hook definitions")
-        # Restart only the idle, threadless discovery listener. Unrelated hook state is
-        # merged from the native config API, never read from CODEX_HOME files.
-        effective = await connection.call("config/read", {"cwd": cwd, "includeLayers": False})
-        from .roles import overlay, apply
-        config = apply(config, overlay(effective.get("config", {})))
-        prior_trust = effective.get("config", {}).get("hooks", {}).get("state", {})
-        config.setdefault("hooks", {})["state"] = dict(prior_trust, **trust)
-        await self.stop_listener(listener)
-        listener = await self.spawn_listener(actor, config, home)
-        connection = self.connections[listener["id"]]
-        listed = await connection.call("hooks/list", {"cwds": roots})
-        own = native.coordinator_hooks(listed, roots, command=command)
-        if len(own) != 2 or any(h["trustStatus"] != "trusted" or not h["enabled"] for h in own):
-            raise CoordinatorError("HOOK_TRUST", "Precise native hook trust was not honored")
-        listener.update(hooks=own, config_digest=digest(effective))
-        self.store.save(listener)
         actor["listener"] = listener["id"]
         self.store.save(actor)
         response = await connection.call("thread/start", {"cwd": cwd,
@@ -728,7 +798,19 @@ class Daemon:
             actor["state"] = "running"
             self.store.save(actor)
 
-    async def stop_listener(self, listener):
+    async def listener_exited(self, listener, seconds):
+        deadline = time.monotonic() + seconds
+        while True:
+            current = await asyncio.to_thread(processes.identity, listener["pid"])
+            if not current or current["birth"] != listener["birth"] or current["zombie"]:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+
+    async def stop_listener(self, listener, drain_s=5, kill=False):
+        """SIGTERM its app-server and wait `drain_s` for Codex's graceful exit. One still draining then is kept
+        (LISTENER_DRAIN), or with `kill`, for an app-server with nothing of its unit in flight, killed."""
         listener = self.store.get(listener["id"])
         if listener["state"] == "stopped" and listener.get("allocation_cleaned"):
             return
@@ -737,13 +819,17 @@ class Daemon:
         await self.detach_listener(listener["id"])
         current = await asyncio.to_thread(processes.identity, listener["pid"])
         if current and current["birth"] == listener["birth"]:
+            began = time.monotonic()
             os.kill(listener["pid"], signal.SIGTERM)
-            for _ in range(100):
+            exited, killed = await self.listener_exited(listener, drain_s), False
+            if not exited and kill:
                 current = await asyncio.to_thread(processes.identity, listener["pid"])
-                if not current or current["zombie"]:
-                    break
-                await asyncio.sleep(0.05)
-            else:
+                if current and current["birth"] == listener["birth"] and not current["zombie"]:
+                    os.kill(listener["pid"], signal.SIGKILL)
+                    killed = True
+                exited = await self.listener_exited(listener, 5)
+            self.store.event("listener/exit", listener["id"], {"seconds": round(time.monotonic() - began, 2), "exited": exited, "killed": killed})
+            if not exited:
                 raise CoordinatorError("LISTENER_DRAIN", "Native listener did not finish draining; retained ownership")
         if listener.get("endpoint_allocation"):
             if Path(listener["endpoint_allocation"]["directory"]).exists():
@@ -956,6 +1042,12 @@ class Daemon:
                 from .locks import busy
                 await self.withdraw(operation["id"], operation.get("custody"), "COORDINATOR_BUSY")
                 raise busy()
+            current = self.store.get(listener["id"])
+            if current["state"] != "connected" or current.get("recovery_state") in ("reconciling", "failed"):
+                # Its app-server began to be reconciled, stopped or replaced after this hook came in: an allow could
+                # belong to an incarnation that is going away, and native may never run the call.
+                await self.withdraw(operation["id"], operation.get("custody"), "LISTENER_RECOVERING")
+                raise CoordinatorError("LISTENER_RECOVERING", "The writer's app-server is being reconciled; call again")
             operation["state"] = "allowed"
             operation["decision"] = "allow"
             self.store.save(operation)
@@ -1515,10 +1607,13 @@ class Daemon:
                              if r.get("workflow") or r["state"] == "admitting"),
             "writers": sum(bool(a.get("active_turn")) for a in self.store.all("actor")),
             "custody": self.store.db.execute("SELECT count(*) FROM records INDEXED BY window_custody WHERE " + WINDOW_ACTIVE["custody"]).fetchone()[0],
+            # A lead reads its mail through its inbox, so no native turn starts for it: unread lead mail is no
+            # delivery in flight, and a stop never waits for it.
             "deliveries": sum(m["recipient"] != "lead" and not m["recipient"].startswith("lead_mailbox_")
                 and m["state"] not in ("entered_context", "acknowledged")
                 and (m["delivery"] in ("submitting", "submitted", "uncertain") or
-                     m["delivery"] == "pending" and m["wake"] != "none") for m in self.store.all("message")),
+                     m["delivery"] == "pending" and m["wake"] != "none")
+                and (self.store.get(m["recipient"], required=False) or {}).get("kind") != "lead" for m in self.store.all("message")),
             "lead_hooks": len(hooks), "lead_operations": len(lead_operations),
             "other_operations": len(operations) - len(lead_operations),
             "publication_rpcs": sum(m in ("unit/publish", "unit/recover") for m in methods),
@@ -1658,9 +1753,12 @@ class Daemon:
             if run.get("workflow"):
                 return await (self.runs.cancel(run) if method == "run/interrupt" else self.runs.resume(run, text=params.get("text", ""), deadline=params.get("deadline"), images=params.get("images")))
             actor = self.store.get(run["root_actor"])
-            connection = self.connections[actor["listener"]]
             if method == "run/interrupt":
+                connection = self.connections.get(actor["listener"])
+                if not connection:
+                    raise CoordinatorError("LISTENER_RECOVERING", "The writer's app-server is not connected; resume it to reconcile")
                 return await connection.call("turn/interrupt", {"threadId": actor["thread"], "turnId": actor["active_turn"]})
+            # A resume reconciles the writer's app-server first, replacing one that is gone or not connected.
             return await self.runs.resume(run, text=params.get("text", ""), deadline=params.get("deadline"), images=params.get("images"))
         if method in ("run/terminals", "run/terminate-terminal"):
             actor = self.store.get(self.store.get(params["run"])["root_actor"])

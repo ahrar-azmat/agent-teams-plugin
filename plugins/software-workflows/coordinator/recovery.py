@@ -11,6 +11,12 @@ from .client import CoordinatorError
 from . import native, processes, participants
 from .store import uid
 
+# A quiet app-server's graceful exit after SIGTERM is bounded by Codex 0.163 itself: its threads' shutdown at
+# 10 s (shutdown_all_threads_bounded; a writer's MCP servers stop there) and each connection's RPC drain at 30 s
+# (CONNECTION_RPC_DRAIN_TIMEOUT; the daemon's own connection is closed first), plus 5 s. One replaced for its hook
+# program has nothing of its unit in flight, so past this it is killed rather than kept.
+READMIT_DRAIN_S = 45
+
 
 async def may_execute(daemon, operation):
     """Whether native may still write for this admitted patch: allowed, with no sign its handler ended, and its
@@ -53,6 +59,8 @@ async def reconcile_listener(daemon, listener, advance=True):
         if alive:
             await daemon.stop_listener(listener)
         return
+    stale = daemon.hook_stale(listener)
+    readmitted = stale and listener["state"] == "stopped"  # stopped below, by an earlier pass, for its hook program
     if not alive:
         await daemon.detach_listener(listener["id"])
         for reservation in daemon.custody.unit_active(actor["unit"]):
@@ -74,10 +82,15 @@ async def reconcile_listener(daemon, listener, advance=True):
         if listener.get("log"):
             Path(listener["log"]).unlink(missing_ok=True)
             daemon.log_offsets.pop(listener["id"], None)
-        replacement = await daemon.spawn_listener(actor, listener["config"], listener.get("home"))
+        if stale:
+            # Its stored config names the old release's hook program: admit the replacement with this one's.
+            replacement = await daemon.admit_listener(actor, daemon.readmission_config(listener["config"]),
+                                                      listener.get("home"), roots, cwd)
+        else:
+            replacement = await daemon.spawn_listener(actor, listener["config"], listener.get("home"))
+            replacement["hooks"] = listener.get("hooks", [])
         replacement["root_thread"] = listener["root_thread"]
         replacement["replaces"] = listener["id"]
-        replacement["hooks"] = listener.get("hooks", [])
         store.save(replacement)
         for child in list(store.all("actor", actor["unit"])):
             if child["kind"] == "lead":
@@ -157,9 +170,9 @@ async def reconcile_listener(daemon, listener, advance=True):
             if not attached:
                 raise CoordinatorError("THREAD_UNMATERIALIZED", "The unused native thread was disconnected; create a new unit")
             continue
-        if child["thread"] != listener["root_thread"] and not attached:
-            # A new app-server connection must subscribe to each live child too.
-            # Resuming history does not start a turn or repeat its input.
+        if child["thread"] != listener["root_thread"] and (not attached or not alive):
+            # A new app-server connection must subscribe to each live child too, and a replacement has loaded only
+            # the root. Resuming history does not start a turn or repeat its input.
             child_response = await connection.call("thread/resume", {"threadId": child["thread"],
                 "approvalPolicy": "never", "sandbox": "danger-full-access",
                 **({"cwd": child.get("cwd", cwd), "runtimeWorkspaceRoots": roots} if unit.get("project_revision") else {})})
@@ -223,6 +236,13 @@ async def reconcile_listener(daemon, listener, advance=True):
     await asyncio.gather(*(daemon.ledger.reconcile(store.get(key), ignore_pending=False, reason="recovery snapshot")
                            for key in participants.checkout_ids(store, actor["unit"])))
     listener = store.get(listener["id"])
+    if alive and listener["state"] == "connected" and daemon.hook_stale(listener) and daemon.unit_quiet(actor["unit"]):
+        # Admitted by another release, its hooks run that release's program, and hook() refuses every call it
+        # makes (HOOK_PROGRAM_CHANGED). Its native turns are read now, and while it reconciles no hook, delivery or
+        # submission starts work: with nothing of its unit in flight, it is stopped (no notification gap) and
+        # replaced by an app-server admitted with this release's hooks, which resumes the same thread.
+        await daemon.stop_listener(listener, drain_s=READMIT_DRAIN_S, kill=True)
+        return await reconcile_listener(daemon, store.get(listener["id"]), advance)
     listener.update(recovery_state="reconciled", state="connected")
     store.save(listener)
     # Progression belongs to the daemon. Persisted prepared intents can submit;
@@ -230,7 +250,10 @@ async def reconcile_listener(daemon, listener, advance=True):
     run = store.get(actor["run"])
     if advance and run.get("workflow"):
         await daemon.writer.advance(run["id"])
-    if not alive:
+    if readmitted:
+        await daemon.messages.send("lead", actor["id"], "Re-admitted with this release's hooks: a replacement app-server resumed this "
+                                   "thread without continuing it. Nothing of the unit was in flight.", "none")
+    elif not alive:
         await daemon.messages.send("lead", actor["id"], "The listener died. A replacement cold-resumed this thread without continuing it. "
                                    "Effects were reconciled; inspect UNKNOWN and retained custody before further mutations.", "none")
 
