@@ -11714,3 +11714,470 @@ run:
   OLD is `export240` or `export241`. NEW is a snapshot, a fault copy or a calibration copy.
 - `SLOW_MCP=60` for the slow MCP server (`slow_mcp.py`).
 - `readmit_offline.py <coordinator dir> <state dir>` against the live state, read-only.
+
+## 2.4.3
+
+### Lead record for 2.4.3 — 2026-10-21
+
+**What prompted it.** Review turn 34 (session 01a14eac) found four HIGH and two MEDIUM defects in
+2.4.2's re-admission. On the user's decision of 10-21 ("Switch now, fixes in 2.4.3"), 2.4.2 shipped
+with them as known limits. The live switch to 2.4.2 then found every writer idle:
+- recovery took 515 s;
+- all 13 writers were re-admitted on the same thread, with 2.4.2's hooks;
+- no UNKNOWN was added.
+
+After that switch, the Sales_Profiler lead reported three more:
+- Values a writer kept in its code-mode runtime were gone after its re-admission.
+- `clocksleep` was refused `HOOK_TOOL_UNSUPPORTED` (writer `actor_d4c68493…`, 10:21 IST).
+- A writer's patch right after its own command was refused `CLAIM_CONFLICT`, naming its own unit.
+
+Review turns 35 to 41 then reviewed each round of fixes (**Review**, below).
+
+**What changed** (against 2.4.2):
+- **`recovery.py`:**
+  - `reconcile_listener` takes the run's lock (`daemon.reconcile_locks`). It re-reads the listener
+    and reconciles the actor's bound incarnation when the one it was given was replaced meanwhile.
+    It sends the lead notice, and advances a workflow, after releasing the lock.
+  - On failure, `reconcile_failed` marks the bound incarnation `failed` with `retry_at` (5 s,
+    doubling to 300 s) and records `listener/reconcile_failed`. A threadless record is not marked.
+  - The replacement is saved `reconciling`, with `initializing`, in the save that adds its
+    `root_thread`. Until a pass over it ends, each pass treats it as fresh: it resumes every thread,
+    passes the writer gate and sends the notice owed.
+  - `ancestry_order` orders the actor loop parent first.
+  - A threadless record is stopped right after its log is settled, and needs no lease.
+  - At startup, `defer_unbound` marks a writer still bound to a dead app-server `failed`
+    (`REPLACEMENT_UNBOUND`, due at once) for maintenance's retry. The startup lease set covers only
+    records with a thread, and a refused lease records `recovery/lease_refused` instead of raising.
+  - The notices carry `RUNTIME_NOTE`.
+- **`daemon.py`:**
+  - `admitting_units`: `unit_quiet` counts the unit's own admissions.
+  - `delivery_owed` and `writer_owed`. `stop_pending`, `_release_lease` and maintenance's retry use
+    them, so a lead's mail (including mail to an actor of kind lead) never counts.
+  - `readmit` also runs a due retry. It starts nothing while the daemon drains, and the drain waits
+    for those under way (`self.readmitting`).
+  - Maintenance retries a failed writer that is bound, not quarantined, due and owed work. It also
+    resubmits a plain run left `transition_pending`.
+  - `spawn_listener` kills a failed start's process group, marks its record stopped, records
+    `listener/cleanup_refused` if the endpoint cannot be removed, and raises the start's own error.
+    `admit_listener`'s cleanup and a failed attach stop with `kill=True`.
+  - `hook()` refuses an effect-capable call of a cancelled run (`RUN_CANCELLED`), at its start and
+    again before the allow, withdrawing what it prepared.
+  - A patch first calls `settle_before_claim`: a project unit's patch always, a checkout unit's when
+    its unit holds custody. Each pass reads the log, then settles every custody holder of the unit.
+    It returns when nothing is left whose end is unread, or at the hook's cutoff. Otherwise it waits
+    on the custody condition for at most 0.25 s. `settle_actor` returns the custody groups that have
+    no process or terminal left and whose result, Post hook or completed item is unread.
+  - A `turn/started` of a cancelled run's actor interrupts that turn (`runs.interrupt_turn`).
+  - `clocksleep` and `clockcurr_time` are effect-free readers.
+- **`writer.py`:**
+  - `submit` reads the run, the phase, the actor and the listener again after its awaits (its
+    leases, a replacement). It starts nothing for a cancelled run, another input, or a listener that
+    is not bound and verified (`unbound`) or is stale.
+  - `resubmit` submits a plain run's prepared continuation again, from maintenance.
+  - `advance_locked` reads the run again after its quiescence check, before saving
+    `settlement_refusal`. Its rollout readback moved before the final read, and that read returns
+    for a terminal or cancelled run, or a phase no longer `settling`.
+- **`runs.py`:**
+  - `cancel` reads the run before saving it and counts a new `cancel_generation`. It discovers
+    descendants only through a live connection, and reads each actor again after the queue's awaits,
+    before its interrupt.
+  - Its pass (`cancel_pass`) checks, before each queue deletion, interrupt and termination, that its
+    cancel still stands (`cancel_current`: a cancel requested, of the same generation). One that no
+    longer stands records `run/cancel_superseded` and stops. While a pass runs (`cancel_passes`), no
+    settlement saves `cancelled`. The pass leaves a lead's mail alone (`daemon.lead_mail`).
+  - `interrupt_turn` takes the cancel's generation, and does nothing for a cancel that no longer
+    stands. It sends `turn/interrupt` and records `run/turn_interrupted`, or
+    `run/turn_interrupt_refused`. A turn whose interrupt native answered (it answers once the turn has
+    aborted) is recorded on its actor (`interrupted_turn`) and not interrupted again.
+  - `_settle_cancel` interrupts every turn still active after its reconcile, and reads the run before
+    saving `cancelled`. It saves nothing for a run with no cancel requested, or for a cancel that no
+    longer stands. Its native reads run at most every 2 s by a monotonic clock held in memory
+    (`cancel_reconciled`), and skip a failed writer whose retry is not yet due. Before `cancelled`,
+    `threads_idle` reads each thread of the unit (`thread/read`, ordered with the thread's requests)
+    and waits while one is active. A thread it cannot read counts as running unless native's
+    `thread/loaded/list` does not hold it (`thread_loaded`), and an app-server with no connection
+    counts as running while its process lives (`app_server_runs`, by birth identity).
+  - A phase `submitting` or `uncertain` with no turn keeps the run `cancelling` while its
+    `turn/start` is in flight (`writer.starting`). Otherwise `start_outcome` reads the thread's status
+    (`thread/read`), then its turns (`includeTurns`), both sent after the loss: native runs a thread's
+    requests one at a time in arrival order, saves the live thread before it reads the turns, and
+    builds the turns before it reads the status. A turn holding the input is recorded as its
+    notifications would have (`found_start`, `workflow/submission_found`). While either read shows
+    the thread active it records the running turn as the actor's, to be interrupted, and tells
+    nothing. An idle thread with the input in no turn marks the phase `not_started`
+    (`workflow/submission_not_started`) only when a second pair of reads, sent at least 2 s after the
+    first (`start_absent`), agrees: `turn/start` answers once core holds the turn, and native reports
+    the thread active once the turn's own task reports it started. The start's app-server is
+    recorded (`start_listener`), and while it still runs no other one is read.
+  - `cancel(expired=True)`, maintenance's deadline cancel, checks the deadline again on the run as
+    it is when the cancel begins (`expired`), so a run resumed since maintenance read it is left.
+  - `resume` takes the cancel generation when it begins. After its quiescence check it reads the
+    run again and is refused `RUN_CANCELLED` if the generation changed. It also checks eligibility and
+    active turns again (`RUN_ACTIVE`).
+- **`daemon.py`, for the cancel:** `run/interrupt` of a plain run is `runs.cancel`, as a workflow's
+  is; a lead-mode run is refused `RUN_LEAD_MODE`. A plain run's `turn/completed` no longer saves the
+  run's state while a cancel is requested, and a `turn/started` passes the cancel's generation.
+- **`writer.py`, for the cancel:** `submit` holds the input's id in `starting` while its
+  `turn/start` is in flight. A start whose result is lost leaves a cancelling run's state as it is,
+  and `observe` leaves the state of any run with a cancel requested.
+- **`messages.py`:** `deliver` starts no turn for a run cancelled while it took its leases.
+
+**Review.** Session 01a14eac, turns 34 to 41, each continuing the same thread, and each sent the
+change since the previous turn.
+- **Turn 34** (2.4.2): four HIGH and two MEDIUM. All six are fixed here (the first table below).
+- **Turn 35** (`s243b`): "Needs changes". The six were addressed. It found three HIGH and one MEDIUM:
+  1. **HIGH:** a cancel during a submission's lease wait was overwritten by its `submitting` save.
+     `submit` now reads everything again after its awaits (cancelsubmit).
+  2. **HIGH:** a retry after a pass that failed part-way skipped the sub-agents' resumes. The
+     replacement is now `initializing` until a pass ends (childretry).
+  3. **HIGH:** a finished run's dead binding became a startup lease, and a refused lease stopped
+     the whole daemon from starting. Such a binding is now deferred to maintenance, and a refused
+     lease fails only its own writers (deadbound).
+  4. **MEDIUM:** an automatic retry could start a replacement after a drain had listed what to stop.
+     `readmit` now starts nothing while draining, and the drain waits for those under way. This one
+     has no run; it was checked by reading.
+- **Turn 36** (`s243p`): "Needs changes". Turn 35's four were fixed, and the own-unit patch only in
+  part. It found two HIGH and two MEDIUM:
+  1. **HIGH:** a phase's settlement and a resume saved runs they had read before their awaits, so a
+     cancel during those awaits was undone (cancelsettle, cancelresume).
+  2. **HIGH:** the retry counted only pending messages, so a delivery left uncertain on a finished
+     run was never settled, and a stop was refused for it (owedretry).
+  3. **MEDIUM:** the own-unit patch was still refused when the command's completed item came late
+     (own patch, slow completion).
+  4. **MEDIUM:** mail to an actor of kind lead counted as a writer's work and re-admitted a finished
+     run's writer (leadretry).
+- **Turn 37** (`s243s`): "Needs changes". Turn 36's four were fixed. It found one HIGH and one MEDIUM:
+  1. **HIGH:** a turn whose `turn/start` was in flight when the cancel began ran to its end. The
+     lead had named this window in the dispatch, and Codex held that the window's size does not
+     excuse it. Such a turn is now interrupted when seen and its calls are refused, and the cancel
+     waits for the start (cancelstart).
+  2. **MEDIUM:** the resume's guard compared wall-clock times, which can move back. It now compares
+     cancel generations (clockresume).
+- **Turn 38** (`s243u`): "Needs changes". Turn 37's MEDIUM was fixed, and its HIGH for a start
+  whose result came back. It found two HIGH and one MEDIUM:
+  1. **HIGH:** a cancel's pass ran outside the lock its settlement takes. Maintenance could report
+     the run `cancelled` during the pass. A resume could then clear the cancel and start a turn, and
+     the old pass interrupted that turn. Its settlement could also save the resumed run `cancelled`
+     (holdcancel).
+  2. **HIGH:** `run/interrupt` of a plain run sent one turn interrupt. It set no cancel, so a start in
+     flight ran its turn, and nothing refused that turn's calls (plaincancel).
+  3. **MEDIUM:** a phase whose `turn/start` result was lost (`uncertain`) did not keep the cancel
+     from reporting `cancelled`, even when no history could be read to tell whether the turn
+     started (losestart, dropstart).
+- **Turn 39** (`s243w`): "Needs changes". Turn 38's two HIGH were fixed, its MEDIUM in part. It
+  found one HIGH and one MEDIUM:
+  1. **HIGH:** maintenance read its run list, then awaited other runs' settlements. A run resumed
+     meanwhile with a fresh deadline could then be cancelled on the deadline of the record it had
+     read (staledeadline).
+  2. **MEDIUM:** the history pages a reconcile reads (`thread/turns/list`, `thread/items/list`) run
+     beside a thread's ordered requests in Codex 0.163. So a lost start could end after them, and its
+     input be marked `not_started` while its turn ran (startlate).
+- **Turn 40** (`s243y`): "Needs changes". Turn 39's HIGH was fixed, its MEDIUM in part. It found
+  two MEDIUM, and no CRITICAL or HIGH:
+  1. **MEDIUM:** a lost start's absence and idleness came from one `thread/read`, and native builds
+     its turns before it reads the status. A turn that recorded its input and ended between the two
+     left the input absent on an idle thread, and it was marked `not_started`. The status is now read
+     first, then the turns.
+  2. **MEDIUM:** `threads_idle` took every `NATIVE_RPC` as a thread native does not hold, but every
+     server error maps to that code. A thread it cannot read now counts as running unless
+     `thread/loaded/list` does not hold it. An app-server running without a connection counts as
+     running.
+
+  Neither has a red run: both windows are inside native. Reading Codex 0.163's source for the next
+  turn, the lead found that the first fix was not enough. `turn/start` answers once core holds the
+  turn, but the turn's own task reports it started only afterwards, and `thread/read`'s status
+  follows that report. So an idle status read right after the start does not show that the start
+  has ended. `not_started` now also needs a second pair of reads, at least 2 s after the first
+  (`s243z2`).
+- **Turn 41** (`s243z2`, the tree committed): "Needs changes". It found one MEDIUM and no CRITICAL or
+  HIGH. Turn 40's `NATIVE_RPC` finding was fixed. The lost start's finding stands in part:
+  1. **MEDIUM:** two pairs of reads, 2 s apart, that find no turn are evidence, not proof. Native
+     spawns the turn's task before that task reports the turn started, and neither native nor its
+     runtime (Tokio) bounds the delay. If the task does not run for that long, the input is marked
+     `not_started` and the run `cancelled` while that turn can still start. Codex's fix is to keep
+     the submission uncertain until its outcome is established, by ending the app-server (verified)
+     and reading what it saved.
+
+  2.4.3 ships this as a known limit (below), with the fix planned for 2.4.4. A turn that starts
+  after its run's cancel is interrupted when seen, and its calls are refused until a resume.
+
+**Runs (`readmit243_check.py`, `ownpatch_check.py`, `clock243_check.py`).** These used real Codex
+0.163.0 app-servers, the loopback fixture model, a 3,700-file checkout (`ownpatch_check.py` and
+`clock243_check.py`: one file), and disposable state and CODEX_HOME:
+- **OLD:** `export242`, the 2.4.2 tag, which equals the installed cache.
+- **Snapshots**, each compared with the tree by `diff -r` when taken:
+  - `s243b`: turn 34's fixes, reviewed in turn 35.
+  - `s243c`: turn 35's fixes. `s243p`: `s243c` plus the own-unit patch, reviewed in turn 36.
+    `s243q`: `s243p` plus the startup lease containment and the threadless retire.
+  - `s243r`: turn 36's fixes. `s243s`: `s243r` plus the wider wait before a patch's claim, reviewed
+    in turn 37.
+  - `s243t`: turn 37's fixes. `s243u`: `s243t` plus its README text, reviewed in turn 38.
+  - `s243v`: turn 38's fixes. `s243w`: `s243v` plus its README text, reviewed in turn 39.
+  - `s243x`: turn 39's fixes. `s243y`: `s243x` with the lost start's reads made safe while its
+    thread is active, and an answered interrupt not sent again, reviewed in turn 40.
+  - `s243z`: turn 40's fixes. `s243z2`: `s243z` plus the second pair of reads before
+    `not_started`, reviewed in turn 41. It is the code committed; the README gained one sentence on
+    the known limit afterwards.
+- **Calibration copies (`mkcal243.py`):** each named after the snapshot it copies (`c242`, `c242b`,
+  `c242c`: 2.4.2; `c243`: `s243b`; `c243c`, `c243p`, `c243q`, `c243r`, `c243s`, `c243t`, `c243u`,
+  `c243v`, `c243w`, `c243x`, `c243y`, `c243z`, `c243z2`). A trailing digit after a letter means it
+  was built again after `mkcal243.py` gained hooks or moved one; `c243z2` copies `s243z2`.
+  `c242d` is 2.4.2 with the turn-38 hooks, except the lost start's reconcile refusal: 2.4.2 has no
+  place for it, and `mkcal243.py` stops there. These hooks are inert unless their variable is set:
+  - `R243_GATE_DELAY`: sleep after a replacement's writer gate.
+  - `R243_SLOW_ADMIT`: sleep after an admission's first app-server starts.
+  - `R243_STALE_DELAY`: sleep before a stale writer's app-server is stopped.
+  - `R243_SLOW_HOOK`: hold a call that mentions SLOWHOOK in admission.
+  - `R243_FAIL_HOOKS_LIST_ONCE`: fail one reconcile `hooks/list`.
+  - `R243_STALL_SPAWN`: start `/bin/sleep 3601` in place of the next app-server.
+  - `R243_SLOW_SUBMIT`: sleep in `submit` after its leases, for an input that mentions SLOWSUBMIT.
+  - `R243_FAIL_CHILD_RESUME_ONCE`: fail a reconcile's next sub-agent `thread/resume` once.
+  - `R243_SLOW_READBACK`: hold the next rollout readback (a phase's settlement) 20 s.
+  - `R243_SLOW_QUIESCENT`: hold the next quiescence check 20 s.
+  - `R243_LOSE_REPLY`: for a message that mentions LOSEREPLY, drop its context echo. Then, 3 s after
+    native answered its delivery, kill the app-server and treat the reply as lost. Native has the
+    message; the coordinator has no evidence of it.
+  - `R243_SLOW_COMPLETION`: process each command's `item/completed` that many seconds late.
+  - `R243_SLOW_START`: sleep in `submit` between its `submitting` save and its `turn/start`, for an
+    input that mentions SLOWSTART.
+  - `R243_CLOCK_BACK`: `runs.py`'s wall clock reads 1 h behind while its flag file exists.
+  - `R243_HOLD_CANCEL`: hold the next cancel's pass 30 s after its discovery, before its interrupts.
+  - `R243_SLOW_DELIVERY`: sleep in a message's delivery between its `submitting` save and its RPC, for
+    a message that mentions SLOWDELIVERY.
+  - `R243_LOSE_START`: for an input that mentions LOSESTART, `submit` sends `turn/start`, discards its
+    result and raises `NATIVE_UNCERTAIN`. While its flag file exists, that thread's notifications
+    are dropped and every reconcile is refused. With `R243_LOSE_START_UNSENT`, the start is never sent.
+  - `R243_HOLD_MAINT`: hold maintenance's run loop 45 s once, after it has read its run list, before
+    its first run.
+  - `R243_START_LATE`: for an input that mentions STARTLATE, `submit` raises `NATIVE_UNCERTAIN`
+    without sending `turn/start`. The cancel's next settlement sends it right after its reconciles,
+    before its queue or turns read. While its flag file exists, that thread's notifications are
+    dropped.
+  - `c243n` is `c243` with `unit_quiet`'s checkout-wide admission count put back.
+
+Turn 34's findings, the clock tools and the runtime notice:
+
+| Case | NEW | Result |
+|---|---|---|
+| gatewindow (message wake to a writer kept busy across the switch; replacement's gate held 15 s) | c242 | message submitted +155.6 s, patch allowed on the replacement +155.7 s, reconcile notice +171.6 s |
+| gatewindow | c243 | notice +172.3 s, message submitted +173.0 s; patch verified; 0 UNKNOWN |
+| cancelrace2 (run/interrupt 20 s before the stale stop of a workflow's next phase) | c242 | 2 replacements of the old listener, both connected, actor bound to the second; interrupt `NATIVE_RPC` "thread not found"; run `cancelling`; stop `NOT_QUIESCENT` `{workflows: 1}` |
+| cancelrace2 | c243 | 1 replacement; interrupt answered after 51 s; run cancelled; implementation `prepared` |
+| cancelrace (run/interrupt 25 s into the replacement's admission) | c242 | interrupt `OPERATIONAL_FAILURE` `KeyError`; implementation `settling` (its turn ran after the cancel) |
+| cancelrace | c243 | interrupt answered; run cancelled; implementation `prepared`; 1 replacement |
+| stranded (resume A while B's call, another unit in the same checkout, is held 45 s) | c242 | A `transition_pending`, input `prepared`, no turn after 150 s (B released about +202.5 s) |
+| stranded | c243 | A's turn started at the resume; patch verified; 0 UNKNOWN |
+| stranded | c243n | A started after B's admission, submitted again by maintenance; patch verified |
+| grandchild (root, child, grandchild whose actor id sorts first; idle at the switch) | c242 | replacement `NATIVE_RPC` in recovery: quarantined, UNKNOWN "listener recovery incomplete", resume `RECOVERY_UNKNOWN` |
+| grandchild | c243 | threads resumed parent first; resume passed; patch verified; 0 UNKNOWN |
+| retryfail (one failing `hooks/list` in a message's re-admission) | c242 | listener left `reconciling`; message pending; stop `NOT_QUIESCENT` `{deliveries: 1}` |
+| retryfail | c243 | `listener/reconcile_failed` retries 1, retried after 5 s, re-admitted (notice with the runtime note); patch verified |
+| stallspawn (a re-admission's first app-server has no socket) | c242 | `/bin/sleep 3601` left running, record `starting`; message pending; stop `NOT_QUIESCENT` |
+| stallspawn | c243 | process ended, record `stopped`; retried; patch verified; 0 UNKNOWN |
+| clock (`clock.sleep` 300 ms, then `clock.curr_time`) | 2.4.2 | both `HOOK_TOOL_UNSUPPORTED` |
+| clock | s243b | both `hook/nonmutator`; run completed |
+
+Turn 35's findings and the own-unit patch:
+
+| Case | NEW | Result |
+|---|---|---|
+| cancelsubmit (run/interrupt while a workflow's implementation input waits 20 s after its leases) | c243 | interrupt answered; the run then completed with no cancel recorded, implementation `complete` |
+| cancelsubmit | c243p | run cancelled; implementation `prepared`, no turn; file unchanged |
+| childretry (switch during a 90 s command, then a message wake; the re-admission's sub-agent `thread/resume` fails once) | c243 | retried and reconciled; the next resume `NATIVE_RPC` "thread not found" (`thread/backgroundTerminals/list`, the sub-agent's thread) |
+| childretry | c243c | the retry resumed the sub-agent; resume passed; third turn completed; patch verified; 0 UNKNOWN |
+| deadbound (A's app-server killed, its replacement's start stalled, the daemon killed; at the restart a legacy writer holds A's checkout) | c243 | the daemon did not start: `startup-error.json` `EXCLUSIVE_WRITER` |
+| deadbound | c243c | the daemon started; B reconciled; A's resume `RECOVERY_UNKNOWN` (the notification gap of the kill) |
+| deadbound with a third run C, legacy writers holding A's and B's checkouts | c242c | the daemon did not start: `startup-error.json` `EXCLUSIVE_WRITER` |
+| deadbound, as above | c243q | the daemon started. A deferred (`REPLACEMENT_UNBOUND`), not retried (nothing owed). `recovery/lease_refused` for B: B quarantined, UNKNOWN "listener recovery incomplete". C reconciled. The stalled start's record stopped |
+| own patch (`cat`, then `apply_patch`, in one cell) | 2.4.2, s243c | patch `CLAIM_CONFLICT` naming the writer's own unit; file unchanged |
+| own patch | s243p | patch verified |
+
+Turn 36's findings:
+
+| Case | NEW | Result |
+|---|---|---|
+| cancelsettle (run/interrupt while the analysis's settlement reads its rollout, held 20 s) | c242b | interrupt answered +37.6 s; the implementation's patch allowed +56.4 s and verified; run `completed`, no cancel recorded |
+| cancelsettle | c243q2 | the same (answered +50.8 s, patch +69.2 s) |
+| cancelsettle | c243r | run cancelled; analysis left `settling`; file unchanged |
+| cancelresume (run/interrupt while a resume's quiescence check is held 20 s) | c242b | interrupt answered +41.6 s; resume returned +60.5 s; patch verified; run completed, cancel cleared |
+| cancelresume | c243q2 | the same |
+| cancelresume | c243r | resume `RUN_CANCELLED`; run cancelled; file unchanged |
+| owedretry (a message's wake delivery whose reply is lost after native took it; the re-admission's first start then stalls) | c243q3 | not retried: message `uncertain`; stop `NOT_QUIESCENT` `{deliveries: 1}` |
+| owedretry | c242c | not retried; the stalled start left running, record `starting`; message `uncertain`; stop `NOT_QUIESCENT` `{deliveries: 1}` |
+| owedretry | c243r2 | retried 5 s after the failure; message found in the thread's history (`entered_context`); stop answered |
+| leadretry (mail to the unit's attached lead actor; the writer's re-admission's first start stalls) | c243q2 | the writer re-admitted in the background for that mail |
+| leadretry | c243r | not re-admitted (its next resume reconciles it); mail pending for its lead; stop answered |
+| own patch, each command's completed item 5 s late | c242b, c243q2 | patch `CLAIM_CONFLICT`; custody released 5.1 s and 5.0 s later; file unchanged |
+| own patch, 5 s late | c243r | the hook waited 5.2 s for the custody's release; patch verified |
+
+Turn 37's findings:
+
+| Case | NEW | Result |
+|---|---|---|
+| cancelstart (run/interrupt while the implementation's `turn/start` is held 20 s after its `submitting` save) | c243s2 | `cancelled` at +50.6 s while the start was held; the turn then ran, and its patch was allowed at +68.3 s and verified |
+| cancelstart | c242c | `cancelled` at +38.4 s while the start was held; the turn then ran, and its patch was allowed at +57.4 s and verified |
+| cancelstart | c243t | the late turn interrupted when seen (`run/turn_interrupted` +70.5 s); `cancelled` at +71.1 s; file unchanged |
+| clockresume (cancelresume with `runs.py`'s clock 1 h back during the hold) | c243s2 | resume returned; patch verified; run completed, cancel cleared |
+| clockresume | c243t | resume `RUN_CANCELLED`; file unchanged |
+| cancelresume | c243t | resume `RUN_CANCELLED` |
+| own patch, 5 s late, three runs | c243t | patch verified each time |
+
+Turn 38's findings:
+
+| Case | NEW | Result |
+|---|---|---|
+| holdcancel (a workflow's cancel, its pass held 30 s after its discovery; a resume during the hold) | c243u | maintenance reported `cancelled` at +39.3 s, during the hold. The resume's turn started at +40.9 s. When the hold ended the old pass interrupted it, and the run was saved `cancelled` again with no cancel requested (+70.1 s). The resume's patch never ran |
+| holdcancel | c242d | maintenance reported `cancelled` at +41.6 s, during the hold. The resume's turn started at +43.3 s, the old pass interrupted it, and the run ended `failed`; file unchanged |
+| holdcancel | c243v | during the hold the run read `cancelling`, and the resume was refused `RUN_ACTIVE` (+50.9 s); `cancelled` at +68.8 s. A resume after it (+71.6 s) ran its turn; patch verified |
+| plaincancel (run/interrupt of a finished plain run while a message's `turn/start` is held 20 s after its `submitting` save) | c243u | `run/interrupt` `SCHEMA_TYPE` ("Wrong type at params.turnId"); the message's turn ran; patch verified (value 100) |
+| plaincancel | c242d | `run/interrupt` `SCHEMA_TYPE`; the message's turn ran; patch verified (value 100) |
+| plaincancel | c243v | the message's turn interrupted when seen (+63.1 s); run `cancelled` (+66.2 s); file unchanged |
+| losestart (the implementation's `turn/start` sent and its result lost; for 25 s the thread's notifications are dropped and every reconcile is refused) | c243u | `cancelled` at +43.9 s, at the request; the first history read after the loss at +79.9 s |
+| losestart | c243v | `cancelling` until the history read at +84.9 s; `cancelled` at +89.2 s; the phase's turn found and settled. The resume after it ran; patch verified |
+| dropstart (as losestart, with the `turn/start` never sent) | c243u | `cancelled` at +48.7 s; implementation left `uncertain`; the resume after it refused `SUBMISSION_UNCERTAIN` |
+| dropstart | c243v | `cancelling` until the history read at +83.8 s; implementation `not_started` and `cancelled` at +89.1 s. The resume after it ran; patch verified |
+
+Turn 39's findings:
+
+| Case | NEW | Result |
+|---|---|---|
+| staledeadline (a workflow with a 35 s deadline; maintenance held 45 s once after reading its run list; meanwhile the run completes and is resumed with a fresh deadline for a patch 40 s later) | c243w3 | when the hold ended (+83.5 s) maintenance cancelled the run; the resumed turn was interrupted; file unchanged |
+| staledeadline | c243x | no cancel; the resumed turn ran; patch verified; run completed |
+| startlate (the implementation's `turn/start` lost before it is sent, then sent by the cancel's next settlement right after its reconciles; notifications dropped until the run reads cancelled) | c243w3 | `not_started` and `cancelled` at +42.6 s, the second native returned the late turn's id; the turn interrupted only at +44.6 s |
+| startlate | c243x | `not_started` recorded at +43.6 s while the turn ran (its input not yet in the read's turns); `cancelled` waited for the turn's interrupt (+47.1 s) |
+| startlate | c243y | no `not_started`; the running turn recorded from the read and interrupted (+39.4 s); `cancelled` at +41.4 s once the thread was idle; the phase settled `interrupted` with its turn |
+| losestart | c243x | turn found at the cancel and interrupted; each later re-interrupt of the aborted turn went unanswered for 60 s; `cancelled` at +170.7 s |
+| losestart | c243y | turn found at the cancel (`workflow/submission_found`) and interrupted once (+39.1 s); `cancelled` 9 s after the fault lifted (+76.2 s); the resume after it ran; patch verified |
+| dropstart | c243y | `not_started` and `cancelled` at the cancel (+37.4 s); the resume after it ran; patch verified |
+
+Turn 40's findings and the second pair of reads have no red run: their windows are inside native.
+The cases that reach the changed code, on the committed tree:
+
+| Case | NEW | Result |
+|---|---|---|
+| losestart | c243z2 | turn found at the cancel (+53.6 s) and interrupted once (+55.7 s); `cancelled` at +95.5 s, once the refused reconciles' retry was due (history read +89.7 s); the resume after it ran; patch verified |
+| dropstart | c243z2 | `not_started` and `cancelled` at +55.7 s, 2.1 s after the cancel (the second pair of reads); the resume after it ran; patch verified |
+| startlate | c243z2 | no `not_started`; the late turn (+55.6 s) recorded from the reads and interrupted (+57.6 s); `cancelled` at +59.8 s; the phase settled `interrupted` with its turn; file unchanged |
+| cancelstart | c243z2 | the held start's turn interrupted when seen (+73.4 s); `cancelled` at +74.0 s; file unchanged |
+
+**Final batch (`final243.sh`).** It ran on `s243z` (calibration copy `c243z`), and the cases that
+reach a lost start ran again on the committed tree `s243z2` (`c243z2`). `s243z2` differs from
+`s243z` only in the second pair of reads before `not_started`, and only a lost start reaches that
+code. Every case of the tables above, on 2.4.3 (32 runs, each exit 0):
+
+| Case | Result |
+|---|---|
+| gatewindow | notice +180.6 s, message submitted +181.0 s; patch verified; 0 UNKNOWN |
+| cancelrace, cancelrace2 | 1 replacement each; interrupt answered; run cancelled; implementation `prepared` |
+| stranded | A's patch verified; stop `NOT_QUIESCENT` `{mutating_rpcs: 1, writers: 1}`: B's call was still held in admission, as in every stranded run since turn 34 |
+| grandchild, retryfail, stallspawn, childretry | patch verified; 0 UNKNOWN. In the grandchild run on `c243z` the grandchild's record did not sort before its parent's. Two of three more runs on `c243z2` did; each resumed the threads parent first, and its resume passed with 0 UNKNOWN. One's patch was verified; the other is the unexplained run below |
+| cancelsubmit | run cancelled; implementation `prepared` |
+| deadbound (A, B, C) | the daemon started; B quarantined; C reconciled; A's resume `RECOVERY_UNKNOWN` |
+| cancelsettle | run cancelled; analysis `settling`; file unchanged |
+| cancelresume, clockresume | resume `RUN_CANCELLED`; file unchanged |
+| cancelstart | late turn interrupted; run cancelled; file unchanged (also on `c243z2`) |
+| holdcancel | the resume during the hold refused `RUN_ACTIVE`; `cancelled` once the pass ended; the resume after it ran; patch verified |
+| plaincancel | the message's turn interrupted when seen; run cancelled; file unchanged |
+| losestart, dropstart, startlate | as in the table above on `c243z2`; on `c243z` the same outcomes, with dropstart's `not_started` taken from one pair of reads |
+| staledeadline | no cancel; the resumed turn ran; patch verified; run completed |
+| owedretry | retried; message `entered_context`; stop answered |
+| leadretry | not re-admitted; stop answered |
+| own patch; own patch, 5 s late | patch verified |
+| clock | both `hook/nonmutator`; run completed |
+
+**Unexplained run.** In one grandchild run on `c243z2`, the run read `completed` 0.1 s after its
+resume, its second turn's patch had not been made, and the stop found one hook call still in flight
+(`NOT_QUIESCENT` `{mutating_rpcs: 1}`). Its state was removed with its work folder. A fourth run, with
+its state kept, passed: the turn ran from `turn/started` to `turn/completed` in 0.14 s, patch
+included, so the quick `completed` is the fixture's speed. Why that one patch was not made is not
+established.
+
+**Calibration notes.**
+- A first stallspawn calibration sent SIGSTOP to the app-server right after exec. That froze the
+  daemon's event loop: on macOS, Python 3.15's threaded child watcher wakes on the stop, and the
+  loop then blocks in `waitpid`. The calibration now starts `/bin/sleep` instead.
+- A second calibration had the app-server listen on another name in the endpoint's directory. That
+  left a file no real start leaves, and its cleanup failed. The tree's start no longer lets such a
+  cleanup failure replace its own error.
+- Through `run/start`, 2.4.2 leaves no stalled process: a run's failed start stops every app-server
+  of its run. The case therefore runs through a re-admission.
+- cancelsubmit first ran on a plain run's resume. It told nothing apart: `run/interrupt` of a plain
+  run with no active turn failed `SCHEMA_TYPE` ("Wrong type at params.turnId") on 2.4.2 and on every
+  2.4.3 tree before `s243v`. The case runs on a workflow's implementation input. Turn 38 found the
+  plain run's interrupt itself wrong, and `s243v` fixed it (plaincancel).
+- cancelstart's slow start sat, in copies built before `s243v`'s `starting`, between the
+  `submitting` save and the RPC. On `c243w` that left the start outside `starting`, a window the
+  code does not have (nothing awaits between that save and `starting.add`): the run was reported
+  `cancelled` at +42.6 s and the held start's turn then interrupted (+60.8 s). `mkcal243.py` now
+  holds the start after `starting` records it, inside the RPC's own window (`c243w2`): the turn
+  was interrupted and the run `cancelled` at +57.5 s; file unchanged.
+- In losestart on `c243x`, the turn's interrupt was answered at once, but its notifications were
+  dropped, so the actor kept it active. Each later settlement interrupted it again, and each of
+  those interrupts went unanswered until its 60 s timeout. Native answers `turn/interrupt` only
+  when the turn aborts. `s243y` does not interrupt a turn again once its interrupt was answered.
+- holdcancel's first resume made its patch after a 45 s command. Codex returns `exec_command` at its
+  30 s yield cap while the command still runs, so the patch was refused `CLAIM_CONFLICT` by its own
+  unit's command, as it should be. The route now has the model wait 40 s before the patch.
+- The cases that kill an app-server (deadbound, owedretry, leadretry) leave the UNKNOWN "native
+  notification gap" on every tree. A writer killed outside the coordinator is a gap by design.
+- deadbound's first version printed only the client's failure to find the endpoint. The harness
+  now prints `startup-error.json`.
+- owedretry's first calibration killed the app-server before native had recorded the message. The
+  delivery stayed `uncertain` on both trees, because there was nothing for history to find. The
+  calibration now drops the context echo and kills the app-server 3 s after native's reply.
+- The busy regression read the plain run's `completed` state before the second turn's patch had
+  settled. `readmit_check.py` now waits for that patch.
+- The own patch with its completed item 5 s late passed once on `c243r`. It was refused once on
+  `c243s`, because no receipt or Post hook of the command had been read when the patch's hook ran,
+  and the wait covered only commands whose end had begun. `s243t` waits for every command with no
+  process or terminal whose end is unread, and reads the log on each pass. It passed four times.
+
+**Regressions (`readmit_check.py`, 2.4.2 to `s243z`, in the final batch).** Each gave its 2.4.2
+result:
+
+| Case | Result |
+|---|---|
+| force (idle at the switch, then a resume for a patch) | replaced in recovery (old exit 0.05 s, this release's hooks, same root thread); patch verified; 0 UNKNOWN |
+| children (a sub-agent whose turn ended before the switch) | sub-agent resumed on the replacement; patch verified; 0 UNKNOWN |
+| busy (switch during a 90 s command; resume once custody is released) | kept in recovery; replaced at the resume; patch verified; 0 UNKNOWN |
+| busymsg (as busy, then a message wake instead of a resume) | replaced once custody was released; message delivered about 30 s later; patch verified; 0 UNKNOWN |
+| wedged (app-server stopped with SIGSTOP before the new daemon starts) | quarantined, UNKNOWN "listener recovery incomplete", resume `OPERATIONAL_FAILURE` `TimeoutError`, stop `LISTENER_DRAIN`, as 2.4.2 |
+| leadmail (unread mail to a lead-kind actor, then a native run on the checkout) | lease released 3 s after the run ended; draining stop answered |
+
+**Known limits.**
+- A lost start's `not_started` rests on native reporting a started turn within 2 s of
+  `turn/start`'s answer, which neither native nor its runtime guarantees (turn 41, MEDIUM). If the
+  turn's task does not run for that long, the run can read `cancelled`, with the input
+  `not_started`, while the turn can still start. Such a turn is interrupted when it is seen, and its
+  calls are refused `RUN_CANCELLED` until a resume. A resume before it starts can join it, because
+  `turn/start` steers a running turn. Planned for 2.4.4: end the app-server (verified), then read
+  what it saved.
+
+**Live ledger (read-only, 14:50 IST, daemon 2.4.2).**
+- 13 listeners are connected and bound to their actors: the 13 writers, each admitted by 2.4.2 (hook
+  digest `caab2d45…`, 2.4.2's `hooks.py`). Each reads stale for 2.4.3, so the switch re-admits it once
+  its unit is quiet.
+- The 13 app-servers replaced at the 2.4.2 switch are `dead`, and none is bound to its actor. So
+  `defer_unbound` marks nothing, and maintenance retries none of them. The 26 `stopped` records are
+  threadless, and recovery skips them.
+- There are no sub-agents, no run `transition_pending`, no cancel left unsettled, no live operation,
+  no custody and no native delivery owed. The 15 messages to writers not yet in context have no wake;
+  the rest is lead mail, which never counts.
+- One writer was in a turn (two at 13:03). A writer in a turn at the switch is kept in recovery and
+  replaced once its unit is quiet (busy, busymsg).
+
+### Commands for the final batch
+From the lead's scratchpad (`projects/`), with `python3.15 -B` and a new work folder `<w>` for each
+run:
+- `mkcal243.py <plugin dir> <new dir> [--nounit]` builds the calibration copies.
+- `readmit243_check.py export242/plugins/software-workflows <NEW> s243b/plugins/software-workflows <w> <case>`
+  runs the readmit cases. The cases are gatewindow, cancelrace, cancelrace2, stranded, grandchild,
+  retryfail, stallspawn, cancelsubmit, childretry, deadbound, cancelsettle, cancelresume, owedretry,
+  leadretry, cancelstart, clockresume, holdcancel, plaincancel, losestart, dropstart, staledeadline
+  and startlate.
+- `ownpatch_check.py <plugin dir> s243r/plugins/software-workflows <w> [<completion delay s>]` runs
+  the own patch.
+- `clock243_check.py <plugin dir> s243b/plugins/software-workflows <w>` runs the clock tools case.
+- `readmit_check.py export242/plugins/software-workflows s243z/plugins/software-workflows s243z/plugins/software-workflows <w> <case>`
+  runs the regressions.
+- `final243.sh` runs the final batch.

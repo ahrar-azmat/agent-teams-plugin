@@ -402,7 +402,7 @@ Bash window that belonged to the retired generation.
 | `checkout/revisions` | `checkout`, optional `path`, `cursor`, `limit`; paginated immutable revision records. |
 | `run/start` | `checkout`, optional `mode`, `task`, `paths`, `model`, `fixture`; returns separate run, attempt, unit and actor IDs plus native policy echoes. `fixture` is only for an owned disposable provider manifest. |
 | `run/status` | `run`, or optional `checkout`; persisted run or detailed checkout status. |
-| `run/interrupt` | `run`; cancel the selected run's root/child turns and queued work, then verify process/terminal settlement. Custody and claims remain until reconciled. |
+| `run/interrupt` | `run`; cancel the selected run's root/child turns and queued work, then verify process/terminal settlement, for a plain run as for a workflow. Its calls are refused (`RUN_CANCELLED`) until a resume. A lead-mode run has no writer turns (`RUN_LEAD_MODE`). Custody and claims remain until reconciled. |
 | `run/resume` | `run`, `text`; reconcile first (replacing an app-server that is gone, not connected or admitted by another release), refuse unresolved recovery UNKNOWN, then explicitly start a new turn. |
 | `run/terminals` | `run`; native terminal inventory. |
 | `run/terminate-terminal` | `run`, `process_id`; native termination, followed by custody reconciliation. This ID is not an OS PID. |
@@ -632,9 +632,31 @@ its next turn instead: a resume, a message that wakes it, a workflow phase. Its
 app-server is stopped, and killed if it has not exited 45 s after its SIGTERM (Codex
 0.163's own bounds, 10 s for its threads and 30 s for a connection, plus 5 s). A new
 one is admitted with this release's hooks and resumes the same thread and each
-sub-agent thread. A call still being admitted when its app-server begins to be
-reconciled is withdrawn (`LISTENER_RECOVERING`). Each stop records the app-server's
-exit time (`listener/exit`).
+sub-agent thread, parent first (Codex refuses a sub-agent whose parent is not
+loaded). A call still being admitted when its app-server begins to be reconciled is
+withdrawn (`LISTENER_RECOVERING`). Each stop records the app-server's exit time
+(`listener/exit`).
+
+The replacement is reconciling from the save that makes it findable until its
+reconcile ends: calls on it are withdrawn the same way, and deliveries and
+submissions wait. Every reconcile of a run's writer holds one lock for the run
+(recovery, resume, re-admission, cancel, a transport gap) and reconciles the
+incarnation that is current once it holds it, so one replacement owns each
+transition. A reconcile that fails after recovery marks the writer failed
+(`listener/reconcile_failed`), and maintenance reconciles it again after 5 s,
+doubling to 5 min; its unit's work waits meanwhile. A finished run's writer is retried
+only while work is owed to it: its unit is not quiet, or a native delivery to one of its
+writers is in flight or pending with a wake. A lead's mail never counts, since a lead
+reads it through its inbox. Otherwise its next resume reconciles it. At startup, a
+checkout whose lease is refused (a writer outside the coordinator took it while no
+daemon ran) fails only its own writers' recovery, each quarantined with an UNKNOWN;
+every other checkout recovers, and the record of a start that never got a thread is
+retired. Maintenance also submits again a prepared continuation left
+`transition_pending`, for a plain run as for a workflow.
+Only the thread's history carries over: what the old app-server held in its tool
+runtime (code-mode variables and functions) is gone, and the notice to the lead says
+so. A start whose socket never appears ends its app-server's process group and marks
+its record stopped.
 
 A refused or withdrawn call that native runs after all is unmediated: UNKNOWN, and its
 custody is held again. C1 compares native effect items with successful recorded
@@ -652,6 +674,11 @@ custody and drain read only unreconciled operations and held custody, or custody
 released since a time, through indexes. So does maintenance, each second: held
 custody, runs still in flight, pending lead hooks, and undelivered messages to
 retry. A readiness check asks for a brief `daemon/status` without the writers listing.
+
+Before a patch claims paths, its unit's commands are settled. One whose call returned,
+with no process or terminal of it left, waits only for Codex's completed item, which
+can arrive after the patch's hook: the hook waits for it until its deadline. A command
+still running conflicts (`CLAIM_CONFLICT`).
 
 Custody lasts beyond a completed turn. Command roots bind the listener, thread and
 tool-call identity to PID plus birth identity. Observed descendants remain recorded
@@ -939,9 +966,37 @@ discovery. Different such log namespaces are not a general exclusion protocol.
 Dispatch and target workspace visibility survive MCP restart. `codex_run_log`
 uses native event sequence cursors, and `codex_resume_run` with an empty nudge
 collects existing results without inference. A nonempty nudge reconciles first
-and refuses active/uncertain turns, frozen units and UNKNOWN. Cancellation targets
-the selected unit's actors, queue and terminals, and reports `cancelling` until
-terminal events and verified process disappearance establish settlement.
+and refuses active/uncertain turns, frozen units and UNKNOWN. Cancellation
+(`run/interrupt`, for a plain run as for a workflow) targets the selected unit's
+actors, queue and terminals, and reports `cancelling` until terminal events and
+verified process disappearance establish settlement. A lead's mail is no work of the
+run, and stays as it is; a message sent to a cancelled run's writer waits for its
+resume. A cancel requested while a resume or a phase's settlement waits stands: the
+resume is refused (`RUN_CANCELLED`), and no phase starts. A turn that starts after its
+run's cancel (its `turn/start` was in flight, or a queued message started it) is
+interrupted once it is seen, and none of its effect-capable calls runs
+(`RUN_CANCELLED`). Each cancel is a new generation, and each step of its pass and of
+its settlement first checks that it still stands: one that a resume cleared, or a
+newer cancel replaced, interrupts and saves nothing more. While a cancel's pass runs,
+the run is not reported `cancelled`, and a resume is refused (`RUN_ACTIVE`). The
+cancel reports `cancelled` only once no phase's `turn/start` is in flight or
+unresolved, and native reports each of the unit's threads idle (`thread/read`, in
+the thread's own request order). A thread it cannot read counts as running unless
+it does not hold it loaded, and an app-server that runs without a connection counts
+as running. When the result of an input's `turn/start` was lost, the run stays
+`cancelling` until a `thread/read` of the thread's status, then one of its turns,
+both sent after that start, show whether the input entered a turn: native runs a
+thread's requests one at a time in arrival order and saves the live thread before
+it reads the turns. A turn the input entered is interrupted and settled. An input
+that entered none while the thread is idle is marked `not_started` only when a
+second pair of reads, sent at least 2 s after the first, agrees: `turn/start`
+answers once core holds the turn, but native reports the thread active only once
+that turn's own task reports it started, so one read can fall between the two.
+Native does not bound that delay: a turn that starts later is interrupted when it is
+seen, and its calls are refused until a resume (a known limit of 2.4.3). A resume
+continues after a `not_started` input. A workflow past its deadline is
+cancelled by maintenance, which checks the deadline again on the run as it is when
+the cancel begins: a resume renews it.
 
 | Lead MCP tool | Operations |
 |---|---|

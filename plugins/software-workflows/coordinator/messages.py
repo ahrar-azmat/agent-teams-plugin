@@ -103,6 +103,8 @@ class Messages:
                     listener["state"] != "connected" or listener.get("recovery_state") in ("reconciling", "failed") or
                     self.daemon.connections.get(listener["id"]) is not connection or connection.closed):
                 return  # A reconnect during lease restoration must verify its pinned bindings first.
+            if self.store.get(target["run"]).get("cancel_requested"):
+                return  # cancelled while its leases were taken: the cancel marks it cancelled
             if not active and self.daemon.hook_stale(listener):
                 # Admitted by another release, its calls would be refused: it is replaced first, once its unit is
                 # quiet, and this message stays pending until then.

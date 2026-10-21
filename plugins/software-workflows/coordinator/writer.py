@@ -94,6 +94,8 @@ class Writer:
         self.daemon, self.store = daemon, daemon.store
         self.locks = KeyedLocks()
         self.advancing = 0  # advances under way: a drain waits for them
+        self.resubmitting = set()  # plain runs whose prepared continuation is being submitted again
+        self.starting = set()  # input ids whose turn/start is in flight in this daemon
 
     def prepare(self, runid, phase):
         run = self.store.get(runid)
@@ -119,37 +121,36 @@ class Writer:
         phase = run["phases"][run["phase"]]
         if phase["state"] != "prepared":
             raise CoordinatorError("SUBMISSION_UNCERTAIN", "Reconcile the previous input identity before continuing")
+        input_id = phase["input_id"]
         actor = self.store.get(run["root_actor"])
         for key in participants.checkout_ids(self.store, run["unit"]):
             await self.daemon.ensure_lease(key)
         listener = self.store.get(actor["listener"])
-        connection = self.daemon.connections.get(listener["id"])
-        if (self.daemon.recovery_barrier or self.daemon.draining or listener["state"] != "connected" or
-                listener.get("recovery_state") in ("reconciling", "failed") or not connection or connection.closed):
-            return  # Keep the prepared input durable until native bindings are verified again, or the next daemon.
-        if self.daemon.hook_stale(listener):
+        if self.daemon.hook_stale(listener) and not self.unbound(listener):
             # Admitted by another release, its calls would be refused: replace it first, once its unit is quiet. The
-            # input stays prepared until then, and maintenance submits it again.
+            # input stays prepared until then, and maintenance submits it again (advance, or resubmit for a plain run).
             if not self.daemon.unit_quiet(run["unit"]):
                 return
             from .recovery import reconcile_listener
             await reconcile_listener(self.daemon, listener, advance=False)
-            actor = self.store.get(actor["id"])
-            listener = self.store.get(actor["listener"])
-            connection = self.daemon.connections.get(listener["id"])
-            if (self.daemon.hook_stale(listener) or listener["state"] != "connected" or
-                    listener.get("recovery_state") in ("reconciling", "failed") or not connection or connection.closed):
-                return
-            run = self.store.get(runid)
-            phase = run["phases"][run["phase"]]
-            if phase["state"] != "prepared":
-                return
+        # Everything is read again after the awaits above (a lease, a replacement): a cancel, a drain, another input
+        # or another incarnation since then starts nothing, and the input stays prepared until native bindings are
+        # verified again, or the next daemon. Nothing awaits between this check and the submitting state's save.
+        run = self.store.get(runid)
+        phase = run["phases"][run["phase"]]
+        actor = self.store.get(run["root_actor"])
+        listener = self.store.get(actor["listener"])
+        connection = self.daemon.connections.get(listener["id"])
+        if (run.get("cancel_requested") or phase["state"] != "prepared" or phase["input_id"] != input_id
+                or self.unbound(listener) or self.daemon.hook_stale(listener)):
+            return
         # Validate again after acquiring custody, before persisting a submitting
         # state. A lost RPC after that state remains uncertain, never replayed.
         image_paths([item["path"] for item in phase["input"] if item["type"] == "localImage"])
-        phase.update(state="submitting", submitted=time.time())
+        phase.update(state="submitting", submitted=time.time(), start_listener=listener["id"])
         run.update(production_started=True, state="running")
         self.store.save(run)  # Durable before the native RPC, including its uncertain window.
+        self.starting.add(input_id)
         try:
             response = await connection.call("turn/start", {
                 "threadId": actor["thread"], "input": phase["input"], "clientUserMessageId": phase["input_id"]})
@@ -158,10 +159,13 @@ class Writer:
             phase = run["phases"][run["phase"]]
             if phase["state"] == "submitting":
                 phase.update(state="uncertain", error=getattr(exc, "code", type(exc).__name__))
-                run["state"] = "submission_uncertain"
+                if not run.get("cancel_requested"):
+                    run["state"] = "submission_uncertain"
                 self.store.save(run)
             self.store.event("workflow/submission_uncertain", runid, {"input_id": phase["input_id"]})
             return
+        finally:
+            self.starting.discard(input_id)
         run = self.store.get(runid)
         phase = run["phases"][run["phase"]]
         phase["turn"] = response["turn"]["id"]
@@ -172,6 +176,35 @@ class Writer:
         if phase.get("status") is None:
             actor.update(active_turn=phase["turn"], state="running")
             self.store.save(actor)
+
+    def unbound(self, listener):
+        """Not a verified binding a turn can start on: recovery or a drain under way, or an app-server not
+        connected, still reconciling, failed, or without a live connection."""
+        connection = self.daemon.connections.get(listener["id"])
+        return (self.daemon.recovery_barrier or self.daemon.draining or listener["state"] != "connected" or
+                listener.get("recovery_state") in ("reconciling", "failed") or not connection or connection.closed)
+
+    def resubmit(self, runid):
+        """In the background, submit again a plain run's continuation that run/resume prepared but could not submit
+        (transition_pending): its writer was being replaced, reconciled or reconnected then."""
+        if runid in self.resubmitting or self.daemon.recovery_barrier or self.daemon.draining:
+            return
+        self.resubmitting.add(runid)
+        async def again():
+            self.advancing += 1  # a drain waits for it, and it stops at its next step
+            try:
+                async with self.locks.hold(runid):
+                    run = self.store.get(runid)
+                    if (self.daemon.draining or run.get("workflow") or run["state"] != "transition_pending" or run.get("cancel_requested")
+                            or (run.get("phases") or {}).get(run.get("phase"), {}).get("state") != "prepared"):
+                        return
+                    await self.submit(runid)
+            except (CoordinatorError, OSError) as exc:
+                self.store.event("run/resubmit_refused", runid, {"code": getattr(exc, "code", type(exc).__name__)})
+            finally:
+                self.advancing -= 1
+                self.resubmitting.discard(runid)
+        self.daemon.background(again())
 
     def observe(self, actor, method, params):
         run = self.store.get(actor["run"])
@@ -199,10 +232,10 @@ class Writer:
                 return
             phase.update(status=params["turn"]["status"], error=params["turn"].get("error"), state="settling")
             phase["answer"] = "\n\n".join(phase["messages"].values()).strip()
-            # History replay must not undo verified cancellation settlement.
-            # Non-workflow turns have no Abraham phase-advance task to finish
-            # a synthetic "settling" state on their behalf.
-            if run.get("cancel_requested") and run["state"] == "cancelled":
+            # A requested cancel owns the run's state (cancelling until it settles, then cancelled), and history
+            # replay must not undo it. Non-workflow turns have no Abraham phase-advance task to finish a synthetic
+            # "settling" state on their behalf.
+            if run.get("cancel_requested"):
                 pass
             elif not run.get("workflow"):
                 run["state"] = params["turn"]["status"]
@@ -240,14 +273,24 @@ class Writer:
             try:
                 await Publisher(self.daemon).quiescent(self.store.get(run["unit"]))
             except CoordinatorError as exc:
+                run = self.store.get(runid)  # read after the await: a cancel since then is not overwritten
                 run["settlement_refusal"] = exc.envelope()
                 self.store.save(run)
                 return
             await asyncio.gather(*(self.daemon.ledger.reconcile(self.store.get(key)) for key in participants.checkout_ids(self.store, run["unit"])))
             if self.daemon.draining:
                 return
+            root = self.store.get(run["root_actor"])
+            readback = await asyncio.to_thread(rollout_policy, run.get("rollout"), root.get("thread"))
+            if self.daemon.draining:
+                return  # the phase stays settling; the next daemon judges it again
+            # Read after every await above. A cancel requested meanwhile (run/interrupt does not wait for this lock)
+            # stands, as one before this advance does: the phase stays settling and no phase starts. Nothing awaits
+            # between this read and the save.
             run = self.store.get(runid)
             phase = run["phases"][run["phase"]]
+            if run["state"] in TERMINAL or run.get("cancel_requested") or phase.get("state") != "settling":
+                return
             new_unknown = [u for u in [u for key in participants.checkout_ids(self.store, run["unit"]) for u in self.store.unresolved(key)] if u["id"] not in phase["unknown_baseline"]]
             success = phase.get("status") == "completed" and phase.get("input_observed") and bool(phase.get("answer", "").strip()) and not new_unknown
             phase.update(state="complete", completed=time.time(), success=success)
@@ -255,10 +298,7 @@ class Writer:
             run.pop("settlement_refusal", None)
             run["state"] = "completed" if success else "blocked" if new_unknown else "failed"
             run["unknown_blockers"] = [u["id"] for u in new_unknown]
-            root = self.store.get(run["root_actor"])
-            run["rollout_readback"] = await asyncio.to_thread(rollout_policy, run.get("rollout"), root.get("thread"))
-            if self.daemon.draining:
-                return  # the phase stays settling; the next daemon judges it again
+            run["rollout_readback"] = readback
             self.store.save(run)
             self.store.event("workflow/phase_completed", runid, {"phase": run["phase"], "success": success, "unknown": run["unknown_blockers"]})
             if success and run["phase"] == "analysis":

@@ -3,6 +3,274 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.3] — 2026-10-21
+
+The six findings 2.4.2 shipped as known limits (review session 01a14eac, turn 34) are fixed, with those of review
+turns 35 to 41 and three reports from the Sales_Profiler lead after the 2.4.2 switch. They concern a writer replaced
+after recovery, a writer with sub-agents, cancels, and failures along the way. Each has a real run that fails on 2.4.2,
+or on the tree before its fix, and passes on 2.4.3 (Measured, below). The exceptions are the order of a lost start's
+reads and the rule for a thread that cannot be read: their windows are inside Codex, so they were checked against
+Codex 0.163's source, and the runs show only that the cancels they serve still settle.
+
+### Fixed: a replacement app-server took work before its reconcile ended
+- A replacement was connected and admitted, and its writer bound to it, before its native history and its unit's
+  operations were read back. A hook, a message's delivery or a workflow's submission could start work on it
+  meanwhile. A call started then could be judged a crash gap and quarantined as UNKNOWN.
+- A replacement now counts as reconciling from the save that makes it findable until its reconcile ends. Calls are
+  withdrawn (`LISTENER_RECOVERING`), and deliveries and submissions wait.
+
+### Fixed: two callers could replace the same app-server
+- A cancel's reconcile used another lock than a re-admission. While a message or a workflow phase was replacing a
+  writer, a cancel could admit a second replacement for the same old app-server. The writer was then bound to
+  whichever finished last, and the other stayed connected.
+- Every reconcile of a run's writer now takes one lock for the run: recovery, resume, re-admission, cancel, a
+  transport gap. Each reconciles the incarnation that is current once it holds the lock.
+- A cancel requested while its writer is replaced starts no further workflow phase.
+- A cancel requested while a workflow phase's input waited for its leases was undone: the submission saved the
+  run as it had read it before, which cleared the cancel, and started the phase's turn (as in 2.4.2). The
+  submission now reads the run again after every wait, and starts nothing for a cancelled run, another input, a
+  draining daemon or a writer being replaced.
+- `run/interrupt` of a workflow whose writer had no connection failed (`KeyError`); it now cancels.
+
+### Fixed: a cancel could be undone by a phase's settlement or by a resume
+- A workflow phase's settlement read the run, then waited: for its quiescence check, its checkouts' reconcile and the
+  readback of its rollout. It then saved the run as it had read it. A cancel requested during those waits was undone:
+  the phase completed, and the next phase's turn started after `run/interrupt` had answered. A resume saved the run
+  the same way after its quiescence check. That cleared a cancel requested meanwhile, and the resume's turn started.
+- The settlement now reads the run again after its waits. For a run cancelled meanwhile it completes nothing, as for
+  one cancelled before it began. A resume is refused (`RUN_CANCELLED`) when a cancel was requested after it began.
+  Each cancel counts a new generation of the run, so the order holds when the clock moves.
+- A cancel interrupted only the turns it saw when it began. A turn whose `turn/start` was in flight then (a phase's
+  submission, a message's delivery), or that a queued message started, ran to its end, patches included. Such a turn
+  is now interrupted as soon as it is seen, and the cancel's reconcile interrupts every turn still active again.
+  Until the turn ends, none of its effect-capable calls runs (`RUN_CANCELLED`). The cancel reports `cancelled` only
+  once no phase's `turn/start` is in flight.
+- A message's delivery reads the run again after taking its leases, and starts no turn for a cancelled run. A cancel
+  reads the run before saving it, and so does its settlement.
+
+### Fixed: an earlier cancel could act on a resumed run
+- A cancel's pass (its queue deletions, interrupts and terminations) ran outside the lock its settlement takes.
+  Maintenance could report the run `cancelled` while that pass was still under way. A resume could then clear the
+  cancel and start a turn, and the pass's next interrupt reached that turn. A later settlement of the old cancel could
+  also save the resumed run `cancelled`.
+- Each step of a cancel's pass and of its settlement now first checks that its cancel still stands: no resume has
+  cleared it, and no newer cancel has replaced it. A run is not reported `cancelled` while a cancel's pass runs, so a
+  resume meanwhile is refused (`RUN_ACTIVE`).
+
+### Fixed: `run/interrupt` of a plain run interrupted only its current turn
+- A plain run's `run/interrupt` sent one turn interrupt to its root thread. It cancelled no queued work, no
+  sub-agent's turn and no start in flight, and nothing refused the next turn's calls. With no turn active it failed
+  (`SCHEMA_TYPE`).
+- It is now the same cancel as a workflow's: the unit's queued work, turns and terminals, and its calls are refused
+  (`RUN_CANCELLED`) until a resume. A lead-mode run has no writer turns, and is refused (`RUN_LEAD_MODE`). The end of a
+  turn no longer overwrites a cancelling or cancelled run's state, and a lead's mail is never cancelled.
+
+### Fixed: a cancel could report `cancelled` with a turn's start unresolved
+- When the result of a phase's `turn/start` was lost, the phase stayed `uncertain`, and a cancel reported `cancelled`
+  once it saw no turn. That held even when it could not read native history to tell whether the turn had started.
+- The run now stays `cancelling` until two reads of the thread sent after the loss (`thread/read`), of its status and
+  then of its turns, show whether the input entered a turn. Codex runs a thread's requests one at a time in arrival
+  order, and saves the live thread before it reads the turns; its history pages (`thread/turns/list`,
+  `thread/items/list`) run beside those requests, so they cannot tell. One read cannot tell either, as Codex builds its
+  turns before it reads the status. A turn the input entered is interrupted and settled like any other. While the
+  thread is active the outcome is read again once the running turn has been interrupted.
+- An input that entered no turn while the thread was idle is marked `not_started` only when a second pair of reads, at
+  least 2 s later, agrees: `turn/start` answers once Codex's core holds the turn, but the thread reads active only once
+  that turn's own task reports it started. A resume continues after a `not_started` input.
+- A cancel reports `cancelled` only once Codex reports each of the unit's threads idle. A thread it cannot read counts
+  as running unless Codex does not hold it loaded (`thread/loaded/list`), and an app-server still running without a
+  connection counts as running. A turn whose interrupt was answered is not interrupted again: a second interrupt of an
+  aborted turn went unanswered for 60 s.
+
+### Fixed: an old deadline could cancel a resumed workflow
+- Maintenance read its list of runs, then awaited the runs ahead of each one. A workflow that finished and was resumed
+  with a new deadline meanwhile was still judged by the record it had read: past its old deadline, it was cancelled,
+  and its resumed turn interrupted.
+- The deadline cancel now checks the deadline again on the run as it is when the cancel begins.
+
+### Fixed: a resume could be left `transition_pending` for good
+- A resume reconciles first, then prepares its input and submits it. When the writer was still waiting to be
+  replaced, the submission returned, and only workflow runs were submitted again: a plain run stayed
+  `transition_pending`, with no turn, and a second resume was refused `RUN_ACTIVE`.
+- A writer was kept waiting because another unit's call was being admitted in the same checkout: the quiet test
+  counted admissions by checkout. It now counts the writer's own unit.
+- Maintenance now submits again every plain run's prepared continuation, as it does a workflow's.
+
+### Fixed: a sub-agent's own sub-agents were not reloaded on a replacement
+- Sub-agent threads were resumed in record order, and Codex refuses a sub-agent before its parent ("resume the
+  parent first"). A tree deeper than one level could fail its replacement: quarantined, with an UNKNOWN, and its
+  resume refused. They are now resumed parent first.
+
+### Fixed: a failed re-admission was never retried
+- A reconcile that failed after recovery left its writer reconciling. Messages, submissions and calls waited for it,
+  and nothing reconciled it again until a resume.
+- It is now marked failed (`listener/reconcile_failed`) and reconciled again from maintenance: first after 5 s, then
+  doubling to 5 min. Its unit's work keeps waiting meanwhile.
+- A replacement stays initializing until a pass over it ends. A retry after a pass that failed part-way resumes its
+  thread and each sub-agent thread again and passes its writer gate, and it sends the lead the notice the failed
+  pass owed.
+- A writer still bound to a dead app-server when a daemon starts (it stopped before the replacement bound) is
+  reconciled by the same retry once the daemon serves, when work is owed to it.
+- A finished run's writer is retried only while work is owed to it. That means its unit is not quiet (a turn,
+  custody, an admission, a live operation, a workflow input or a native delivery in flight), or a message to one of
+  its writers is pending with a wake. A lead's mail never counts, including mail to an actor of kind lead. Otherwise
+  its next resume reconciles the writer.
+- At startup, a checkout whose lease is refused (`EXCLUSIVE_WRITER`) fails only its own writers' recovery: they are
+  quarantined, with an UNKNOWN. This happens when a writer outside the coordinator took the checkout while no daemon
+  ran. The daemon starts, and every other checkout recovers. A record left by an app-server start that never got a
+  thread is retired, and needs no lease.
+- No re-admission or retry starts while the daemon drains, and a drain waits for those under way.
+
+### Fixed: a failed app-server start left its process running
+- `spawn_listener` recorded its app-server before waiting for its socket. When the socket never appeared, it raised
+  `LISTENER_START` and left the process running, with a `starting` record. A run's start stops every app-server of
+  its run when it fails, but a re-admission or a recovery did not.
+- A start that fails now ends its app-server and what it started (its process group) and marks the record stopped.
+  If its endpoint cannot be removed, that is recorded (`listener/cleanup_refused`), and the start's own error is the
+  one raised.
+- A failed admission's app-servers, and one whose attach fails, are killed if they do not drain: none was given work.
+
+### Fixed: a writer's patch right after its own command was refused
+- A command's custody covers its whole checkout, the unit's own claims included, until the coordinator settles it:
+  its call has returned and its processes are gone. Maintenance settles it about once a second. A patch the same
+  unit made meanwhile was refused `CLAIM_CONFLICT` naming its own unit (reported by the Sales_Profiler lead after the
+  2.4.2 switch). A project unit's patch already settled its writer's commands first. A checkout unit's patch now
+  does too, when its unit holds custody.
+- Codex can report a command's end after the next call's hook: its result in the log, its Post hook, its completed
+  item. A command with no process or terminal left holds its custody only until that end is read. The patch's hook
+  now waits for it, until the hook's deadline, before it claims paths. A command still running conflicts
+  (`CLAIM_CONFLICT`), as before.
+
+### Fixed: Codex's clock tools were refused
+- Codex 0.163 puts `sleep` and `curr_time` in its `clock` tool namespace, and the hook names a namespaced tool by its
+  namespace and name: `clocksleep`, `clockcurr_time`. Only a bare `sleep` was in the effect-free set, so a writer's
+  wait was refused `HOOK_TOOL_UNSUPPORTED` (reported by the Sales_Profiler lead after the 2.4.2 switch). Both are
+  allowed now. Neither takes custody: they read or wait on time.
+
+### Changed: the re-admission and replacement notices say what is lost
+- A replacement keeps the thread's history only. Values the old app-server held in its tool runtime (code-mode
+  variables and functions) are gone. Both notices now say so (reported by the Sales_Profiler lead after the 2.4.2
+  switch). Writers should keep drafts in files before an upgrade.
+
+### Measured (2.4.2 as calibration, then 2.4.3)
+- **How these runs were made.** All used the real Codex 0.163 engine with the loopback fixture
+  model, on a 3,700-file checkout. A forced switch from the 2.4.2 tag sent SIGTERM to the supervisor
+  and then the worker, as on 10-21, and the writer's app-server kept running. The new daemon was a
+  copy of 2.4.2 or of 2.4.3 that adds one delay or fault, inert unless its variable is set.
+- **A message to a writer whose replacement is held 15 s after its admission.** 2.4.2 started the
+  message's turn at +155.6 s and admitted its patch on the replacement at +155.7 s. The replacement's
+  reconcile ended at +171.6 s. 2.4.3 started the turn at +173.0 s, after the reconcile ended at
+  +172.3 s. The patch was verified each time, with no UNKNOWN.
+- **A cancel 20 s before a workflow's next phase stops its writer's app-server to replace it.**
+  - 2.4.2 replaced that app-server twice. Both replacements stayed connected, and the writer was
+    bound to the second. `run/interrupt` failed `NATIVE_RPC` ("thread not found"), the run stayed
+    `cancelling`, and a stop was refused `NOT_QUIESCENT`.
+  - 2.4.3 made one replacement and answered the interrupt once it was bound (51 s). It started no
+    phase and cancelled the run.
+- **A cancel 25 s into the replacement's admission.** 2.4.2's `run/interrupt` failed `KeyError`, and
+  the implementation phase's turn ran after the cancel. 2.4.3 answered and started no phase.
+- **A resume while another unit's call in the same checkout is held 45 s in admission.**
+  - 2.4.2 started no turn. 150 s later the run was still `transition_pending`, though the other
+    admission had ended more than 100 s earlier.
+  - 2.4.3 started the turn at the resume. With 2.4.2's checkout-wide count put back, the turn
+    started once the other admission ended, submitted again by maintenance. The patch was verified
+    each time.
+- **A sub-agent of a sub-agent, whose record sorts before its parent's, idle at the switch.** 2.4.2's
+  replacement failed `NATIVE_RPC` in recovery. The writer was quarantined with an UNKNOWN ("listener
+  recovery incomplete"), and its resume was refused `RECOVERY_UNKNOWN`. 2.4.3 resumed the threads
+  parent first, and the resume's patch was verified, with no UNKNOWN.
+- **One failed `hooks/list` in a re-admission.** 2.4.2 left the writer reconciling. The message
+  stayed pending, and a stop was refused `NOT_QUIESCENT` (`deliveries: 1`). 2.4.3 retried 5 s later
+  and re-admitted the writer. The message was delivered, and the patch was verified.
+- **A re-admission whose first app-server never creates its socket** (`/bin/sleep` in its place).
+  - 2.4.2 left that process running and its record `starting`, and nothing retried the re-admission.
+  - 2.4.3 ended the process and marked the record stopped. Its retry re-admitted the writer, and the
+    message's patch was verified.
+- **A message's wake delivery whose reply is lost after native took it, then a re-admission whose
+  first start stalls.** 2.4.2 retried nothing. The message stayed `uncertain`, the stalled start was
+  left running, and a stop was refused `NOT_QUIESCENT` (`deliveries: 1`). 2.4.3 retried the writer
+  5 s after the failure and found the message in the thread's history (`entered_context`). The stop
+  was answered.
+- **Mail to the lead attached to a writer's unit, after that writer's re-admission failed.** An
+  earlier 2.4.3 candidate re-admitted the writer for that mail. 2.4.3 leaves the writer for its next
+  resume, and the stop is answered.
+- **A re-admission whose sub-agent's `thread/resume` fails once.** An earlier 2.4.3 candidate's
+  retry did not resume the sub-agent, and the next resume failed `NATIVE_RPC` ("thread not found").
+  2.4.3's retry resumed it. The resume passed, and the patch was verified.
+- **A daemon restart with one writer still bound to a dead app-server, and writers outside the
+  coordinator holding two checkouts.** 2.4.2 did not start (`EXCLUSIVE_WRITER`). 2.4.3 started:
+  - It quarantined the live writer whose lease was refused, with an UNKNOWN.
+  - The third writer recovered.
+  - The dead-bound writer of a finished run was left for its next resume.
+- **`clock.sleep`, then `clock.curr_time`, in one turn.** 2.4.2 refused both (`HOOK_TOOL_UNSUPPORTED`).
+  2.4.3 allowed both, and the run completed.
+- **A cancel while a workflow's next phase waits for its leases (held 20 s).** 2.4.2 completed the run,
+  with no cancel recorded, and the implementation's turn ran. 2.4.3 cancelled the run, and the
+  implementation's input stayed prepared, with no turn.
+- **A cancel while a phase's settlement reads its rollout (held 20 s).** 2.4.2 answered the
+  interrupt, then completed the analysis. The implementation's turn started, its patch was verified
+  19 s after the answer, and the run ended `completed`, with no cancel recorded. 2.4.3 kept the run
+  cancelled, with the analysis left settling and the file unchanged.
+- **A cancel while a resume's quiescence check waits (held 20 s).** 2.4.2's resume returned after
+  the interrupt had answered, and its turn's patch was verified. 2.4.3 refused the resume
+  (`RUN_CANCELLED`), kept the run cancelled and left the file unchanged.
+- **A cancel while a phase's `turn/start` is held 20 s after its `submitting` save.** 2.4.2 reported
+  `cancelled` at once. The turn then started, and its patch was verified 19 s later. 2.4.3
+  interrupted the turn when it started, reported `cancelled` after that, and left the file unchanged.
+- **The same cancel during a resume, with the wall clock set 1 h back.** An earlier 2.4.3 candidate,
+  which compared times, let the resume clear the cancel, and its patch was verified. 2.4.3 refused
+  the resume (`RUN_CANCELLED`).
+- **A cancel whose pass is held 30 s, with a resume during the hold.** 2.4.2 reported the run
+  `cancelled` during the hold. The resume started its turn, and the held pass then interrupted it:
+  the run ended `failed`, and the resume's patch was never made. An earlier 2.4.3 candidate did the
+  same. 2.4.3 kept the run `cancelling` during the hold and refused the resume (`RUN_ACTIVE`). After
+  the cancel ended, a resume ran and its patch was verified.
+- **`run/interrupt` of a finished plain run while a message's `turn/start` is held 20 s.** 2.4.2's
+  interrupt failed `SCHEMA_TYPE` ("Wrong type at params.turnId": no turn was active), and the
+  message's turn then ran and made its patch. 2.4.3 cancelled the run, interrupted the message's
+  turn when it started, and left the file unchanged.
+- **A cancel when a phase's `turn/start` result was lost, and no history could be read for 25 s.**
+  An earlier 2.4.3 candidate reported `cancelled` at once, 36 s before a history read could show
+  whether the turn had started. 2.4.3 found the turn in a read ordered after the start, interrupted
+  it, and reported `cancelled` 9 s after the fault lifted. When the start had never reached Codex,
+  it marked the phase `not_started` at once, and a resume continued. The earlier candidate refused
+  that resume (`SUBMISSION_UNCERTAIN`).
+- **A lost start that Codex runs between the cancel's history reads and its ordered requests, with
+  its notifications dropped.** The tree reviewed at turn 39 marked the input `not_started` and
+  reported `cancelled` in the second Codex returned the turn, and interrupted the turn only 2 s
+  later. 2.4.3 recorded the running turn, interrupted it, and reported `cancelled` once the thread
+  was idle; the phase kept its turn.
+- **A workflow resumed with a new deadline while maintenance waits on another run, past its old
+  deadline.** The tree reviewed at turn 39 cancelled it when maintenance went on, and its resumed
+  turn was interrupted. 2.4.3 left it running, and its patch was verified.
+- **A writer's patch right after its own command, in one cell.** 2.4.2 refused the patch
+  (`CLAIM_CONFLICT`, naming the writer's own unit). The command's custody was released 0.2 s
+  later, and the file was unchanged. 2.4.3 admitted and verified the patch. It did the same when
+  each command's completed item was processed 5 s late. On 2.4.2 that case was refused the same way,
+  and custody was released 5.1 s later.
+- **2.4.2's own runs, 2.4.2 to 2.4.3**: a writer idle at the switch, a sub-agent, a switch during a
+  90 s command followed by a resume or by a message, an app-server stopped with SIGSTOP, and unread
+  lead mail. Each gave 2.4.2's result. The
+  app-server stopped with SIGSTOP is still quarantined with an UNKNOWN, a known limit.
+
+### Known limits
+- An app-server that does not answer the new daemon cannot be read, so it is not replaced: its recovery fails with an
+  UNKNOWN, as in 2.4.2.
+- A message the earlier release had already put in a writer's native queue starts its turn there without the
+  coordinator, so it runs on the earlier release's hooks. The writer is replaced before its next turn after that.
+- `run/status` reports a run's last state while a turn started by a message runs (planned for 2.4.4).
+- Outside a cancel, a phase whose `turn/start` result was lost still refuses a resume (`SUBMISSION_UNCERTAIN`) until
+  native history shows its input, as in 2.4.2.
+- In a cancel, a lost start's `not_started` rests on Codex reporting a started turn within 2 s of `turn/start`'s
+  answer, which neither Codex nor its runtime guarantees (review turn 41, MEDIUM). If the turn's task does not run for
+  that long, the run can read `cancelled` while that turn can still start. Such a turn is interrupted when it is seen,
+  and its calls are refused (`RUN_CANCELLED`) until a resume; a resume before it starts can join it. Planned for 2.4.4:
+  end the app-server (verified), then read what it saved.
+- Mail to a lead-mode run's actor still cannot be acknowledged (`ACK_ACTOR` / `NATIVE_BOUND`), as in 2.4.2. It blocks
+  nothing.
+- A replaced writer is first reconciled as it is, then replaced, so recovery takes about 40 s for each writer it
+  replaces, one after another (515 s for 13 writers at the 2.4.2 switch).
+
 ## [software-workflows 2.4.2] — 2026-10-21
 
 ### Fixed: after an upgrade, writers admitted by the earlier release were refused every call
