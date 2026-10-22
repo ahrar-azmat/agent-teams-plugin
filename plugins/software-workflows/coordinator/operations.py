@@ -67,7 +67,15 @@ async def complete_patch(ledger, operation, item):
             if not match or match["kind"] != kind or match["target"] != target or match["moved"] != bool(move) or key in seen:
                 raise CoordinatorError("PATCH_SCOPE", "Native computed endpoints differ from admitted patch")
             seen.add(key)
+            outside = parts[source["checkout"]].get("outside", ())  # written, never recorded (ledger.prepare)
+            if target["path"] in parts[target["checkout"]].get("outside", ()):
+                # What lands outside the ledger is not recorded; a source in the ledger is gone.
+                if source["path"] not in outside:
+                    expected[source["checkout"]][source["path"]] = {"blob": None, "mode": None}
+                continue
             pre = parts[source["checkout"]]["pre"][source["path"]]
+            if pre is None:
+                raise CoordinatorError("PATCH_EVIDENCE", "A move from outside the ledger left no readable pre-image", {"path": source["path"]})
             before = store.read_blob(pre["blob"]) if pre["blob"] else b""
             diff = change["diff"]
             if kind == "add":
@@ -87,7 +95,8 @@ async def complete_patch(ledger, operation, item):
                     if not diff.endswith(suffix):
                         raise CoordinatorError("PATCH_MOVE", "Native move suffix differs from destination")
                     diff = diff[:-len(suffix)]
-                    expected[source["checkout"]][source["path"]] = {"blob": None, "mode": None}
+                    if source["path"] not in outside:
+                        expected[source["checkout"]][source["path"]] = {"blob": None, "mode": None}
                     if parts[target["checkout"]]["pre"][target["path"]]["blob"] is not None:
                         raise CoordinatorError("PATCH_MOVE", "Move destination already exists")
                 after = unified_post(before, diff)
@@ -108,7 +117,8 @@ async def verify(ledger, operation, expected, attribution, evidence):
         for checkout in sorted({part["checkout"] for part in parts}):
             await stack.enter_async_context(ledger.lock(checkout))
         for part in parts:
-            if set(expected[part["checkout"]]) != set(part["paths"]):
+            # Paths outside the ledger are written, never recorded: no receipt covers them (ledger.prepare).
+            if set(expected[part["checkout"]]) - set(part.get("outside", ())) != set(part["paths"]):
                 raise CoordinatorError("PATCH_SCOPE", "Computed result does not cover every endpoint")
         observations = await asyncio.gather(*(ledger.verify_images(p, expected[p["checkout"]]) for p in parts))
         # No receipt is visible until every repository has passed validation.

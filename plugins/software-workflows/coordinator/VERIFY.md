@@ -12181,3 +12181,139 @@ run:
 - `readmit_check.py export242/plugins/software-workflows s243z/plugins/software-workflows s243z/plugins/software-workflows <w> <case>`
   runs the regressions.
 - `final243.sh` runs the final batch.
+
+## 2.4.4
+
+Every fix below was run for real: red on the released 2.4.3 bytes (`git archive 74d70a8`), green on that export with
+only the fix's files (each writer's tree), and again on the combined tree. Daemons ran on disposable state;
+native writers were the installed Codex 0.163.0 app-server (real code-mode cells, the fixture model) unless stated.
+Logs: the lead's scratchpad, `r244/<area>/logs` (`lead-env`, `lead-gate`, `w-cancel`, `w-lead`, `w-recovery`,
+`w-ledger`). No test files were added.
+
+### Environment and the git shim
+| Case | 2.4.3 | 2.4.4 |
+|---|---|---|
+| session with the 2.4.2 then 2.4.3 shim on PATH: `git status` (zsh) | exit 1, mirror error | one shim on PATH (this version's, first); exit 0; `git commit` reaches the gate (zsh and bash) |
+| daemon started from a shell with `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CODEX_GATE_SESSION` and a shim on PATH: `ps -E` of serve and worker | all present, shim first on PATH | none present; PATH `/opt/homebrew/bin:/usr/bin:/bin` |
+| admission listener (real 0.163.0 app-server) under the same dirty parent | inherited | clean |
+
+### Push gate (round 52)
+Stale review, PreToolUse Bash JSON on the hook entrypoint, python3.15 and /usr/bin/python3 (3.9), full plugin layout
+(`lead-gate/matrix2.out`): 45 commands; exactly three decisions change, each DENY to allow — the reported docker
+pipeline, `grep -v '^\s*$' f | wc -l`, `grep -c -E '^[a-z]+$' words.txt`. Every ordinary command (npm, python3,
+pytest, make, cd, export, gh, docker compose …) gives the 2.4.3 decision; every adversarial shape (`g$'\x69t' push`,
+`$'/usr/bin/git' push`, `u='t pu'; g$'i'$u'sh'`, `"eval" …`, `/bin/bash -c …`, `$(git push)` in a quoted word,
+`sort --compress-program`, `docker exec`, redirection, `|&`, `;sh -c`) is still asked. The writer's own run: 115
+payloads per interpreter. Latency of the reported command: 277 to 134 ms (3.15), 579 to 451 ms (3.9). A first rewrite
+(+572 lines) was rejected: it denied npm test, python3, pytest, make, `cd && ls`, `sleep; echo` and others with a stale
+review (`lead-gate/matrix.out`).
+
+### Cancels and uncertain native outcomes (w-cancel)
+| Case | 2.4.3 | 2.4.4 |
+|---|---|---|
+| losestart/latestart: a cancel while a phase's `turn/start` result is lost and its turn starts late | `not_started` and `cancelled` at +45.9; the late turn started at +46.5; `run/cancelled` twice | latestart: the advance's settlement ends the app-server +41.2: `submission_unproven`, one `run/cancelled {generation 1}`; the late start (+47.1) refused, no turn after `cancelled`. losestart: the phase settled `interrupted` with its turn from history, cancelled once +80.3 |
+| resumelost: resume of a run left `submission_uncertain` | `RUN_ACTIVE` twice; stop `NOT_QUIESCENT {workflows:1}` | `submission_unproven` at once (+41.4); the lead's first resume sends it ahead of its text (`resumed_unproven`), completed +48.6 |
+| maintlost: same, no resume | still uncertain after 120 s, stop refused | maintenance settles it `unproven` +46.4, still unproven 5 s on; the lead's resume sends it (`resumed_unproven`), completed +55.2 |
+| resumefirst: the lead's resume reaches it first | resume refused, run stuck | the resume settles it `unproven` and sends it ahead of its own text (`resumed_unproven`), completed |
+| dropkeep/dropkill (+ queue variants): an uncertain delivery | uncertain forever; stop `NOT_QUIESCENT {deliveries:1}` | `message/delivery_unproven` with its reason; `message/wake` refused `MESSAGE_WAKE`; `message/retry` delivers it, `entered_context` |
+| dropstart: a cancel while a never-sent start's result is lost | `not_started`, cancelled | `submission_unproven` and one `run/cancelled` at the cancel (+41.2); the resume after it sends it again (`resumed_unproven`) |
+| plaincancel and every cancel case | `run/cancelled` twice (Z5_pc +79.2, +80.8) | once, with `generation` |
+| msgstatus: run/status during a message's turn | `completed` | `running` with the turn listed |
+| cancelstart (regression found and fixed in the writer's first tree) | cancel answers after the held start's turn is interrupted | the same (+107.0 interrupted, +107.1 cancelled) |
+A real lead wake steered into a running cell about to `apply_patch` (18 runs): the cell runs on, its Pre hook waits for
+the turn-end reconcile's checkout lock (2.4-8 s), stop is `NOT_QUIESCENT` only during that wait; the patch is verified,
+or, when native abandons the call, it is withdrawn `NATIVE_ABANDONED` with the file untouched. No fix needed.
+2.4.3 cases re-run on the writer's tree match: cancelstart, cancelsubmit, cancelresume, clockresume,
+cancelsettle, staledeadline, gatewindow, cancelrace, cancelrace2, leadretry, grandchild, startlate,
+plaincancel, holdcancel. owedretry differs by design: the delivery is settled from the killed app-server's rollout, so
+no re-admission is owed.
+
+### Notices, lead mail, lead hooks (w-lead)
+| Case | 2.4.3 | 2.4.4 |
+|---|---|---|
+| a notice steered 2 s into an 8 s cell that then patches (nc-active) | the cell preempted; VALUE 0 | injected; the next request carries it after the cell; one turn; VALUE 100 |
+| grandchild (the 2.4.3 unexplained run), 5 runs on the combined tree | 1 of 4 runs VALUE 0, stop `{mutating_rpcs:1}` | 5 of 5 VALUE 100, notice injected with capability "active", stop ok |
+| inject probe | — | "active" in 6.9 s on 0.163.0 writer mode (a binding's first admission 39.5 s in all; a cache hit 1.1 s); a known-bad calibration (inject sent as steer or queue/add) gives no capability; cached per fingerprint |
+| two projects on one daemon: inbox and ack (mail1) | session B missed its own legacy mail; an empty session saw both projects' mail and could acknowledge another project's | each lead sees its own scope; cross-project ack refused `ACK_ACTOR` |
+| lead-actor mail ack | `ACK_ACTOR` / `NATIVE_BOUND`, retried every second | acknowledged |
+| push-gate + refuse_cd + permission denials in a real `claude -p` (2.1.306) | 3 records observed; stop `NOT_QUIESCENT {lead_hooks:3}` | settled at PostToolBatch; stop accepted |
+| PostToolBatch with nothing unsettled (20 batches) | — | median 28 ms (3.15), 45 ms (3.9), no daemon call; 6 unsettled calls on a SIGSTOPped daemon (each call waits out 3 s) end in 12.06 s (< 15 s) |
+| Smartpay_POC shape: `.gitignore *`, lead edits of Bash-written notes | 4 UNKNOWN + "Writer coordinator is unavailable" | 0 UNKNOWN, no warning, no claim |
+| a message queued natively behind a stale writer's turn (sq240) | turn on the old hooks +186.9; `HOOK_PROGRAM_CHANGED`; VALUE 0 | withdrawn (`deleted: true`) +34.2; delivered by the replacement; VALUE 100 |
+The 2.4.3 cases leadretry, busymsg, leadmail, gatewindow, retryfail, stallspawn, childretry, owedretry and plaincancel
+match.
+
+### Ledger, custody, restore, publication (w-ledger)
+| Case | 2.4.3 | 2.4.4 |
+|---|---|---|
+| ic_outside: a writer's tests write ignored output, the writer reads it | 9 UNKNOWN (6 ignored), restores refused, resume `RECOVERY_UNKNOWN` | the 3 controls only; resume ok; seal a.py |
+| ic_forceadd / pm_*: patches and moves creating ignored files | candidate tree includes the ignored files | excluded; moves across the edge verified |
+| pi: a Codex project unit (outer, Backend, Frontend) | ignored file force-added; another unit's patch of it `CLAIM_CONFLICT` | 0 UNKNOWN; the ignored file free; a tracked file still refused to another unit; seal allowed |
+| rx: the lead session restores a file, the writer then edits it | resume `RECOVERY_UNKNOWN`; then (2.4.4 before the provenance fix) edit `CLAIM_CONFLICT`, seal `UNPUBLISHED_DEPENDENCY` | `resolution: baseline`; edit verified; seal allowed |
+| churn: 20 commands while this user's processes exit | 10 `PROCESS_UNREADABLE` + 10 custody uncertain | 20 of 20 clean |
+| race2, 60 ms reaping | 155 of 249 baselines refused | 226 of 226 |
+| ic_symlink: a writer creates an unignored symlink | `*` "native evidence processing failed"; calls denied `PATH_SYMLINK`; custody held | one UNKNOWN at the link; custody released |
+| copies of the live ledger, recovered by 2.4.4 in-process (no app-server; the four repositories byte-identical before and after; git ran only ls-files, check-ignore, cat-file) | — | Smartpay_POC 10 to 0, SmartPay_Frontend 10 to 0 (`outside-ledger`, notices to their leads); Smartpay_Backend's 3 `*` stay for one narrow; Sales_Profiler 0 to 0; unit_e6acbaa9's seal refused on 2.4.3 `UNPUBLISHED_DEPENDENCY`, allowed on 2.4.4 (74 operations) |
+The 2.4.3 cases ownpatch (x2), gatewindow, stranded, retryfail, stallspawn, grandchild, childretry, deadbound, force,
+children, busy and wedged match.
+
+### Recovery and process lifetime (w-recovery)
+| Case | 2.4.3 | 2.4.4 |
+|---|---|---|
+| forced switch with 13 writers on 4 checkouts | calls admitted at 187.2 s, with recovery/complete; 328 of 334 lead reads refused `RECOVERING` | admitted at 1.5 s; writers reconciled +44.6 to +52.4 s; complete 54.7 s; lead reads answered from +1.6 s (108 calls, slowest 0.279 s); a resume for a writer still reconciling refused `WRITER_RECOVERING` twice (20.0 s each, retry_after 21, 41), admitted after 52.0 s in all; 0 UNKNOWN; 13 of 13 re-admitted; patch verified (code fingerprint d5399533ef3c1a52 before and after the run; the same outcome on the trees before the turn-45 and turn-46 fixes, complete 57.2 s and 55.0 s, and on the released tree 980d73baf6260ee1, admitted 1.7 s and complete 60.3 s while four live Codex writer turns ran on the machine) |
+| the same, twice in a row | — | admitted 1.6 s, complete 55.2 s, then 55.5 s; the second switch's retry_after (34, then 14) from the first's measured length |
+| loop stalls during recovery | 62 stalls of 0.3-0.85 s (admission probes' fixture shutdown on the loop) | none ≥ 0.3 s |
+| a child app-server stopped by SIGSTOP | status timed out 42 of 52 (slowest 2.9 s) | 106 of 106 answered (slowest 6 ms); the child's real exit still seen |
+| stopped app-server at startup | quarantined, UNKNOWN "listener recovery incomplete", resume `OPERATIONAL_FAILURE`, stop `LISTENER_DRAIN` | ended and replaced; 0 UNKNOWN; patch verified; stop ok |
+| stopped app-server holding custody | stop `NOT_QUIESCENT` | one UNKNOWN for the possibly escaped effects; stop ok |
+| app-server stopped while the daemon runs (SIGSTOP) | never noticed | ended 55.5 s after the stop (two process reads 30 s apart), replaced, notice injected; patch verified |
+| a brief stop (continued 10 s after the daemon started) | — | not ended; the same app-server reconciled; patch verified |
+| a silent socket (the app-server alive, its socket unanswered) | — | kept alive and reported (`silent` 1, `ended` {}); recovery quarantined with an UNKNOWN; resume `RECOVERY_UNKNOWN` until resolved |
+| silent probes, then answers again | — | reported silent 37.8 s after the probes stopped answering; a resume meanwhile refused `LISTENER_SILENT`, the app-server alive; answered again +9.8 s, reconciled +11.8 s (same pid, no lead call); patch verified |
+| a hook waiting while its stale writer is reconciled (prewait) | the writer replaced under the hook: `HOOK_IDENTITY`, patch never ran | the hook waited ~38 s, allowed, patch verified |
+| a worker restarted while upgrade.lock is held | restarted | the supervisor waits holding its lease (`supervisor-wait.json`); the worker restarted after the release; patch verified |
+| a custodian lost while upgrade.lock is held | a supervisor spawned | a supervisor spawned with the lock still held, no lease event; patch verified |
+| owdead: an app-server dies just before the daemon writes to it | `BrokenPipeError` x4, never replaced, stop refused | no write loop; the delivery settled `entered_context` from the killed app-server's rollout, so no replacement is owed (the next resume reconciles it); stop ok |
+| gap: a plain run's turn ends while no daemon is attached | the run stays `running`; every resume `RUN_ACTIVE` | the turn completed; resume ok; patch verified |
+Thread/loaded/list answer latency over 2,410 probes of 13 busy writers: slowest 0.70 s (ANSWER_S 10 s).
+
+### Review findings (Codex code_review, session 01a14eac, turns 42 to 48)
+Each finding was run on the reviewed tree (red) and on the fix (green), disposable state.
+| Finding | Reviewed tree | Fix |
+|---|---|---|
+| HIGH: a restore released its claim before resolving; another unit edits the path while a restore is paused after its write (path and checkout restores) | the other unit's claim succeeded; its quarantined edit and both UNKNOWNs were cleared; the restore answered `resolved` | that claim refused `CLAIM_CONFLICT` until the restore commits; the newer UNKNOWN stays; `restored_requires_new_edit`; a control with nothing in the pause still resolves at baseline; rx, ic_outside, ic_symlink unchanged |
+| HIGH: a lead edit's exclusion ended at 120 s; a real `claude -p` (2.1.306) Write held 150 s by a slower Pre hook while another lead unit edits the path | at +132.5 s the edit was settled no_effect, the claim handed back, the other unit's Write verified; the host then refused the lead's Write itself ("File content has changed since it was last read") | quarantined at 120 s, as in 2.4.3: handback refused `UNVERIFIED_OPERATION`, the other unit refused `CLAIM_CONFLICT`; the lead's Write lands with no receipt and 1 UNKNOWN (a known limit) |
+| the same race in a hook-only harness, which does not model the host's check; the host killed during the wait | the other unit's verified edit overwritten by the late Write; a killed host's edit settled no_effect | both refusals hold; a killed host's edit stays quarantined with its claim |
+| MEDIUM (turn 43): a restore's cleanup released a claim it never took; its claim handed back during the pause and the path claimed again by the same unit (path and checkout restores) | the restore released that replacement claim, and another unit could take the path | the replacement claim stays held (the other unit refused `CLAIM_CONFLICT`); the restore releases only claims its own edit created and no other call acquired since |
+| HIGH: a supervisor stepping aside for upgrade.lock released its leases while the dead worker's app-servers could still write (worker killed during a 6,000-file patch or an appending command; each also with the custodian lost first) | legacy lock acquired 2 s after the kill, the app-server alive and the command still appending (15, 16, then 26 lines); `UPGRADE_HELD leases_released 1`; a lost custodian not replaced while the lock was held | refused while the worker was dead and once a daemon served again (same token); `supervisor-wait.json`; a client waiting meanwhile refused `DAEMON_UNRESPONSIVE` after 30.1 s, one replacing it `DAEMON_OUTDATED` after 30.0 s; the worker restarted 0.10-0.15 s after the release; a lost custodian replaced within 1 s with the lock held |
+| HIGH: a lost start whose app-server's rollout appends failed (CODEX_HOME on a full volume) while its command ran; the executor then ended (fullstart) | `not_started` at +44.3, sent again automatically, the command ran twice; native.log held none of native's "failed to record rollout items" errors (filtered out) | `submission_unproven` at +56.5 naming native's "No space left on device" and the rollout's cut record; the command ran once; the lead's resume sent it again (`resumed_unproven`), completed, 0 UNKNOWN |
+| MEDIUM: a never-sent input with the same text as an older killed, unended turn (sametext) | `submission_found` from rollout content, in the older turn | no `submission_found`; `submission_unproven`, its reason naming no text (the older message with that text carries its own client id's record); the lead's next resume sent it (`resumed_unproven`); completed |
+| MEDIUM: an unreadable rollout skipped the replacement's active-turn check | — | history, queue and the active-turn check run whatever the rollout's readability (read in the code; no run) |
+| dropkill: the app-server SIGKILLed before a delivery was sent | (2.4.4 before the fix) `not_delivered`, delivered again | `delivery_unproven`: its log shows nothing of native's session after the send; `message/retry` sends it |
+| HIGH (turn 44): an exited app-server's rollout without the input's record proved it absent when the log showed native's session after the send with no error (a full disk drops native's error line) | resumelost, maintlost, sametext, dropkeep: `not_started`/`not_delivered`, sent again automatically | `unproven` in each; sent again only by the lead's resume or `message/retry` |
+| MEDIUM (turn 44): a text match proved `entered` | an unpaired match in an unended turn gave `submission_found` | `rollout.scan` finds only by client id; an unpaired match is named in the reason with its turn (synthetic rollouts on the checkout's `scan`: own record lost → named; paired with another id or before the send → not named; cut record → damage) |
+| MEDIUM (turn 45): a workflow whose input is `unproven` held stop and its checkouts' compatibility lease while it waited for the lead, though nothing of it could run (maintlost, a stop sent during that wait) | stop refused `NOT_QUIESCENT {workflows: 1}`; the lease kept (read in the code) | stop accepted, daemon and app-servers gone; after a restart the run still waits, `unproven`; the lead's resume sends it (`resumed_unproven`), completed, VALUE 100, 0 UNKNOWN. Without a stop: the lease released during the wait, taken again by the resume |
+| MEDIUM (turn 46): with turn 45's fix a stop can pass while a run waits for the lead; a deadline cancel started as the stop closes (injected right after the run's writer is stopped) | stop accepted; one app-server of the run alive after the daemon exited; the run cancelled during the stop | stop accepted; no app-server left; the next daemon cancels the expired run, and the lead's resume then completes it, VALUE 100, 0 UNKNOWN |
+| MEDIUM (turn 47, as in 2.4.3): a writer whose connection dropped while a stop drained was reconciled in the background, and its replacement outlived the stop (13 writers; injected: once the stop has stopped its first listener, another writer's app-server SIGKILLed) | stop accepted; one app-server left after the daemon exited | stop accepted; no app-server left; that writer left failed for the next daemon's recovery |
+Turns 43 to 45 also found that a lead edit quarantined at 120 s holds no compatibility lease, stop, quiet window or
+restore while its call may still run, as in 2.4.3. The design built for it (an `executing` state ended by the call's
+Post, its batch, its transcript result or its host's exit) drew new races in each round; it was taken out of 2.4.4
+(kept for 2.4.5), and the limit is listed below. The 12 lead-hook cases were run again after it was taken out and
+match their earlier results; the 150 s held Write is quarantined at 120 s, as in 2.4.3. Turn 45 also found two states
+2.4.4 never writes: a lead edit the unreleased turn-44 tree left `executing`, which nothing would end, and a phase 2.4.3
+left `not_started`, which a resume continues without its saved input (as in 2.4.3). The live ledger, read before the
+switch, held neither: 0 operations `executing` or carrying a host, 0 runs whose phase is `not_started` or `unproven`.
+Turn 48 found one more caller of the same stop race, as in 2.4.3: maintenance settling a plain run's cancel can
+reconcile a writer the stop has already ended. It ships as a known limit (CHANGELOG.md), planned for 2.4.5 as one fence
+for every reconcile.
+staledeadline could not run on the checkout (its maintenance hold was never ported to the import-time injection); a
+deadline cancel outside a stop is the one the restarted daemon made in the turn-46 run.
+
+### Static checks on the combined tree
+Every file compiles under Python 3.15; the hook-run files (coordinator/hooks.py, client.py, hooks/*.py) under 3.9;
+`hooks.py --check` reports compatible; `ruff --select F821,F822,F823,F811,F841,F401` gives the same 36 findings as
+2.4.3 across the plugin, file by file, and no new one; `claude plugin validate --strict` passes for the plugin and
+the marketplace.
+
+### Known limits
+Those of CHANGELOG.md, 2.4.4.

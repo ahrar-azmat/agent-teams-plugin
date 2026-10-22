@@ -3,6 +3,186 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.4] — 2026-10-22
+
+Everything 2.4.3 left open: its known limit (a lost start judged by a 2 s rule), the candidates reported by the
+SmartPay and Sales_Profiler leads since the 2.4.1 switch, and the defects found while fixing them. Each fix has a real
+run that fails on 2.4.3 and passes on 2.4.4 (coordinator/VERIFY.md, 2.4.4). A forced switch with 13 writers now
+answers leads after about 2 s instead of after the whole recovery (187 s).
+
+### Fixed: the daemon and its writers carried the launching session's identity
+- The coordinator daemon and every writer app-server inherited the environment of the Claude Code session whose Bash
+  started them: its messaging socket and token, its session id, `CLAUDECODE`, the push gate's `CODEX_GATE_*` wiring,
+  and a PATH whose first entry was that session's plugin copy's git shim. Every writer's git ran through an old
+  release's push gate, attributed to that session.
+- The daemon (serve and worker) and every app-server now start without Claude Code's session and hook variables,
+  without `CODEX_GATE_*`, without any plugin version's shim or exec-path mirror on PATH, and without a mirror
+  `GIT_EXEC_PATH`. User configuration is kept.
+
+### Fixed: git failed in a session resumed after an upgrade
+- A resumed session has the new version's shim first on PATH and the old one after it. The new shim took the old
+  shim for the real git, and git failed: "The push gate could not build or inherit a mirror of git's exec-path".
+- The shim, the push gate and SessionStart now skip every plugin version's shim and every mirror. SessionStart leaves
+  exactly one shim on PATH, this version's, first.
+
+### Fixed: the push gate asked about read-only commands with a regex end anchor
+- Any `$'` sent a command to the full detection, so `grep -E '^[0-9a-f]{64}$'` or a `docker ps` pipeline asked for an
+  acknowledgement whenever a review was stale.
+- When `$'` is the only trigger, the worker now allows the command if it proves a closed grammar: allowlisted programs
+  that cannot run their arguments (docker limited to inspection), every `$` single-quoted, no substitution,
+  redirection or expansion. Anything else is asked about as before (round 52 in `_ansi_c_quote`).
+
+### Fixed: a cancel judged a lost start by elapsed time
+- 2.4.3 marked an input whose `turn/start` result was lost `not_started` after two idle reads 2 s apart. Native bounds
+  nothing there: a late turn could start after the run read `cancelled` (its calls were refused until a resume).
+- The thread is read in its own request order. Where that cannot decide, the writer's app-server is ended (birth
+  identity checked), so that nothing can start the input any more, and its rollout, final once the process has
+  exited, is read. No elapsed time decides anything.
+- Only native's own record of an input settles it: its client id's record in the rollout or in the thread's history
+  (the turn it entered), native's queue holding it, or `thread/queue/delete` answering `deleted: true`. No silence
+  proves an input never ran: native goes on from memory when a rollout append fails, and its log drops a line it
+  cannot write (a full disk). An input that nothing can start any more and that no such record shows is `unproven`:
+  one sent to an app-server that has exited, a queued one native's queue no longer holds, and on a running app-server
+  one whose turn has ended or a steer while no turn runs. Its reason names what the rollout and the log show (a
+  failure native logged after the send, a log showing nothing of native's session after it, damage to the rollout, a
+  user message holding its text without its client id's record, by turn), none of it as proof: a text match never
+  settles an input.
+- The same settlement now ends the two other waits nobody could end: a resume of a run whose phase was left uncertain
+  (2.4.3 refused it `SUBMISSION_UNCERTAIN` forever) and a message delivery left uncertain (2.4.3 held every stop
+  `NOT_QUIESCENT`). Maintenance settles uncertain deliveries in the background.
+- Nothing sends an `unproven` input again of itself. The run reads `submission_uncertain` (the writer's result carries
+  `input_unproven`) until the lead resumes it, and holds no stop and no compatibility lease meanwhile, as it runs
+  nothing; the resume sends the input ahead of its own text (`run/input_resent`,
+  `reason: resumed_unproven`, with the `proof`). `message/wake` refuses an `unproven` delivery (`MESSAGE_WAKE`, naming
+  `message/retry`), and only `message/retry` sends it; either may run it twice. A cancel ends the run without it; a
+  coordinator notice is owed again (it starts no turn, and its id tells a copy apart). Its run never ends `failed` for
+  it.
+- `run/cancelled` is emitted once per cancel generation and carries the generation. A cancel still waits for a phase's
+  `turn/start` in flight.
+
+### Fixed: a coordinator notice could cost a writer its patch
+- Coordinator notices (a replacement's "runtime values did not carry over") were steered into the writer's running
+  turn. Codex 0.163 preempts a running code-mode cell when user input is steered into its turn: the cell yields to the
+  model and runs on, and when the turn ended first, native abandoned the patch the cell then made (the "unexplained
+  run" of 2.4.3).
+- Notices with no wake now go through native `thread/inject_items`, which neither preempts a cell nor starts a turn,
+  where an admission probe proved it on that Codex binary. A probe that failed or timed out counts as idle-only: its
+  notices are injected only between turns. Where the probe found it absent, a notice waits for an app-server that has
+  it; it is never steered or started as a turn.
+
+### Fixed: lead mail and the lead's inbox
+- A lead's inbox showed every project's mail when read without a session, and a session's inbox missed mail from
+  CLI-started writers. A lead now reads its sessions' mailboxes, mail to its own lead actors, and writers' lead mail
+  whose unit shares a checkout with its scope. An unscoped read is answered empty with a notice to restart the session.
+- A lead session could not acknowledge mail to its lead actor (`ACK_ACTOR` / `NATIVE_BOUND`), and that mail was
+  retried every second. A lead now acknowledges its own mail; lead mail is never delivered natively or retried.
+
+### Fixed: refused lead calls held every drain
+- A lead call that another hook denied (the push gate, refuse_cd), that permission refused or that the user rejected
+  gets no PostToolUse from Claude Code. Its record held `stop` and every lead's quiet window until its 180 s deadline.
+- A `PostToolBatch` hook now settles each such call when its batch ends.
+- The plugin's own live-view `tail` is no longer coordinated. It never held a drain (its Post comes 0.1 s after its
+  Pre), but it cost a record in every session.
+
+### Fixed: lead edits and ignored files became UNKNOWNs
+- A lead's edit of a file git ignores (Smartpay_POC's `.gitignore` is `*`) recorded two UNKNOWNs and warned
+  "Writer coordinator is unavailable". A writer's read of ignored test output recorded one, and every rerun of the
+  tests added more. A patch creating an ignored file was force-added into the seal, and its claim refused other units.
+- A path git ignores (or inside an embedded repository) that neither HEAD nor the index holds is now outside the
+  ledger, whoever writes it: no receipt, claim, UNKNOWN, refusal or seal entry. A tracked path stays in the ledger.
+- Open UNKNOWNs at such paths are resolved at startup (`outside-ledger`, nothing deleted) and each unit's lead gets one
+  notice. A lead's edit of a path whose pre-image was stale is prepared again, so it gets an exact receipt.
+
+### Fixed: a restore could not clear an UNKNOWN
+- A path the baseline lacked could not be restored, and every restore still needed a new verified edit. A restore by
+  the lead's session kept its claims and counted as that unit's unpublished work, so the writer's next edit was refused
+  and its seal blocked.
+- A restore to the baseline (what HEAD and the index hold, or absence) resolves its UNKNOWNs and joins no unit's scope.
+  A restore keeps no claim, and what follows it depends on whose bytes it restored (the baseline: no one's).
+- A restore resolves only the UNKNOWNs and quarantined edits it found before its edit, and holds its claims until that
+  resolution commits; it is resolved only while the path still holds the restore's own revision. Another unit's later
+  failure at the path stays open.
+
+### Fixed: custody refused processes that had just exited
+- A zombie, and every `ps` this user ran (setuid root), read as `PROCESS_UNREADABLE`, quarantining custody on gate
+  commands. Exited processes are now gone, zombies are read as zombies, and a setuid program of this user is read
+  through `sysctl`.
+- A writer's symlink failed its turn-end reconcile, which recorded checkout-wide `*` UNKNOWNs and kept its custody
+  held. The reconcile now records one UNKNOWN at the link and releases custody. Any other notification failure that
+  names a path records that path's UNKNOWN in the checkout it names, not a checkout-wide one.
+
+### Fixed: startup recovery blocked every lead for its whole length
+- Recovery reconciled each writer in turn before serving: 187.2 s with 13 writers in a run, 847 s at the 2.4.3 switch.
+  It now makes the ledger consistent, serves, and reconciles writers in parallel in the background. A call for a
+  writer still reconciling waits up to 20 s, then is answered `WRITER_RECOVERING` with `retry_after`: the 2.4.4 MCP
+  server calls again within its own 90 s, and the CLI prints the refusal (exit 3) for its caller to run again.
+- A stopped child app-server froze the daemon: CPython 3.15's threaded child watcher wakes on a stop on macOS and then
+  blocks the loop in `waitpid`. A kqueue exit watcher replaces it, verified at every start.
+- An app-server stopped by a signal (at two reads 30 s apart), or alive behind a socket that refuses or closes, is
+  ended and replaced instead of quarantined; an UNKNOWN is recorded only where custody was held. A silent one is
+  reported (`daemon/status` `silent`) and never ended for it: one that is only slow would lose its turn and its
+  runtime values.
+- A supervisor restarting its worker could start a daemon during an upgrade. It now restarts only under
+  `upgrade.lock`: while another process holds it, a supervisor with no lease steps aside (`UPGRADE_HELD`), and one
+  holding leases keeps them and restarts its worker once the lock is free (`supervisor-wait.json`), since the dead
+  worker's app-servers may still be writing.
+- A writer whose app-server died while the daemon wrote to it was never replaced: closing its connection re-raised
+  the write error. A plain run whose turn ended while no daemon was attached stayed `running`. Both fixed.
+- A stop could leave a writer's app-server running: a transport gap's reconcile (as in 2.4.3) or a deadline cancel
+  during the drain started a replacement the stop never ended. Neither starts while a stop drains, and the drain waits
+  for a reconcile under way. A writer whose connection drops then is left failed for the next daemon's recovery.
+
+### Known limits
+- A message an earlier release's daemon left in a writer's native queue, which native starts while no daemon runs,
+  cannot be taken back: its turn runs on that release's hooks. A running 2.4.4 daemon withdraws such a message
+  (`thread/queue/delete`, `deleted: true`) before it starts.
+- Where a writer's app-server died before its native queue was read and its rollout cannot be read, a queued message
+  that neither the replacement's queue nor its history holds costs one more app-server: the replacement, which may be
+  starting it, is ended too, and the message is `unproven`.
+- Ending a writer's app-server to settle an input holds the maintenance loop while it ends (about 50 s at worst).
+- An app-server stopped while the daemon runs is ended 30 to 60 s after the stop (measured 55.5 and 56.2 s). A
+  debugger pause longer than one probe period (`SOFTWARE_WORKFLOWS_ANSWER_EVERY_S`, 30 s) counts as a stop.
+- A writer whose app-server stays silent is only reported, never ended (answer latency through a context compaction
+  is unmeasured): it stays failed, and a cancel of its run stays `cancelling`, until it answers or its process is
+  ended by hand, after which a reconcile replaces it.
+- `retry_after` is coarse on the first switch from 2.4.3, which recorded no recovery length; later switches use the
+  last recovery's measured length.
+- A stop sent just as a re-admission begins can be refused `NOT_QUIESCENT {readmissions: 1}`; sending it again passes.
+- Startup recovery serves after about 2 s, but 13 writers are reconciled only after about 55 s: each checkout's
+  calibration (about 26 s) is the long pole. A call for a writer still reconciling waits up to 20 s, then is refused
+  `WRITER_RECOVERING`; the 2.4.4 MCP server calls again, a 2.4.3 one (a session not yet restarted) does not.
+- A call made with an idempotency key and refused `WRITER_RECOVERING` gets the same refusal again under that key. The
+  MCP server never retries a keyed call.
+- A cancel of a writer whose app-server was stopped while disconnected records one failure, then settles.
+- A killed app-server's delivery leaves one "native notification gap" UNKNOWN for its transport gap.
+- A worker that dies while another process holds `upgrade.lock` is restarted only once that process lets go; its
+  supervisor keeps every lease meanwhile. A client waiting for the daemon then is refused `DAEMON_UNRESPONSIVE` after
+  its own timeout (30 s), one replacing it `DAEMON_OUTDATED`; the worker restarts about 0.1 s after the release. Only a
+  signal to the supervisor, as in a forced switch, ends its leases while the dead worker's app-servers may still write.
+- An input or delivery that nothing can start any more is `unproven` unless native's own record shows where it went
+  (its client id's record in the rollout or in history, its queue, `thread/queue/delete` `deleted: true`): a rollout,
+  and history read from it, can miss a record when native's append fails, and native's log can miss the error. So an
+  input that never reached native (resumelost, maintlost, dropstart) also waits for the lead. Only the lead's resume
+  or `message/retry` sends it again, which may run it twice.
+- The office console has no label for an `unproven` delivery (`message/delivery_unproven`): it reads "could not tell
+  whether it reached the turn" or, for a steer, "send it again", and its Send sends a new message rather than
+  `message/retry`. Either way the message may already have run.
+- A lead edit that no Post or batch settles within 120 s (a slow permission prompt, an interrupt) is quarantined, as
+  in 2.4.3: overlapping operations and a handback are refused, and its UNKNOWN needs a restore or a narrow. The
+  quarantine does not hold the checkout's compatibility lease, a stop, other leads' quiet windows or a restore while
+  the call may still run (review turns 43 to 45, HIGH; as in 2.4.3). Claude Code re-checks a file before it writes it,
+  so a late Write that finds the file changed is refused by the host (measured on 2.1.306). Planned for 2.4.5: an
+  executing state ended only by the call's Post, its batch, its transcript result or its process's exit.
+- A workflow phase 2.4.3 left `not_started` is resumed without its saved input, as in 2.4.3. The live ledger held none
+  at the switch, and 2.4.4 records none.
+- A stop can still leave a writer's app-server running when a reconcile asked for late in a maintenance pass
+  (settling a plain run's cancel) replaces a writer the stop has already ended (review turn 48; as in 2.4.3). Planned
+  for 2.4.5: no reconcile starts once a stop has listed the app-servers it ends, and the stop waits for those under
+  way.
+- A lead's background command: what it writes after its hook's Post is not covered and becomes UNKNOWN at the next
+  reconcile. Only the plugin's own live-view `tail` is exempt from coordination; any other command is coordinated.
+- Smartpay_Backend keeps its 3 checkout-wide `*` UNKNOWNs until its lead narrows them (one narrow).
+
 ## [software-workflows 2.4.3] — 2026-10-21
 
 The six findings 2.4.2 shipped as known limits (review session 01a14eac, turn 34) are fixed, with those of review

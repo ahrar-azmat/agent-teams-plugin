@@ -1,7 +1,9 @@
 """Durable two-turn Abraham workflow. MCP connections only observe this state.
 
 Intent precedes every native submission. A lost reply never causes replay: the
-client input ID must be found in paginated native history before progression.
+client input ID must be found in native history or the rollout before
+progression (runs.settle_inputs). An input nothing shows is unproven, and only
+the lead's resume sends it again.
 """
 import asyncio
 import json
@@ -264,6 +266,17 @@ class Writer:
             if not run.get("workflow") or run["state"] in TERMINAL or run.get("cancel_requested"):
                 return
             phase = run.get("phases", {}).get(run.get("phase"), {})
+            if (phase.get("state") in ("submitting", "uncertain") and phase.get("status") is None
+                    and phase.get("input_id") not in self.starting):
+                # Its turn/start's result was lost: settled as a resume settles it, by reads in its thread's order or by
+                # what its app-server saved once ended (runs.settle_inputs), reading native at most each 2 s.
+                if not self.daemon.runs.inputs_due(runid):
+                    return
+                await self.daemon.runs.settle_inputs(runid, "resume")
+                run = self.store.get(runid)
+                if run["state"] in TERMINAL or run.get("cancel_requested"):
+                    return
+                phase = run["phases"][run["phase"]]
             if phase.get("state") == "prepared":
                 await self.submit(runid)
                 return
@@ -318,7 +331,9 @@ class Writer:
                    "state": run["state"], "thread": actor.get("thread"), "policy": actor.get("policy"),
                    "settlement": run.get("settlement_refusal"), "rollout": run.get("rollout"),
                    "rollout_readback": run.get("rollout_readback"),
-                   "admission": run.get("admission"), "refusal": run.get("refusal")}, sort_keys=True)
+                   "admission": run.get("admission"), "refusal": run.get("refusal"),
+                   # Why this phase's input may have run though nothing shows it: a resume sends it again, a cancel ends it.
+                   "input_unproven": phase.get("unproven")}, sort_keys=True)
         text += "\n\n" + phase.get("answer", "") + "\n\n[UNIT ATTRIBUTION]\n"
         for row in self.store.db.execute("SELECT * FROM revisions WHERE unit=? ORDER BY created,id", (run["unit"],)):
             operation = self.store.get(row["operation"])

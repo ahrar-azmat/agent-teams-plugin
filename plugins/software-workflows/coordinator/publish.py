@@ -5,6 +5,7 @@ writers while a copy of its exact contents receives only this unit's entries.
 """
 import asyncio
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -62,7 +63,72 @@ class Publisher:
         if any(r["state"] == "waiting" for r in self.store.all("custody_request", unit["id"])):
             raise CoordinatorError("PENDING_HOOK", "A hook is waiting for command custody")
 
-    def dependency_check(self, unit, operations):
+    def restored_from(self, operation, path):
+        """What a restore operation wrote at `path`: a revision id, "baseline", or None (absence). Its own record
+        (restored_from, from 2.4.4), else the unknown/restored or unknown/checkout_restored event 2.4.3 left beside it;
+        KeyError when neither names it."""
+        recorded = operation.get("restored_from") or {}
+        if path in recorded:
+            return recorded[path]
+        for (unknown,) in self.store.db.execute("SELECT unknown_id FROM resolutions WHERE restore=?", (operation["id"],)).fetchall():
+            for (data,) in self.store.db.execute("SELECT data FROM events WHERE subject=? AND kind IN ('unknown/restored', "
+                                                 "'unknown/checkout_restored') ORDER BY seq", (unknown,)).fetchall():
+                event = json.loads(data)
+                if event.get("restore") != operation["id"]:
+                    continue
+                if path in (event.get("known_revisions") or {}):
+                    return event["known_revisions"][path]
+                if event.get("known_revision"):
+                    return event["known_revision"]
+        raise KeyError(path)
+
+    def provenance(self, row, unitid):
+        """The revision whose unit a reference to `row` depends on, or None for no unit's work. A restore writes known
+        bytes (recovery.restore_unknown), so its dependency is whose bytes they are, never the restoring unit's: the
+        revision the restore recorded as its source, followed through restores of restores, where a baseline, or
+        absence where the branch commit held nothing, is no unit's work. A restore that recorded no source is matched by
+        its bytes: the path's baseline bytes are no unit's; other bytes are those of a receipt holding them, the sealing
+        unit's or a published one first; with none, the restoring unit's, as before. (2.4.3 refused Smartpay_Frontend's
+        unit_e6acbaa9 for each of 16 paths its lead had restored to the baseline from its own session's unit.)"""
+        seen = set()
+        while row["attribution"] == "restore" and row["id"] not in seen:
+            seen.add(row["id"])
+            operation = self.store.get(row["operation"], required=False) if row["operation"] else None
+            if not operation:
+                return self.matched(row, unitid)
+            if operation.get("resolution") == "baseline":
+                return None
+            try:
+                source = self.restored_from(operation, row["path"])
+            except KeyError:
+                return self.matched(row, unitid)
+            if source is None or source == "baseline":
+                return None
+            found = self.store.db.execute("SELECT * FROM revisions WHERE id=?", (source,)).fetchone()
+            if (not found or found["checkout"] != row["checkout"] or found["path"] != row["path"]
+                    or found["attribution"] not in ("baseline", "exact", "restore")):
+                return self.matched(row, unitid)
+            row = found
+        return None if row["attribution"] == "baseline" else row
+
+    def matched(self, row, unitid):
+        """provenance() of a restore that recorded no source, by its bytes."""
+        baselines = {(r["blob"], r["mode"]) for r in self.store.db.execute(
+            "SELECT blob, mode FROM revisions WHERE checkout=? AND path=? AND attribution='baseline'", (row["checkout"], row["path"]))}
+        if (row["blob"], row["mode"]) in baselines or row["blob"] is None and not baselines:
+            return None  # the bytes registration found there, or absence where it found nothing
+        holders = self.store.db.execute("SELECT * FROM revisions WHERE checkout=? AND path=? AND attribution='exact' AND blob IS ? "
+                                        "AND mode IS ? ORDER BY rowid", (row["checkout"], row["path"], row["blob"], row["mode"])).fetchall()
+        if any(not h["unit"] or h["unit"] == unitid or self.store.get(h["unit"])["state"] == "published" for h in holders):
+            return None
+        return holders[0] if holders else row
+
+    async def dependency_check(self, unit, operations):
+        """Refuse a seal whose operations started from, or read, unexplained bytes or another unit's unpublished
+        revision. A reference to a path outside the ledger (ledger.unwatched) is no dependency: nothing there is
+        published (2.4.0-2.4.3 refused a unit whose writer had read test output while it was UNKNOWN). A reference to a
+        restore depends on whose bytes it restored (provenance). A git failure refuses (GIT_FAILED)."""
+        rows = {}
         for operation in operations:
             if operation["state"] == "resolved" or operation["kind"] == "restore":
                 continue  # Restores deliberately replace an UNKNOWN base with known receipt bytes.
@@ -72,16 +138,26 @@ class Publisher:
             references = list(operation["bases"].values()) if operation["kind"] not in ("command", "mcp", "lead-command") else []
             references += [revision for read in operation.get("dependencies", []) for revision in read.values()]
             for revision in references:
-                if not revision:
+                if not revision or revision in rows:
                     continue
                 row = self.store.db.execute("SELECT * FROM revisions WHERE id=?", (revision,)).fetchone()
                 if not row:
                     raise CoordinatorError("PROVENANCE_MISSING", "A base/read revision is unavailable")
-                if row["attribution"] == "UNKNOWN":
-                    raise CoordinatorError("UNKNOWN_DEPENDENCY", "Operation depends on unexplained bytes")
-                if row["unit"] and row["unit"] != unit["id"] and self.store.get(row["unit"])["state"] != "published":
-                    raise CoordinatorError("UNPUBLISHED_DEPENDENCY", "Operation read an unpublished other-unit revision",
-                                           {"unit": row["unit"], "revision": revision})
+                rows[revision] = row
+        checkouts = {}
+        for row in rows.values():
+            checkouts.setdefault(row["checkout"], set()).add(row["path"])
+        outside = {key: await self.daemon.ledger.unwatched(self.store.get(key), paths) for key, paths in checkouts.items()}
+        rows = [row for row in rows.values() if row["path"] not in outside[row["checkout"]]]
+        unknown = sorted({row["path"] for row in rows if row["attribution"] == "UNKNOWN"})
+        if unknown:
+            raise CoordinatorError("UNKNOWN_DEPENDENCY", "Operation depends on unexplained bytes", {"paths": unknown})
+        rows = [source for source in (self.provenance(row, unit["id"]) for row in rows) if source]
+        unpublished = [row for row in rows if row["unit"] and row["unit"] != unit["id"] and self.store.get(row["unit"])["state"] != "published"]
+        if unpublished:
+            raise CoordinatorError("UNPUBLISHED_DEPENDENCY", "Operation read an unpublished other-unit revision",
+                                   {"unit": unpublished[0]["unit"], "revision": unpublished[0]["id"],
+                                    "paths": sorted({row["path"] for row in unpublished})})
 
     async def seal(self, unitid, validation, order=None):
         unit = self.store.get(unitid)
@@ -153,7 +229,7 @@ class Publisher:
         rows = await self.scope_rows(unit, sealing=True)
         paths = [row["path"] for row in rows]
         operations = list(self.store.all("operation", unitid))
-        self.dependency_check(unit, operations)
+        await self.dependency_check(unit, operations)
         branch = await asyncio.to_thread(gitio.text, checkout["root"], ["symbolic-ref", "HEAD"])
         if branch != unit["branch"]:
             raise CoordinatorError("BRANCH_CHANGED", "Unit's named branch changed")

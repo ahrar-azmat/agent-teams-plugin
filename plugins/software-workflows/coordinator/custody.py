@@ -329,17 +329,26 @@ class Custody:
     def unit_active(self, unitid):
         return list(self.store.held_custody(unit=unitid))
 
-    async def acquire(self, actor, paths, cwd=None):
-        from .routing import grouped
+    async def acquire(self, actor, paths, cwd=None, mark=None):
+        """Claim these paths for the actor's unit. A path outside the ledger (ledger.unwatched) is neither claimed nor
+        held against another unit's claim: nothing there is recorded, so nothing there refuses an edit (2.4.0-2.4.3
+        claimed it, and another unit's edit of the same ignored file was refused CLAIM_CONFLICT). Those are returned
+        as `outside`. A restore passes its `mark`: a claim this call creates carries it until another call acquires
+        that claim as well, and the restore lets go only of claims still carrying it (recovery.release_taken)."""
+        from .routing import grouped, qualified
         groups = grouped(self.store, actor, paths, cwd)
         normalized = {key: [normalize(self.store.get(key), path) for path in values] for key, values in groups.items()}
         for key in groups:
             self.ledger.require_owned(self.store.get(key))
+        outside = {key: await self.ledger.classify(self.store.get(key), [p["path"] for p in values]) for key, values in normalized.items()}
+        normalized = {key: [p for p in values if p["path"] not in outside[key]] for key, values in normalized.items()}
+        normalized = {key: values for key, values in normalized.items() if values}
+        outside = [qualified(key, path) for key, values in sorted(outside.items()) for path in sorted(values)]
         async with self.condition:
             if self.store.get(actor["unit"])["state"] != "open":
                 raise CoordinatorError("UNIT_FROZEN", "Cannot claim paths for a sealed unit")
             from .participants import require_writable
-            for key in groups:
+            for key in normalized:
                 require_writable(self.store, actor["unit"], key)
             conflicts = [dict(conflict, checkout=key, root=self.store.get(key)["root"])
                          for key, values in normalized.items() for conflict in self.conflicts(key, actor["unit"], values)]
@@ -357,14 +366,18 @@ class Custody:
                     for path in values:
                         existing = held.get(path["key"])
                         if existing:
+                            if existing.get("restore") not in (None, mark):
+                                existing.pop("restore")  # this call holds it too: no longer the restore's alone
+                                self.store.save(existing)
                             result.append(existing["id"])
                         else:
                             ident = uid("claim")
                             held[path["key"]] = self.store.put("claim", ident, dict(path, checkout=key, root=self.store.get(key)["root"],
-                                                               unit=actor["unit"], actor=actor["id"], state="held"), actor["unit"])
+                                                               unit=actor["unit"], actor=actor["id"], state="held",
+                                                               **({"restore": mark} if mark else {})), actor["unit"])
                             result.append(ident)
                 self.store.event("claim/acquired", actor["id"], {"claims": result})
-            return {"claims": result}
+            return {"claims": result, **({"outside": outside} if outside else {})}
 
     def release_request(self, actor, paths, cwd=None):
         from .routing import grouped, qualified

@@ -172,6 +172,11 @@ class Store:
                 ("message_unit", "json_extract(data,'$.unit'),id", "kind='message'"),
                 ("message_recipient", "json_extract(data,'$.recipient'),id", "kind='message'"),
                 ("mailbox_session", "json_extract(data,'$.session_id'),id", "kind='lead_mailbox'"),
+                # A lead's inbox reads mail to lead actors and the sessions they belong to; PostToolBatch finds a
+                # lead hook's record by the host's call id.
+                ("lead_actor", "id", "kind='actor' AND json_extract(data,'$.kind')='lead'"),
+                ("lead_session_actor", "json_extract(data,'$.actor'),id", "kind='lead_session'"),
+                ("lead_hook_call", "json_extract(data,'$.tool_use_id'),id", "kind='lead_hook'"),
                 ("claim_checkout", "json_extract(data,'$.checkout'),id", "kind='claim' AND json_extract(data,'$.state')='held'"),
                 # Every native notification and hook finds its operation by call id; every admission
                 # checks the checkout's unreconciled operations.

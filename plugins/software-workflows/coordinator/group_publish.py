@@ -34,22 +34,40 @@ class GroupPublisher:
         return {key: sorted(values.values(), key=lambda value: (value["path"], value["revision"] or "")) for key, values in result.items()}
 
     async def check_dependencies(self, unitid, checkoutid, evidence):
+        """Refuse a project seal whose writers read unexplained bytes or another unit's unpublished revision in this
+        participant. A read of a path outside the ledger (ledger.unwatched) is no dependency, a read of a restore depends
+        on whose bytes it restored (Publisher.provenance), and a git failure refuses."""
         paths = sorted({row["path"] for row in evidence})
         if not paths:
             return
         checkout = self.store.get(checkoutid)
         await self.daemon.ledger.reconcile(checkout, paths)
+        outside = await self.daemon.ledger.unwatched(checkout, paths)
+        paths = [path for path in paths if path not in outside]
+        if not paths:
+            return
         unknowns = self.store.unresolved(checkoutid, paths)
         if unknowns:
             raise CoordinatorError("UNKNOWN_DEPENDENCY", "Participant read scope includes unresolved UNKNOWN",
-                                   {"root": checkout["root"], "unknowns": [u["id"] for u in unknowns]})
+                                   {"root": checkout["root"], "unknowns": [u["id"] for u in unknowns],
+                                    "paths": sorted({u["path"] for u in unknowns})})
+        unknown, unpublished = set(), {}
         for entry in evidence:
-            if entry["revision"]:
+            if entry["revision"] and entry["path"] not in outside:
                 row = self.store.db.execute("SELECT * FROM revisions WHERE id=?", (entry["revision"],)).fetchone()
                 if not row or row["checkout"] != checkoutid or row["path"] != entry["path"] or row["attribution"] == "UNKNOWN":
-                    raise CoordinatorError("UNKNOWN_DEPENDENCY", "Recorded participant read is not a known revision")
-                if row["unit"] and row["unit"] != unitid and self.store.get(row["unit"])["state"] != "published":
-                    raise CoordinatorError("UNPUBLISHED_DEPENDENCY", "Read depends on an unpublished other unit", {"unit": row["unit"]})
+                    unknown.add(entry["path"])
+                    continue
+                source = self.repo.provenance(row, unitid)  # a restore: whose bytes it restored
+                if source and source["unit"] and source["unit"] != unitid and self.store.get(source["unit"])["state"] != "published":
+                    unpublished.setdefault(source["unit"], set()).add(entry["path"])
+        if unknown:
+            raise CoordinatorError("UNKNOWN_DEPENDENCY", "Recorded participant read is not a known revision",
+                                   {"root": checkout["root"], "paths": sorted(unknown)})
+        if unpublished:
+            unit = min(unpublished)
+            raise CoordinatorError("UNPUBLISHED_DEPENDENCY", "Read depends on an unpublished other unit",
+                                   {"unit": unit, "paths": sorted(path for paths in unpublished.values() for path in paths)})
 
     async def seal(self, unitid, validation, order):
         unit = self.store.get(unitid)
@@ -79,7 +97,7 @@ class GroupPublisher:
     async def freeze(self, unit, members, order, validation, sealid):
         await self.repo.quiescent(unit)
         operations = list(self.store.all("operation", unit["id"]))
-        self.repo.dependency_check(unit, operations)
+        await self.repo.dependency_check(unit, operations)
         dependencies = self.dependencies(unit)
         await asyncio.gather(*(self.check_dependencies(unit["id"], key, values) for key, values in dependencies.items()))
         vector, seals = [], []

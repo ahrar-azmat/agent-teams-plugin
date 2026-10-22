@@ -27,6 +27,12 @@ from .locks import KeyedLocks
 
 
 PROBES = ("hooks", "evidence", "dynamic", "delivery", "tty", "receipts", "reconnect", "terminals", "ownership", "policy", "validation")
+# Optional capabilities: each probed once for a writer binding (calibrate_writer), cached with it and recorded on its
+# listeners; none is ever a refusal. inject: messages.deliver_notice injects a no-wake notice where it is "active" (at
+# any time) or "idle" (while no turn runs), and holds it where the probe found it absent (None). A probe that raised or
+# timed out (each of its steps is bounded) proves neither: its binding takes FALLBACK, recorded with the error.
+CAPABILITIES = ("inject",)
+FALLBACK = {"inject": "idle"}
 
 
 class ProbeListener:
@@ -36,7 +42,7 @@ class ProbeListener:
         self.home, self.repo = directory / "home", directory / "repo"
         self.home.mkdir(mode=0o700, exist_ok=True)
         self.repo.mkdir(exist_ok=True)
-        gitio.git(self.repo, ["init", "--quiet"])
+        self.repo_initialized = False  # git init runs at the first spawn, off the event loop
         self.config = dict(provider.config)
         self.config.update({"approval_policy": "never", "sandbox_mode": "danger-full-access", "agents.enabled": True,
                             "features.multi_agent_v2": True, "web_search": "live"})
@@ -66,6 +72,9 @@ class ProbeListener:
         return self
 
     async def spawn(self):
+        if not self.repo_initialized:
+            await asyncio.to_thread(gitio.git, self.repo, ["init", "--quiet"])
+            self.repo_initialized = True
         environment = native.environment(CODEX_HOME=str(self.home), LOG_FORMAT="json")
         if self.trace:
             environment["RUST_LOG"] = "codex_core::exec_policy=trace"
@@ -158,6 +167,19 @@ class ProbeListener:
 
 
 @asynccontextmanager
+async def serving(router=None):
+    """A loopback model provider for one probe (fixture.Provider), shut down off the event loop: socketserver's
+    shutdown waits for its serve loop's next poll, up to 0.5 s, and every writer's hooks and reconciles share this
+    loop (measured: 62 stalls of 0.3 to 0.85 s through one 13-writer recovery's four calibrations)."""
+    provider = Provider(router)
+    provider.__enter__()
+    try:
+        yield provider
+    finally:
+        await asyncio.to_thread(provider.__exit__, None, None, None)
+
+
+@asynccontextmanager
 async def listening(directory, provider, **kwargs):
     listener = ProbeListener(directory, provider, **kwargs)
     try:
@@ -187,17 +209,20 @@ class Admission:
         binary = native.native_codex()
         sha = await asyncio.to_thread(native.file_digest, binary)
         directory = self.store.root / "schemas" / sha
-        if not (directory / "complete.json").exists():
-            directory.mkdir(mode=0o700, exist_ok=True)
-            home = directory / "generation-home"
-            home.mkdir(mode=0o700, exist_ok=True)
-            process = await asyncio.create_subprocess_exec(binary, "app-server", "generate-json-schema", "--experimental", "--out", str(directory),
-                        env=dict(os.environ, CODEX_HOME=str(home)), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-            code = await process.wait()
-            if code:
-                raise CoordinatorError("SCHEMA_GENERATION", "Native schema generation failed", {"exit_code": code})
-            hashes = {str(p.relative_to(directory)): native.file_digest(p) for p in directory.rglob("*.json")}
-            (directory / "complete.json").write_text(encoded({"digest": digest(hashes), "exit_code": code}))
+        # One generation at a time for each binary: writers reconciled in parallel all attach, and two generators
+        # writing the same files would interleave them.
+        async with self.store.admission_locks.hold("schema:" + sha):
+            if not (directory / "complete.json").exists():
+                directory.mkdir(mode=0o700, exist_ok=True)
+                home = directory / "generation-home"
+                home.mkdir(mode=0o700, exist_ok=True)
+                process = await asyncio.create_subprocess_exec(binary, "app-server", "generate-json-schema", "--experimental", "--out", str(directory),
+                            env=dict(os.environ, CODEX_HOME=str(home)), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                code = await process.wait()
+                if code:
+                    raise CoordinatorError("SCHEMA_GENERATION", "Native schema generation failed", {"exit_code": code})
+                hashes = {str(p.relative_to(directory)): native.file_digest(p) for p in directory.rglob("*.json")}
+                (directory / "complete.json").write_text(encoded({"digest": digest(hashes), "exit_code": code}))
         return directory, json.loads((directory / "complete.json").read_text())["digest"]
 
     async def fingerprint(self, listener, schema_digest):
@@ -223,9 +248,13 @@ class Admission:
         binary = native.native_codex()
         proc = await asyncio.create_subprocess_exec(binary, "--version", stdout=asyncio.subprocess.PIPE)
         version = (await proc.communicate())[0].decode().strip()
+        # Off the event loop: the binary is 250 MB (0.1 s to hash, measured), and every writer gate reads these.
+        binary_digest, git_version, adapter = await asyncio.gather(asyncio.to_thread(native.file_digest, binary),
+                                                                   asyncio.to_thread(gitio.text, listener.repo, ["--version"]),
+                                                                   asyncio.to_thread(native.adapter_digest))
         config = effective.get("config", {})
         complete_policy = version == "codex-cli 0.163.0" and requirements.get("requirements") is None and bool(listener.trace_rules)
-        result = {"binary": binary, "binary_digest": native.file_digest(binary), "version": version,
+        result = {"binary": binary, "binary_digest": binary_digest, "version": version,
                 "user_agent": listener.initialized["userAgent"], "methods": sorted(set(inventory)),
                 "schema_digest": schema_digest, "config_digest": digest(config), "requirements_digest": digest(requirements),
                 "features": features, "hooks_digest": digest(hooks), "hook_program_digest": native.file_digest(Path(__file__).with_name("hooks.py")),
@@ -237,11 +266,11 @@ class Admission:
                                 "managed_requirements_absent": requirements.get("requirements") is None,
                                 "basis": "0.163.0 requirements null proves requirements_toml.is_empty including rules; trace is the resulting complete policy" if complete_policy else
                                          "post-managed-overlay effective execution policy is not exposed"},
-                "git": gitio.text(listener.repo, ["--version"]), "sqlite": sqlite3.sqlite_version,
+                "git": git_version, "sqlite": sqlite3.sqlite_version,
                 "python": sys.version.split()[0], "os": platform.platform(),
                 "case_sensitive": listener.case_sensitive if hasattr(listener, "case_sensitive") else case_sensitive(listener.repo),
                 "socket": {key: listener.endpoint.get(key) for key in ("measured_limit", "uid", "mode")},
-                "adapter_digest": native.adapter_digest()}
+                "adapter_digest": adapter}
         if getattr(listener, "project_revision", None):
             result["project"] = {"revision": listener.project_revision, "roots": roots, "cwd": str(listener.repo),
                                  "configuration_digests": [digest(c) for c in configurations]}
@@ -294,49 +323,78 @@ class Admission:
                                    {"exec_policy": fingerprint["exec_policy"]})
         binding = digest(fingerprint)
         async with self.store.admission_locks.hold(binding):
-            cached = await self.calibrate_writer(binding, fingerprint, fixture)
+            cached, capabilities = await self.calibrate_writer(binding, fingerprint, fixture)
         listener = self.store.get(listenerid)
         listener["admission"] = binding
         listener["admission_fingerprint"] = fingerprint
+        listener["capabilities"] = {name: value.get("capability") for name, value in capabilities.items()}
+        listener["capability_fallback"] = {name: value["error"] for name, value in capabilities.items() if value.get("fallback")}
         listener["admission_observations"] = {"endpoint": listener["endpoint"], "listener": listenerid, "cache_hit": cached, "writer_catalog": catalog}
         self.store.save(listener)
-        self.store.event("admission/writer", listenerid, {"fingerprint": binding, "fixture": fixture, "cache_hit": cached})
+        self.store.event("admission/writer", listenerid, {"fingerprint": binding, "fixture": fixture, "cache_hit": cached,
+                                                          "capabilities": listener["capabilities"]})
         return {"admitted": True, "fingerprint": binding, "cache_hit": cached, "effective_modes": modes}
 
     async def calibrate_writer(self, binding, fingerprint, fixture):
+        """Calibrate a writer binding once: its required probes, then each of its optional capabilities (CAPABILITIES)
+        once, a probe that raised included (its fallback is cached). Returns (whether the cache held the required
+        probes, the capabilities' observations)."""
         cache = self.store.root / "calibrations" / ("writer-" + binding + ".json")
         try:
             cached = json.loads(cache.read_text())
         except (OSError, ValueError):
             cached = {}
-        if not (cached.get("completed") is True and cached.get("fingerprint_digest") == binding and cached.get("fingerprint") == fingerprint):
+        hit = cached.get("completed") is True and cached.get("fingerprint_digest") == binding and cached.get("fingerprint") == fingerprint
+        owed = [name for name in CAPABILITIES if not hit or name not in (cached.get("capabilities") or {})]
+        if not owed:
+            return True, cached["capabilities"]
+        # Isolated state under the OS temporary tree keeps every calibration
+        # artifact under that same caller-owned root. Normal state continues
+        # to use the OS temporary directory accepted by the fixture adapter.
+        temporary_roots = {Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve()}
+        parent = self.store.root / "calibrations" if any(p in self.store.root.parents for p in temporary_roots) else None
+        directory = tempfile.mkdtemp(prefix="software-workflows-admission-", dir=parent)
+        if not hit:
             self.store.event("admission/calibrating", binding, {"state": "running"})
-            # Isolated state under the OS temporary tree keeps every calibration
-            # artifact under that same caller-owned root. Normal state continues
-            # to use the OS temporary directory accepted by the fixture adapter.
-            temporary_roots = {Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve()}
-            parent = self.store.root / "calibrations" if any(p in self.store.root.parents for p in temporary_roots) else None
-            directory = tempfile.mkdtemp(prefix="software-workflows-admission-", dir=parent)
             calibration = await self.check({"scratch": directory, "probes": list(PROBES) + (["projects"] if fingerprint.get("project") else [])})
             if not calibration["completed"]:
                 raise CoordinatorError("ADMISSION_INCOMPLETE", "Required runtime probes did not all complete")
-            record = {"fingerprint": fingerprint, "fingerprint_digest": binding,
+            cached = {"fingerprint": fingerprint, "fingerprint_digest": binding,
                       "evidence": calibration["evidence"], "completed": True, "fixture": fixture}
-            descriptor, pending = tempfile.mkstemp(prefix="writer-pending-", dir=cache.parent)
-            with os.fdopen(descriptor, "w") as output:
-                output.write(encoded(record))
-                output.flush()
-                os.fsync(output.fileno())
-            os.replace(pending, cache)
-            fsync_dir(cache.parent)
-            return False
-        return True
+        cached["capabilities"] = dict(cached.get("capabilities") or {}, **await self.capabilities(directory, owed))
+        descriptor, pending = tempfile.mkstemp(prefix="writer-pending-", dir=cache.parent)
+        with os.fdopen(descriptor, "w") as output:
+            output.write(encoded(cached))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(pending, cache)
+        fsync_dir(cache.parent)
+        return hit, cached["capabilities"]
+
+    async def capabilities(self, scratch, names):
+        """Probe the optional capabilities `names` (CAPABILITIES). Each is its probe's "capability" (None where that
+        was not proven) with its observations, or, where the probe raised or timed out, its FALLBACK with the error;
+        with the seconds it added to this admission."""
+        directory = scratch_directory(scratch) / uid("capabilities")
+        directory.mkdir(mode=0o700)
+        found = {}
+        for name in names:
+            started = time.monotonic()
+            try:
+                observations = await getattr(self, "probe_" + name)(directory / name)
+                found[name] = {"capability": observations.get("capability"), "observations": observations}
+            except Exception as exc:
+                found[name] = {"capability": FALLBACK[name], "fallback": True, "error": getattr(exc, "code", type(exc).__name__),
+                               "message": str(exc) if isinstance(exc, CoordinatorError) else type(exc).__name__}
+            found[name]["seconds"] = round(time.monotonic() - started, 2)
+            self.store.event("admission/capability", name, {k: v for k, v in found[name].items() if k != "observations"})
+        return found
 
     async def check(self, params):
         directory = scratch_directory(params["scratch"]) / uid("admission")
         directory.mkdir(mode=0o700)
         requested = params.get("probes") or list(PROBES)
-        if set(requested) - set(PROBES) - {"exec_policy", "projects"}:
+        if set(requested) - set(PROBES) - set(CAPABILITIES) - {"exec_policy", "projects"}:
             raise CoordinatorError("ADMISSION_PROBE", "Unknown capability probe")
         schema_directory, schema_digest = await self.schema()
         results = []
@@ -351,7 +409,7 @@ class Admission:
             (directory / "results.json").write_text(encoded(results))
             self.store.event("admission/probe", name, results[-1])
         try:
-            with Provider() as provider:
+            async with serving() as provider:
                 async with listening(directory / "fingerprint", provider, trace=True) as listener:
                     await listener.start_thread()
                     fingerprint = await self.fingerprint(listener, schema_digest)
@@ -377,7 +435,7 @@ class Admission:
         observations = {}
         for mode, trusted in (("observe", False), ("observe", True), ("deny", True), ("wait", True), ("crash", True), ("timeout", True)):
             label = mode + ("-trusted" if trusted else "-untrusted")
-            with Provider(steps_router([patch(add_patch("patch.txt")), function("exec_command", {"cmd": "printf command > command.txt", "login": False}), message()])) as provider:
+            async with serving(steps_router([patch(add_patch("patch.txt")), function("exec_command", {"cmd": "printf command > command.txt", "login": False}), message()])) as provider:
                 async with listening(directory / label, provider, hook=mode, trusted=trusted) as listener:
                     await listener.start_thread()
                     start = time.monotonic()
@@ -399,7 +457,7 @@ class Admission:
                 "permission_request": "measured count under never; not used as custody gate"}
 
     async def probe_policy(self, directory):
-        with Provider() as provider:
+        async with serving() as provider:
             async with listening(directory / "bad", provider) as listener:
                 response = await listener.connection.call("thread/start", {"cwd": str(listener.repo), "approvalPolicy": "on-request", "sandbox": "read-only"})
                 try:
@@ -416,7 +474,7 @@ class Admission:
 
     async def probe_validation(self, directory):
         params = {"cwd": str(directory), "approvalPolicy": "never", "sandbox": "danger-full-access", "c1UnknownField": True}
-        with Provider() as provider:
+        async with serving() as provider:
             async with listening(directory, provider) as listener:
                 params["cwd"] = str(listener.repo)
                 response = await listener.connection.call("thread/start", params, unchecked=True)
@@ -431,7 +489,7 @@ class Admission:
     async def probe_tty(self, directory):
         results = []
         for enabled in (True, False):
-            with Provider(steps_router([function("exec_command", {"cmd": "printf tty", "tty": True, "login": False}), message()])) as provider:
+            async with serving(steps_router([function("exec_command", {"cmd": "printf tty", "tty": True, "login": False}), message()])) as provider:
                 async with listening(directory / str(enabled), provider, config={"features.unified_exec_tty": enabled}) as listener:
                     await listener.start_thread()
                     await listener.turn()
@@ -453,7 +511,7 @@ class Admission:
         results = []
         for log in ("codex_core::exec_policy=trace", native.WRITER_LOG):
             steps = [action({"exec": cell}), function("exec_command", {"cmd": "printf tty", "tty": True, "login": False}), message()]
-            with Provider(steps_router(steps)) as provider:
+            async with serving(steps_router(steps)) as provider:
                 async with listening(directory / str(len(results)), provider, config={"features.unified_exec_tty": False}, log=log) as listener:
                     await listener.start_thread()
                     await listener.turn()
@@ -482,7 +540,7 @@ class Admission:
                 "cases": results}
 
     async def probe_reconnect(self, directory):
-        with Provider() as provider:
+        async with serving() as provider:
             async with listening(directory, provider) as listener:
                 await listener.start_thread()
                 await listener.turn()
@@ -500,7 +558,7 @@ class Admission:
                         "policy": native.policy_echo(resumed), "transport": "WebSocket over Unix socket"}
 
     async def probe_terminals(self, directory):
-        with Provider(steps_router([function("exec_command", {"cmd": "sleep 20", "login": False, "yield_time_ms": 1000}), message()])) as provider:
+        async with serving(steps_router([function("exec_command", {"cmd": "sleep 20", "login": False, "yield_time_ms": 1000}), message()])) as provider:
             async with listening(directory, provider) as listener:
                 await listener.start_thread()
                 await listener.turn()
@@ -524,7 +582,7 @@ class Admission:
     async def probe_ownership(self, directory):
         spawn = "import subprocess,time; subprocess.Popen(['/bin/sleep','4'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); time.sleep(1)"
         command = shlex.join(["/bin/zsh", "-f", "-c", "/usr/bin/true; " + shlex.join([sys.executable, "-B", "-c", spawn]) + "; /usr/bin/true"])
-        with Provider(steps_router([function("exec_command", {"cmd": command, "login": False, "yield_time_ms": 1000}), message()])) as provider:
+        async with serving(steps_router([function("exec_command", {"cmd": command, "login": False, "yield_time_ms": 1000}), message()])) as provider:
             async with listening(directory, provider, config={"features.unified_exec_tty": False}) as listener:
                 await listener.start_thread()
                 owner = processes.identity(listener.process.pid)
@@ -576,7 +634,7 @@ class Admission:
                     await unrelated.wait()
 
     async def probe_delivery(self, directory):
-        with Provider(steps_router([function("exec_command", {"cmd": "sleep 1", "login": False, "yield_time_ms": 1000}), message()])) as provider:
+        async with serving(steps_router([function("exec_command", {"cmd": "sleep 1", "login": False, "yield_time_ms": 1000}), message()])) as provider:
             async with listening(directory, provider) as listener:
                 await listener.start_thread()
                 try:
@@ -597,16 +655,69 @@ class Admission:
                 await listener.wait(lambda e: e.get("method") == "turn/completed" and e["params"]["turn"]["id"] != turn["turn"]["id"])
                 return {"negative_observed": negative, "positive_observed": bool(echo and queue_echo), "steer_id": ident, "queue_id": queued}
 
+    async def probe_inject(self, directory):
+        """thread/inject_items in a writer's mode (code_mode_only, a Pre hook). Into a turn while its code-mode cell
+        runs: the model's next request carries the note and shows the cell completed, and no other turn starts. Into
+        an idle thread: no turn starts, and the next turn's first request carries it. Red: turn/steer of a note while
+        the cell runs preempts it (core input_queue.rs watch_user_input), so the request after it shows the cell still
+        running: the detector sees a preemption. The capability is "active" where both held, "idle" where only the idle
+        thread did, else None (messages.deliver_notice)."""
+        cell = ('await tools.exec_command({cmd: "/bin/sleep 3", yield_time_ms: 20000})'
+                '.catch(e => text("refused " + String(e).slice(0, 120))); text("C1-CELL-COMPLETED");')
+        start = "C1 inject probe: run the cell."
+        def router(body, index):
+            items = body.get("input") or []
+            return action({"exec": cell}) if items and items[-1].get("type") == "message" and start in json.dumps(items[-1]) else message()
+        def note(text):
+            return {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
+        def after_cell(requests, text):
+            # The request after the cell's call: whether its output shows the cell completed, and whether it carries the note.
+            for body in requests:
+                outputs = [i for i in body.get("input") or [] if i.get("type") == "custom_tool_call_output"]
+                if outputs:
+                    return {"completed": "C1-CELL-COMPLETED" in json.dumps(outputs), "carried": text in json.dumps(body["input"])}
+            return {"completed": None, "carried": None}
+        cases = {}
+        for case in ("steer", "inject"):
+            text = "C1 inject probe note: " + case
+            async with serving(router) as provider:
+                async with listening(directory / case, provider, hook="observe") as listener:
+                    await listener.start_thread()
+                    turn = await listener.turn(start, wait=False)
+                    await listener.wait(lambda e: e.get("method") == "item/started" and e["params"]["item"]["type"] == "commandExecution")
+                    await asyncio.sleep(0.5)
+                    if case == "steer":
+                        await listener.connection.call("turn/steer", {"threadId": listener.thread, "expectedTurnId": turn["turn"]["id"],
+                                                                      "input": [{"type": "text", "text": text}]})
+                    else:
+                        await listener.connection.call("thread/inject_items", {"threadId": listener.thread, "items": [note(text)]})
+                    await listener.wait(lambda e: e.get("method") == "turn/completed", timeout=60)
+                    cases[case] = dict(after_cell(provider.requests, text), turns=sum(e.get("method") == "turn/started" for e in listener.events))
+                    if case == "inject":
+                        text, mark = "C1 inject probe note: idle", len(listener.events)
+                        await listener.connection.call("thread/inject_items", {"threadId": listener.thread, "items": [note(text)]})
+                        # Native starts a turn for pending work at once (tasks/mod.rs maybe_start_turn_for_pending_work):
+                        # none in 1.5 s is none (measured on 0.163.0: none in 6 s).
+                        await asyncio.sleep(1.5)
+                        started, count = sum(e.get("method") == "turn/started" for e in listener.events[mark:]), len(provider.requests)
+                        await listener.turn("C1 inject probe: next.")
+                        cases["idle"] = {"turns": started, "carried": len(provider.requests) > count and text in json.dumps(provider.requests[count]["input"])}
+        negative = cases["steer"]["completed"] is False and cases["steer"]["carried"] is True
+        idle = cases["idle"]["turns"] == 0 and cases["idle"]["carried"] is True
+        active = cases["inject"]["completed"] is True and cases["inject"]["carried"] is True and cases["inject"]["turns"] == 1
+        capability = ("active" if active else "idle") if negative and idle else None
+        return {"negative_observed": negative, "positive_observed": capability == "active", "capability": capability, "cases": cases}
+
     async def probe_dynamic(self, directory):
         specification = {"type": "function", "name": "c1_identity", "description": "Admission identity echo", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}}
-        with Provider() as provider:
+        async with serving() as provider:
             async with listening(directory / "bad", provider, experimental=False) as listener:
                 try:
                     await listener.start_thread(dynamicTools=[specification])
                     negative = False
                 except CoordinatorError:
                     negative = True
-        with Provider(steps_router([function("c1_identity", {}), message()])) as provider:
+        async with serving(steps_router([function("c1_identity", {}), message()])) as provider:
             async with listening(directory / "good", provider) as listener:
                 await listener.start_thread(dynamicTools=[specification])
                 await listener.turn(wait=False)
@@ -622,7 +733,7 @@ class Admission:
                 if child:
                     return function("c1_identity", {}) if not any(x.get("name") == "c1_identity" for x in data) else message("child done")
                 return function("spawn_agent", {"task_name": "probe", "message": "C1_DYNAMIC_CHILD", "fork_turns": "none"}, "collaboration") if not any(x.get("name") == "spawn_agent" for x in data) else message()
-            with Provider(router) as provider:
+            async with serving(router) as provider:
                 async with listening(directory / ("child-" + str(enabled)), provider, config={"features.multi_agent_v2_dynamic_tools": enabled}) as listener:
                     await listener.start_thread(dynamicTools=[specification])
                     await listener.turn()
@@ -657,7 +768,7 @@ class Admission:
                 if len(calls) == 2:
                     return function("spawn_agent", {"task_name": "probe", "message": "C1_PATCH_CHILD", "fork_turns": "none"}, "collaboration")
                 return message()
-            with Provider(router) as provider:
+            async with serving(router) as provider:
                 async with listening(directory / str(enabled), provider, config={"agents.enabled": enabled, "features.multi_agent_v2": enabled}) as listener:
                     await listener.start_thread()
                     await listener.turn()
@@ -674,7 +785,7 @@ class Admission:
 
     async def probe_exec_policy(self, directory):
         observations = []
-        with Provider() as provider:
+        async with serving() as provider:
             listener = ProbeListener(directory, provider, trace=True)
             rules = listener.home / "rules"
             rules.mkdir()

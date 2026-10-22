@@ -1,5 +1,6 @@
 """Scoped durable run observation and explicit control; no exec watchdog IDs."""
 import asyncio
+from contextlib import nullcontext
 import json
 import os
 import time
@@ -8,7 +9,7 @@ from pathlib import Path
 from .client import CoordinatorError
 from .store import uid, digest
 from .writer import TERMINAL
-from . import processes, participants
+from . import processes, participants, rollout
 from .locks import KeyedLocks
 
 
@@ -18,7 +19,8 @@ class Runs:
         self.cancel_locks = KeyedLocks()
         self.cancel_passes = {}  # run -> cancel passes still interrupting and terminating: no cancelled meanwhile
         self.cancel_reconciled = {}  # run -> monotonic time of its cancel's last reconcile: one each 2 s at most
-        self.start_absent = {}  # run -> (input, monotonic time) of the first read of a lost start that found no turn
+        self.settle_locks = KeyedLocks()  # run -> one settlement of its unit's inputs of unknown outcome at a time
+        self.input_reads = {}  # run -> monotonic time of maintenance's last settlement of its deliveries: one each 2 s
 
     def visible(self, run, cwd):
         from .observations import checkout_at
@@ -35,11 +37,41 @@ class Runs:
             raise CoordinatorError("RUN_SCOPE", "Run is not visible from this dispatch or target folder")
         return run
 
+    def reported(self, run):
+        """The run's state as its readers see it, with the unit's writer turns running: a finished or idle run whose
+        writer runs a turn (a message's, or a sub-agent's) is running that turn. Derived from the actors' turns, never
+        stored, so a turn's end read later (a reconcile's history) leaves nothing behind. A requested cancel's states
+        stand (cancelling, cancelled)."""
+        turns = []
+        for actor in self.store.all("actor", run["unit"]):
+            if actor.get("active_turn") and actor["kind"] != "lead":
+                turns.append(dict({"actor": actor["id"], "kind": actor["kind"], "thread": actor.get("thread"),
+                                   "turn": actor["active_turn"]}, **self.turn_source(run, actor)))
+        state = run["state"]
+        if turns and not run.get("cancel_requested") and state in TERMINAL | {"idle"}:
+            state = "running"
+        return state, turns
+
+    def turn_source(self, run, actor):
+        """What started a root turn: the phase whose input it took, or the message whose delivery started it."""
+        turn = actor["active_turn"]
+        if actor["kind"] != "root":
+            return {}
+        phase = next((name for name, p in (run.get("phases") or {}).items() if p.get("turn") == turn), None)
+        if phase:
+            return {"phase": phase}
+        # Through the unit's mail (message_unit, then record_parent): never every delivery in the ledger.
+        row = self.store.db.execute("SELECT json_extract(d.data,'$.message') FROM records m JOIN records d ON d.parent=m.id AND "
+                                    "d.kind='delivery' WHERE m.kind='message' AND json_extract(m.data,'$.unit')=? AND "
+                                    "json_extract(d.data,'$.result.turn.id')=? LIMIT 1", (run["unit"], turn)).fetchone()
+        return {"message": row[0]} if row else {}
+
     def summary(self, run):
         unit = self.store.get(run["unit"])
         surface = participants.surface(self.daemon, unit)
+        state, turns = self.reported(run)
         return {"run": run["id"], "revision": run.get("_revision", 0) + surface["participant_revision"], "backend": "native", "unit": unit["id"], "unit_state": unit["state"],
-                "phase": run.get("phase"), "state": run["state"], "created": run.get("created", 0),
+                "phase": run.get("phase"), "state": state, "turns": turns, "created": run.get("created", 0),
                 "dispatch_cwd": run.get("dispatch_cwd"), "target_cwd": run.get("target_cwd"),
                 "claims": [c for p in surface["participants"] if p["checkout"] == run["checkout"] for c in p["claims"]],
                 "custody": [{k: v for k, v in c.items() if k != "process_baseline"}
@@ -83,7 +115,7 @@ class Runs:
                                          [cursor, *sorted(subjects), limit + 1]))
         data = [dict(row, data=json.loads(row["data"])) for row in rows[:limit]]
         return {"run": run["id"], "data": data, "cursor": data[-1]["seq"] if data else cursor,
-                "more": len(rows) > limit, "state": self.store.get(run["id"])["state"]}
+                "more": len(rows) > limit, "state": self.reported(self.store.get(run["id"]))[0]}
 
     def cancel_current(self, runid, generation):
         """Whether the cancel of this generation still stands: no resume has cleared it and no newer cancel replaced
@@ -104,9 +136,11 @@ class Runs:
 
     async def cancel(self, run, expired=False):
         run = self.store.get(run["id"])  # maintenance's deadline cancel runs later than its read
-        if expired and not self.expired(run):
+        if expired and (self.daemon.draining or not self.expired(run)):
             # Maintenance read the run before the awaits of the runs ahead of it: resumed with a new deadline, finished
-            # or cancelled since, its old deadline no longer holds. Nothing awaits between this check and the save below.
+            # or cancelled since, its old deadline no longer holds. While a stop drains, the next daemon cancels it: its
+            # settlement could start a writer's replacement after the stop listed the app-servers it ends (a run waiting
+            # for the lead holds no stop). Nothing awaits between this check and the save below.
             return self.summary(run)
         # Each cancel is a new generation: a resume that began before it does not clear it (resume compares them), and
         # each step of this cancel's pass and of its settlement first checks that it still stands (cancel_current).
@@ -156,13 +190,19 @@ class Runs:
             if not actor.get("listener"):
                 continue
             connection = self.daemon.connections.get(actor["listener"])
+            if not connection and self.store.get(actor["listener"]).get("recovery_error") == "ENDED":
+                continue  # ended to settle an input (end_writer): nothing runs there; its queue is read on its replacement
             try:
                 from .native import page
                 async for queued in page(connection, "thread/queue/list", {"threadId": actor["thread"]}):
                     for entry in queued["data"]:
                         if not self.cancel_current(runid, generation):
                             return self.superseded(runid, generation)
-                        await connection.call("thread/queue/delete", {"threadId": actor["thread"], "queuedSubmissionId": entry["id"]})
+                        deleted = await connection.call("thread/queue/delete", {"threadId": actor["thread"], "queuedSubmissionId": entry["id"]})
+                        if not deleted.get("deleted"):
+                            # Native started it first: its dispatch and a deletion hold one guard (ext/queue/src/service.rs).
+                            # Its turn is interrupted below, and its own records settle the message.
+                            continue
                         for message in list(self.store.all("message")):
                             if message.get("unit") == run["unit"] and entry["clientUserMessageId"] in (message["native_id"], message["native_id"] + ":relay"):
                                 message["delivery"] = "cancelled"
@@ -226,7 +266,6 @@ class Runs:
             done = await self._settle_cancel(runid)
             if done:
                 self.cancel_reconciled.pop(runid, None)
-                self.start_absent.pop(runid, None)
             return done
 
     async def _settle_cancel(self, runid):
@@ -235,8 +274,12 @@ class Runs:
         run = self.store.get(runid)
         if not run.get("cancel_requested"):
             return True
+        if run["state"] == "cancelled":
+            # Settled by the caller this one waited for (the cancel's own loop, maintenance): reported once. A newer
+            # cancel is a new generation, which sets cancelling first.
+            return True
         generation = run.get("cancel_generation", 0)
-        # A pass that reads native (reconciles, a lost start's outcome) at most every 2 s, by a monotonic clock: a wall
+        # A pass that reads native (reconciles, an input's outcome) at most every 2 s, by a monotonic clock: a wall
         # clock set back would hold the next one, and a cancel that waits for it.
         due = time.monotonic() - self.cancel_reconciled.get(runid, float("-inf")) > 2
         if due:
@@ -244,6 +287,8 @@ class Runs:
             from .recovery import reconcile_listener
             for ident in {a["listener"] for a in self.store.all("actor", run["unit"]) if a.get("listener")}:
                 listener = self.store.get(ident)
+                if listener.get("recovery_error") == "ENDED":
+                    continue  # ended to settle an input (end_writer): nothing runs there, and a cancel needs no replacement
                 if listener.get("recovery_state") == "failed" and listener.get("retry_at", 0) > time.time():
                     continue  # its retry is not due yet: a start that keeps failing is not tried every 2 s
                 try:
@@ -263,119 +308,482 @@ class Runs:
             return False
         if self.cancel_passes.get(runid):
             return False  # a cancel's pass is still interrupting and terminating: cancelled only once it ends
-        run = self.store.get(runid)
-        phase = (run.get("phases") or {}).get(run.get("phase")) or {}
-        if phase.get("state") in ("submitting", "uncertain") and not phase.get("turn"):
-            # Its turn/start's outcome is unknown: native may have started its turn. One in flight here is waited for;
-            # otherwise a read ordered after it tells (start_outcome), on a pass that reads native. Until one does,
-            # the run stays cancelling.
-            input_id = phase["input_id"]
-            if input_id in self.daemon.writer.starting or not due:
-                return False
-            first = self.start_absent.get(runid)
-            first = first[1] if first and first[0] == input_id else None
-            if first is not None and time.monotonic() - first < 2:
-                return False
-            turn = await self.start_outcome(run, phase)
-            if turn is None or not self.cancel_current(runid, generation):
-                self.start_absent.pop(runid, None)
-                return False
-            run = self.store.get(runid)
-            phase = run["phases"][run["phase"]]
-            if phase.get("turn") or phase["state"] not in ("submitting", "uncertain"):
-                return False  # its turn was seen meanwhile: the next pass settles it
-            if turn:
-                self.start_absent.pop(runid, None)
-                self.found_start(run, turn)
-                return False  # interrupted while it runs, then settled as any turn is
-            if first is None:
-                # turn/start answers once core holds its turn, but native reports the thread active only once that
-                # turn's task reports it started: a read between the two finds no turn on an idle thread. A second
-                # read, sent at least 2 s after this one, settles it.
-                self.start_absent[runid] = (input_id, time.monotonic())
-                return False
-            self.start_absent.pop(runid, None)
-            phase.update(state="not_started", status="not_started")
-            self.store.save(run)
-            self.store.event("workflow/submission_not_started", runid, {"input_id": phase["input_id"]})
-        # A steer the turn never took cannot enter it once no turn is active: say so, rather than wait
-        # for an echo that cannot come (a pause after a pending Send now never settled, measured 2.3.0).
-        # A later echo still enters it; only an explicit retry sends it again.
-        for message in list(self.store.all("message")):
-            if (message.get("unit") == run["unit"] and message["state"] not in ("entered_context", "acknowledged")
-                    and message["delivery"] == "submitted"):
-                async with self.daemon.messages.locks.hold(message["id"]):
-                    message = self.store.get(message["id"])
-                    if message["state"] not in ("entered_context", "acknowledged") and message["delivery"] == "submitted":
-                        message["delivery"] = "turn_ended"
-                        self.store.save(message)
-                        self.store.event("message/turn_ended", message["id"], {"run": runid})
-        if any(m.get("unit") == run["unit"] and m["state"] not in ("entered_context", "acknowledged")
-               and m["delivery"] in ("submitting", "submitted", "uncertain") for m in self.store.all("message")):
+        # An input whose RPC is in flight in this daemon is waited for: its result, or its loss, tells what it started.
+        # An input whose native outcome is unknown (a lost turn/start, a delivery not in context yet) may still start a
+        # turn: each is settled, on a pass that reads native, by reads in its thread's order or, where those cannot
+        # tell, by ending the app-server it went to and reading what that saved (settle_inputs). Until then the run
+        # stays cancelling.
+        if self.in_flight(self.store.get(runid)):
             return False
+        if self.unsettled(self.store.get(runid), "cancel"):
+            if not due or not await self.settle_inputs(runid, "cancel", generation=generation):
+                return False
         if not await self.threads_idle(run):
             return False  # a turn runs that no record shows: the next reconcile finds it, and it is interrupted
         run = self.store.get(runid)  # read after the awaits above: what a notification saved meanwhile is kept
-        if not run.get("cancel_requested") or run.get("cancel_generation", 0) != generation:
+        if not run.get("cancel_requested") or run.get("cancel_generation", 0) != generation or run["state"] == "cancelled":
             return True  # a resume or a newer cancel since then: this cancel saves nothing
         run["state"] = "cancelled"
         self.store.save(run)
-        self.store.event("run/cancelled", runid, {"terminal_and_processes_settled": True})
+        self.store.event("run/cancelled", runid, {"generation": generation, "terminal_and_processes_settled": True})
         await self.daemon.release_lease(run["checkout"])
         return True
 
-    async def start_outcome(self, run, phase):
-        """The turn that a phase's input entered when its turn/start result was lost, False when none did, or None
-        while that cannot be told. Native runs a thread's requests one at a time in arrival order, across connections,
-        and drops a closed connection's queued ones; turn/start starts or steers a turn, never queues, and answers once
-        core holds the turn it starts. So the thread/read of the status, sent after the loss, runs once that start has
-        ended or was dropped, and the read of the turns that follows (native saves the live thread first) holds the
-        input of a turn that ended. One read cannot tell, as native builds its turns before it reads the status. Nor can
-        an idle status alone: native reports a thread active once the turn's own task reports it started, after the
-        start answers, so False is settled by a second read (_settle_cancel). (codex 0.163.0: request_serialization.rs,
-        thread_processor.rs, thread_status.rs, session/turn_input.rs, tasks/mod.rs, tasks/regular.rs)"""
-        actor = self.store.get(run["root_actor"])
-        sent = phase.get("start_listener")
-        if sent and sent != actor.get("listener") and (self.store.get(sent, required=False) or {}).get("state") in ("connected", "starting"):
-            return None  # its start went to an app-server that still runs: no read of another one is ordered after it
-        connection = self.daemon.connections.get(actor.get("listener"))
-        if not connection or connection.closed:
-            return None
-        try:
-            status = await connection.call("thread/read", {"threadId": actor["thread"], "includeTurns": False})
-            read = await connection.call("thread/read", {"threadId": actor["thread"], "includeTurns": True})
-        except (CoordinatorError, OSError) as exc:
-            self.store.event("run/cancel_start_unread", run["id"], {"code": getattr(exc, "code", type(exc).__name__)})
-            return None
-        turns = read["thread"].get("turns") or []
-        for turn in turns:
-            if any(item.get("type") == "userMessage" and item.get("clientId") == phase["input_id"] for item in turn.get("items") or []):
-                return turn
-        if any((r["thread"].get("status") or {}).get("type") == "active" for r in (status, read)):
-            # A turn runs, and native may not have saved its input yet: it may be this input's. It is the actor's
-            # active turn, so the cancel interrupts it, and the outcome is read again once the thread is idle.
-            running = next((t for t in reversed(turns) if t["status"] == "inProgress"), None)
-            actor = self.store.get(actor["id"])
-            if running and not actor.get("active_turn"):
-                actor.update(active_turn=running["id"], state="running")
-                self.store.save(actor)
-            return None
-        return False
+    def unsettled(self, run, mode, holding=None):
+        """The unit's native inputs whose outcome is not known, for a settlement in `mode` ("cancel", "resume", or
+        "background": maintenance's, of deliveries). The run's phase input whose turn/start result was lost
+        (submitting, uncertain) or, answered, whose turn was never seen to end (submitted); unless for a resume, each
+        writer delivery not in context whose result was lost (submitting, uncertain) or, answered and not seen to
+        enter (submitted), one for a cancel, and for maintenance once no turn of the unit runs. One whose RPC is in
+        flight in this daemon is not: its start is in writer.starting, and a delivery holds its message's lock
+        (`holding`: the caller's own)."""
+        found = []
+        actors = list(self.store.all("actor", run["unit"]))
+        root = next((a for a in actors if a["id"] == run.get("root_actor")), {})
+        if mode != "background":
+            name = run.get("phase")
+            phase = (run.get("phases") or {}).get(name) or {}
+            if (phase.get("status") is None and phase.get("input_id") and phase["input_id"] not in self.daemon.writer.starting
+                    and (phase.get("state") in ("submitting", "uncertain") or phase.get("state") == "submitted" and phase.get("turn"))
+                    and not (phase.get("turn") and root.get("active_turn") == phase["turn"])):
+                found.append({"key": ("phase", name), "client": phase["input_id"], "method": "turn/start",
+                              "state": phase["state"], "listener": phase.get("start_listener"), "turn": phase.get("turn"),
+                              "texts": [i["text"] for i in phase.get("input", []) if i.get("type") == "text"], "needle": None,
+                              "sent": phase.get("submitted"), "since": phase.get("submitted")})
+        if mode == "resume":
+            return found
+        running = any(a.get("active_turn") for a in actors)
+        for message in self.store.selected("SELECT * FROM records WHERE kind='message' AND json_extract(data,'$.unit')=? AND "
+                                           "json_extract(data,'$.delivery') IN ('submitting','uncertain','submitted') AND "
+                                           "json_extract(data,'$.state') NOT IN ('entered_context','acknowledged') ORDER BY id",
+                                           (run["unit"],)):
+            if self.daemon.lead_mail(message) or not message.get("attempts"):
+                continue
+            if (message.get("relay") or {}).get("state") == "entered_context":
+                continue  # in the root's context: the child's own acknowledgement settles the rest
+            if message["id"] != holding and message["id"] in self.daemon.messages.locks.entries:
+                continue  # its delivery is under way
+            attempt = self.store.get(message["attempts"][-1], required=False) or {}
+            if message["delivery"] == "submitted" and mode == "background" and running:
+                continue  # native has it: its echo enters it, or it is read once no turn runs
+            # Every attempt sends the same client id and text: a record of an earlier one is this message's too.
+            first = self.store.get(message["attempts"][0], required=False) or {}
+            found.append({"key": ("message", message["id"]), "client": attempt.get("client_id") or message["native_id"],
+                          "method": attempt.get("method"), "state": message["delivery"], "listener": attempt.get("listener"),
+                          "turn": ((attempt.get("result") or {}).get("turn") or {}).get("id"),
+                          "texts": [], "needle": "C1_MESSAGE " + message["id"],
+                          "sent": attempt.get("created"), "since": first.get("created")})
+        return found
 
-    def found_start(self, run, turn):
-        """Record the turn a lost start's input entered, as its notifications would have: the phase's turn and its
-        input seen, then its end, or the actor's active turn while it runs (the cancel's next pass interrupts it)."""
+    def in_flight(self, run):
+        """A native input of the unit whose RPC is in flight in this daemon: a phase's turn/start (writer.starting), or
+        a delivery not in context under its message's lock."""
+        return (any(p.get("input_id") in self.daemon.writer.starting for p in (run.get("phases") or {}).values())
+                or any(m["id"] in self.daemon.messages.locks.entries and not self.daemon.lead_mail(m)
+                       for m in self.store.selected(
+                           "SELECT * FROM records WHERE kind='message' AND json_extract(data,'$.unit')=? AND "
+                           "json_extract(data,'$.delivery') IN ('submitting','uncertain','submitted') AND "
+                           "json_extract(data,'$.state') NOT IN ('entered_context','acknowledged')", (run["unit"],))))
+
+    async def settle_inputs(self, runid, mode, generation=None, holding=None):
+        """Settle each of the unit's inputs whose native outcome is not known (unsettled) as its notifications would
+        have, from native's own records of that input: it entered a turn (that turn, and its end when it has ended),
+        or it waits in native's queue. A record's absence proves nothing, so an input that nothing can start any more
+        and nothing shows is unproven: only the lead sends it again (a resume, message/retry). Reads first (locate);
+        where they cannot tell, the app-server the input went to is ended, so that nothing can start it, and what it
+        saved read (end_writer), with no bound of time in the decision. Returns whether none is left."""
+        async with self.settle_locks.hold(runid):
+            unqueued = set()  # queued inputs native's queue did not hold when read, on an app-server ended since
+            for attempt in (0, 1):
+                run = self.store.get(runid)
+                if mode == "cancel" and not self.cancel_current(runid, generation):
+                    return True
+                inputs = self.unsettled(run, mode, holding)
+                if not inputs:
+                    return True
+                ambiguous = {}  # listener to end -> whether it was connected when read
+                for item, outcome in await self.locate(run, inputs, mode, unqueued):
+                    if outcome[0] == "ambiguous":
+                        ambiguous[outcome[2]] = self.connected(outcome[2])
+                        if outcome[3]:
+                            unqueued.add(item["key"])
+                    elif outcome[0] == "wait":
+                        self.running(runid, outcome[2])
+                    elif item["key"][0] == "phase":
+                        self.apply_phase(runid, item, outcome)
+                    else:
+                        await self.apply_message(runid, item, outcome, mode, generation, holding)
+                if not ambiguous or attempt or not await self.end_writer(runid, ambiguous, mode, holding):
+                    break
+            return not self.unsettled(self.store.get(runid), mode, holding)
+
+    async def settle_delivery(self, message, actor):
+        """Settle a delivery whose native outcome is not known, from deliver (maintenance's retries, under the
+        message's lock), with the unit's other such deliveries (settle_inputs). Native is read for a run once each
+        2 s at most, by a monotonic clock. A cancel settles its run's own (_settle_cancel)."""
+        run = self.store.get(actor["run"])
+        if run.get("cancel_requested") or self.daemon.draining or self.daemon.recovery_barrier:
+            return
+        if not self.inputs_due(run["id"]):
+            return
+        if await self.settle_inputs(run["id"], "background", holding=message["id"]):
+            self.input_reads.pop(run["id"], None)
+
+    def inputs_due(self, runid):
+        """Whether maintenance's settlement may read native for this run's inputs now: once each 2 s at most, by a
+        monotonic clock (a delivery's, settle_delivery; a workflow phase's, writer.advance)."""
+        if time.monotonic() - self.input_reads.get(runid, float("-inf")) < 2:
+            return False
+        self.input_reads[runid] = time.monotonic()
+        return True
+
+    async def locate(self, run, inputs, mode, unqueued=()):
+        """Where each input went, as [(input, outcome)]: ("entered", turn, status, source), status that turn's end or
+        None while it runs; ("queued", entry); ("unproven", why) when nothing can start it any more and no record of it
+        shows where it went (unproven_reason); ("wait", why, running turn); or
+        ("ambiguous", why, listener, unqueued) when only ending that app-server can tell, `unqueued` whether native's
+        queue, read there in the thread's order, did not hold the input. Each is read from where it went: the
+        app-server it was sent to, if it has exited (by birth identity), from what that saved (its rollout, final
+        then); if it runs, by reads in its thread's own order on its connection. `unqueued` holds the queued inputs
+        whose queue read was on an app-server ended since."""
+        root = self.store.get(run["root_actor"])
+        groups, outcomes = {}, []
+        for item in inputs:
+            groups.setdefault(item["listener"] or root.get("listener"), []).append(item)
+        for ident, items in groups.items():
+            if not await self.app_server_runs(ident):
+                outcomes += await self.locate_saved(run, root, ident, items, unqueued)
+            elif ident == root.get("listener") and self.connected(ident):
+                outcomes += await self.locate_live(run, root, self.daemon.connections[ident], items, mode)
+            else:
+                outcomes += [(i, ("ambiguous", "its app-server runs without a connection to read it in order", ident, False))
+                             for i in items]
+        return outcomes
+
+    def connected(self, ident):
+        connection = self.daemon.connections.get(ident)
+        return bool(connection and not connection.closed and (self.store.get(ident, required=False) or {}).get("state") == "connected")
+
+    async def ordered_reads(self, connection, thread, queue, turns=True):
+        """The thread read in its own order, after every input sent to it on this app-server before: native runs a
+        thread's requests one at a time in arrival order, across connections, and drops a closed connection's queued
+        ones (request_serialization.rs). Its queue when asked, its status, then its turns with their items (unless
+        `turns` is false and a turn runs). One read cannot tell a running turn, as native builds its turns before it
+        reads the status. Returns (reads, None) or (None, code)."""
+        from .native import page
+        try:
+            entries = {}
+            if queue:
+                async for result in page(connection, "thread/queue/list", {"threadId": thread}):
+                    entries.update({e.get("clientUserMessageId"): e["id"] for e in result["data"]})
+            status = await connection.call("thread/read", {"threadId": thread, "includeTurns": False})
+            active = (status["thread"].get("status") or {}).get("type") == "active"
+            history = []
+            if turns or not active:
+                read = await connection.call("thread/read", {"threadId": thread, "includeTurns": True})
+                history = read["thread"].get("turns") or []
+                active = active or (read["thread"].get("status") or {}).get("type") == "active"
+        except (CoordinatorError, OSError) as exc:
+            return None, getattr(exc, "code", type(exc).__name__)
+        return {"queue": entries, "active": active, "turns": history,
+                "running": next((t["id"] for t in reversed(history) if t["status"] == "inProgress"), None)}, None
+
+    @staticmethod
+    def in_history(turns, client):
+        return next((t for t in turns if any(i.get("type") == "userMessage" and i.get("clientId") == client
+                                             for i in t.get("items") or [])), None)
+
+    async def locate_live(self, run, root, connection, items, mode):
+        """Inputs sent to the running, connected app-server: read in the thread's order. A turn/start or a queue/add
+        is told only by its record: native answers turn/start once core holds the turn, but reports the thread active
+        and records the input once that turn's task runs, so an idle thread without it may still be about to start
+        it (tasks/mod.rs start_task, tasks/regular.rs); and a queued input leaves the queue once its turn has started,
+        before it is recorded (ext/queue/src/service.rs). Nothing can start an input any more once the turn native
+        started for it has ended, nor a steer once no turn runs: the turn it entered records it when it takes it or at
+        its finish, and an abort drops it (tasks/mod.rs on_task_finished, abort_all_tasks). Without its record, such an
+        input is unproven: history is native's reading of the rollout, which lacks what native failed to write."""
+        reads, error = await self.ordered_reads(connection, root["thread"], any(i["method"] == "thread/queue/add" for i in items),
+                                                turns=mode != "background")
+        if reads is None:
+            return [(i, ("ambiguous", "its thread could not be read: " + error, root["listener"], False)) for i in items]
+        outcomes = []
+        for item in items:
+            turn = self.in_history(reads["turns"], item["client"])
+            if turn:
+                outcome = ("entered", turn["id"], None if turn["status"] == "inProgress" else turn["status"], "history")
+            elif item["method"] == "thread/queue/add" and item["client"] in reads["queue"]:
+                outcome = ("queued", reads["queue"][item["client"]])
+            elif reads["active"]:
+                outcome = ("wait", "a turn runs that may take it", reads["running"])
+            elif item["turn"] and any(t["id"] == item["turn"] for t in reads["turns"]):
+                outcome = ("unproven", "the turn native started for it has ended, and its thread's history holds no record "
+                                       "of it, " + self.unproven_reason(run, root, root["listener"], item))
+            elif item["method"] == "turn/steer":
+                outcome = ("unproven", "no turn runs, and its thread's history holds no record of it (a steer enters its "
+                                       "turn or is dropped with it), " + self.unproven_reason(run, root, root["listener"], item))
+            elif item["state"] == "submitted" and mode == "background":
+                # Native answered it: its turn is about to start, or it is about to leave the queue for one. A cancel
+                # or a resume tells by ending the app-server; maintenance waits for it to show.
+                outcome = ("wait", "native answered it, and its turn has not shown yet", None)
+            else:
+                # Read after it in the thread's order, native's queue does not hold a queued one: once this app-server
+                # has ended, what it saved tells whether a turn took it (locate_saved).
+                outcome = ("ambiguous", "the thread is idle and holds no record of it", root["listener"],
+                           item["method"] == "thread/queue/add")
+            outcomes.append((item, outcome))
+        return outcomes
+
+    async def locate_saved(self, run, root, ident, items, unqueued=()):
+        """Inputs sent to an app-server that has exited: its rollout is final, and none can start a turn/start's or a
+        steer's input now, as native keeps it only in that process. One whose client id's record the rollout holds
+        entered that record's turn. One it holds no record of is unproven, as native goes on from memory when it fails
+        to write a record (core session/mod.rs persist_rollout_items): only the lead sends it again (a resume, a
+        message retry), told what the rollout and the log show of it (unproven_reason). A queued one stays in native's
+        durable queue (it survives restarts: thread-store/src/queue_store.rs) until a turn starts with it, and leaves
+        it before that turn records it (ext/queue/src/service.rs dispatch_if_idle): unproven as well once the queue
+        did not hold it when read on an app-server ended since (`unqueued`). Otherwise the queue is read on the
+        replacement, which dispatches a resumed thread's queue itself; where neither its queue nor its history holds
+        the input, the replacement is ended too, as it may be starting it. The replacement's history is native's own
+        reading of the rollout. A turn without an end in the rollout ended with that process."""
+        wanted = {i["key"]: (i["client"], i["texts"], i["needle"], i.get("since")) for i in items}
+        saved = await asyncio.to_thread(rollout.scan, run.get("rollout"), root.get("thread"), wanted)
+        replacement = root.get("listener") if root.get("listener") != ident else None
+        if replacement and not (self.connected(replacement) and await self.app_server_runs(replacement)):
+            replacement = None
+        reads, outcomes = None, []
+        for item in items:
+            turn = saved["found"].get(item["key"]) if saved["readable"] else None
+            if turn:
+                outcomes.append((item, ("entered", turn, saved["turns"].get(turn) or "interrupted", "rollout")))
+                continue
+            if saved["readable"] and (item["method"] != "thread/queue/add" or item["key"] in unqueued):
+                outcomes.append((item, ("unproven", "its app-server exited, and its rollout holds no record of it"
+                                        + (", nor native's queue read after it" if item["key"] in unqueued else "") + ", "
+                                        + self.unproven_reason(run, root, ident, item, saved))))
+                continue
+            # Native's durable queue, or the thread's history when the rollout cannot be read: on the replacement.
+            if not replacement:
+                outcomes.append((item, ("wait", "a replacement app-server must read it: " + (saved.get("reason") or "native's queue"), None)))
+                continue
+            if reads is None:
+                reads, error = await self.ordered_reads(self.daemon.connections[replacement], root["thread"], True)
+                if reads is None:
+                    outcomes += [(i, ("wait", "the replacement could not read it: " + error, None)) for i in items[items.index(item):]]
+                    break
+            turn = self.in_history(reads["turns"], item["client"])
+            if turn:
+                outcomes.append((item, ("entered", turn["id"], None if turn["status"] == "inProgress" else turn["status"], "history")))
+            elif item["method"] == "thread/queue/add" and item["client"] in reads["queue"]:
+                outcomes.append((item, ("queued", reads["queue"][item["client"]])))
+            elif reads["active"]:
+                outcomes.append((item, ("wait", "a turn runs on the replacement that may have taken it", reads["running"])))
+            elif item["method"] == "thread/queue/add" and item["key"] not in unqueued:
+                outcomes.append((item, ("ambiguous", "native's queue no longer holds it, and the replacement may be starting it",
+                                        replacement, True)))
+            else:
+                # Here only where the rollout cannot be read: the replacement's history is native's reading of it.
+                outcomes.append((item, ("unproven", "its app-server exited, its rollout cannot be read (" + saved["reason"]
+                                        + "), and neither its history nor native's queue holds it, "
+                                        + self.unproven_reason(run, root, ident, item))))
+        return outcomes
+
+    def unproven_reason(self, run, root, ident, item, saved=None):
+        """What the lead is told of an input nothing can start any more and no record of which shows where it went: no
+        proof either way, as native goes on from memory when it fails to write a record, and its log can lose the line
+        telling of the failure, so its rollout's silence (or history's) says nothing. What the app-server `ident` and
+        its rollout show is named: a failure of its session's or its rollout writer's that native logged from the
+        send on, or that its log shows nothing of native's session after the send (rollout.native_mark), for a queued
+        input the same of each of its thread's app-servers; damage to the rollout after the input was sent; and a user
+        message holding its text without its client id's record (rollout.scan)."""
+        sent, told = item.get("sent"), []
+        hosts = [ident]
+        if item["method"] == "thread/queue/add":
+            hosts += [l["id"] for l in self.store.all("listener", run["id"]) if l.get("actor") == root["id"] and l["id"] != ident]
+        for host in hosts:
+            listener = self.store.get(host, required=False) or {}
+            if not listener.get("log"):
+                if host == ident:
+                    told.append("its app-server kept no log of its rollout's writing (started before 2.4.1)")
+                continue
+            # What it wrote that this daemon has not read yet (it is read to its end before a stop deletes it).
+            for operation in self.daemon.read_native_log(host):
+                self.daemon.background(self.daemon.settle_returned(self.store.get(operation)))
+            marks = self.daemon.native_log(self.store.get(host))
+            failed = marks.get("failed")
+            if sent is not None and failed and failed["time"] >= sent - rollout.MARGIN_S:
+                told.append("native logged a failure of its session or rollout writing after it was sent (" + failed["line"] + ")")
+            elif sent is not None and host == ident and (marks.get("written") or {}).get("time", float("-inf")) <= sent:
+                told.append("the log of its app-server shows nothing of native's session after it was sent")
+        if sent is None:
+            told.append("when it was sent is not recorded")
+        damage = (saved or {}).get("damage")
+        if damage and (damage["mended"] or float("inf")) >= (item.get("since") or sent or 0) - rollout.MARGIN_S:
+            told.append("that rollout " + damage["reason"])
+        if item["key"] in (saved or {}).get("texts", {}):
+            turn, when = saved["texts"][item["key"]]
+            told.append("a user message of turn " + str(turn) + " holds its text without its client id's record"
+                        + (", at a time that cannot be read" if when is None else ""))
+        return ("which proves nothing, as native goes on from memory when it fails to write a record and its log can "
+                "lose the line telling of it" + (": " + "; ".join(told) if told else ""))
+
+    def apply_phase(self, runid, item, outcome):
+        """Record a phase input's outcome as its notifications would have."""
+        run = self.store.get(runid)
+        phase = (run.get("phases") or {}).get(item["key"][1]) or {}
+        if phase.get("status") is not None or phase.get("input_id") != item["client"]:
+            return  # settled meanwhile: its notifications, a reconcile's history
         actor = self.store.get(run["root_actor"])
-        input_id = run["phases"][run["phase"]]["input_id"]
-        item = next(i for i in turn["items"] if i.get("type") == "userMessage" and i.get("clientId") == input_id)
-        self.daemon.writer.observe(actor, "item/completed", {"threadId": actor["thread"], "turnId": turn["id"], "item": item})
-        if turn["status"] == "inProgress":
-            actor = self.store.get(actor["id"])
-            actor.update(active_turn=turn["id"], state="running")
+        if outcome[0] == "entered":
+            turn, status = outcome[1], outcome[2]
+            self.daemon.writer.observe(actor, "item/completed", {"threadId": actor["thread"], "turnId": turn,
+                                       "item": {"type": "userMessage", "clientId": item["client"], "id": ""}})
+            if status is None:
+                # Interrupted while it runs by a cancel, and settled as any turn is.
+                actor = self.store.get(actor["id"])
+                actor.update(active_turn=turn, state="running")
+                self.store.save(actor)
+                run = self.store.get(runid)
+                if run["state"] == "submission_uncertain":
+                    run["state"] = "running"
+                    self.store.save(run)
+            else:
+                self.daemon.writer.observe(actor, "turn/completed", {"threadId": actor["thread"], "turn": {"id": turn, "status": status}})
+            self.store.event("workflow/submission_found", runid, {"input_id": item["client"], "turn": turn, "status": status,
+                                                                  "source": outcome[3]})
+        elif outcome[0] == "unproven":
+            # Nothing can tell whether it ran, so nothing sends it again of itself (writer.advance): the lead's
+            # explicit resume sends it, ahead of its own text, as the lead's decision (resume); a cancel ends the run
+            # without it. Nothing can start it any more, so it holds nothing of the unit in flight (unit_quiet).
+            phase.update(state="unproven", unproven=outcome[1])
+            if not run.get("cancel_requested"):
+                run["state"] = "submission_uncertain"
+            self.store.save(run)
+            self.store.event("workflow/submission_unproven", runid, {"input_id": item["client"], "proof": outcome[1]})
+
+    def running(self, runid, turn):
+        """A turn runs on the root thread that native may not have recorded its input in yet: it may be an unsettled
+        input's. It is the root actor's active turn, so a cancel interrupts it and a resume waits for it; the input's
+        outcome is read once it ends."""
+        actor = self.store.get(self.store.get(runid)["root_actor"])
+        if turn and not actor.get("active_turn"):
+            actor.update(active_turn=turn, state="running")
             self.store.save(actor)
-        else:
-            self.daemon.writer.observe(actor, "turn/completed", {"threadId": actor["thread"], "turn": turn})
-        self.store.event("workflow/submission_found", run["id"], {"input_id": input_id, "turn": turn["id"], "status": turn["status"]})
+
+    async def apply_message(self, runid, item, outcome, mode, generation, holding):
+        """Record a delivery's outcome. A delivery under way meanwhile (its lock held) is left to it."""
+        ident = item["key"][1]
+        if outcome[0] == "wait" or ident != holding and ident in self.daemon.messages.locks.entries:
+            return
+        async with nullcontext() if ident == holding else self.daemon.messages.locks.hold(ident):
+            message = self.store.get(ident)
+            if message["state"] in ("entered_context", "acknowledged") or message["delivery"] != item["state"]:
+                return  # settled meanwhile
+            if mode == "cancel" and not self.cancel_current(runid, generation):
+                return
+            root = self.store.get(self.store.get(runid)["root_actor"])
+            if outcome[0] == "entered":
+                self.daemon.messages.entered(root["id"], item["client"], {"settled": outcome[3], "turn": outcome[1]})
+                message = self.store.get(ident)
+                message["delivery"] = "submitted"
+                self.store.save(message)
+            elif outcome[0] == "queued" and mode == "cancel":
+                connection = self.daemon.connections.get(root["listener"])
+                try:
+                    if not connection or connection.closed:
+                        raise CoordinatorError("LISTENER_RECOVERING", "The writer's app-server is not connected")
+                    deleted = await connection.call("thread/queue/delete", {"threadId": root["thread"], "queuedSubmissionId": outcome[1]})
+                except (CoordinatorError, OSError) as exc:
+                    self.store.event("message/cancel_refused", ident, {"queue_id": outcome[1], "code": getattr(exc, "code", type(exc).__name__)})
+                    return
+                if not deleted.get("deleted"):
+                    return  # native started it first (one guard holds its dispatch and a deletion): its turn's records settle it
+                message = self.store.get(ident)
+                message["delivery"] = "cancelled"
+                self.store.save(message)
+                self.store.event("message/cancelled", ident, {"queue_id": outcome[1]})
+            elif outcome[0] == "queued":
+                message["delivery"] = "submitted"
+                self.daemon.messages.transition(message, "submitted", {"native_queue": True, "queue_id": outcome[1]})
+            elif outcome[0] == "unproven" and self.daemon.messages.notice(message):
+                # A notice (a legacy one 2.4.3 steered) starts no turn and is owed at least once: delivered again as
+                # notices are (deliver_notice), into history only, where C1_NOTICE <id> tells its copies apart.
+                message["delivery"] = "pending"
+                self.store.save(message)
+                self.store.event("message/delivery_unproven", ident, {"attempt": message["attempts"][-1], "proof": outcome[1],
+                                                                      "possible_duplicate_native_delivery": True})
+            elif outcome[0] == "unproven":
+                # Nothing can tell whether its turn ran, so it is never delivered again of itself (deliver): only the
+                # lead's explicit retry (message/retry) sends it, which may deliver it twice. A cancel ends the run
+                # without it: nothing can start it any more.
+                message.update(delivery="unproven", unproven=outcome[1] + ". message/retry sends it again, which may deliver it twice")
+                self.store.save(message)
+                self.store.event("message/delivery_unproven", ident, {"attempt": message["attempts"][-1], "proof": outcome[1]})
+
+    def quiet_but_inputs(self, run, mode, holding=None):
+        """Nothing of the run's unit in flight but its inputs of unknown outcome, so ending its app-server cuts no
+        work: no turn, custody, admission or live operation, no input start or delivery under way in this daemon, and
+        no resume, advance, re-admission or cancel of the run under way but the caller's own (each holds the run's
+        writer lock or its cancel lock)."""
+        unit = run["unit"]
+        if (any(a.get("active_turn") for a in self.store.all("actor", unit)) or self.daemon.custody.unit_active(unit)
+                or self.daemon.admitting_units.get(unit)
+                or any(o["state"] in ("prepared", "allowed", "running") or o.get("executing") for o in self.store.all("operation", unit))
+                or any(p.get("input_id") in self.daemon.writer.starting for p in (run.get("phases") or {}).values())):
+            return False
+        if mode != "resume" and run["id"] in self.daemon.writer.locks.entries or mode != "cancel" and run["id"] in self.cancel_locks.entries:
+            return False
+        if self.cancel_passes.get(run["id"]):
+            return False
+        return not any(m["id"] != holding and m["id"] in self.daemon.messages.locks.entries for m in self.store.selected(
+            "SELECT * FROM records WHERE kind='message' AND json_extract(data,'$.unit')=?", (unit,)))
+
+    async def end_writer(self, runid, ambiguous, mode, holding=None):
+        """End the app-servers these inputs went to, so that what each saved is final, once nothing of the unit is in
+        flight but its inputs of unknown outcome (quiet_but_inputs) and native reports each of its threads idle. Each
+        is ended as one replaced for its hook program is (stop_listener: its birth identity checked, SIGTERM, Codex's
+        own drain, then a kill), after a startup interrupt (an empty turnId: Op::Interrupt, answered once submitted)
+        ordered after every input sent to its thread before it, so a task one of them started aborts rather than runs
+        through the drain (app-server turn_processor.rs turn_interrupt, core tasks/mod.rs abort_all_tasks). Its record
+        is then failed with ENDED and no retry wait: maintenance replaces it while work is owed to its writer
+        (writer_owed), and a resume or a reconcile replaces it as one that died. `ambiguous` maps each to whether it
+        was connected when its inputs were read. Returns whether each has exited."""
+        from .recovery import READMIT_DRAIN_S
+        if self.daemon.draining or self.daemon.recovery_barrier:
+            return False
+        async with self.daemon.reconcile_locks.hold(runid):
+            for ident, was_connected in ambiguous.items():
+                if not ident or not await self.app_server_runs(ident):
+                    continue
+                if self.connected(ident) != was_connected:
+                    return False  # reconciled since it was read (reattached, or replaced): read again first
+                run = self.store.get(runid)
+                root = self.store.get(run["root_actor"])
+                if not self.quiet_but_inputs(run, mode, holding) or not await self.threads_idle(run):
+                    return False
+                connection = self.daemon.connections.get(ident)
+                if connection and not connection.closed:
+                    try:
+                        await connection.call("turn/interrupt", {"threadId": root["thread"], "turnId": ""})
+                    except (CoordinatorError, OSError) as exc:
+                        self.store.event("run/startup_interrupt_refused", runid, {"listener": ident, "code": getattr(exc, "code", type(exc).__name__)})
+                # Read after the awaits above. Nothing awaits from here to stop_listener's first save (stopping): a
+                # delivery, a submission or a hook after it finds the app-server not connected, and is refused.
+                if not self.quiet_but_inputs(self.store.get(runid), mode, holding):
+                    return False
+                listener = self.store.get(ident)
+                listener["ended"] = "to settle inputs whose native outcome reads could not tell"
+                self.store.save(listener)
+                try:
+                    await self.daemon.stop_listener(listener, drain_s=READMIT_DRAIN_S, kill=True)
+                except (CoordinatorError, OSError) as exc:
+                    self.store.event("listener/end_refused", ident, {"run": runid, "code": getattr(exc, "code", type(exc).__name__)})
+                    return False
+                listener = self.store.get(ident)
+                if self.store.get(listener["actor"]).get("listener") == ident:
+                    listener.update(recovery_state="failed", recovery_error="ENDED", retry_at=0)
+                    self.store.save(listener)
+                self.store.event("listener/ended", ident, {"run": runid, "reason": listener["ended"]})
+        return True
 
     async def threads_idle(self, run):
         """Whether native reports no turn running on the unit's threads, each read in its thread's own order: a turn
@@ -423,6 +831,19 @@ class Runs:
             return None
         return False
 
+    @staticmethod
+    def resendable(run):
+        """Whether a resume sends the run's current phase input again, ahead of its own text: one whose outcome
+        nothing can tell (unproven), which only the lead's resume sends."""
+        return (run.get("phases") or {}).get(run.get("phase"), {}).get("state") == "unproven"
+
+    @staticmethod
+    def awaiting_lead(run):
+        """A run that waits only for the lead's decision on its unproven input: nothing of it can run until a resume
+        sends that input again or a cancel ends the run, so, like a blocked run, it holds no stop and no compatibility
+        lease (the resume's submission takes the lease again)."""
+        return run["state"] == "submission_uncertain" and Runs.resendable(run)
+
     async def resume(self, run, text, deadline=None, images=None):
         from .writer import image_paths, IMAGES_NUDGE
         images = image_paths(images)
@@ -436,13 +857,27 @@ class Runs:
             raise CoordinatorError("RUN_DEADLINE", "A resumed turn requires a fresh deadline within the supported runtime budget")
         generation = self.store.get(run["id"]).get("cancel_generation", 0)
         async with self.daemon.writer.locks.hold(run["id"]):
-            root = self.store.get(run["root_actor"])
             from .recovery import reconcile_listener
+            # A prior input whose native outcome is not known is settled first: by reads, or by ending the app-server
+            # it went to and reading what that saved (settle_inputs). Never resumed beside it, nor left unresumable.
+            # A replacement reads what a rollout could not tell.
+            for replaced in (False, True):
+                if not self.unsettled(self.store.get(run["id"]), "resume") or await self.settle_inputs(run["id"], "resume"):
+                    break
+                if any(a.get("active_turn") for a in self.store.all("actor", run["unit"])):
+                    raise CoordinatorError("RUN_ACTIVE", "Collect this run; an active or uncertain turn cannot be resumed")
+                if replaced:
+                    raise CoordinatorError("SUBMISSION_UNCERTAIN", "The prior input's native outcome cannot be told while "
+                                           "work of its unit is in flight; resume again once it is quiet")
+                await reconcile_listener(self.daemon, self.store.get(self.store.get(run["root_actor"])["listener"]), advance=False)
+            root = self.store.get(run["root_actor"])
             # Reconcile without advancing the workflow while this control lock is held.
             await reconcile_listener(self.daemon, self.store.get(root["listener"]), advance=False)
             run = self.store.get(run["id"])
             eligible = TERMINAL | ({"idle"} if not run.get("workflow") else set())
-            if run["state"] not in eligible or any(a.get("active_turn") for a in self.store.all("actor", run["unit"])):
+            # A run whose phase input nothing can tell waits for the lead (unproven): this resume sends it, ahead of
+            # its own text.
+            if (run["state"] not in eligible and not self.resendable(run)) or any(a.get("active_turn") for a in self.store.all("actor", run["unit"])):
                 raise CoordinatorError("RUN_ACTIVE", "Collect this run; an active or uncertain turn cannot be resumed")
             if self.store.get(run["unit"])["state"] != "open":
                 raise CoordinatorError("UNIT_FROZEN", "Reopen a sealed unit before resuming; published units cannot resume")
@@ -456,9 +891,10 @@ class Runs:
             if run.get("cancel_generation", 0) != generation:
                 raise CoordinatorError("RUN_CANCELLED", "The run was cancelled while this resume waited; the cancel stands. "
                                        "Resume again to continue it")
-            if run["state"] not in eligible or any(a.get("active_turn") for a in self.store.all("actor", run["unit"])):
+            if (run["state"] not in eligible and not self.resendable(run)) or any(a.get("active_turn") for a in self.store.all("actor", run["unit"])):
                 raise CoordinatorError("RUN_ACTIVE", "Collect this run; an active or uncertain turn cannot be resumed")
             old = run.get("phases", {}).get(run.get("phase"), {})
+            resent = "resumed_unproven" if old.get("state") == "unproven" else None
             if old.get("state") in ("submitting", "submitted", "uncertain") and old.get("status") is None:
                 raise CoordinatorError("SUBMISSION_UNCERTAIN", "Reconcile the prior native input identity before resuming")
             missing = []
@@ -472,13 +908,25 @@ class Runs:
                         missing.append(item["path"])
             run.setdefault("previous_phases", []).append(dict(old, phase=run.get("phase")))
             inputs = [{"type": "text", "text": "Continue the same task under the original instructions.\n" + text}]
+            if resent:
+                # No record shows it in the thread, so the continuation carries it, ahead of the new text. It may have
+                # run, its records lost: sending it again is this resume's decision, recorded as such.
+                inputs = [i for i in old.get("input", []) if i.get("type") == "text"] + inputs
             inputs += [{"type": "localImage", "path": p} for p in images]
             run.setdefault("phase", "continuation")
-            run.setdefault("phases", {})[run["phase"]] = {"state": "prepared", "input_id": uid("input"), "input": inputs,
-                "input_digest": digest(inputs), "messages": {}, "created": time.time(), "unknown_baseline": []}
+            record = {"state": "prepared", "input_id": uid("input"), "input": inputs, "input_digest": digest(inputs),
+                      "messages": {}, "created": time.time(), "unknown_baseline": []}
+            if resent:
+                record["resent"] = old["input_id"]
+            run.setdefault("phases", {})[run["phase"]] = record
             run.update(state="transition_pending", cancel_requested=False)
             if run.get("workflow"):
                 run["workflow"]["deadline"] = deadline
-            self.store.save(run)
+            with self.store.transaction():
+                self.store.save(run)
+                if resent:
+                    self.store.event("run/input_resent", run["id"], dict({"phase": run["phase"], "input_id": record["input_id"],
+                                                                          "resent": record["resent"], "reason": resent},
+                                                                         **({"proof": old["unproven"]} if old.get("unproven") else {})))
             await self.daemon.writer.submit(run["id"])
             return dict(self.summary(self.store.get(run["id"])), missing_historical_images=missing)

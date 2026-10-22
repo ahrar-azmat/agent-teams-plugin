@@ -7,10 +7,12 @@ establish an exact patch. UNKNOWN history cannot be erased by matching bytes.
 import asyncio
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import tempfile
 import time
 import unicodedata
@@ -57,11 +59,11 @@ def normalize(checkout, value):
         except (FileNotFoundError, NotADirectoryError):
             continue
         if stat.S_ISLNK(info.st_mode):
-            raise CoordinatorError("PATH_SYMLINK", "Mutation traverses a symlink", {"path": str(relative)})
+            raise CoordinatorError("PATH_SYMLINK", "Mutation traverses a symlink", {"path": str(relative), "checkout": checkout.get("id")})
         if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
-            raise CoordinatorError("PATH_HARDLINK", "Hardlinked mutations cannot be modelled", {"path": str(relative)})
+            raise CoordinatorError("PATH_HARDLINK", "Hardlinked mutations cannot be modelled", {"path": str(relative), "checkout": checkout.get("id")})
         if not stat.S_ISREG(info.st_mode) and not stat.S_ISDIR(info.st_mode):
-            raise CoordinatorError("PATH_TYPE", "Unsupported filesystem node", {"path": str(relative)})
+            raise CoordinatorError("PATH_TYPE", "Unsupported filesystem node", {"path": str(relative), "checkout": checkout.get("id")})
     name = relative.as_posix()
     return {"path": name, "key": key(checkout, name)}
 
@@ -105,14 +107,65 @@ def hidden(checkout):
 
 
 def _ignored(root, names):
-    """Which of these untracked folders an exclude rule itself names. check-ignore reads its input
-    as pathspecs: "./" keeps a folder named like `:(glob)cache` literal (it echoes the input)."""
+    """Which of these paths an exclude rule matches, of those the index does not track (`hidden` asks of folders,
+    `unwatched` of files). check-ignore reads its input as pathspecs: "./" keeps a name like `:(glob)cache` literal (it
+    echoes the input). It fails the whole batch for a path beyond a symlink: none is given to it."""
     if not names:
         return set()
     result = gitio.git(root, ["check-ignore", "-z", "--stdin"], data=b"".join(b"./" + os.fsencode(n) + b"\0" for n in names), check=False)
     if result.returncode not in (0, 1):
-        raise CoordinatorError("GIT_FAILED", "Git could not classify ignored folders", {"returncode": result.returncode})
+        raise CoordinatorError("GIT_FAILED", "Git could not classify ignored paths", {"returncode": result.returncode})
     return {os.fsdecode(name[2:] if name.startswith(b"./") else name) for name in result.stdout.split(b"\0") if name}
+
+
+def _nested(root, path):
+    """What a folder on the way to `path` is when git cannot see past it: "link" (a symlink; git refuses to classify
+    the path) or "repository" (it holds a .git: the path is an embedded repository's), else None."""
+    current = root
+    for part in path.split("/")[:-1]:
+        current = os.path.join(current, part)
+        try:
+            if stat.S_ISLNK(os.lstat(current).st_mode):
+                return "link"
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+        if os.path.lexists(os.path.join(current, ".git")):
+            return "repository"
+    return None
+
+
+def _committed(root, names):
+    """Which of these paths the branch commit or the index holds an entry at (a file, a folder, a submodule)."""
+    names = sorted(names)
+    if not names:
+        return set()
+    # One object name a line, read whole: "HEAD:<path>" and ":0:<path>" (stage 0 of the index) take <path> literally.
+    data = b"".join(prefix + os.fsencode(name) + b"\n" for name in names for prefix in (b"HEAD:", b":0:"))
+    lines = gitio.git(root, ["cat-file", "--batch-check=%(objecttype)"], data=data).stdout.split(b"\n")
+    if len(lines) < 2 * len(names):
+        raise CoordinatorError("GIT_FAILED", "Git did not classify every path", {"command": "cat-file"}, True)
+    kinds = (b"blob", b"tree", b"commit")
+    return {name for i, name in enumerate(names) if lines[2 * i] in kinds or lines[2 * i + 1] in kinds}
+
+
+def unwatched(checkout, paths):
+    """Of these paths, those outside the ledger: git ignores them, or they lie in an embedded repository, and neither
+    the branch commit nor the index holds them. None is commit material, whoever writes it, so the coordinator records
+    nothing there and publishes nothing from there: no receipt, claim, UNKNOWN or refusal. A path git tracks stays in the
+    ledger though an ignore rule matches it, as does one beyond a symlink (git cannot classify it). Raises GIT_FAILED
+    when git cannot tell."""
+    root = checkout["root"]
+    nested = {path: _nested(root, path) for path in set(paths) if path and path != "*"}
+    candidates = {path for path, where in nested.items() if where == "repository"}
+    candidates |= _ignored(root, sorted(path for path, where in nested.items() if where is None))
+    return candidates - _committed(root, candidates)
+
+
+# What a scan reads at a path but cannot record bytes of: a symlink, a hardlinked or special file, bytes that kept
+# changing while read. Each is that path's UNKNOWN (2.4.0-2.4.3: one such path failed the whole reconcile, and a
+# writer's turn end then recorded a checkout-wide UNKNOWN).
+UNREADABLE = {"PATH_SYMLINK": "a symlink", "PATH_HARDLINK": "a hardlinked file", "PATH_TYPE": "not an ordinary file",
+              "UNSTABLE_READ": "changing while read"}
 
 
 def covered(checkout, entries, path):
@@ -145,7 +198,7 @@ def read_path(store, checkout, name):
             with os.fdopen(fd, "rb") as stream:
                 before = os.fstat(stream.fileno())
                 if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-                    raise CoordinatorError("PATH_TYPE", "Only ordinary single-link files have receipts", {"path": name})
+                    raise CoordinatorError("PATH_TYPE", "Only ordinary single-link files have receipts", {"path": name, "checkout": checkout.get("id")})
                 blob = store.blob(stream)
                 after = os.fstat(stream.fileno())
                 current = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
@@ -158,7 +211,7 @@ def read_path(store, checkout, name):
         finally:
             for descriptor in reversed(descriptors):
                 os.close(descriptor)
-    raise CoordinatorError("UNSTABLE_READ", "File changed while reading", {"path": name})
+    raise CoordinatorError("UNSTABLE_READ", "File changed while reading", {"path": name, "checkout": checkout.get("id")})
 
 
 def _decoded(name):
@@ -168,18 +221,22 @@ def _decoded(name):
         raise CoordinatorError("PATH_ENCODING", "Path must be valid UTF-8", {"path": os.fsdecode(name)}) from exc
 
 
-def visible(checkout):
+def visible(checkout, unreadable=None):
     """Git's own view of the checkout, the set Codex itself diffs: tracked paths, including
     deleted ones, plus untracked paths no ignore rule covers. Ignored trees (node_modules,
-    virtualenvs, build output) are never commit material and are never read."""
+    virtualenvs, build output) are never commit material and are never read. A submodule is
+    refused, or with `unreadable` (a dict) put there as its path's PATH_TYPE."""
     root, paths = checkout["root"], set()
     for entry in gitio.git(root, ["ls-files", "-z", "--stage"]).stdout.split(b"\0"):
         if not entry:
             continue
         meta, name = entry.split(b"\t", 1)
         if meta.split()[0] == b"160000":
+            if unreadable is not None:
+                unreadable[_decoded(name)] = "PATH_TYPE"
+                continue
             raise CoordinatorError("PATH_TYPE", "Git's view of the checkout includes a submodule; the coordinator records "
-                                   "ordinary files only", {"path": _decoded(name)})
+                                   "ordinary files only", {"path": _decoded(name), "checkout": checkout.get("id")})
         paths.add(_decoded(name))
     for name in gitio.git(root, ["ls-files", "-z", "--others", "--exclude-standard"]).stdout.split(b"\0"):
         # An embedded repository is listed once, as "name/": its files belong to that checkout.
@@ -205,33 +262,47 @@ def _folders(root, paths):
     return found
 
 
-def _snapshot_once(store, checkout, known):
-    listed = visible(checkout)
-    # Paths the ledger already holds stay in scope after an ignore rule starts covering them.
-    scope = sorted(listed | known)
+def _snapshot_once(store, checkout, known, unreadable=None):
+    listed = visible(checkout, unreadable)
+    # Paths the ledger already holds stay in scope after an ignore rule starts covering them (outside the ledger,
+    # reconcile lets them go: Ledger.outside).
+    scope = sorted((listed | known) - set(unreadable or ()))
     folders = _folders(checkout["root"], scope)
     found = {}
     for path in scope:
         try:
             found[path] = read_path(store, checkout, path)
         except CoordinatorError as exc:
+            if unreadable is not None and exc.code in UNREADABLE:
+                unreadable[path] = exc.code
+                continue
             if exc.code in ("PATH_SYMLINK", "PATH_HARDLINK", "PATH_TYPE"):
                 raise CoordinatorError(exc.code, "Git's view of the checkout includes a path that is not an ordinary file; "
-                                       "ignore it in .gitignore or remove it", {"path": path}) from exc
+                                       "ignore it in .gitignore or remove it", {"path": path, "checkout": checkout.get("id")}) from exc
             raise
     # Equal listings alone miss a tracked file deleted or replaced after it was read: it stays listed.
-    if visible(checkout) != listed or _folders(checkout["root"], scope) != folders:
+    if visible(checkout, None if unreadable is None else {}) != listed or _folders(checkout["root"], scope) != folders:
         raise CoordinatorError("UNSTABLE_SNAPSHOT", "Git's view of the checkout changed during the full snapshot")
-    return found
+    return found, listed
 
 
-def full_snapshot(store, checkout, known=()):
+def full_snapshot(store, checkout, known=(), unreadable=None, listed=None):
+    """What every path of git's view, and every path in `known`, holds. With `unreadable` (a dict), a path that cannot
+    be read as an ordinary file (UNREADABLE) is put there with its code instead of failing the snapshot; `listed` (a
+    set) receives git's own view, whose paths are all in the ledger."""
     for _ in range(3):
+        found_unreadable = None if unreadable is None else {}
         try:
-            return _snapshot_once(store, checkout, set(known))
+            found, seen = _snapshot_once(store, checkout, set(known), found_unreadable)
         except CoordinatorError as exc:
             if exc.code != "UNSTABLE_SNAPSHOT":
                 raise
+            continue
+        if unreadable is not None:
+            unreadable.update(found_unreadable)
+        if listed is not None:
+            listed.update(seen)
+        return found
     raise CoordinatorError("UNSTABLE_SNAPSHOT", "Git's view of the checkout did not stabilize for reconciliation")
 
 
@@ -320,6 +391,8 @@ class Ledger:
         self.registration = asyncio.Lock()
         self.lifecycle = KeyedLocks()
         self.ownership = {}
+        self.messages = None  # the daemon's Messages: how a release reaches the leads (notify_released)
+        self.notifying = asyncio.Lock()
 
     def lock(self, checkout):
         return self.locks.setdefault(checkout, asyncio.Lock())
@@ -456,19 +529,24 @@ class Ledger:
                     self.store.event("checkout/ownership_refused", identity, {"reason": reason, "members": [c["id"] for c in members]})
 
     def mutation_scope(self, unitid, checkoutid=None):
+        """Every path the unit's mutations in this checkout touched, each of which its seal needs a final exact receipt
+        of. A restore to the path's baseline (recovery.restore_unknown) adds none; a path another operation of the unit
+        touched stays through that one. A path outside the ledger (unwatched) is never publication material, whoever
+        wrote it (2.4.0-2.4.3 force-added an ignored file a patch created into the candidate tree)."""
         checkout = self.store.get(checkoutid or self.store.get(unitid)["checkout"])
         paths = set()
         for operation in self.store.all("operation", unitid):
             if operation["checkout"] != checkout["id"] or operation.get("parts") or operation["kind"] not in ("patch", "lead-edit", "restore"):
                 continue
-            if operation["state"] == "denied" and operation.get("no_effect") is True:
+            if operation["state"] == "denied" and operation.get("no_effect") is True or operation.get("resolution") == "baseline":
                 continue
             paths.update(operation["paths"])
             for entry in operation.get("intended", {}).get("scope", []):
                 paths.add(entry["path"])
                 if entry.get("move"):
                     paths.add(entry["move"])
-        return sorted({normalize(checkout, path)["path"] for path in paths})
+        paths = {normalize(checkout, path)["path"] for path in paths}
+        return sorted(paths - unwatched(checkout, paths))
 
     def _untouched(self, ident):
         db = self.store.db
@@ -499,14 +577,26 @@ class Ledger:
                 "git_common": common, "object_format": gitio.text(root, ["rev-parse", "--show-object-format"])}
 
     async def reconcile(self, checkout, paths=None, reason="unexplained filesystem change", ignore_pending=True, attribute=None):
+        """Record what differs from the ledger, path by path (the whole checkout without `paths`). What is outside the
+        ledger (unwatched) is let go instead (release), and a path that cannot be read as an ordinary file
+        (UNREADABLE) is that path's UNKNOWN."""
         async with self.lock(checkout["id"]):
+            unreadable, listed = {}, None
             try:
                 if paths is None:
                     known = {r[0] for r in self.store.db.execute("SELECT path FROM heads WHERE checkout=?", (checkout["id"],))}
-                    actual = await asyncio.to_thread(full_snapshot, self.store, checkout, known)
+                    listed = set()
+                    actual = await asyncio.to_thread(full_snapshot, self.store, checkout, known, unreadable, listed)
                     paths = set(actual)
                 else:
-                    actual = {path: await asyncio.to_thread(read_path, self.store, checkout, path) for path in paths}
+                    actual = {}
+                    for path in paths:
+                        try:
+                            actual[path] = await asyncio.to_thread(read_path, self.store, checkout, path)
+                        except CoordinatorError as exc:
+                            if exc.code not in UNREADABLE:
+                                raise
+                            unreadable[path] = exc.code
             except CoordinatorError as exc:
                 if exc.code in ("BLOB_MISSING", "BLOB_CORRUPT"):
                     with self.store.transaction():
@@ -519,9 +609,134 @@ class Ledger:
                         checkout["quarantine"] = exc.code
                         self.store.save(checkout)
                 raise
-            return self.apply_observation(checkout, paths, actual, reason, ignore_pending, attribute)
+            outside = await self.outside(checkout, actual, unreadable, listed)
+            result = self.apply_observation(checkout, paths, actual, reason, ignore_pending, attribute, outside=outside, unreadable=unreadable)
+        await self.notify_released()
+        return result
 
-    def apply_observation(self, checkout, paths, actual, reason, ignore_pending=True, attribute=None, transaction=True):
+    async def unwatched(self, checkout, paths):
+        """unwatched(), off the event loop. A git failure raises (GIT_FAILED)."""
+        paths = set(paths)
+        return await asyncio.to_thread(unwatched, checkout, paths) if paths else set()
+
+    async def classify(self, checkout, paths):
+        """unwatched(), where a git failure must not stop the caller: none is taken as outside, so each is recorded as
+        before 2.4.4 (an event says so), and a later reconcile releases what is outside."""
+        try:
+            return await self.unwatched(checkout, paths)
+        except (CoordinatorError, OSError, subprocess.SubprocessError) as exc:
+            self.store.event("ledger/ignore_check_failed", checkout["id"], {"paths": len(paths), "code": getattr(exc, "code", type(exc).__name__)})
+            return set()
+
+    async def outside(self, checkout, observed, unreadable=(), listed=None):
+        """Of what a reconcile read (`observed` images, `unreadable` paths), the paths outside the ledger (unwatched):
+        asked of those whose bytes differ from the ledger's, that it could not read or that have an open UNKNOWN, and in
+        a whole-checkout read (`listed`: git's own view, all in the ledger) of every open UNKNOWN's path. What a command
+        writes there and a writer then reads with read_file is never UNKNOWN (2.4.0-2.4.3 recorded it, and every later
+        run of the tests another), and an UNKNOWN recorded there before is resolved (release). Called holding the
+        checkout's lock, before the observation is applied."""
+        if listed is not None:  # a whole checkout: one read of its heads and UNKNOWNs, not one per path
+            heads = {r["path"]: {"blob": r["blob"], "mode": r["mode"]} for r in self.store.db.execute(
+                "SELECT h.path, r.blob, r.mode FROM heads h JOIN revisions r ON r.id=h.revision WHERE h.checkout=?", (checkout["id"],))}
+        else:
+            heads = {}
+            for path in observed:
+                row = self.store.head(checkout["id"], path)
+                if row:
+                    heads[path] = {"blob": row["blob"], "mode": row["mode"]}
+        absent = {"blob": None, "mode": None}
+        candidates = {path for path, image in observed.items() if image != heads.get(path, absent)} | set(unreadable)
+        candidates |= {r[0] for r in self.store.db.execute("SELECT DISTINCT u.path FROM unknowns u LEFT JOIN resolutions s ON "
+                       "s.unknown_id=u.id WHERE u.checkout=? AND s.edit IS NULL AND u.path!='*'", (checkout["id"],))
+                       if listed is not None or r[0] in observed or r[0] in unreadable}
+        candidates -= listed or set()
+        return await self.classify(checkout, candidates) if candidates else set()
+
+    def release(self, checkout, paths, reason):
+        """Let go of paths outside the ledger (unwatched), in the caller's transaction: the head held of each is let go,
+        so it reads as a path the ledger never saw, and each UNKNOWN open there is resolved as "outside-ledger" by one
+        resolution record that keeps its reason and time (nothing is deleted). Returns that record's id, or None when no
+        UNKNOWN was open there; the leads hear of it once (notify_released)."""
+        paths = sorted(set(paths))
+        if not paths:
+            return None
+        heads = {}
+        for start in range(0, len(paths), 500):
+            chunk = paths[start:start + 500]
+            marks = ",".join("?" for _ in chunk)
+            heads.update((r["path"], r["revision"]) for r in self.store.db.execute(
+                "SELECT path, revision FROM heads WHERE checkout=? AND path IN (" + marks + ")", [checkout["id"], *chunk]))
+            self.store.db.execute("DELETE FROM heads WHERE checkout=? AND path IN (" + marks + ")", [checkout["id"], *chunk])
+        if heads:
+            self.store.event("ledger/left", checkout["id"], {"heads": heads, "reason": "outside the ledger: " + reason})
+        wanted = set(paths)
+        found = [u for u in self.store.unresolved(checkout["id"]) if u["path"] in wanted]
+        if not found:
+            return None
+        ident, units, unscoped = uid("resolution"), {}, []
+        for unknown in found:
+            # The units it names: those whose custody it records, or the operation it may be.
+            context, owners = json.loads(unknown["context"] or "{}"), set()
+            for key in (context.get("custody") or []) + [context.get("possible_operation")]:
+                record = self.store.get(key, required=False) if isinstance(key, str) else None
+                if record and record.get("unit"):
+                    owners.add(record["unit"])
+            for unit in owners:
+                units.setdefault(unit, []).append(unknown["id"])
+            if not owners:
+                unscoped.append(unknown["id"])
+        self.store.put("resolution", ident, {"kind": "outside-ledger", "checkout": checkout["id"], "reason": reason,
+                       "created": time.time(), "units": units, "unscoped": unscoped, "notices": None,
+                       "unknowns": [{k: u[k] for k in ("id", "path", "reason", "created")} for u in found]}, checkout["id"])
+        for unknown in found:
+            self.store.db.execute("INSERT INTO resolutions(unknown_id,restore,edit) VALUES(?,?,?) ON CONFLICT(unknown_id) "
+                                  "DO UPDATE SET edit=excluded.edit WHERE resolutions.edit IS NULL", (unknown["id"], ident, ident))
+        self.store.event("unknown/outside_ledger", ident, {"checkout": checkout["id"], "unknowns": [u["id"] for u in found],
+                         "paths": sorted({u["path"] for u in found}), "reason": reason})
+        return ident
+
+    async def notify_released(self):
+        """Tell the leads of each release once: one message to the lead mailbox of each unit its UNKNOWNs name, and one
+        to the checkout's leads (`lead`, by its folder) for those naming no unit or a unit without one. A release made
+        while no messages are wired (self.messages) waits for the next call."""
+        if self.messages is None:
+            return
+        async with self.notifying:
+            for record in list(self.store.selected("SELECT * FROM records WHERE kind='resolution' AND "
+                                                   "json_extract(data,'$.notices') IS NULL ORDER BY id")):
+                try:
+                    await self._notify(record)
+                except Exception as exc:  # a notice never fails the reconcile that released them; the next call sends it
+                    self.store.event("unknown/notice_failed", record["id"], {"code": getattr(exc, "code", type(exc).__name__)})
+
+    async def _notify(self, record):
+        checkout = self.store.get(record["checkout"])
+        rows = {u["id"]: u for u in record["unknowns"]}
+        recipients = {}
+        for unit, ids in sorted(record["units"].items()):
+            box = (self.store.get(unit, required=False) or {}).get("lead_mailbox")
+            recipients.setdefault(box or "lead", set()).update(ids)
+        if record["unscoped"]:
+            recipients.setdefault("lead", set()).update(record["unscoped"])
+        sent = []
+        for recipient, ids in sorted(recipients.items()):
+            listed = sorted((rows[i] for i in ids), key=lambda u: (u["path"], u["created"]))
+            text = (str(len(listed)) + " UNKNOWN" + ("s" if len(listed) != 1 else "") + " in " + checkout["root"] +
+                    " resolved as outside the ledger (resolution " + record["id"] + "): git ignores these paths and neither "
+                    "the branch commit nor the index holds them, so the coordinator records nothing there and never "
+                    "publishes them. Nothing was written or deleted. " + "; ".join(u["path"] + " (" + u["reason"] + ")" for u in listed))
+            try:
+                message = await self.messages.send("coordinator", recipient, text, "none", cwd=checkout["root"] if recipient == "lead" else "")
+            except CoordinatorError:
+                if recipient == "lead":
+                    raise
+                message = await self.messages.send("coordinator", "lead", text, "none", cwd=checkout["root"])
+            sent.append(message["id"])
+        record["notices"] = sent
+        self.store.save(record)
+
+    def apply_observation(self, checkout, paths, actual, reason, ignore_pending=True, attribute=None, transaction=True, outside=(),
+                          unreadable=None):
         pending = set()
         if ignore_pending:
             for operation in self.store.live_operations(checkout["id"]):
@@ -537,11 +752,26 @@ class Ledger:
             # The installed prefix belongs to the old unit; later bytes do not.
             if published_participant(self.store, attribute["unit"], checkout["id"]):
                 attribute = None
-        unknowns, attributed = [], []
+        unknowns, attributed, released = [], [], None
+        unreadable = unreadable or {}
         from contextlib import nullcontext
         with self.store.transaction() if transaction else nullcontext():
+            if outside:
+                # A head held there (2.4.0-2.4.3 kept test output a writer read) would refuse its next read_file
+                # UNSTABLE_READ: it is let go with the UNKNOWNs open there.
+                released = self.release(checkout, [path for path in outside if path not in pending], reason)
+            opened = None
+            for path, code in sorted(unreadable.items()):
+                if path in pending or path in outside:
+                    continue
+                if opened is None:
+                    opened = {(u["path"], json.loads(u["context"] or "{}").get("unreadable")) for u in self.store.unresolved(checkout["id"])}
+                if (path, code) in opened:
+                    continue  # already UNKNOWN for that: one per reason, not one per scan
+                unknowns.append(self.store.unknown(checkout["id"], path, "unreadable (" + UNREADABLE[code] + "): " + reason,
+                                                   {"custody": context, "label": "custody" if context else "UNKNOWN", "unreadable": code}))
             for path in paths:
-                if path in pending:
+                if path in pending or path in outside or path in unreadable:
                     continue
                 current = actual.get(path, {"blob": None, "mode": None})
                 head = self.store.head(checkout["id"], path)
@@ -562,6 +792,8 @@ class Ledger:
                     unknowns.append(self.store.unknown(checkout["id"], path, why,
                                                       {"custody": context, "label": "custody" if context else "UNKNOWN"}, revision))
         result = {"unknowns": unknowns, "paths_scanned": len(paths)}
+        if released:
+            result["released"] = released
         if attribute:
             result["attributed"] = attributed
         return result
@@ -573,13 +805,16 @@ class Ledger:
                 await stack.enter_async_context(self.lock(checkout["id"]))
             async def collect(checkout):
                 known = {r[0] for r in self.store.db.execute("SELECT path FROM heads WHERE checkout=?", (checkout["id"],))}
-                return await asyncio.to_thread(full_snapshot, self.store, checkout, known)
+                unreadable, listed = {}, set()
+                actual = await asyncio.to_thread(full_snapshot, self.store, checkout, known, unreadable, listed)
+                return actual, unreadable, listed
             observations = await asyncio.gather(*(collect(c) for c in checkouts))
+            outsides = [await self.outside(c, *observed) for c, observed in zip(checkouts, observations)]
             if attribute and attribute.get("still_quiet") and not attribute["still_quiet"]():
                 attribute = None
             results = {}
             with self.store.transaction():
-                for checkout, actual in zip(checkouts, observations):
+                for checkout, (actual, unreadable, _), outside in zip(checkouts, observations, outsides):
                     proof = None
                     if attribute:
                         if "checkouts" in attribute:
@@ -589,23 +824,35 @@ class Ledger:
                         elif checkout["id"] == target:
                             proof = attribute
                     results[checkout["id"]] = self.apply_observation(checkout, set(actual), actual, reason,
-                        attribute=proof, transaction=False)
+                        attribute=proof, transaction=False, outside=outside, unreadable=unreadable)
             result = dict(results.get(target, {}))
             result["participants"] = [{"checkout": c["id"], "root": c["root"], **results[c["id"]]} for c in checkouts]
-            return result
+        await self.notify_released()
+        return result
 
-    async def prepare(self, actor, kind, intended, paths, native=None, deadline=None):
+    async def prepare(self, actor, kind, intended, paths, native=None, deadline=None, outside=None):
+        """Admit an operation on these paths. Those outside the ledger (unwatched; `outside` when the caller classified
+        them already) are written but never recorded: the operation keeps them apart (`outside`), with no base, claim
+        or receipt, and nothing there refuses it. A restore names only paths in the ledger."""
         unit, checkout = self.store.get(actor["unit"]), self.store.get(actor["checkout"])
         self.require_owned(checkout)
         if unit["state"] != "open" or checkout.get("quarantine"):
             raise CoordinatorError("UNIT_FROZEN", "Unit or checkout is not open for operations")
         from .participants import require_writable
-        if paths or kind in ("command", "mcp", "lead-command"):
-            require_writable(self.store, unit, checkout["id"])
-        paths = sorted({normalize(checkout, path)["path"] for path in paths})
-        keys = [normalize(checkout, path)["key"] for path in paths]
+        endpoints = sorted({normalize(checkout, path)["path"] for path in paths})
+        keys = [normalize(checkout, path)["key"] for path in endpoints]
         if any(overlaps(left, right) for i, left in enumerate(keys) for right in keys[i + 1:]):
             raise CoordinatorError("OPERATION_SCOPE", "A single mutation cannot contain aliased or ancestor/descendant endpoints")
+        if kind in ("command", "mcp", "lead-command", "restore") or not endpoints:
+            outside = set()
+        elif outside is None:
+            outside = await self.classify(checkout, endpoints)
+        else:
+            outside = {normalize(checkout, path)["path"] for path in outside} & set(endpoints)
+        paths = [path for path in endpoints if path not in outside]
+        keys = [normalize(checkout, path)["key"] for path in paths]
+        if paths or kind in ("command", "mcp", "lead-command"):
+            require_writable(self.store, unit, checkout["id"])
         from .locks import held
         async with held(self.lock(checkout["id"]), deadline):
             from .custody import interfering
@@ -619,7 +866,14 @@ class Ledger:
                 existing = [normalize(checkout, path)["key"] for path in operation["paths"]]
                 if any(overlaps(a, b) for a in keys for b in existing):
                     raise CoordinatorError("OPERATION_BUSY", "An overlapping operation is unreconciled", {"operation": operation["id"]})
-            pre = {path: await asyncio.to_thread(read_path, self.store, checkout, path) for path in paths}
+            pre = {}
+            for path in endpoints:
+                try:
+                    pre[path] = await asyncio.to_thread(read_path, self.store, checkout, path)
+                except CoordinatorError as exc:
+                    if path not in outside or exc.code not in UNREADABLE:
+                        raise
+                    pre[path] = None  # outside the ledger and no ordinary file: nothing moved from it can be verified
             if self.store.get(actor["unit"])["state"] != "open":
                 raise CoordinatorError("UNIT_FROZEN", "Unit froze while operation pre-images were being saved")
             if paths or kind in ("command", "mcp", "lead-command"):
@@ -627,7 +881,8 @@ class Ledger:
             if paths and interfering(self.store, checkout, paths, since=started):
                 raise CoordinatorError("CUSTODY_CONFLICT", "Command custody changed during pre-image capture")
             bases = {}
-            for path, image in pre.items():
+            for path in paths:
+                image = pre[path]
                 head = self.store.head(checkout["id"], path)
                 known = {"blob": head["blob"], "mode": head["mode"]} if head else {"blob": None, "mode": None}
                 if image != known:
@@ -648,7 +903,8 @@ class Ledger:
                          "attempt": actor.get("attempt"), "generation": self.store.generation,
                          "state": "prepared", "paths": paths, "pre": pre, "bases": bases,
                          "intended": intended, "native": native or {}, "dependencies": dependencies,
-                         "created": started, "hook_valid": False, **({"heads": heads} if heads else {})}
+                         "created": started, "hook_valid": False, **({"heads": heads} if heads else {}),
+                         **({"outside": sorted(outside)} if outside else {})}
             if unit.get("project_revision"):
                 operation["qualified_dependencies"] = [{"checkout": r.get("checkout", actor["checkout"]), "revisions": r["revisions"]} for r in reads]
             with self.store.transaction():
@@ -669,6 +925,7 @@ class Ledger:
             expected, seen = {}, set()
             intended = operation["intended"]["scope"]
             native_changes = item.get("changes", [])
+            outside = set(operation.get("outside", ()))
             if len(native_changes) != len(intended):
                 raise CoordinatorError("PATCH_SCOPE", "Native changes differ from admitted complete scope")
             for change in native_changes:
@@ -680,7 +937,14 @@ class Ledger:
                 if not match or match["kind"] != kind or match.get("move", path) != target or path in seen:
                     raise CoordinatorError("PATCH_SCOPE", "Native computed change mismatches original patch")
                 seen.add(path)
+                if target in outside:
+                    # What lands outside the ledger is not recorded; a source in the ledger is gone.
+                    if path not in outside:
+                        expected[path] = {"blob": None, "mode": None}
+                    continue
                 pre = operation["pre"][path]
+                if pre is None:
+                    raise CoordinatorError("PATCH_EVIDENCE", "A move from outside the ledger left no readable pre-image", {"path": path})
                 before = self.store.read_blob(pre["blob"]) if pre["blob"] else b""
                 diff = change["diff"]
                 if kind == "add":
@@ -700,7 +964,8 @@ class Ledger:
                         if not diff.endswith(suffix):
                             raise CoordinatorError("PATCH_MOVE", "Native move suffix disagrees with structured destination")
                         diff = diff[:-len(suffix)]
-                        expected[path] = {"blob": None, "mode": None}
+                        if path not in outside:
+                            expected[path] = {"blob": None, "mode": None}
                     after = unified_post(before, diff)
                 else:
                     raise CoordinatorError("PATCH_KIND", "Unknown native patch kind")
@@ -722,6 +987,8 @@ class Ledger:
 
     async def verify_images(self, operation, expected):
         checkout = self.store.get(operation["checkout"])
+        outside = set(operation.get("outside", ()))  # written, never recorded (prepare)
+        expected = {path: image for path, image in expected.items() if path not in outside}
         actual = {p: await asyncio.to_thread(read_path, self.store, checkout, p) for p in operation["paths"]}
         if actual != expected:
             raise CoordinatorError("POSTIMAGE_MISMATCH", "Observed bytes or modes differ from recorded intended result")
@@ -841,9 +1108,11 @@ class Ledger:
                 self.store.save(record)
             for part in parts or [operation]:
                 ids = checkout_ids(self.store, part["unit"]) if part["kind"] in ("command", "mcp", "lead-command") else [part["checkout"]]
-                for key in ids:
-                    scopes.setdefault(key, set()).update(part["paths"] or ["*"])
-                    for path in part["paths"] or ["*"]:
+                # An operation with paths outside the ledger only could change nothing the ledger records.
+                targets = part["paths"] or ([] if part.get("outside") else ["*"])
+                for key in ids if targets else []:
+                    scopes.setdefault(key, set()).update(targets)
+                    for path in targets:
                         self.store.unknown(key, path, reason, {"possible_operation": part["id"]})
         async def reconcile(key, paths):
             checkout = self.store.get(key)

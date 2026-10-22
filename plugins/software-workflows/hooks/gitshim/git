@@ -12,8 +12,9 @@ old_ifs=$IFS
 IFS=:
 for d in $PATH; do
   [ -n "$d" ] || d=.
-  # a mirror of git's exec-path is not the real git: its `git` leads back to this script
-  if [ -f "$d/git" ] && [ -x "$d/git" ] && ! [ "$d/git" -ef "$0" ] && ! [ -f "$d/.codex-gate-farm" ]; then
+  # Neither another plugin version's shim nor an exec-path mirror is the real git.
+  if [ -f "$d/git" ] && [ -x "$d/git" ] && ! [ "$d/git" -ef "$0" ] \
+      && ! [ -f "$d/../push_gate.py" ] && ! [ -f "$d/.codex-gate-farm" ]; then
     real=$d/git
     break
   fi

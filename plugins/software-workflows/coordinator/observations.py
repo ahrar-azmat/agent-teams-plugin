@@ -97,6 +97,9 @@ def query(daemon, cwd, session_id, git_common=None):
         members = [c["id"] for c in same]
     if members:
         result["publications"] = publications(daemon, members)
+    # Fresh once startup recovery is done with what this answer covers: its checkouts and their publications' units.
+    result["fresh"] = daemon.ready and not any(scope in daemon.recovering for scope in
+                                               [("checkout", key) for key in members] + [("unit", p["unit"]) for p in result["publications"]])
     if checkout and not changed:
         projects = {}
         for revision in daemon.store.all("project_revision"):

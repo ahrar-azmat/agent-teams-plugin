@@ -142,7 +142,27 @@ def _install_shim(data):
     _drop_dead_mirrors(state, now)
     q = shlex.quote
     with open(env_file, "a", encoding="utf-8") as fh:
-        fh.write(f'case ":$PATH:" in *:{q(shim)}:*) ;; *) export PATH={q(shim)}:"$PATH" ;; esac\n'
+        # Filter when sourced: earlier SessionStart statements may have added older shims.
+        # Consume delimiters explicitly to keep spaces, glob characters and empty entries.
+        fh.write(f'_codex_gate_path={q(shim)}\n'
+                 '_codex_gate_rest=${PATH-}\n'
+                 'while :; do\n'
+                 '  _codex_gate_entry=${_codex_gate_rest%%:*}\n'
+                 '  _codex_gate_dir=${_codex_gate_entry:-.}\n'
+                 '  if [ -f "$_codex_gate_dir/.codex-gate-farm" ] || {\n'
+                 '    [ -f "$_codex_gate_dir/git" ] && [ -f "$_codex_gate_dir/../push_gate.py" ];\n'
+                 '  }; then\n'
+                 '    :\n'
+                 '  else\n'
+                 '    _codex_gate_path=$_codex_gate_path:$_codex_gate_entry\n'
+                 '  fi\n'
+                 '  case $_codex_gate_rest in\n'
+                 '    *:*) _codex_gate_rest=${_codex_gate_rest#*:} ;;\n'
+                 '    *) break ;;\n'
+                 '  esac\n'
+                 'done\n'
+                 'export PATH="$_codex_gate_path"\n'
+                 'unset _codex_gate_path _codex_gate_rest _codex_gate_entry _codex_gate_dir\n'
                  f"export CODEX_GATE_SESSION={q(session)}\n"
                  f"export CODEX_GATE_TRANSCRIPT={q(str(data.get('transcript_path') or ''))}\n"
                  f"export CODEX_GATE_STATE={q(state)}\n"
@@ -165,7 +185,7 @@ def _prebuild_mirror(shim, state):
     gate = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(gate)
     search = os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep)
-                             if not gate._same_dir(d, shim) and not gate._is_farm(d))
+                             if not gate._is_shim(d or ".") and not gate._is_farm(d or "."))
     real = shutil.which("git", path=search)
     if real:
         os.environ["CODEX_GATE_STATE"] = state

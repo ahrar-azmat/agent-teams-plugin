@@ -79,3 +79,42 @@ def mailbox(store, session_id, unitid):
     if not store.get(key, required=False):
         store.put("lead_mailbox", key, {"session_id": session_id, "unit": unitid}, unitid)
     return key
+
+
+def reach(store, checkoutid):
+    """The checkout and every checkout a registered project revision binds with it: what a lead working in it
+    reaches."""
+    ids = {checkoutid}
+    for revision in store.all("project_revision"):
+        bound = {b["checkout"] for b in revision["bindings"]}
+        if checkoutid in bound:
+            ids.update(bound)
+    return ids
+
+
+def scope(store, session_id="", cwd=""):
+    """The checkouts whose writers' unaddressed mail (to `lead`, or to a lead actor no session owns) a lead reads:
+    the reach of every unit its session leads or holds a mailbox for, and the reach of the checkout its folder is
+    in. Another project's writers share none of them."""
+    units = set()
+    if session_id:
+        units.update(m["unit"] for m in store.lead_sessions(session_id))
+        units.update(row[0] for row in store.db.execute("SELECT json_extract(data,'$.unit') FROM records WHERE "
+                                                         "kind='lead_mailbox' AND json_extract(data,'$.session_id')=?", (session_id,)))
+    ids = set()
+    for unit in units:
+        if store.get(unit, required=False):
+            for key in participants.checkout_ids(store, unit):
+                ids.update(reach(store, key))
+    if cwd:
+        from .observations import checkout_at
+        checkout, _ = checkout_at(store, cwd)
+        if checkout:
+            ids.update(reach(store, checkout["id"]))
+    return ids
+
+
+def owners(store, actorid):
+    """The lead sessions whose lead actor this is (lead/session's mapping). An actor lead/attach made has none."""
+    return list(store.selected("SELECT * FROM records WHERE kind='lead_session' AND json_extract(data,'$.actor')=? "
+                               "ORDER BY id", (actorid,)))

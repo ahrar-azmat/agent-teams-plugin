@@ -13,19 +13,25 @@ advisor, without the user asking.
 """
 import json
 
+# coordinator_lead.py reads these: the tail they name cannot touch a checkout, so a lead's Bash running it is not
+# coordinated (no record, no scan, no quiet window held).
+LIVE_VIEW_LOG = "$HOME/.claude/logs/codex-oracle/stream.log"
+LIVE_VIEW_COMMAND = 'tail -F "' + LIVE_VIEW_LOG + '"'
+
 CONTEXT = (
     "LIVE VIEW: an advisory MCP run is starting. If you have NOT already "
     "started the mcp-live background shell in this session, start it now "
     "(one per session) so the user can watch the run live via the Shells "
     "panel (Enter to view): Bash tool, run_in_background=true, command: "
-    'tail -F "$HOME/.claude/logs/codex-oracle/stream.log" '
+    + LIVE_VIEW_COMMAND + " "
     "— description: \"mcp-live: live view of codex-oracle runs\". If it is "
     "already running, do nothing and do not mention it."
 )
 
-print(json.dumps({
-    "hookSpecificOutput": {
-        "hookEventName": "PreToolUse",
-        "additionalContext": CONTEXT,
-    }
-}))
+if __name__ == "__main__":
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": CONTEXT,
+        }
+    }))

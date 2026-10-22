@@ -123,8 +123,33 @@ def venv_fds():
         raise CoordinatorError("VENV_LOCK", "Cannot preserve the launcher's interpreter lifetime lock") from exc
 
 
+def clean_environment(source=None):
+    """Detach from the launching Claude session and its push gate, keeping user configuration."""
+    environment = dict(os.environ if source is None else source)
+    for key in tuple(environment):
+        if key in {"CLAUDECODE", "CLAUDE_PID", "CLAUDE_ENV_FILE", "CLAUDE_EFFORT", "CLAUDE_PROJECT_DIR",
+                   "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA", "CLAUDE_JOB_DIR"} or key.startswith(
+                       ("CLAUDE_CODE_", "CODEX_GATE_", "CLAUDE_PLUGIN_OPTION_")):
+            del environment[key]
+
+    def is_farm(directory):
+        return os.path.isfile(os.path.join(directory, ".codex-gate-farm"))
+
+    def is_shim(directory):
+        # Traverse the directory before '..': a symlink to a shim has the shim's parent.
+        return (os.path.isfile(os.path.join(directory, "git")) and
+                os.path.isfile(os.path.join(directory, os.pardir, "push_gate.py")))
+
+    if "PATH" in environment:
+        environment["PATH"] = os.pathsep.join(d for d in environment["PATH"].split(os.pathsep)
+                                             if not is_farm(d or ".") and not is_shim(d or "."))
+    if environment.get("GIT_EXEC_PATH") and is_farm(environment["GIT_EXEC_PATH"]):
+        del environment["GIT_EXEC_PATH"]
+    return environment
+
+
 def launch_environment():
-    environment = dict(os.environ)
+    environment = clean_environment()
     plugin = str(Path(__file__).resolve().parents[1])
     environment["PYTHONPATH"] = plugin + (os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else "")
     return environment

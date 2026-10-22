@@ -150,6 +150,11 @@ class Leases:
             except BaseException:
                 connection.close()
                 raise
+        # The custodian started here holds this worker's leases from its first instruction (each an inherited
+        # duplicate), and starts no worker of its own until this one has died, then under upgrade.lock as every daemon
+        # start (supervise): so it is started while another process holds that lock too. Were it not, this worker
+        # would be their only holder there, and its death would open every checkout it holds to another writer while
+        # its app-servers may still write.
         parent, child = socket.socketpair()
         parent.settimeout(15)
         environment = launch_environment()
@@ -218,7 +223,8 @@ class Leases:
                 try:
                     await asyncio.to_thread(self.repair)
                 except Exception as repair_error:
-                    raise CoordinatorError("CUSTODIAN_LOST", "Lease references retained; redundancy unavailable, production refused", operational=True) from repair_error
+                    raise CoordinatorError("CUSTODIAN_LOST", "Lease references retained; redundancy unavailable, production refused",
+                                           {"cause": getattr(repair_error, "code", type(repair_error).__name__)}, operational=True) from repair_error
                 if action == "ping":
                     return {"ok": True}
                 raise CoordinatorError("LEASE_UNCERTAIN", "Custodian replaced; retained leases require reconciliation before retry", operational=True) from exc

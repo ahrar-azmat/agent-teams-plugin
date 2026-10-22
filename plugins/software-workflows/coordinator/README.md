@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.1 / P1
+# Writer coordinator — software-workflows 2.4.4 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -47,9 +47,19 @@ Do not construct `<state>/rpc.sock` yourself. Startup failures are preserved in
 `startup-error.json` and returned by bootstrap with their specific error code.
 
 The detached supervisor owns a `flock`, restarts a failed worker, and exits after
-an orderly stop. The worker has a separate lock. Native listeners do not inherit
-either descriptor. Repeated bootstrap discovers the existing daemon. PID files
-and heartbeats are never authority to steal a lock or custody.
+an orderly stop. A restart is a daemon start like any other, made under
+`upgrade.lock`. While another process holds that lock (it is starting, replacing or
+stopping the daemon), a supervisor that holds no lease exits instead (`UPGRADE_HELD`
+in `supervisor-exit.json`). One that holds leases keeps them and restarts its worker
+once the lock is free (`supervisor-wait.json`): the app-servers of the worker that
+died may still be writing, and they hold no lease themselves. The lock's holder
+lets go when its own wait ends: a client waiting for the daemon to answer is refused
+`DAEMON_UNRESPONSIVE` (retryable) after its timeout, 30 s. Only a signal ends a
+supervisor that holds leases. A restarted worker holds the lock until it serves, at
+most 30 s. The worker has a separate lock. Native
+listeners do not inherit either descriptor. Repeated bootstrap discovers the
+existing daemon. PID files and heartbeats are never authority to steal a lock or
+custody.
 
 ```sh
 python3 -B -m coordinator rpc checkout/register '{"path":"/absolute/checkout"}'
@@ -63,11 +73,27 @@ writer before sending its first message. Each writer owns one private listener,
 one coordinator WebSocket connection and a namespace for its native IDs.
 
 Native writers retain the user's normal CODEX_HOME, provider, MCP configuration
-and unrelated hook trust. C1 passes session flags for approvals `never`, sandbox
-`danger-full-access`, live web search, V2 agents, coordinator hooks, and disabled
-TTY. It validates the effective modes and the start/resume policy echoes.
+and unrelated hook trust. The supervisor, the worker and every app-server they
+start run without the launching Claude Code session's identity and messaging
+variables (`CLAUDECODE`, `CLAUDE_PID`, `CLAUDE_ENV_FILE`, `CLAUDE_EFFORT`,
+`CLAUDE_PROJECT_DIR`, `CLAUDE_JOB_DIR`, `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`,
+`CLAUDE_PLUGIN_OPTION_*`, `CLAUDE_CODE_*`), without the push gate's `CODEX_GATE_*`
+wiring, without any plugin version's git shim or exec-path mirror on `PATH`, and
+without a mirror `GIT_EXEC_PATH`. C1 passes session flags for approvals `never`,
+sandbox `danger-full-access`, live web search, V2 agents, coordinator hooks, and
+disabled TTY. It validates the effective modes and the start/resume policy echoes.
 Incompatible managed settings cause refusal. This is cooperative coordination
 with full access, not operating-system confinement against arbitrary code.
+
+No child process can block the worker's event loop. On macOS, CPython's threaded
+child watcher returns when a child stops (`waitid` reports `CLD_STOPPED`) and the
+loop then reaps it with a blocking `waitpid`, so one app-server, probe or lead
+command stopped by a signal froze the daemon until it was continued or died. As the
+worker starts, before any child, a probe shown red on the interpreter's watcher
+installs one that waits for the exit through kqueue (`NOTE_EXIT`, which no stop or
+continue fires) and reaps without blocking. Where a pidfd watches children (Linux)
+the interpreter's watcher is kept. `daemon/status.child_watcher` reports what was
+measured.
 
 ## Native projects, revisions and selection
 
@@ -169,14 +195,20 @@ A native project patch has one parent invocation and per-checkout parts. Every
 claim and pre-image is reserved before the hook allows execution. All parts must
 pass native lifecycle, post-payload, computed-image, head and custody checks
 before one SQLite transaction writes any receipts. Cross-repository moves bind
-both source deletion and destination creation to the source pre-image. A partial
+both source deletion and destination creation to the source pre-image. A path
+outside the ledger (below) is written but gets no claim, pre-image or receipt, and
+a move across that edge records only its endpoint inside the ledger. A partial
 or interrupted group is quarantined in every affected checkout, with no successful
 part receipts. Quarantine marks the parent and all parts in one transaction before
 waiting for reconciliation locks. Completion re-reads their durable states inside
 the receipt transaction: a quarantined invocation cannot become verified again.
 Recovery does not grant group authorship retrospectively from
 matching history. Restoring known bytes still requires a new verified edit to
-resolve authorship; it never adopts unexplained bytes.
+resolve authorship, unless they are the path's baseline (what the branch commit
+and the index both hold, or absence where both lack it): read again and found
+equal to it, the restore resolves the UNKNOWNs it found there before its edit
+(resolution `baseline`) and adds the path to no unit's scope (Recovery and
+refusals). A restore never adopts unexplained bytes.
 
 Opaque commands reserve every participant together, excluding other units'
 existing claims independently in each checkout. Conflicts are rechecked after
@@ -294,19 +326,40 @@ it in their observable revision. `claim/list {unit}` covers all participants;
 
 Server lead tools accept `project`, trusted `dispatch_cwd`, and cwd in any
 participant. A supplied `unit` uses its pinned membership. Lead mailboxes are
-identified by **session plus unit**; reading does not acknowledge messages, and
-another session gets another mailbox. Legacy pending messages and acknowledgment
-records are preserved, including the raw RPC's legacy `lead` mailbox.
-Without an explicit unit, `coordinator_inbox(session_id=S)` reads the union of
-S's writer and lead mailboxes. Its acknowledgements check the owning session;
-an explicit unit keeps the original single-mailbox scope. Lead-tool unread
-notices use the same session union. Aggregation changes neither message IDs nor
-recipients and never acknowledges a message by reading it.
+identified by **session plus unit**; another session gets another mailbox. A lead's
+inbox, its unread count and every lead tool's unread notice hold only the mail that
+lead may read: its session's mailboxes (with an explicit `unit`, its mailbox of that
+unit alone); mail to its own lead actor, the one its session's `lead/session` mapping
+names, whose new mail is stored in that session's mailbox; and mail to the legacy
+`lead` recipient, or to a lead actor no session owns, whose unit shares a checkout
+with the lead's scope. That scope is the reach of every unit the session leads or
+holds a mailbox for, plus the reach of the checkout its folder (`cwd`) is in; a
+checkout's reach is itself plus every checkout a registered project revision binds
+with it. A writer's mail to `lead` from a unit without a lead mailbox (a plain run
+started without a lead session) belongs to that writer's unit, a lead's own `lead`
+mail to the checkout of the folder it was sent from, and mail with neither to every
+lead. Another project's writers share no checkout with that scope, so their mail
+reaches neither this lead's inbox, its count nor its notice. Legacy pending messages
+and acknowledgment records are preserved. Reading never acknowledges a message, and
+aggregation changes neither message IDs nor recipients.
 The common lead-tool wrapper carries the caller's session through normal and
 early-return notices, including Abraham completion, `codex_runs`,
 `codex_resume_run`, `codex_cancel_run`, `codex_run_log`, and `code_review`.
-Helpers inherit that call's session context. An explicitly empty session retains
-the legacy `lead` mailbox; another session does not see this session's mail.
+Helpers inherit that call's session context. A call with an empty session reads by
+its folder alone: every lead tool sends its folder, and since 2.4.4 so does the
+unread notice. Another session does not see this session's mail.
+
+A lead read that names neither a session nor a folder has no project to read; a
+2.4.0-2.4.3 server's unread notice makes such a read when its session is unknown.
+`message/inbox` answers it with no mail (`data: []`, `unread: 0`) and a `notice`,
+"Restart this Claude session to load software-workflows 2.4.4: its MCP server sent
+neither a session_id nor a folder (cwd), and a lead's inbox holds only its own
+project's mail.", never with another project's mail. A refusal would not reach that
+lead: such a server's unread notice swallows any failure and shows only `unread`, so
+the lead sees nothing until the session restarts. `message/ack` with neither is
+refused `INBOX_SCOPE` ("A lead's inbox holds only its own project's mail: supply its
+session_id or its folder (cwd). …"). Every lead tool's acknowledgement has sent its
+folder since 2.4.0.
 
 Lead tools reuse the registered native catalog instead of spawning native discovery
 or re-registering roots on every call. Explicit `project/register` and each Abraham
@@ -331,6 +384,20 @@ reconciliation reach. Such an edit during an armed quiet window can be credited
 to the lead. Existing limitations in detecting fully detached, markerless processes
 remain. The push gate's behavior when the coordinator is unreachable is unchanged;
 gate and Office consumer changes are outside P1's write boundary.
+
+The git shim (`hooks/gitshim/git`), the `PATH` line the SessionStart hook writes and
+the push gate skip every plugin version's shim (a folder holding `git` beside a
+`push_gate.py`) and every exec-path mirror: `PATH` holds one shim, this version's,
+first, and the shim runs the real git behind it. The push gate's evaluation worker
+lets a Bash command through whose only trigger is ANSI-C quoting (`$'`) once it
+proves the command belongs to a closed grammar: allowlisted readers that cannot run
+their arguments (`grep`, `egrep`, `fgrep`, `wc`, `head`, `tail` without following,
+`cat`, `cut`, `tr`, `uniq`, `sort` without a compress program, `jq`, `ls`) and Docker
+inspection (`ps`, `images`, `info`, `version`, `inspect`, `logs`, `volume ls`,
+`network ls`, `stats --no-stream`, with no host, context or config override),
+joined by `;`, `|`, `||` or `&&`, every `$` single-quoted data, and no substitution,
+expansion, redirection or background job. A command it cannot prove keeps the
+existing acknowledgement.
 
 ## RPC and C2 contract
 
@@ -384,7 +451,9 @@ new mutations receive retryable `DAEMON_DRAINING` while admitted requests and
 completion calls finish. RPC settlement has a one-second bound; a timeout returns
 `NOT_QUIESCENT` and immediately resumes admission without cancelling the requests.
 Once settled, the daemon closes admission, detaches listeners and releases leases
-before stopping. Listener identity and settlement safeguards still apply.
+before stopping. Re-admissions and transport-gap reconciles under way end first, and
+none starts while it drains: a writer whose connection drops then is left failed, for
+the next daemon's recovery (or this one's maintenance, if the stop is refused). Listener identity and settlement safeguards still apply.
 
 Host hooks use three-second client calls within a fourteen-second budget, below
 their fifteen-second host timeout. If a call encounters an unavailable or draining
@@ -396,34 +465,34 @@ Bash window that belonged to the retired generation.
 
 | Method | Parameters and result |
 |---|---|
-| `daemon/status` | Optional `checkout`; generation, PID/birth, `boot`, `capabilities`, `draining`, readiness, version, writers, claims, custody, pending requests and messages. |
+| `daemon/status` | Optional `checkout`, `brief`; generation, PID/birth, `boot`, `capabilities`, `draining`, readiness, version, `child_watcher`, `recovering` (the writers, units and checkouts startup recovery is still reconciling), `ended` (writer app-servers the coordinator ended, by reason), `silent` (those not answering now), and unless `brief` the writers (each with its app-server's admitted `capabilities` and, when its probe fell back, `capability_fallback`) with their claims, custody, pending requests and messages. |
 | `checkout/register` | `path`; serializes canonical registration and returns only a ready, complete baseline. Pre-existing dirty bytes are UNKNOWN. |
 | `checkout/reconcile` | `checkout`, optional `paths`; returns new UNKNOWN IDs and scanned count. `resolve_quarantine:true` with a full scan clears a resolved I/O quarantine, never UNKNOWN history. |
 | `checkout/revisions` | `checkout`, optional `path`, `cursor`, `limit`; paginated immutable revision records. |
 | `run/start` | `checkout`, optional `mode`, `task`, `paths`, `model`, `fixture`; returns separate run, attempt, unit and actor IDs plus native policy echoes. `fixture` is only for an owned disposable provider manifest. |
-| `run/status` | `run`, or optional `checkout`; persisted run or detailed checkout status. |
+| `run/status` | `run`, or optional `checkout`; persisted run or detailed checkout status. A run whose writer runs a turn after the run's own work ended (a message's turn) reads `running`, and `turns` lists each running writer turn (`actor`, `kind`, `thread`, `turn`, and for a root turn the `phase` or `message` that started it); the stored state is unchanged. `run/list`, the run's events and the checkout status report the same state. |
 | `run/interrupt` | `run`; cancel the selected run's root/child turns and queued work, then verify process/terminal settlement, for a plain run as for a workflow. Its calls are refused (`RUN_CANCELLED`) until a resume. A lead-mode run has no writer turns (`RUN_LEAD_MODE`). Custody and claims remain until reconciled. |
-| `run/resume` | `run`, `text`; reconcile first (replacing an app-server that is gone, not connected or admitted by another release), refuse unresolved recovery UNKNOWN, then explicitly start a new turn. |
+| `run/resume` | `run`, `text`; reconcile first (replacing an app-server that is gone, not connected, admitted by another release, stopped by a signal, or alive behind a socket that refuses or closes on it), refuse unresolved recovery UNKNOWN, then explicitly start a new turn. |
 | `run/terminals` | `run`; native terminal inventory. |
 | `run/terminate-terminal` | `run`, `process_id`; native termination, followed by custody reconciliation. This ID is not an OS PID. |
 | `lead/attach` | `unit`; create a lead actor in an existing unit, useful for recovery and C2 editor integration. |
-| `claim/acquire` | `actor`, `paths`; all-or-none acquisition using the shared claim/custody conflict model. |
+| `claim/acquire` | `actor`, `paths`; all-or-none acquisition using the shared claim/custody conflict model. A path outside the ledger is neither claimed nor checked against other claims; the result lists it under `outside`. |
 | `claim/release-request` | `actor`, `paths`; records a pending lead request and retains claims. |
 | `claim/handback` | `unit`, optional `paths`; explicit lead release after operations/custody reconcile. |
 | `command/declare` | `actor`, exact `command`, nonempty `reason`; grants one shared invocation to that actor. |
 | `custody/reconcile` | `custody`; lead-requested process/terminal reconciliation. An uninspectable survivor keeps quarantine. |
-| `lead-edit` | `actor`, `changes`; durably record complete intended images, install them, then verify bytes and modes. |
-| `operation/prepare` | `actor`, `kind:"lead-edit"`, `changes`; record intent **before** an external editor writes. |
+| `lead-edit` | `actor`, `changes`; durably record complete intended images, install them, then verify bytes and modes. A path outside the ledger is installed but not recorded; the operation (each part, in a project) lists it under `outside`. |
+| `operation/prepare` | `actor`, `kind:"lead-edit"`, `changes`; record intent **before** an external editor writes. A path outside the ledger is neither recorded nor verified; the operation lists it under `outside`. |
 | `operation/complete` | `operation`; compare the actual result to the already recorded intent. An after-the-fact hash cannot establish authorship. |
 | `lead-command` | `actor`, explicit `argv` array; opaque command with custody, actual exit code and output digests. |
 | `unknown/list` | `checkout`, optional `paths`; unresolved UNKNOWNs, context and restoration links. |
-| `unknown/restore` | `actor`, `unknown`, `revision`; restore a known receipt for a path. For checkout-wide `*`, use `revisions:{path:revision_id_or_null}` covering every ledger path. Null is accepted only for baseline absence. |
-| `unknown/narrow` | `actor`, `unknown` (a checkout-wide `*`); read the whole checkout again, record each path whose bytes differ from its ledger head as its own UNKNOWN, and resolve every checkout-wide UNKNOWN recorded before the read. Writes nothing; refused (`RESTORE_CUSTODY`) while custody is active in the checkout, `RESTORE_EXECUTING` while a patch may still be writing, `NARROW_SCOPE` for a path's UNKNOWN. |
-| `message/send` | `recipient`, `text`, required `wake:"none|queue|start"`, optional lead `sender`; durable message record. |
-| `message/inbox` | Optional `recipient` (default lead), `cursor`, `limit`, `session_id`; a nonempty session selects all its unit mailboxes. Includes total unread count independently of pagination. Reading does not acknowledge or claim context entry. |
-| `message/ack` | `message`, optional lead `actor` or `session_id`; a session may acknowledge only messages in its own mailboxes. Writers acknowledge through native-bound tools. |
-| `message/wake` | `message`, `wake:"queue|start"`; explicitly wake a pending idle recipient. |
-| `message/retry` | `message`; reconcile native history/queue before an explicitly requested retry of uncertain delivery. |
+| `unknown/restore` | `actor`, `unknown`, `revision` (a known revision, or `baseline`); for a checkout-wide `*`, `revisions:{path: revision_id\|"baseline"\|null}` covering every path in the ledger. Null only where the branch commit and the index both lack the path; a path without a baseline is refused `RESTORE_BASELINE` with its `latest_known_revision`. Found at the baseline afterwards: `state: resolved, resolution: baseline`; otherwise `restored_requires_new_edit`. A path outside the ledger: `resolution: outside-ledger`, nothing written. A restore resolves only what it found before its edit, and holds its claims until that resolution commits. It then releases the claims its edit created (not one another call has acquired since) and is no unit's work: an edit or read that follows depends on whose bytes it restored. |
+| `unknown/narrow` | `actor`, `unknown` (a checkout-wide `*`); read the whole checkout again, record each path whose bytes differ from its ledger head, and each path it cannot read (a symlink, a special file, bytes changing while read), as its own UNKNOWN, leave out a path outside the ledger (its UNKNOWNs resolved `outside-ledger`), and resolve every checkout-wide UNKNOWN recorded before the read. Writes nothing; refused (`RESTORE_CUSTODY`) while custody is active in the checkout, `RESTORE_EXECUTING` while a patch may still be writing, `NARROW_SCOPE` for a path's UNKNOWN. |
+| `message/send` | `recipient`, `text`, required `wake:"none\|queue\|start"`, optional lead `sender`; durable message record. |
+| `message/inbox` | Optional `recipient` (default `lead`, or a lead mailbox), `cursor`, `limit`, `session_id`, `cwd`. A lead's inbox is the mail its session or folder may read (lead session surfaces), one page in id order, with that mail's unread count independent of pagination. A lead read with neither session nor folder answers an empty inbox with a restart `notice`. Any other recipient's inbox (a writer's own `inbox` tool) is the mail to it. Reading does not acknowledge or claim context entry. |
+| `message/ack` | `message`; optional lead `actor` (`lead`, a lead mailbox or a lead actor), `session_id`, `cwd`. A lead acknowledges the mail it may read, as its inbox reads it: as its session, as its mailbox of an explicit unit, as a lead actor (its own mail wherever it went), or as `lead` by its folder. Anything else is `ACK_ACTOR`; `lead` with neither session nor folder is `INBOX_SCOPE`. The evidence records who acknowledged (`by`). A second acknowledgement answers `duplicate:true`. A writer acknowledges only through its own native-bound `ack` tool, after its context echo (`NATIVE_BOUND` here). |
+| `message/wake` | `message`, `wake:"queue\|start"`; explicitly wake a pending idle recipient; an `unproven` delivery is refused `MESSAGE_WAKE`, naming `message/retry`. |
+| `message/retry` | `message`; reconcile native history/queue before an explicitly requested retry of an uncertain or `unproven` delivery, which may deliver it twice. |
 | `unit/seal` | `unit`, optional `validation` array; freezes a candidate from verified receipt blobs. |
 | `unit/diff` | `unit`; object diff and exact review binding. |
 | `unit/review-record` | `unit`, `evidence`; lead-only completed review contract described below. |
@@ -464,12 +533,23 @@ for UNKNOWN restoration.
 A checkout's content is git's view of it, the set Codex itself diffs: tracked
 paths, deleted ones included, plus untracked paths no ignore rule covers
 (`git ls-files --cached --others --exclude-standard`). Ignored folders such as
-`node_modules`, virtualenvs and build output are never read or stored. A path
-the ledger already holds stays in a full scan after an ignore rule covers it, and
-registration also reads every path of the base tree. An embedded repository is
-its own checkout; a submodule in the index is refused with its path. A path in
-git's view that is not an ordinary single-link file is refused with that path;
-ignore it or remove it. A tracked file that became a folder reads as deleted,
+`node_modules`, virtualenvs and build output are never read or stored. A path git
+ignores (or one inside an embedded repository) that neither the branch commit nor
+the index holds is outside the ledger, whoever wrote it: a patch, edit, read or
+command there gets no receipt, claim, UNKNOWN or refusal, and no seal includes it.
+A tracked path stays in the ledger though an ignore rule matches it, as does one
+beyond a symlink, and registration also reads every path of the base tree. A head
+or open UNKNOWN the ledger holds at an outside path, as releases before 2.4.4
+recorded them, is let go at startup or the next reconcile that reads the path: its
+UNKNOWNs are resolved by one record (`outside-ledger`, their reasons and times kept,
+nothing deleted), and the lead mailbox of each unit they name, else the checkout's
+leads, gets one notice listing them. A git failure while classifying keeps the
+paths in the ledger, and a later reconcile lets them go. An embedded repository is
+its own checkout; a submodule in the index is refused with its path at registration
+and is its path's UNKNOWN afterwards. A scan records a path in git's view that is
+not an ordinary single-link file, or that kept changing while read, as that path's
+UNKNOWN, once per reason; ignore it or remove it. Registration still refuses it
+with its path. A tracked file that became a folder reads as deleted,
 in every scan and at sealing. A
 scan whose folders gained, lost or replaced an entry while it read them is taken
 again (three attempts). A first registration that failed or was killed, wrote no
@@ -490,7 +570,8 @@ because the host has not run it yet: see the armed window below.
 
 Native function tools are `claim`, `release`, `declare`, `send`, `inbox`, `ack`,
 `status`, `read_file`, and `list_paths`. Their input schemas reject unknown fields.
-`read_file` returns base64 bytes with offsets and records the returned revision;
+`read_file` returns base64 bytes with offsets and records the returned revision
+(`revision:null` for a path outside the ledger, which is no dependency);
 `list_paths` pages known revisions and records those dependencies. They invoke no
 shell, filters, credential helpers or Git hooks. Arbitrary shell strings never
 receive the fixed-reader exemption.
@@ -536,9 +617,11 @@ hook client counts from its own birth and denies 8 s before that, one deadline a
 connecting, sending and every receive; the coordinator decides 4 s before the client. A call it cannot admit in time, waiting for the
 writer's admission lock, the checkout lock or custody, is refused `COORDINATOR_BUSY`
 (nothing ran; retry), and one admitted after that point is withdrawn instead of
-allowed. A call that a Pre hook blocked, ours or another, never runs: its admission
-is withdrawn and its custody released, in every repository it spans. A hook that
-still dies or times out fails open in Codex.
+allowed. A call whose writer is being reconciled (startup recovery, a reconnect, a
+re-admission) waits for that reconcile until the same point, then is refused
+`LISTENER_RECOVERING`. A call that a Pre hook blocked, ours or another, never runs:
+its admission is withdrawn and its custody released, in every repository it spans.
+A hook that still dies or times out fails open in Codex.
 
 Codex 0.163 can refuse a call inside its handler, after an allowed Pre hook. Examples
 are `tty` on the TTY-disabled runtime C1 configures, a patch whose context is not in
@@ -551,10 +634,19 @@ nothing about them.
 The evidence C1 settles such a call by is Codex's own result line. A writer's
 app-server writes its log (JSON, Codex's stderr) to `listeners/<id>/native.log` in the
 state root, a private file it holds open itself, with the filter
-`codex_core::exec_policy=trace,codex_otel.trace_safe=info`. Once a call's handler has
-returned, direct or nested, Codex writes `codex.tool_result` to the trace-safe target,
-with `success=false` for a failure. That target carries identifiers, names and lengths,
-never arguments or output.
+`codex_core::exec_policy=trace,codex_otel.trace_safe=info,codex_core::session=warn,codex_core::session::handlers=info,codex_rollout::recorder=warn`.
+Once a call's handler has returned, direct or nested, Codex writes `codex.tool_result`
+to the trace-safe target, with `success=false` for a failure. That target carries
+identifiers, names and lengths, never arguments or output. The session and
+rollout-writer targets show how the thread's rollout is being written. Each operation
+native's session dispatches writes a line: a turn's input, an interrupt, a shutdown.
+When native fails to append a record, it logs a warning or an error
+(`failed to record rollout items`, `rollout writer failed for …`) and the turn goes on
+from memory. The daemon keeps on the log's record when the latest line of each kind
+was written (`written`; `failed`, with what it said; a line that is not native's JSON
+counts as `failed`, as of when it is read). The settlement of an input of unknown
+outcome names them in its reason (below), never as proof: native's log drops a line it
+cannot write, as when its disk is full.
 
 The daemon reads the log from an offset in a record only the reader writes. It reads
 at each Pre hook, at turn end, every 50 ms, at a stop, and in recovery, so a result
@@ -637,9 +729,31 @@ loaded). A call still being admitted when its app-server begins to be reconciled
 withdrawn (`LISTENER_RECOVERING`). Each stop records the app-server's exit time
 (`listener/exit`).
 
+Until then nothing new is queued or started on such an app-server: a message for its
+idle thread waits, and its re-admission is requested, so it is replaced once its unit
+is quiet. A turn it is running still takes a message (`turn/steer`) while that turn's
+calls pass, that is, while its hook program is this daemon's (`hooks_fail`). Once its
+calls fail (a different hook program, `HOOK_PROGRAM_CHANGED`; a hook whose
+interpreter or program file is gone; no coordinator hooks at all), the turn could
+read the message but not act on it, so the message waits for the replacement too.
+Codex 0.163 starts a thread's next queued input as soon as the thread is idle, inside
+the app-server, with no request of ours (ext/queue `on_thread_idle`), so a message an
+older daemon queued there (`thread/queue/add`) would start its turn on the old hooks.
+Each of ours in such an app-server's native queue is taken back with
+`thread/queue/delete`: as soon as its reconcile has resumed the thread, again just
+before it is judged for replacement (a unit only that message kept busy then reads
+quiet and is replaced at once), and by maintenance each second. Native runs a
+deletion and its own dispatch under one guard. `deleted:true` means no turn started
+for the message: it is pending again (`message/withdrawn`) and the replacement
+delivers it. `deleted:false` means native started it first, and its history settles
+it. A message whose delivery is under way (its lock held) is left to a later pass,
+and only the coordinator's own entries (`msg_…` client ids) are taken back: an input
+a user queued in Codex stays.
+
 The replacement is reconciling from the save that makes it findable until its
-reconcile ends: calls on it are withdrawn the same way, and deliveries and
-submissions wait. Every reconcile of a run's writer holds one lock for the run
+reconcile ends: a call that arrives for it waits for that until its hook's cutoff,
+then is refused `LISTENER_RECOVERING`, and deliveries and submissions wait. Every
+reconcile of a run's writer holds one lock for the run
 (recovery, resume, re-admission, cancel, a transport gap) and reconciles the
 incarnation that is current once it holds it, so one replacement owns each
 transition. A reconcile that fails after recovery marks the writer failed
@@ -654,15 +768,38 @@ every other checkout recovers, and the record of a start that never got a thread
 retired. Maintenance also submits again a prepared continuation left
 `transition_pending`, for a plain run as for a workflow.
 Only the thread's history carries over: what the old app-server held in its tool
-runtime (code-mode variables and functions) is gone, and the notice to the lead says
-so. A start whose socket never appears ends its app-server's process group and marks
-its record stopped.
+runtime (code-mode variables and functions) is gone, and the coordinator's notice to
+the writer says so (Message delivery). A start whose socket never appears ends its
+app-server's process group and marks its record stopped.
+
+A live writer app-server nothing can be done with is ended and replaced the same
+way. Maintenance probes each connected one every 30 s
+(`SOFTWARE_WORKFLOWS_ANSWER_EVERY_S`) with nothing that can wait behind its turn: its
+process, read without a request, then `thread/loaded/list`, which native answers on
+a task of its own. One stopped by a signal at two reads 30 s apart, as the same
+process, is ended: SIGTERM, SIGCONT (a stopped process acts on it then), and SIGKILL
+45 s later, its birth identity checked before each signal. So is one alive behind a
+socket that refuses or closes on a reconcile's connection; a connection broken under
+a write counts as closed, as one closed under a read or in its handshake. Its
+replacement resumes the thread, and the coordinator's notice tells the writer why.
+An app-server ended this way leaves an UNKNOWN only in a checkout where its unit held
+custody, and `daemon/status.ended` counts them by reason. One that leaves
+`thread/loaded/list` unanswered for 10 s (`SOFTWARE_WORKFLOWS_ANSWER_S`; of 2,410
+measured answers on 0.163.0 the slowest took 0.70 s, with 13 writers each running a
+heavy turn) is only reported (`listener/silent`, `daemon/status.silent`), and a
+reconcile that needs it is refused `LISTENER_SILENT` (retryable) and made again
+later: silence alone never ends a writer, since one that is only slow would lose its
+turn and its runtime values.
 
 A refused or withdrawn call that native runs after all is unmediated: UNKNOWN, and its
 custody is held again. C1 compares native effect items with successful recorded
 decisions, creates UNMEDIATED context and one UNKNOWN per item, and retains the opaque
 operation window. Nonempty `write_stdin` remains part of its existing command window;
-it has no native PreToolUse hook.
+it has no native PreToolUse hook. A writer notification whose processing fails on a
+path it cannot read (a symlink, a special file, bytes changing while read) records
+that path's UNKNOWN in the checkout the failure names, or in a single-checkout
+unit's checkout; any other failure is a checkout-wide UNKNOWN in each of the unit's
+checkouts (`native evidence processing failed`).
 
 An opaque operation (a writer's command or MCP call, a lead Bash command) records a
 fingerprint, the count and SHA-256 of the heads it was admitted against, not a copy
@@ -713,12 +850,52 @@ persisted → submitted → entered_context → acknowledged
 Submission means the native RPC returned. Context entry requires the correlated
 `userMessage.clientId` echo. Acknowledgement requires the recipient's native-bound
 `ack`. Native echoes can arrive before the submission response; state never moves
-backwards. An inbox read changes none of these states.
+backwards. An inbox read changes none of these states. Mail to a lead (to `lead`, a
+lead mailbox or a lead actor) is never delivered natively, retried or woken: the lead
+reads it through its inbox and settles it by acknowledging it there. Mail a lead
+sends is settled by its writer recipient's delivery and `ack`.
 
 A running root receives `turn/steer` with its expected turn ID. An idle root obeys
 the sender's wake policy. A lost result is reconciled against full native history
-and every queue page before a retry is considered. Native delivery is not promised
+and every queue page before a retry is considered. Where those reads cannot tell, it
+is settled as any input of unknown outcome is (C2, cancellation): one proven
+undelivered is delivered again as its wake says. Native delivery is not promised
 exactly once; application-level acknowledgement is deduplicated.
+
+A coordinator notice is what recovery tells a writer's root thread after replacing
+its app-server (`messages.notify`: sender `coordinator`, wake `none`, no reply
+asked). It is never steered, queued or started as a turn: Codex 0.163 preempts a
+running code-mode cell whenever user input lands in the active turn (core
+`input_queue.rs`, `watch_user_input`). The cell yields to the model and runs on,
+and if the turn ends first, native can abandon the `apply_patch` the cell then
+makes. A notice goes through `thread/inject_items` as one user message, which
+native records in the thread's history without a turn: at once on an idle thread,
+and at a running turn's next sampling request without preempting its cell. It
+reads:
+
+```text
+C1_NOTICE <message-id> from the coordinator
+<text>
+(No reply or acknowledgement needed.)
+```
+
+When it is sent depends on what its app-server's admission proved
+(`capabilities.inject`): with `active` at any time, with `idle` only while no turn
+runs (it waits for the turn to end). With neither it is held (`message/notice_held`,
+once per app-server) for the first app-server of that thread whose admission proves
+one, and never steered meanwhile; a writer admitted by another release is not
+calibrated, so its notices wait for its replacement. On an idle thread a notice is in
+context at once; injected into a running turn, once `thread/turns/list` shows that
+turn completed, since native records at a turn's finish what the turn had not taken.
+An interrupt drops what a turn had not taken, as does the end of its app-server, and
+a failed turn may have been aborted: each is injected again (`message/inject_dropped`,
+`possible_duplicate_native_delivery`), so a notice arrives at least once and its id
+tells a second copy apart. A lost RPC result is injected again the same way
+(`message/inject_uncertain`); a refusal (`NATIVE_RPC`, `OUTBOUND_INPUT`) waits for
+another app-server. A notice to a cancelled run or a closed unit is cancelled. Notices
+recovery sent before 2.4.4 as no-wake mail from `lead` that are still pending are
+recognised by their openings and delivered the same way; one that 2.4.3 already
+steered is first settled as any steer.
 
 A child message has a separate root relay hop. The root is instructed to use its
 native collaboration tools; its echo or acknowledgement cannot acknowledge the
@@ -731,7 +908,14 @@ client connected.
 
 Sealing checks the root and all discoverable descendants, active turns, pending
 hooks/tools, native terminals, process custody and unverified operations. It
-refuses UNKNOWN paths and dependencies on unpublished other-unit revisions.
+refuses UNKNOWN paths and dependencies on unpublished other-unit revisions; a
+dependency refusal (`UNKNOWN_DEPENDENCY`, `UNPUBLISHED_DEPENDENCY`) names its paths
+(`details.paths`). A reference to a path outside the ledger is no dependency. A
+revision a restore wrote is the work of whoever wrote the bytes it restored: the
+source the restore recorded, followed through restores of restores, or where it
+recorded none, the receipt holding the same bytes. The path's baseline, or its
+absence where the baseline lacks it, is no unit's work; bytes no receipt holds
+remain the restoring unit's.
 The complete mutation scope comes from operations, including add/delete and both
 move endpoints. An UNKNOWN head or another unit's later revision cannot make a
 path disappear. Every scoped path must still have this unit's final exact receipt,
@@ -809,16 +993,37 @@ back the branch. Claims release only after complete reconciliation.
 
 ## Recovery and refusals
 
-Worker generations and attempt generations fence interrupted work. Startup first
-invalidates outstanding lead Bash windows, reestablishes canonical checkout ownership,
-then reconnects registered listeners,
-initializes/resumes without starting inference,
-pages full history, resolves children lazily, replays durable received evidence,
-checks terminals/processes and reconciles filesystem bytes. It then reconciles
-seal attempts, owned index locks/publications and messages before normal dispatch.
-A replacement listener and any changed implementation fingerprint require fresh
-admission before work can continue.
-Uncertain mutation requests are never automatically replayed.
+Worker generations and attempt generations fence interrupted work. Startup
+recovery has two parts. Before any call is admitted, and with no request to an
+app-server, it makes the ledger consistent: it invalidates outstanding lead Bash
+windows, reestablishes canonical checkout ownership and every recoverable
+participant lease, applies each writer log's receipts, and quarantines interrupted
+cross-checkout operations, lead operations and seal attempts. The daemon then
+serves, and reconciles writers in the background, each run in parallel with the
+others; what two runs share is serialized where it is shared (a checkout's locks, a
+calibration's binding). Each run's writer app-servers are reconnected or replaced,
+initialized/resumed without starting inference, read back (full history paged,
+children resolved lazily, durable received evidence replayed, terminals and
+processes checked) and its workflow advanced. Each checkout's filesystem bytes are
+reconciled after every run in it, each unit's publications and owned index locks
+after its runs and checkouts, and messages last. Measured with 13 writers in 4
+checkouts, the daemon served after about 2 s and recovery completed after about 55 s
+(VERIFY.md). A plain run whose turn ended while no daemon read its app-server takes
+that turn's state from history. A writer whose startup reconcile fails is quarantined
+with a checkout-wide UNKNOWN in each of its unit's checkouts; a resume reconciles it
+again, and is refused `RECOVERY_UNKNOWN` until that UNKNOWN is narrowed or restored.
+
+A call for a run (`run/resume`, `run/terminate-terminal`), a unit's lifecycle
+(`unit/seal`, `unit/review-record`, `unit/publish`, `unit/reopen`, `unit/recover`)
+or a checkout's UNKNOWN (`unknown/restore`, `unknown/narrow`) that startup recovery
+is still reconciling waits for it, at most 20 s per attempt
+(`SOFTWARE_WORKFLOWS_RECOVERY_WAIT_S`), then is refused `WRITER_RECOVERING`
+(retryable), with `retry_after` and what is still reconciling. The plugin's MCP
+server sends such a call again while its own 90 s last; the CLI returns the
+refusal. A keyed call keeps the refusal as its key's answer. A cancel is recorded
+at once, and a hook waits for its writer as above. A replacement listener and any
+changed implementation fingerprint require fresh admission before work can
+continue. Uncertain mutation requests are never automatically replayed.
 
 Use `daemon/status`, `records/list`, `unknown/list`, and `run/terminals` to inspect
 an incident. Terminate a known native terminal through the native endpoint. Use
@@ -827,10 +1032,19 @@ Claims never expire because a heartbeat stopped. Quarantine cannot be cleared by
 submitting a newer PID or an after-the-fact content hash.
 
 UNKNOWN is permanent history. To resolve it, first reconcile custody and stop
-active writers, reopen a sealed unit if necessary, then restore stored known
-revisions with `unknown/restore`. A restore alone still blocks publication. A new
-verified edit must follow; a checkout-wide gap requires that edit to cover the
-entire restored scope. No `adopt`, risk acknowledgement or publication bypass is
+active writers, reopen a sealed unit if necessary, then restore with
+`unknown/restore`. A restore found at the baseline afterwards (every path of it, for
+a checkout-wide gap) resolves the UNKNOWN. It is read again while it still holds
+its claims, must show the restore's own revision, and that revision must still be
+the head when the resolution commits. A restore resolves only the UNKNOWNs and
+quarantined operations it found before its edit: one recorded later is an effect it
+never saw, and stays. Another unit's claim of a restored path is refused until the
+resolution commits. The restore then releases only the claims its own edit created
+that no other call has acquired since: one its unit's other call also took, or one
+taken again after a handback, stays. Any other restore alone still blocks
+publication, and a new verified edit must follow; a checkout-wide gap requires that
+edit to cover the entire restored scope. No `adopt`, risk acknowledgement or
+publication bypass is
 provided. Missing/corrupt receipt data refuses verification or publication and
 does not release claims.
 
@@ -838,7 +1052,9 @@ A checkout-wide gap is narrowed instead with `unknown/narrow`, without restoring
 anything or stopping writers. What C1 tracks of a checkout, and so what a gap can
 have left unexplained, is its bytes. C1 compares every path with its head under the
 checkout lock, while no command holds custody there. Each path that differs becomes its own UNKNOWN, as in any
-reconcile, so no unexplained byte is adopted. Every checkout-wide UNKNOWN recorded
+reconcile, so no unexplained byte is adopted; so does each path it cannot read (a
+symlink, a special file), and a path outside the ledger is left out. Every
+checkout-wide UNKNOWN recorded
 before the read is then resolved. A patch or edit still in flight keeps its own
 lifecycle. Seal reads its scope again and publish the whole checkout before they
 freeze anything, so a change made after the read is still found. Not found: a change
@@ -848,7 +1064,11 @@ A recorded process id that another user's process now holds (a root daemon that
 took the id of one that exited) counts as gone. macOS refuses both the process's
 description and a signal to it. Its short description (`PROC_PIDT_SHORTBSDINFO`)
 still answers, and none of its user ids is this user's, while every writer process,
-hook and service runs as this user. A process of this user that cannot be read keeps
+hook and service runs as this user. A process that has exited and is not reaped yet
+is read as a zombie, not refused. A process of this user that macOS will not
+describe because it runs a set-user-ID program (every `/bin/ps` is setuid root) is
+read through `sysctl` (`kinfo_proc`: start time and state) and its short description
+(parent and user). Only a process of this user that none of these reads answers keeps
 its custody held (`PROCESS_UNREADABLE`). On Linux with `/proc` mounted `hidepid=1`, a
 process that cannot be read keeps custody held whoever owns it: the directory shows only
 its effective user, and a set-user-ID child of a writer keeps the writer's real one.
@@ -856,7 +1076,8 @@ its effective user, and a set-user-ID child of a writer keeps the writer's real 
 Common refusal codes include `CLAIM_CONFLICT`, `OPERATION_BUSY`, `CUSTODY_WAIT`,
 `LEAD_RECORDS`, `UNIT_FROZEN`, `STALE_BASE`, `REVIEW_BINDING`,
 `UNKNOWN_BLOCKS_SEAL`, `UNKNOWN_BLOCKS_PUBLICATION`, `UNPUBLISHED_DEPENDENCY`,
-`UNIT_INDEX_CHANGED`, `INDEX_LOCKED`, and `ADMISSION_EXEC_POLICY_UNOBSERVABLE`.
+`UNIT_INDEX_CHANGED`, `INDEX_LOCKED`, `WRITER_RECOVERING`, `LISTENER_RECOVERING`,
+`LISTENER_SILENT`, `RESTORE_BASELINE`, and `ADMISSION_EXEC_POLICY_UNOBSERVABLE`.
 Preserve the error envelope and its context; a refusal is not successful work.
 
 ## Admission, fixture and state layout
@@ -895,6 +1116,21 @@ Only completed successful calibration is reusable under its fingerprint. A
 separate C1-owned red/green Git probe proves that missing objects cannot invoke
 lazy-fetch helpers during helper-free reads.
 
+Admission also probes one optional capability for each writer binding, `inject`,
+once, after the required probes; it is cached with the binding and never a refusal.
+Its red is a `turn/steer` of a note while a code-mode cell runs: the request after it
+must show the cell still running, the preemption the detector looks for. A
+`thread/inject_items` into the same running cell must leave the cell to complete, be
+carried by the next request and start no other turn; an inject on an idle thread
+must start no turn within 1.5 s and be carried by the next turn's first request. The
+verdict is `active` when the red came back red and both other parts held, `idle`
+when the red came back red and only the idle part held, and none otherwise (notices
+are then held). A probe that raised or timed out proves neither way and takes
+`idle`, recorded with its error in `capability_fallback`, and is not probed again for
+that binding; each of its steps has its own bound, so it always ends. The probe adds
+about 7 s to a binding's first admission and nothing to a cache hit;
+`admission/capability` records the verdict and its seconds.
+
 | State entry | Purpose |
 |---|---|
 | `ledger.sqlite`, WAL/SHM | Versioned schema, identities, revisions, events, UNKNOWNs, idempotency and journals; daemon only. |
@@ -904,7 +1140,11 @@ lazy-fetch helpers during helper-free reads.
 | `schemas/<binary-digest>/` | Native generated experimental schema and completion marker. |
 | `calibrations/` | Successful capability bindings and evidence locations. |
 | `supervisor.lock`, `worker.lock` | Singleton lifecycle. |
+| `upgrade.lock` | Held by the one process starting, replacing or stopping the daemon: a client, or a supervisor restarting its worker. |
+| `lead-hooks/` | One marker per lead call the coordinator may hold something of, named by the SHA-256 of its session and tool-use id, until a Post or PostToolBatch settles it. |
 | `endpoint.json`, `startup-error.json` | Private endpoint discovery and structured startup diagnostics. |
+| `supervisor-exit.json` | Why a supervisor exited without restarting its worker (`UPGRADE_HELD`): only one holding no lease does. |
+| `supervisor-wait.json` | A supervisor waiting for `upgrade.lock` to restart its worker, its leases held: since when, how many leases, and `until` once it restarted it. |
 | Canonical `/tmp/c1-<uid>/s*/` | Owned per-incarnation RPC/native/probe endpoint allocations. |
 | Canonical `/tmp/c1-<uid>/<identity>.owner` | Cross-state checkout ownership anchor; never remove to steal ownership. |
 
@@ -936,9 +1176,12 @@ tool output or credential content from that file is copied into the result.
 The supervisor holds one compatibility lease per checkout writer group, using
 the existing filesystem-identity lock, legacy bridges and mixed-version barrier.
 Multiple native units share that lease. The MCP server and replacement workers
-do not own its lifetime. An inherited, inode-verified venv `.in-use` descriptor
-also survives worker replacement. Queued/uncertain deliveries, process custody, a
-live operation and a patch native may still be writing (`executing`) retain
+do not own its lifetime. A worker whose supervisor is gone starts a new one holding
+the same leases at once, whoever holds `upgrade.lock`: that supervisor starts no
+worker until this one has died, and then only under the lock, as any restart. An
+inherited, inode-verified venv `.in-use` descriptor also survives worker replacement.
+Queued/uncertain deliveries, process custody, a live operation and a patch native
+may still be writing (`executing`) retain
 exclusion, whatever the run's state; a stop releases it after every app-server has
 exited. An effect-capable Pre hook holds it, under the lock its release takes, until
 its operation is recorded, and takes it back if a run's end released it: a cell's call
@@ -951,6 +1194,10 @@ explicit write-mode refusal; its lock lifetime has not been implemented.
 The server starts the coordinator on demand with its actual Python >=3.11
 interpreter. Module resolution is independent of the target checkout. First
 admission can take tens of seconds and is visible in progress and durable events.
+A call the daemon refuses `WRITER_RECOVERING` is sent again while the call's own
+time lasts (90 s by default), only while a whole wait (the refusal's
+`waited_seconds`) and 5 s of the call's own work still fit in it; a keyed call is
+not, since the daemon keeps that answer as its key's.
 Capability cache keys exclude random endpoint observations and use a per-key
 calibration lock; every listener still proves effective policy, hook trust and
 writer tool catalogs. The measured native execution-policy representation has
@@ -983,20 +1230,55 @@ cancel reports `cancelled` only once no phase's `turn/start` is in flight or
 unresolved, and native reports each of the unit's threads idle (`thread/read`, in
 the thread's own request order). A thread it cannot read counts as running unless
 it does not hold it loaded, and an app-server that runs without a connection counts
-as running. When the result of an input's `turn/start` was lost, the run stays
-`cancelling` until a `thread/read` of the thread's status, then one of its turns,
-both sent after that start, show whether the input entered a turn: native runs a
-thread's requests one at a time in arrival order and saves the live thread before
-it reads the turns. A turn the input entered is interrupted and settled. An input
-that entered none while the thread is idle is marked `not_started` only when a
-second pair of reads, sent at least 2 s after the first, agrees: `turn/start`
-answers once core holds the turn, but native reports the thread active only once
-that turn's own task reports it started, so one read can fall between the two.
-Native does not bound that delay: a turn that starts later is interrupted when it is
-seen, and its calls are refused until a resume (a known limit of 2.4.3). A resume
-continues after a `not_started` input. A workflow past its deadline is
-cancelled by maintenance, which checks the deadline again on the run as it is when
-the cancel begins: a resume renews it.
+as running. An input whose RPC is still in flight is waited for. One whose native
+outcome was lost (a phase's `turn/start` result, a writer delivery not yet in
+context) keeps the run `cancelling` until it is settled, with no time bound in the
+decision. Its thread is read on the app-server it went to, in the thread's own
+request order: `thread/queue/list`, then `thread/read` of its status and of its
+turns (native runs a thread's requests one at a time in arrival order). A turn that
+holds the input is its turn, interrupted and settled; a queued input is deleted, and
+only native's `deleted: true` proves it withdrawn without starting a turn (one native
+dispatched first is settled by its turn). The reads cannot tell when the thread is
+idle and holds no record of the input: `turn/start` answers once core holds the turn,
+but native records the input and reports the thread active only once that turn's own
+task runs, with no bound on the delay. That app-server is then ended once nothing
+else of the unit is in flight there (a `turn/interrupt` with an empty `turnId`, which
+aborts a turn still starting, ordered after every input sent to the thread, then its
+stop: `listener/ended`), and its rollout is read, final once the process has exited.
+Native writes a turn's records in order, but a record it fails to append is missing
+while the turn goes on from memory, and the line its log writes of the failure can be
+lost too, so no silence proves that an input never ran: not the rollout's, not
+history's, not the log's. Only native's own record of the input tells where it went:
+its client id's record in the rollout or in history (that turn: it entered), native's
+queue holding it (queued), or native's `deleted: true`. An input that nothing can start
+any more and no such record shows is `unproven` (`workflow/submission_unproven`,
+`message/delivery_unproven`, each with its reason): one sent to an exited app-server
+whose rollout holds no record of it, or whose rollout cannot be read and neither the
+replacement's history nor its queue holds it; a queued one once native's queue, read
+after it in order on that app-server or on its replacement, no longer holds it (a
+replacement that may be dispatching it from that queue is ended first); and on a
+running app-server, one whose turn has ended, or a steer when no turn runs, that
+history holds no record of. The reason names what the rollout and the log do show: a
+failure native logged after the send, a log showing nothing of native's session after
+it, damage to the rollout after it, and a user message holding the input's text
+without its client id's record, naming its turn (a text proves nothing: another input
+can say the same). Nothing sends an unproven input again of itself, as it may have run
+with its records lost (a coordinator notice excepted, below): the run reads
+`submission_uncertain`, and the writer's result carries `input_unproven`. It runs nothing
+meanwhile, so it holds neither a stop nor its checkouts' compatibility lease. Only the lead
+sends it again, and doing so may run it twice: a resume sends it ahead of its own text
+(`run/input_resent`: `phase`, `input_id`, `resent`, the input it repeats,
+`reason: resumed_unproven` and its `proof`), and `message/retry` sends a delivery. A
+resume settles its run's inputs the same way before it proceeds, and maintenance settles
+them in the background, at most once each 2 s per run (an uncertain delivery, and a
+workflow's phase input as it advances the workflow), so neither a stop nor a cancel
+waits on one indefinitely. A delivery `unproven` (its record's `unproven` says why) is
+delivered again only by `message/retry`; a coordinator notice is owed again instead
+(`pending`): it starts no turn, and its id tells a second copy apart. A writer ended
+this way is replaced, without continuing its thread, while work is owed to it or by its
+run's next resume. Each cancel generation reports `run/cancelled` once, with its
+`generation`. A workflow past its deadline is cancelled by maintenance, which checks the
+deadline again on the run as it is when the cancel begins: a resume renews it.
 
 | Lead MCP tool | Operations |
 |---|---|
@@ -1042,13 +1324,22 @@ revalidated before object creation and both before and inside ref transactions.
 
 ## Claude lead edit hooks
 
-`hooks/coordinator_lead.py` runs under Python 3.9 for PreToolUse, PostToolUse and
-PostToolUseFailure. It never starts a daemon or registers an unrelated checkout.
+`hooks/coordinator_lead.py` runs under Python 3.9 for PreToolUse, PostToolUse,
+PostToolUseFailure and PostToolBatch. It never starts a daemon or registers an
+unrelated checkout.
 Write, literal Edit and ordered MultiEdit prepare a complete intended image and
 bind it to checkout/session/tool-use identity before the host edit. Successful
 completion verifies bytes, mode and preconditions; duplicate posts are idempotent.
 Ambiguous replacements, failure, missing pre/post events or altered inputs grant
-no receipt. Pending gaps are quarantined after 120 seconds or during recovery.
+no receipt. An edit that failed (PostToolUseFailure) or never ran (its batch shows
+it with no Post), and is still at its pre-image, is settled as no effect; any other
+bytes are quarantined (UNKNOWN). A prepared edit that no Post or batch settles within
+120 seconds is quarantined. Elapsed time is no evidence that the host will not still
+run it: a permission prompt or a slower PreToolUse hook can hold the call longer. It
+stays live, so overlapping operations are refused (`OPERATION_BUSY`) and its claim
+cannot be handed back. A Post that comes later grants no receipt: the lead restores
+the path (`unknown/restore`) and makes the edit again. During recovery such an edit
+is quarantined.
 Encoding/BOM and CRLF preservation are checked by expected bytes; host behavior
 that differs is refused or quarantined, never adopted after the fact.
 
@@ -1058,6 +1349,37 @@ path another unit claims it is denied as CLAIM_CONFLICT; elsewhere the host's
 edit goes ahead unrecorded, so what it wrote reconciles as UNKNOWN. The
 refusal names a full-file Write route. Direct hook observations are not evidence
 of the host's encoding/serialization behavior; see VERIFY.md for coverage.
+
+Claude Code (2.1.306, measured) sends neither PostToolUse nor PostToolUseFailure for
+a call that another PreToolUse hook denied (the push gate, a project hook), that a
+permission refused, or that the user rejected. Such a call shows only in
+PostToolBatch's `tool_calls`, sent once every call of a batch has resolved; without
+it, the call's record would hold every lead's quiet window and `daemon/stop`
+(`lead_hooks`) until its deadline, up to 180 s. Each lead call the coordinator may
+hold something of leaves a marker in `<state>/lead-hooks/`, named by the SHA-256 of
+its session and tool-use id, made before its Pre's call and removed once a Post
+settles the call or the daemon decides it. PostToolBatch asks the daemon
+(`lead-hook/dispatch`) only about calls whose marker is left, one at a time while its
+time lasts; the daemon admits these as completion calls during a drain, as it does a
+Post. Each is settled as its Post would be, from what shows. A Bash call is
+reconciled with no `lead-command` credit: a batch is no evidence the command ran, so
+what changed in its window is nobody's, as at its deadline. An edit is decided by its
+bytes: no effect at its pre-image, verified at its intended image, quarantined
+otherwise. A batch whose calls all settled at their Posts makes no daemon call and
+no scan. Its timeout is the other lead hooks' 15 s, under the same budget: a 3 s
+daemon call starts only while a whole one fits before 14 s, so a hung daemon ends
+the batch by 14 s after at most four calls, and a call left over keeps its own
+deadline. A marker its session never settled (a session that ended mid-call, or a
+daemon down at both events) is dropped by a later Pre once it is a day old, in a
+sweep at most hourly; one dropped early only leaves its record to its own deadline.
+
+The live-view tail that `hooks/live_view_nudge.py` asks a lead to start
+(`tail -F "$HOME/.claude/logs/codex-oracle/stream.log"`, in the background) reads one
+log file and writes only its own output, so it cannot touch a checkout. A lead Bash
+call that is exactly that command is not coordinated: no record, no scan, no window
+held. Exactly means three words: `tail`; `-F` or `-f`; and that log path spelled with
+`$HOME`, `${HOME}`, `~` or the home directory. Any other shape, such as a pipe, a
+redirection or a second command, is coordinated as any lead Bash call.
 
 Bash hooks never run the command again. PreToolUse reconciles the project reach, so
 what changed before the command is not its doing, and records a quiet-window

@@ -4,12 +4,12 @@ macOS environment parsing follows ../procenv.py's KERN_PROCARGS2 boundary. Only
 Codex identity markers are returned; process environments are never logged.
 """
 import ctypes
+import errno
 import os
 from pathlib import Path
 import signal
 import subprocess
 import sys
-import time
 
 from .client import CoordinatorError
 
@@ -39,68 +39,92 @@ class ProcBSDShortInfo(ctypes.Structure):
     _fields_ += [(name, ctypes.c_uint32) for name in ("flags", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "rfu")]
 
 
-def _gone(lib, pid):
-    """After a failed kernel read: whether no process of this user holds the PID. The kernel refuses
-    both the read and a signal for a process of another user, such as a root daemon that took the PID
-    of one that exited. None of its user ids is this user's, so it is no writer's process, hook or
-    service: those run as this user, and keep its real uid across a set-user-ID program."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    except PermissionError:
-        short = ProcBSDShortInfo()
-        if (lib.proc_pidinfo(pid, 13, 0, ctypes.byref(short), ctypes.sizeof(short)) == ctypes.sizeof(short)
-                and os.getuid() not in (short.uid, short.ruid, short.svuid)):
-            return True
-        raise CoordinatorError("PROCESS_UNREADABLE", "Cannot verify process birth identity", {"pid": pid})
-    return False
+class KinfoProc(ctypes.Structure):
+    # struct kinfo_proc from sysctl(CTL_KERN, KERN_PROC, KERN_PROC_PID), 648 bytes on 64-bit macOS. Only kp_proc's
+    # leading start time and run state are read: the same p_start PROC_PIDTBSDINFO reports (measured).
+    _fields_ = [("start_sec", ctypes.c_int64), ("start_usec", ctypes.c_int32), ("pad", ctypes.c_int32),
+                ("vmspace", ctypes.c_void_p), ("sigacts", ctypes.c_void_p), ("flag", ctypes.c_int32),
+                ("stat", ctypes.c_uint8), ("rest", ctypes.c_uint8 * 611)]
+
+
+def _unreadable(pid, error):
+    return CoordinatorError("PROCESS_UNREADABLE", "Cannot verify process birth identity", {"pid": pid, "errno": error})
+
+
+def _bsd(lib, pid):
+    """(start, run state, parent, user) of the process holding the PID, or None when no process of this user does.
+
+    Every read passes arg 1, which a process that has exited and is not reaped yet (a zombie) answers too, so ESRCH
+    means nothing holds the PID. With arg 0 a zombie fails ESRCH while it still takes a signal (measured on macOS
+    26): an exit racing the read was refused PROCESS_UNREADABLE, and 2.4.3 quarantined the custody of 47 of 1,492
+    commands so and refused two. The kernel refuses (EPERM) to describe a process of another user, such as a root
+    daemon that took the PID of one that exited. None of its user ids is this user's, so it is no writer's process,
+    hook or service: those run as this user, and keep its real uid across a set-user-ID program. A process of this
+    user running a set-user-ID program is refused too: /bin/ps is setuid root, so is every ps the coordinator runs
+    while it lists. sysctl's kinfo_proc gives its start time and run state, and the short read its parent and user,
+    as for any process (measured)."""
+    info = ProcBSDInfo()
+    if lib.proc_pidinfo(pid, 3, 1, ctypes.byref(info), ctypes.sizeof(info)) == ctypes.sizeof(info):
+        return (info.start_sec, info.start_usec), info.status, info.ppid, info.uid
+    error = ctypes.get_errno()
+    if error == errno.ESRCH:
+        return None
+    if error != errno.EPERM:
+        raise _unreadable(pid, error)
+    short = ProcBSDShortInfo()
+    if lib.proc_pidinfo(pid, 13, 1, ctypes.byref(short), ctypes.sizeof(short)) != ctypes.sizeof(short):
+        error = ctypes.get_errno()
+        if error == errno.ESRCH:
+            return None
+        raise _unreadable(pid, error)
+    if os.getuid() not in (short.uid, short.ruid, short.svuid):
+        return None
+    kinfo, size = KinfoProc(), ctypes.c_size_t(ctypes.sizeof(KinfoProc))
+    libc = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+    if libc.sysctl((ctypes.c_int * 4)(1, 14, 1, pid), 4, ctypes.byref(kinfo), ctypes.byref(size), None, 0):
+        raise _unreadable(pid, ctypes.get_errno())
+    if not size.value:
+        return None  # it ended meanwhile
+    if size.value != ctypes.sizeof(KinfoProc):
+        raise _unreadable(pid, None)
+    return (kinfo.start_sec, kinfo.start_usec), kinfo.stat, short.ppid, short.uid
 
 
 def identity(pid, _attempt=0):
-    """The process's birth identity, or None when no process of this user holds the PID."""
+    """The process's birth identity, or None when no process of this user holds the PID. A process that has
+    exited and is not reaped yet is a zombie: its identity, with "zombie" true."""
     pid = int(pid)
     if sys.platform == "darwin":
         lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-        info = ProcBSDInfo()
-        size = lib.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
-        if size != ctypes.sizeof(info):
-            if _gone(lib, pid):
+        first = _bsd(lib, pid)
+        if first is None:
+            return None
+        unique = ProcUniqueInfo()  # answered for any process, another user's too (measured)
+        if lib.proc_pidinfo(pid, 17, 1, ctypes.byref(unique), ctypes.sizeof(unique)) != 56:
+            error = ctypes.get_errno()
+            if error == errno.ESRCH:
                 return None
+            raise CoordinatorError("PROCESS_KERNEL_IDENTITY", "Kernel process identity is unavailable", {"pid": pid, "errno": error})
+        # Check the PID did not change between the kernel reads.
+        after = _bsd(lib, pid)
+        if after is None:
+            return None
+        if after[0] != first[0]:
+            # Another process took the PID between the reads: read the one that holds it now.
             if _attempt < 3:
-                time.sleep(0.002)
                 return identity(pid, _attempt + 1)
-            raise CoordinatorError("PROCESS_UNREADABLE", "Cannot verify process birth identity", {"pid": pid})
-        unique = ProcUniqueInfo()
-        size = lib.proc_pidinfo(pid, 17, 0, ctypes.byref(unique), ctypes.sizeof(unique))
-        if size != 56:
-            if _gone(lib, pid):
-                return None
-            if _attempt < 3:
-                time.sleep(0.002)
-                return identity(pid, _attempt + 1)
-            raise CoordinatorError("PROCESS_KERNEL_IDENTITY", "Kernel process identity is unavailable", {"pid": pid})
-        # Check the PID did not change between the two kernel reads.
-        after = ProcBSDInfo()
-        if lib.proc_pidinfo(pid, 3, 0, ctypes.byref(after), ctypes.sizeof(after)) != ctypes.sizeof(after):
-            if _gone(lib, pid):
-                return None
-            if _attempt < 3:
-                time.sleep(0.002)
-                return identity(pid, _attempt + 1)
-            raise CoordinatorError("PROCESS_UNREADABLE", "Cannot recheck process birth identity", {"pid": pid})
-        if (after.start_sec, after.start_usec) != (info.start_sec, info.start_usec):
             raise CoordinatorError("PROCESS_REUSED", "PID changed during kernel identity lookup", {"pid": pid})
-        return {"pid": pid, "birth": str(info.start_sec) + ":" + str(info.start_usec),
-                "ppid": info.ppid, "uid": info.uid, "zombie": info.status == 5,
+        (start_sec, start_usec), status, ppid, uid = first
+        return {"pid": pid, "birth": str(start_sec) + ":" + str(start_usec),
+                "ppid": ppid, "uid": uid, "zombie": status == 5, "stopped": status == 4,
                 "kernel_id": unique.unique, "parent_kernel_id": unique.parent_unique}
     if sys.platform.startswith("linux"):
         directory = Path("/proc") / str(pid)
         try:
             parts = (directory / "stat").read_text().rsplit(")", 1)[1].split()
             return {"pid": pid, "birth": parts[19], "ppid": int(parts[1]),
-                    "uid": directory.stat().st_uid, "zombie": parts[0] == "Z"}
-        except FileNotFoundError:
+                    "uid": directory.stat().st_uid, "zombie": parts[0] == "Z", "stopped": parts[0] in ("T", "t")}
+        except (FileNotFoundError, ProcessLookupError):  # a process reaped while its entry is read reads ESRCH
             return None
         except PermissionError:
             # /proc mounted with hidepid=1 refuses another user's process. The directory's owner is only its

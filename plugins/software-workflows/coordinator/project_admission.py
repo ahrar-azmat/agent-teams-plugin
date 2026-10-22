@@ -4,12 +4,12 @@ import sqlite3
 
 from . import native
 from .client import CoordinatorError
-from .fixture import Provider, function, message
+from .fixture import function, message
 from .projects import verify_thread
 
 
 async def probe(directory):
-    from .admission import ProbeListener
+    from .admission import ProbeListener, serving
     observations = {}
     def router(body, index):
         items = [i for i in body.get("input", []) if i.get("type") in ("message", "agent_message", "function_call", "function_call_output")]
@@ -19,7 +19,7 @@ async def probe(directory):
         if not calls:
             return function("spawn_agent", {"task_name": "roots", "message": "P1_ROOT_CHILD_PROBE", "fork_turns": "none"}, "collaboration")
         return message()
-    with Provider(router) as provider:
+    async with serving(router) as provider:
         listener = ProbeListener(directory, provider, experimental=False, config={"features.unified_exec_tty": False})
         try:
             await listener.start()

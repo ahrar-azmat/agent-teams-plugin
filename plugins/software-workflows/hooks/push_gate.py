@@ -448,11 +448,135 @@ def _ansi_c_quote(command):
     content is an expansion's VALUE. This module already says so — "a denylist
     of launchers recurs forever; a whitelist of one shape ends it" — and the
     trust model places execution-boundary enforcement in the exact-argv git
-    shim (`hooks/gitshim`, 2.0). So the exemption is WITHDRAWN rather than narrowed a sixth time:
-    a `$'` is detection, the idiom costs one acknowledgement, and a silent push
-    costs the acknowledgement itself. Over-detection is the designed failure
-    direction; under-detection never was."""
+    shim (`hooks/gitshim`, 2.0). Round 51 therefore WITHDREW the exemption:
+    a `$'` is detection. Over-detection is the designed failure direction;
+    under-detection never was.
+
+    Round 52 keeps that unconditional PARENT predicate. Only the Bash WORKER
+    may exempt a command whose SOLE prefilter trigger is `$'`, after proving
+    every command and argument belongs to a closed, non-expanding top-level
+    grammar. Every dollar must be single-quoted data; substitutions,
+    redirections, unsupported syntax and unfinished parses are refused.
+    Every literal argv[0] must be an allowlisted utility that cannot re-read
+    arguments as shell commands, with executing/following utility options
+    excluded and Docker limited to inspection (stats requires --no-stream).
+    Unlike the quote scans, delimiter shapes, parity rules and launcher
+    denylists above, this proof excludes ALL other parses and expansions,
+    rather than trying to recognize their effects. Quote state then describes
+    the ONLY shell parse that can occur, so `$'` can only close literal data.
+    Anything not proven retains detection and today's acknowledgement."""
     return "$'" in command
+
+
+def _ansi_c_data_only(command):
+    """Prove the worker-only round-52 exception; unsupported means False."""
+    if ("$'" not in command or
+            _PREFILTER_RE.search(re.sub(r"[\"'$]", "", _deescaped(command))) is not None):
+        return False
+
+    def allowed(argv):
+        if not argv or argv[0] not in {
+                "grep", "egrep", "fgrep", "wc", "head", "tail", "cat", "cut",
+                "tr", "uniq", "sort", "jq", "ls", "docker"}:
+            return False
+        for arg in argv[1:]:
+            option = arg.split("=", 1)[0]
+            if argv[0] == "sort" and option.startswith("--") and option != "--":
+                if "--compress-program".startswith(option):
+                    return False  # GNU long options accept abbreviations
+            if argv[0] == "tail":
+                if option.startswith("--") and option != "--":
+                    if any(name.startswith(option) for name in ("--follow", "--retry")):
+                        return False
+                elif arg.startswith(("-", "+")) and ("f" in arg or "F" in arg):
+                    return False  # includes clusters and obsolete -10f / +10f
+        if argv[0] != "docker":
+            return True
+        if len(argv) < 2:
+            return False
+        if argv[1] in ("volume", "network"):
+            if argv[2:3] != ["ls"]:
+                return False
+        elif argv[1] not in ("ps", "images", "info", "version", "inspect", "logs", "stats"):
+            return False
+        for arg in argv[2:]:
+            if arg.startswith(("--host", "--context", "--config")):
+                return False
+            if arg.startswith("-") and not arg.startswith("--") and ("H" in arg or "c" in arg):
+                return False  # connection overrides, including short clusters
+        if argv[1] != "stats":
+            return True
+        no_stream, options, i = False, True, 2
+        while i < len(argv):
+            arg = argv[i]
+            i += 1
+            if not options:
+                continue
+            if arg == "--":
+                options = False
+            elif arg == "--format":
+                if i == len(argv):
+                    return False
+                i += 1  # its value is data, even if it spells --no-stream
+            elif arg.startswith("--format="):
+                continue
+            elif arg in ("--no-stream", "--no-stream=true"):
+                no_stream = True
+            elif arg in ("-a", "--all", "--all=true", "--all=false",
+                         "--no-trunc", "--no-trunc=true", "--no-trunc=false"):
+                continue
+            elif arg.startswith("-"):
+                return False  # unknown or contradictory options stay detected
+        return no_stream
+
+    argv, word = [], []
+    quote, last_operator = "", ""
+    started, i = False, 0
+    while i < len(command):
+        char = command[i]
+        i += 1
+        if (not char.isprintable() and char != "\t") or char == "`":
+            return False
+        if quote == "'":
+            if char == "'":
+                quote = ""
+            else:
+                word.append(char)  # backslashes and dollars remain literal
+            continue
+        if char in "$\\!":
+            return False
+        if quote == '"':
+            if char == '"':
+                quote = ""
+            else:
+                word.append(char)
+            continue
+        if char in "'\"":
+            quote, started = char, True
+            continue
+        if char in "<>(){}[]*?~#":
+            return False
+        if char in " \t;|&":
+            if started:
+                argv.append("".join(word))
+                word, started = [], False
+            if char in " \t":
+                continue
+            operator = char
+            if char in "|&" and i < len(command) and command[i] == char:
+                operator += char
+                i += 1
+            if operator == "&" or not allowed(argv):
+                return False
+            argv, last_operator = [], operator
+            continue
+        word.append(char)
+        started = True
+    if quote:
+        return False
+    if started:
+        argv.append("".join(word))
+    return allowed(argv) if argv else last_operator == ";"
 
 
 def _maybe_git(command):
@@ -2903,11 +3027,10 @@ def _git_alias(real_git, cwd, prefix, name):
     return values[-1].decode("utf-8", "surrogateescape") if values else None
 
 
-def _same_dir(a, b):
-    try:
-        return os.path.samefile(a or ".", b)
-    except OSError:
-        return False
+def _is_shim(directory):
+    """Any plugin version's shim, including a directory reached through a symlink."""
+    return (os.path.isfile(os.path.join(directory, "git")) and
+            os.path.isfile(os.path.join(directory, os.pardir, "push_gate.py")))
 
 
 NOTICE_LOCK = "notices.lock"  # hooks/gate_notice.py NOTICE_LOCK; hooks/session_start.py never removes it
@@ -2946,13 +3069,12 @@ def _argv_main(real_git, args):
     run the real git, or decide a commit/push. Returns an exit status only
     when git is not run."""
     import shlex
-    shim_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gitshim")
     path = os.environ.get("PATH", "")
     inherited = os.environ.pop("GIT_EXEC_PATH", None)
     nested = _is_farm(inherited or "")  # started by a git this shim ran (its exec-path is a mirror)
     # the gate's own git calls (inspection, configuration, aliases) go to the real git
     os.environ["PATH"] = os.pathsep.join(d for d in path.split(os.pathsep)
-                                         if not _same_dir(d, shim_dir) and not _is_farm(d))
+                                         if not _is_shim(d or ".") and not _is_farm(d or "."))
     builtins = _git_builtins(real_git)
     farm, exec_path = _farm_passed_down(inherited, real_git) if nested else ("", "")
     if not farm:
@@ -3190,7 +3312,11 @@ def main() -> int:
         # parent's deadline (round 40: detection ran in the parent, outside
         # any bound, and one regex was quadratic)
         try:
-            print(_evaluate(data) if _detected(command) else NOT_DETECTED)
+            if (str(data.get("tool_name") or "").lower() == "bash"
+                    and _ansi_c_data_only(command)):
+                print(NOT_DETECTED)
+            else:
+                print(_evaluate(data) if _detected(command) else NOT_DETECTED)
         except Exception as exc:
             print(_deny(EVAL_FAILED_REASON.format(why=f"worker crashed: {type(exc).__name__}: {exc}")))
         return 0

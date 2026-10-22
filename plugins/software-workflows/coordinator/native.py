@@ -11,7 +11,7 @@ import struct
 import subprocess
 import time
 
-from .client import CoordinatorError
+from .client import CoordinatorError, clean_environment
 
 
 def environment(**overrides):
@@ -21,14 +21,19 @@ def environment(**overrides):
     result = {key: value for key, value in os.environ.items() if key not in
               {"CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID", "SOFTWARE_WORKFLOWS_OPERATION"}}
     result.update(overrides)
-    return result
+    return clean_environment(result)
 
 
 # A writer's log filter. The policy trace is admission's view of the effective execution policy. Codex 0.163
 # writes `codex.tool_result` to the trace-safe target once a call's handler has returned, direct or nested in a
 # code-mode cell, with success=false when it returned a failure; that target carries identifiers, names and
-# lengths, never arguments or output.
-WRITER_LOG = "codex_core::exec_policy=trace,codex_otel.trace_safe=info"
+# lengths, never arguments or output. Native's session logs each failed rollout append and goes on from its
+# in-memory history (core session/mod.rs persist_rollout_items, an error), as its rollout writer logs each failed
+# write (rollout/src/recorder.rs, errors and warnings), and the session's handlers log each operation they dispatch
+# (a span opened and closed: session/handlers.rs submission_dispatch) and its shutdown: what an app-server saved
+# proves an input absent only with this log (rollout.native_mark, runs.locate_saved).
+WRITER_LOG = ("codex_core::exec_policy=trace,codex_otel.trace_safe=info,codex_core::session=warn,"
+              "codex_core::session::handlers=info,codex_rollout::recorder=warn")
 
 
 def startup_diagnostic(line):
@@ -112,7 +117,7 @@ METHODS = {
     "thread/turns/list": "ThreadTurnsListParams", "thread/items/list": "ThreadItemsListParams",
     "thread/queue/add": "ThreadQueueAddParams", "thread/queue/list": "ThreadQueueListParams",
     "thread/queue/start": "ThreadQueueStartParams",
-    "thread/queue/delete": "ThreadQueueDeleteParams",
+    "thread/queue/delete": "ThreadQueueDeleteParams", "thread/inject_items": "ThreadInjectItemsParams",
     "thread/backgroundTerminals/list": "ThreadBackgroundTerminalsListParams",
     "thread/backgroundTerminals/terminate": "ThreadBackgroundTerminalsTerminateParams",
     "experimentalFeature/list": "ExperimentalFeatureListParams", "config/read": "ConfigReadParams",
@@ -139,6 +144,10 @@ FIELDS = {
     "thread/queue/list": ({"threadId", "cursor", "limit"}, {"threadId"}),
     "thread/queue/start": ({"threadId"}, {"threadId"}),
     "thread/queue/delete": ({"threadId", "queuedSubmissionId"}, {"threadId", "queuedSubmissionId"}),
+    # History only: an idle thread records the items at once and starts no turn; a running turn takes them at its next
+    # sampling request without preempting a running code-mode cell, which a steer's user input does (measured on
+    # 0.163.0, r244/w-lead/logs/inject1.log). Admission's inject probe decides whether a listener may use it.
+    "thread/inject_items": ({"threadId", "items"}, {"threadId", "items"}),
     "thread/turns/list": ({"threadId", "cursor", "limit", "sortDirection", "itemsView"}, {"threadId"}),
     "thread/items/list": ({"threadId", "turnId", "cursor", "limit", "sortDirection"}, {"threadId"}),
     "thread/loaded/list": ({"cursor", "limit"}, set()),
@@ -231,6 +240,18 @@ def validate(method, params):
         object_keys(item, {"type", field, "text_elements"} if kind == "text" else {"type", field}, {"type", field}, "input")
         if not isinstance(item[field], str) or not item[field]:
             raise CoordinatorError("OUTBOUND_INPUT", "Native input content is empty")
+    if method == "thread/inject_items":
+        # Raw Responses items reach the model as written: only user text messages are sent.
+        if not isinstance(params["items"], list) or not params["items"]:
+            raise CoordinatorError("OUTBOUND_INPUT", "Injected items must be a nonempty list")
+        for item in params["items"]:
+            object_keys(item, {"type", "role", "content"}, {"type", "role", "content"}, "items")
+            if item["type"] != "message" or item["role"] != "user" or not isinstance(item["content"], list) or not item["content"]:
+                raise CoordinatorError("OUTBOUND_INPUT", "Only user message items are injected")
+            for part in item["content"]:
+                object_keys(part, {"type", "text"}, {"type", "text"}, "items.content")
+                if part["type"] != "input_text" or not isinstance(part["text"], str) or not part["text"]:
+                    raise CoordinatorError("OUTBOUND_INPUT", "Injected message content must be nonempty input_text")
     for spec in params.get("dynamicTools", []):
         object_keys(spec, {"type", "name", "description", "inputSchema"},
                     {"type", "name", "description", "inputSchema"}, "dynamicTools")
@@ -440,6 +461,8 @@ class Connection:
         self.writer.close()
         try:
             await self.writer.wait_closed()
+        except OSError:
+            pass  # lost with an error before this close (a write after its peer exited): asyncio raises it on every wait
         finally:
             if self.receiver is not asyncio.current_task():
                 self.receiver.cancel()

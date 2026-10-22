@@ -160,6 +160,26 @@ def entries(root, tree=None, index=None):
     return result
 
 
+def entries_at(root, path):
+    """The branch commit's and the index's entries at exactly `path` (as `entries` gives them; [] where absent), read
+    with literal pathspecs."""
+    literal = {"GIT_LITERAL_PATHSPECS": "1"}
+    found = []
+    for args in (["ls-tree", "-z", "--full-tree", "HEAD", "--", path], ["ls-files", "--stage", "-z", "--", path]):
+        listed = []
+        for entry in git(root, args, extra_env=literal).stdout.split(b"\0"):
+            if not entry:
+                continue
+            meta, name = entry.split(b"\t", 1)
+            if name.decode("utf-8", "strict") != path:
+                continue  # an index entry inside a folder of that name
+            fields = meta.decode().split()
+            mode, oid, stage = (fields[0], fields[2], "0") if args[0] == "ls-tree" else fields
+            listed.append({"mode": mode, "oid": oid, "stage": stage})
+        found.append(listed)
+    return found[0], found[1]
+
+
 def blob_oid(data, algorithm="sha1"):
     return hashlib.new(algorithm, b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
 

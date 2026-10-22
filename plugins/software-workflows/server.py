@@ -4733,17 +4733,30 @@ def _analysis_note(before: dict, after: dict, phase2: bool) -> str:
 
 async def _coordinator_call(method: str, params: dict | None = None, *, start: bool = False,
                             key: str | None = None, timeout: float = 90) -> Any:
-    from coordinator.client import Client
+    from coordinator.client import Client, CoordinatorError
     client = Client(timeout=timeout)
     if start:
         await asyncio.to_thread(client.ensure, python=sys.executable, inherited_fds=_VENV_LOCK_FDS)
         deadline = time.monotonic() + 90
         while not (await asyncio.to_thread(client.call, "daemon/status", {"brief": True}))["ready"]:
             if time.monotonic() >= deadline:
-                from coordinator.client import CoordinatorError
                 raise CoordinatorError("COORDINATOR_RECOVERING", "Coordinator recovery is still in progress")
             await asyncio.sleep(0.2)
-    return await asyncio.to_thread(client.call, method, params, key)
+    # A call for a writer, unit or checkout startup recovery is still reconciling is answered WRITER_RECOVERING once
+    # the daemon has waited for it (coordinator/recovery.py RECOVERY_WAIT_S, 20 s: per attempt, since the envelope
+    # carries no caller deadline), before any effect. It is sent again while this call's own time lasts: an attempt
+    # only while a whole wait (the refusal's waited_seconds) and 5 s of the call's own work still fit in it, so the
+    # refusal, not a lost answer, ends a call whose time runs out. Not a keyed call: the daemon keeps that answer as
+    # its key's.
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return await asyncio.to_thread(client.call, method, params, key)
+        except CoordinatorError as exc:
+            wait = (exc.details or {}).get("waited_seconds", 20)
+            if exc.code != "WRITER_RECOVERING" or key is not None or time.monotonic() + wait + 5 > deadline:
+                raise
+            await asyncio.sleep(0.2)  # never a hot loop, should a refusal come back early
 
 
 async def _coordinator_notice(text: str, session_id: str | None = None) -> str:
@@ -4756,7 +4769,9 @@ async def _coordinator_notice(text: str, session_id: str | None = None) -> str:
     if notice in text:
         return text
     try:
-        inbox = await _coordinator_call("message/inbox", {"recipient": "lead", "limit": 1, "session_id": session_id}, timeout=2)
+        # The folder scopes it as the session does: with neither, 2.4.4 has no project to read and finds no mail.
+        inbox = await _coordinator_call("message/inbox", {"recipient": "lead", "limit": 1, "session_id": session_id,
+                                                          "cwd": _get_cwd()}, timeout=2)
         if inbox["unread"]:
             return text.rstrip() + "\n" + notice
     except Exception:
@@ -4926,9 +4941,17 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
     """Inspect status/object diff/UNKNOWN, reconcile effects or custody, restore a
     known revision, narrow a checkout-wide UNKNOWN, reopen a seal, recover
     publication, or abandon an unapplied publication. Actions: status, diff,
-    unknown, reconcile, restore, narrow, reopen, recover, abandon. Restoration
-    writes the chosen known bytes and grants no authorship to unexplained bytes.
-    A new exact edit is still required. narrow takes the id of a checkout-wide
+    unknown, reconcile, restore, narrow, reopen, recover, abandon. restore
+    writes the UNKNOWN's path again: revision names a known revision of it, or
+    "baseline" (what the branch commit and the index both hold there), and
+    revisions {path: null} removes a path both lack. A restore found at the
+    baseline when read again resolves the path's UNKNOWNs; any other grants no
+    authorship to unexplained bytes, and a new exact edit is still required.
+    A restore keeps no claim, and what follows it depends on whose bytes it
+    restored, not on the unit that restored them.
+    A path git ignores that neither the branch commit nor the index holds is
+    outside the ledger: nothing there is recorded, refused or published, and
+    its UNKNOWNs are resolved without a write. narrow takes the id of a checkout-wide
     UNKNOWN (path "*"): the whole checkout is read again, each path whose bytes
     the coordinator cannot explain becomes its own UNKNOWN, and every
     checkout-wide UNKNOWN recorded before the read is resolved. It writes
