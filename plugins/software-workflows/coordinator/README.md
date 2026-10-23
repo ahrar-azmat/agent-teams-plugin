@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.5 / P1
+# Writer coordinator — software-workflows 2.4.6 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -1020,19 +1020,441 @@ app-server, it makes the ledger consistent: it invalidates outstanding lead Bash
 windows, reestablishes canonical checkout ownership and every recoverable
 participant lease, applies each writer log's receipts, and quarantines interrupted
 cross-checkout operations, lead operations and seal attempts. The daemon then
-serves, and reconciles writers in the background, each run in parallel with the
-others; what two runs share is serialized where it is shared (a checkout's locks, a
+serves, and reconciles writers in the background with bounded concurrency;
+what two runs share is serialized where it is shared (a checkout's locks, a
 calibration's binding). Each run's writer app-servers are reconnected or replaced,
-initialized/resumed without starting inference, read back (full history paged,
-children resolved lazily, durable received evidence replayed, terminals and
+initialized/resumed without starting inference, read back (incremental native
+history, newly discovered children, unapplied durable evidence, terminals and
 processes checked) and its workflow advanced. Each checkout's filesystem bytes are
 reconciled after every run in it, each unit's publications and owned index locks
 after its runs and checkouts, and messages last. Measured with 13 writers in 4
 checkouts, the daemon served after about 2 s and recovery completed after about 55 s
 (VERIFY.md). A plain run whose turn ended while no daemon read its app-server takes
 that turn's state from history. Recovery resumes use `excludeTurns:true`: policy,
-identity and ancestry are checked from the response, and full turns and items are
-still read through pagination afterward.
+identity and ancestry are checked from the response. History metadata uses
+`thread/turns/list` with `itemsView:"notLoaded"`, ascending, in pages of 25;
+item bodies use turn-scoped `thread/items/list`, also in pages of 25. No history
+size, item count, page count or total recovery time limit truncates observation.
+
+A writer's recovery snapshot preserves paths held by lead file calls admitted
+in the current daemon generation and still awaiting settlement, including calls
+still admitting or settling. Current-generation prepared, allowed or running
+lead-edit/restore operations have the same protection, including direct editor
+operations without a host-call record and leads attached to the writer's unit.
+For multi-checkout operations, recovery also exempts the current-generation parent
+before its initial cross-checkout quarantine pass; every part retains its own
+settlement and snapshot protection. The same kind/generation predicate covers
+parents, parts and single-checkout operations. Native-writer groups remain subject
+to reconnect quarantine. Startup's pre-admission crash-gap pass still quarantines
+unfinished groups from the previous daemon generation.
+The snapshot protection is checked after filesystem IO, immediately before applying the
+observation. It grants no receipt: the call's own verification or failed-call
+settlement remains responsible for those bytes. Earlier-generation holds and
+native writer operations keep crash-gap observation and quarantine semantics.
+
+Quarantine snapshots also preserve unrelated current-generation lead holds,
+while excluding the operation being quarantined from that protection. A failed
+lead call therefore still records changed bytes as UNKNOWN before its hold ends.
+Restore pre-reads and checkout-wide post-reads require a complete snapshot:
+they refuse overlapping active lead work before the scan and again after IO,
+rather than skipping paths and resolving an incomplete view. A completion-only
+hook has no hold of its own; its full observation stays durably pending when
+another admitted call overlaps and retries after that call settles. The ordinary
+lead-call settlement reads still observe their own held paths in full.
+
+The separate, versioned `native_history` record belongs to an actor/thread across
+listener replacements. Its native `backwardsCursor` is an inclusive ascending
+turn boundary, obtained from a descending one-turn metadata read. The boundary
+is published only after that turn and everything preceding it has been applied,
+or unfinished work has a durable obligation. `native_turn` records retain status,
+a conservative completed prefix, the applied item tail, and each unfinished item's
+native predecessor. Catch-up reads each unfinished item with that predecessor's
+exclusive item anchor and a limit of one, then reads new items after the applied
+tail. Completed successors are not repeatedly decoded behind an unfinished item.
+Mutable older turns remain pending after the main boundary advances. Item effects
+and unfinished obligations are durable before the tail advances; a crash before
+that save repeats the effects.
+Native 0.163.0 does not persist `ItemStarted`: a code-mode command can still be
+running after its turn finishes while no unfinished item appears in the listing.
+Each observation therefore also pins turns named by the actor's prepared, allowed
+or running operations that lack a completed item or a returned failure. These
+pins come from durable admission and journal evidence, including operations whose
+turn has already fallen behind the saved boundary. Turn records retain native
+metadata positions so that finding an older pinned turn does not reread earlier
+item payloads. Older records without a position locate that turn through paged
+metadata once.
+
+If the item tail does not supply an expected completion, a handler receipt,
+dispatch-end receipt, Post hook or original executor exit makes closure uncertain.
+The observer then reads that entire turn in bounded pages, applies its evidence,
+and records which closure evidence it checked. This scoped read repeats only when
+that evidence changes. It never scans other turns' item bodies, infers completion
+from an empty listing, or releases custody merely because the executor ended.
+If the call remains absent, existing settlement and UNKNOWN rules still apply.
+`native_input` records retain client-ID entry evidence for message and uncertain
+submission lookups. These facts are small; they do not copy historical payloads.
+
+An absent, malformed or rejected checkpoint, a mismatched inclusive boundary,
+reversion notification, or changed native rollout identity triggers a full paged
+bootstrap. The observer checks native mode/path and file replacement/truncation,
+and checks identity again before committing progress. Native cursor acceptance
+alone does not establish trust. Any native refusal of a history request carrying
+a stored cursor or item anchor discards trust and retries from a fresh epoch once;
+the fallback records native's code and message without classifying its wording.
+Cursor-free refusals and transport uncertainty still raise and retain existing
+retry/quarantine behavior. Native `historyMode:"legacy"` is explicitly refused as
+`NATIVE_HISTORY_UNSUPPORTED`; it differs from old coordinator records, which
+bootstrap normally against paginated native history.
+
+Normal, successfully applied notifications schedule coalesced observation through
+the same observer. Receiving or dequeuing an event does not establish a history
+prefix. `native_applied` retains journal application progress; successful progress
+is flushed in one transaction across listeners after 100 ms or at 256 applied
+messages. The timer is a scheduling target, not a hard wall-clock bound. A crash
+can repeat that idempotent suffix; receipts remain immediately durable. Failed
+application discards that listener's buffered progress and freezes its durable
+prefix until recovery. Before reconnecting, the daemon also freezes progress
+through the last previously received event. New notifications cannot skip that
+unapplied suffix. Journal replay uses batches of 25 and yields between records.
+Asynchronous native tool requests commit their `native_obligation` in the same
+transaction as the received journal event, before enqueueing. Replay leaves
+pending requests owned by the current daemon generation to the normal handler.
+Only a failed handler or an ended receiving generation makes its unfinished
+request uncertain; recovery never executes it again. Legacy requests with an
+already durable dynamic response need no new obligation during migration.
+
+Lock order is the run reconciliation lock, the selected capacity lane, then the
+observer's actor lock. Trusted observers use a separate short-observation lane.
+An observer that discovers an invalid checkpoint releases its actor lock and short
+slot before acquiring bootstrap capacity. A temporary offline reader first takes
+its per-actor reader lock; its startup uses a short slot, released before history
+observation can acquire bootstrap capacity.
+Recursive work in the same task reuses capacity; child tasks acquire their own.
+Observation does not advance workflows or deliver messages while holding its
+lock. Queued reconciliations remain registered with the stop fence, including
+when their callers cancel. Workflow advancement happens after capacity is freed.
+
+`SOFTWARE_WORKFLOWS_RECOVERY_CONCURRENCY` is a positive integer, default **4**.
+The shared bound covers startup, retries, gaps, re-admission, native resume and
+replacement, plus untrusted history bootstraps. Trusted live catch-ups, message
+lookups and input settlement use `SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY`, a
+positive integer defaulting to **2**. They do not wait for bootstrap slots.
+Waiting in either lane creates no timeout, retry or quarantine of its own. Both
+status forms expose `recovery_capacity` and `history_capacity` (each with
+`limit`, `active`, `queued`), `history_observers` and `native_decode`. The latter counts actual JSON bytes at the transport decoder,
+including late responses, with separate history response bytes, maximum response
+size and maximum decode time. `history/observed` records page/item counts and
+duration; `history/fallback` records why trust was lost.
+`history/closure` identifies the turn and outstanding operations requiring a
+broader read; `history/observed.closure_reads` counts those reads.
+
+The 2026-10-23 real native fixture used 27 synthetic histories, 1,997.85 MB total,
+with the supplied seven largest sizes and an explicitly synthetic tail. Limits
+1/2/4 completed native start, resume and full observation in 77.0/45.5/33.3 s.
+At 4, full-status p50/p99/max were 8.0/15.8/27.1 ms; actual Python 3.9 lead
+PreToolUse Write p50/p99/max were 93.7/144.8/156.1 ms, with all 128 Write/Post
+lifecycles verified. The slowest resume was 3.24 s. This sizes the highest
+measured candidate, 4, with headroom against the native 10 s answer bound;
+it is not a universal host-capacity guarantee.
+
+A separate run exercised `recovery_plan` and `recover_writers` with those same
+27 histories, real native hooks and independent RPC/hook samplers. The installed
+2.4.5 initial pass took 75.235 s: 20 writers recovered and seven were quarantined
+after genuine native history timeouts. The changed pass recovered all 27 in
+30.207 s with zero startup quarantines. The following idle reconciliation of all
+27 took 0.151 s and decoded only 29,691 history-response bytes. Latencies below
+include samples during fixture preparation and cleanup as well as recovery:
+
+| Round trip | 2.4.5 p50 / p99 / max, ms | Changed p50 / p99 / max, ms |
+| --- | --- | --- |
+| Brief `daemon/status` | 2.84 / 42.95 / 184.34 | 0.61 / 9.32 / 28.82 |
+| Full `daemon/status` | 15.95 / 104.25 / 228.80 | 8.57 / 16.45 / 30.91 |
+| Python 3.9 lead PreToolUse Write | 183.20 / 420.61 / 559.28 | 84.58 / 118.14 / 282.57 |
+| Native writer PreToolUse hook | 128 / 262 / 270 | 61 / 86 / 103 |
+
+The baseline and changed runs verified all 240 and 216 lead Write/Post
+lifecycles respectively, and 169 and 156 writer admissions. The changed run's
+largest history response was 206,641 bytes; maximum decode time was 2.90 ms.
+These runs used pre-provisioned checkout/lease records, scoped fixture filesystem
+enumeration and pre-started app-servers. They exercise startup's recovery entry
+point, not the complete supervisor/admission launch. Separate daemon hard-kill
+and restart runs exercise durable state recovery. The live incident's 20–30 s
+status stalls were not reproduced by native histories alone; the long-history
+timeouts were.
+
+A supplemental real-daemon run isolated the local journal bottleneck: four native
+writers, 80 turns, 20,080 items and 191.3 MB of native rollouts, plus 581,804
+synthetic repeated deliveries of an actual native agent-message notification
+(2,660,007,888 JSON bytes). On 2.4.5, full-status p50/p99/max were
+2.47/4520.32/4520.32 ms; lead PreToolUse Write was 128.29/3337.35/3337.35 ms,
+including one fail-open coordinator-unavailable warning. The changed run read
+the entire unapplied journal: full-status was 2.53/9.70/457.11 ms; lead PreToolUse
+was 78.28/755.52/755.52 ms, with all 65 Write/Post lifecycles verified and no
+warnings. Writer PreToolUse was 52/194/194 ms. All four writers recovered without
+quarantine. Cooperative first recovery took 19.79 s (baseline 6.46 s); the next
+hard-kill restart took 0.359 s and decoded 5,467 history-response bytes without
+replaying the old journal. The baseline restart still took 6.25 s and full-status
+p99 reached 4.29 s. This establishes a journal-induced responsiveness red/green;
+it does not reproduce the incident's exact 20–30 s maximum.
+
+The final combined run used 27 native histories (1,997,860,144 bytes) plus a
+2,660,157,537-byte journal. Baseline first recovery took 89.44 s and left seven
+writers quarantined; restart took 67.48 s with the same seven still pending.
+The changed first recovery completed all 27 in 46.62 s, with zero quarantines,
+native slow-answer events or hook warnings. Its full-status p50/p99/max were
+7.33/14.81/207.89 ms; Python 3.9 lead PreToolUse Write was
+84.43/209.96/330.21 ms; writer PreToolUse was 55/112/118 ms. All 148 lead
+Write/Post lifecycles were verified and 147 writer Pre/Post pairs completed.
+The next changed hard-kill restart completed all writers in 1.227 s, decoding
+only 32,478 native history-response bytes. The baseline restart's maximum
+full-status / lead PreToolUse / writer PreToolUse latencies were
+5.636 / 1.836 / 7.567 s. The combined fixture retained the same scoped admission,
+filesystem enumeration and unchanged-byte lead Write adaptations described above.
+
+A later comparison ran separate `Daemon.serve` processes and measured only the
+recovery window, then killed each daemon with SIGKILL and restarted it against
+the same durable state. The recreated 27 histories totalled 1,997,860,477 bytes;
+one additional short writer supplied real writer-hook samples. The baseline's
+initial pass took 86.535 s and left seven long writers quarantined; a second
+restart still left those seven quarantined after 61.002 s. The changed daemon
+recovered every writer in 36.736 s with no quarantine, then recovered all of
+them in 1.238 s after the hard kill, decoding only 34,244 history-response bytes.
+Its initial full scan decoded 1,970,667,741 history-response bytes.
+
+| Recovery-window round trip | 2.4.5 p50 / p99 / max, ms | Changed p50 / p99 / max, ms |
+| --- | --- | --- |
+| Brief `daemon/status` | 4.33 / 41.72 / 147.54 (3,018 samples) | 0.92 / 9.73 / 25.34 (1,597) |
+| Full `daemon/status` | 13.39 / 67.63 / 224.08 (2,249) | 7.38 / 14.88 / 27.08 (1,283) |
+| Python 3.9 lead PreToolUse Write | 198.50 / 429.75 / 582.11 (138) | 89.42 / 160.19 / 181.41 (112) |
+| Native writer PreToolUse hook | 113 / 265 / 268 (137) | 60 / 119 / 151 (110) |
+
+All these RPC/hook samples succeeded without hook warnings, and every lead
+Write/Post lifecycle was durably verified. This historical comparison wrote
+unchanged fixture bytes: an earlier changing-Write variant exposed the recovery
+snapshot versus lead revision conflict (`REVISION_CHANGED`). Its failed samples
+are retained separately rather than counted as admitted calls. The unit-S
+comparison below repeats the combined workload with changing Writes.
+The separate-daemon run retains the scoped filesystem, pre-admitted lease/gate
+and pre-started native fixtures; it does not measure cold admission or the
+supervisor CLI. During the changed restart the full-status p99/max was 25.49 ms,
+lead PreToolUse 99.54 ms, and writer PreToolUse 66 ms, with only 38/5/4 samples
+respectively because recovery finished quickly. Status reported at most four
+active and 24 queued recoveries (including the short sampler writer).
+
+For one 251,241,389-byte synthetic history, 2.4.5's full turn hydration reached
+the unchanged 60 s timeout. The observer bootstrapped 30,002 items in 1,202
+bounded pages in 2.67 s; the subsequent idle scan decoded 1,092 history bytes.
+A further fixture generated 300 actual native turns, including a 16 MB item:
+bootstrap took 0.729 s, the next scan read zero items in 0.0047 s, and status
+p99/max was 8.53 ms. Its largest JSON response was 16,000,766 bytes and maximum
+decode time 11.61 ms. Native limits bound entry count, not individual item size;
+these measurements do not promise a latency bound for arbitrarily large items.
+Raw commands, recipes, samples and coverage limits are in the external
+`scratchpad/r246-r` run directory's `acceptance-report.log` and
+`regression-comparison.log`; synthetic histories were removed after measurement.
+
+
+Round-2 review measurements on the same native 0.163.0 binary:
+
+- With the notification worker held immediately before a real `item/tool/call`,
+  the previous tree let concurrent replay create UNKNOWN and answer
+  `DYNAMIC_UNCERTAIN` without dispatching the tool. Atomic receipt/obligation
+  recording leaves the live request to its handler: one dispatch, successful
+  response, no UNKNOWN. A separate actual SIGKILL during a pending tool still
+  produced uncertainty after restart, without dispatching it again.
+- Four 150.75 MB bootstraps occupied all recovery slots. Message delivery, live
+  catch-up and resume input settlement previously waited about 2.8 s; with the
+  separate two-slot lane they finished in 8.6, 55.3 and 9.1 ms while all four
+  bootstraps were still active. An import-time negative control restoring shared
+  capacity reproduced 2.50–2.51 s waits with the corrected fixture inputs.
+- Twenty synchronized waves across 27 real writer app-servers produced 21,605
+  native events in 61.25 s (21,165/min), including 12,420 text deltas (57.5%),
+  and 1,587 item/turn completion triggers/min. The two-slot observer performed
+  1,183 catch-ups, averaging 6.57 native RPCs and 1,641 history-response bytes.
+  Status sampled at most two active and 25 queued short observations, with zero
+  active/queued bootstrap work during steady state. All lead Write/Post
+  lifecycles and 540 writer Pre/Post pairs succeeded; there were no warnings.
+  One/two short slots gave lead Pre p99 643/583 ms and writer Pre p99 723/512 ms.
+  Two is the highest measured candidate, with at least 1.7x headroom below the
+  one-second target. This is a one-minute burst measurement, not a day-long soak.
+
+| Round-2 streamed burst, two short slots | Samples | p50 / p99 / max, ms |
+| --- | ---: | --- |
+| Brief status | 2,184 | 1.23 / 84.76 / 318.08 |
+| Full status | 1,739 | 7.32 / 148.11 / 339.47 |
+| Python 3.9 lead PreToolUse Write | 220 | 98.48 / 583.20 / 724.06 |
+| Native writer PreToolUse | 540 | 277 / 512 / 569 |
+
+The burst fixture keeps the scoped filesystem, pre-admitted lease/gate and
+unchanged-byte lead Write adaptations above. Its model provider emits real
+Responses SSE text chunks, which native converts to delta notifications; the
+daemon notification path and native timeouts are unchanged. In the comparable
+non-streamed 27-writer runs, batching reduced `native_applied` row writes from
+9,181 to 2,134, and measured SQL commits from 35,960 to 26,346 (including hook and
+observer work). The streamed two-slot run made 3,671 applied-prefix row writes
+for 21,605 native receipts.
+
+A pinned-prefix fixture placed one unfinished command before 200 completed
+64 KB outputs, then appended six batches of 50 outputs. Before the change,
+catch-ups decoded 148,016,486 bytes for 19,656,300 new text bytes, with the reads
+growing each batch. Afterward they decoded 19,751,112 bytes: 51 items and nine
+RPCs per batch, consistently about 3.29 MB and 20–22 ms. Updating the pinned
+item to completed was applied with a one-item read and ended its operation;
+deliberately dropping its pending obligation made that control miss completion.
+The unfinished projection row and large successor outputs were synthesized from
+a real native code-command start event and fixture-generated records, then read
+through the real app-server. Native did not expose that running command in
+item history before completion, so this does **not** establish natural persistence
+of an unfinished code-mode item followed by that many outputs.
+
+Round-3 verification reproduced the missing-start case naturally on installed
+0.163.0. A code-mode cell yielded while its admitted command waited on a fixture
+file; turn A finished, turn B finished, and the observer advanced to B. Native's
+listing for A contained no command yet. After SIGKILL of only the daemon, the
+command finished and native persisted its completed item in A. Before operation
+pins, restart left `completed_item` absent and custody held. With the pins,
+restart applied the item, ended execution, reconciled the operation and released
+custody with no UNKNOWN. No history or completion-order injection was needed.
+
+With that real command still open, A also contained 200 completed 32 KB model
+outputs. Six subsequent catch-ups, each following 50 new outputs, decoded
+9,939,674 history bytes for 9,830,400 new text bytes: 51 items and 11 RPCs per
+catch-up, 14.5–18.9 ms, and zero broader reads. Background scheduling was disabled
+at import only for these explicit observer measurements; notification handling
+and the observer were unchanged. The final hard-kill/restart still released
+custody. The separate pinned-projection control exercised a completion before
+the applied tail: dropping its pending-item record missed completion; a durable
+handler receipt then caused one scoped 503-item read which found it. Five later
+observations decoded 1,087 bytes each and performed no broader read.
+
+An actual app-server kill while the command was still running exercised the
+unfindable-completion path through an unloaded offline reader. Its first read
+checked A's 201 items (6,612,021 history bytes, 52.6 ms); five subsequent reads
+decoded 2,063 bytes each in 4.0–4.4 ms, with no repeated broader read. The operation
+had no invented completion, custody stayed held, and the existing notification-gap
+UNKNOWN remained. This preserves the previous uncertainty outcome.
+
+On the final round-3 tree, the 27-writer streamed burst produced 21,601 events
+in 61.21 s (21,173/min; 57.5% text deltas). Its 1,199 catch-ups used 7,868 RPCs
+and 1,956,992 history bytes, averaging 6.56 RPCs and 1,632 bytes. Lead Pre p99/max
+were 496/783 ms; writer Pre p99/max were 529/548 ms. All 540 writer Pre/Post
+pairs and 204 lead Write lifecycles succeeded, without warnings or quarantines.
+Short-observation capacity peaked at two active and 25 queued; bootstrap capacity
+was idle. This remains a one-minute fixture burst, not a day-long soak. The late
+completion probe covers a real command; the prior-position closure probe uses
+the explicit native-projection adaptation described above. Neither establishes
+the behavior of future native versions or every external MCP tool's lifetime.
+
+The round-3 combined rerun used 27 synthetic writers (1,997,862,223 rollout bytes),
+2,660,157,537 JSON bytes in 321,357 unapplied journal rows, and a separate hook
+sampler writer. First recovery took 45.22 s and decoded 1,971,131,997 history
+bytes. After an actual daemon SIGKILL, recovery took 1.54 s and decoded 42,727
+history bytes (377,446 total native JSON bytes); launch through sampler completion
+took 2.30 s. Both passes recovered every writer with zero quarantines and zero
+slow native answers. The existing fixture adaptations remain: pre-admitted
+lease/gate, scoped filesystem enumeration, app-servers started before recovery,
+and real lead/writer hooks. The long external runtime path uses a fixture-only
+relative Unix-socket adapter; its socket files and all native homes remain under
+the external run directory.
+
+| Round-3 combined recovery | First pass p50 / p99 / max, ms | Restart p50 / p99 / max, ms |
+| --- | ---: | ---: |
+| Brief status | 1.17 / 10.38 / 195.78 | 2.57 / 30.08 / 30.08 |
+| Full status | 7.27 / 16.84 / 199.91 | 13.87 / 64.62 / 64.62 |
+| Python 3.9 lead PreToolUse Write | 96.93 / 233.46 / 418.90 | 117.81 / 126.16 / 126.16 |
+| Native writer PreToolUse | 73 / 130 / 169 | 89 / 191 / 191 |
+
+First-pass sample counts were 1,954 brief status, 1,584 full status, 117 lead Pre
+and 117 writer Pre. Restart had 58, 42, four and three respectively; its short
+window does not establish a reliable tail-latency distribution. All recorded
+round trips succeeded and every lead lifecycle was durably verified.
+
+Unit S repeated the combined full-daemon comparison with changing lead Writes
+on the accepted round-3 base, then the final unit-S code. The 27 native histories
+totalled 1,997,862,254 bytes, with the same 2,660,157,537-byte synthetic journal
+and one short writer for native hook samples. On the base, one of 60 admitted
+Writes was quarantined with `lead completion: REVISION_CHANGED`, creating two
+path UNKNOWN records; 111 later admissions were refused. Every Write installed
+distinct new bytes between the real Python 3.9 Pre and Post hooks. This race
+occurred without a timing injection in the combined run.
+
+On the final code, all 137 first-pass Writes and four restart Writes verified
+with exact receipts, with no path UNKNOWN, hook warning or admission refusal.
+First recovery completed every writer in 52.49 s, with zero startup quarantines
+and zero slow native answers. After SIGKILL of only the daemon, recovery completed
+in 1.324 s and decoded 42,727 history bytes (378,744 total native JSON bytes).
+Launch through sampler completion took 1.885 s. Capacity peaked at four active
+and 24 queued recoveries.
+
+| Unit-S changing-Write recovery | First pass p50 / p99 / max, ms | Restart p50 / p99 / max, ms |
+| --- | ---: | ---: |
+| Brief status | 1.13 / 11.64 / 153.98 | 2.50 / 21.80 / 21.80 |
+| Full status | 7.36 / 17.36 / 160.32 | 12.29 / 23.86 / 23.86 |
+| Python 3.9 lead PreToolUse Write | 95.35 / 250.47 / 376.83 | 105.49 / 123.53 / 123.53 |
+| Native writer PreToolUse | 73 / 150 / 169 | 82 / 134 / 134 |
+
+First-pass sample counts were 2,254 brief status, 1,825 full status, 137 lead
+Pre and 136 writer Pre; restart counts were 54, 41, four and three. The short
+restart window does not establish a reliable tail-latency distribution.
+The scoped filesystem, pre-admitted lease/gate, pre-started native processes
+and external relative-socket adaptations remain. These runs do not measure
+cold admission, the supervisor CLI, or arbitrary concurrent filesystem writers.
+
+Separate real-daemon cases held the snapshot at import-time barriers after a
+real Pre/write and before Post. Startup and later reconciliation, a broad
+command quarantine, a restore pre-read and a completion-only hook all reproduced
+revision damage before their fixes and verified the held Write afterward.
+An earlier-generation call still quarantined and retained its hold until Post;
+its matching bytes earned no receipt. A failed call whose path recovery skipped
+then recorded the differing bytes as UNKNOWN when settlement ended the hold.
+Direct editor completion and a complete checkout restore also succeeded.
+A lead attached to the writer's own unit remained pending through reconciliation
+and verified through its own completion, instead of being treated as a crash gap.
+No test files or synthetic outcome injection were used.
+
+The unit-S completion run used a real native project with two participant roots
+and a lead attached to its writer's unit. On the accepted unit-S base, reconnect
+quarantined the lead-edit parent and both parts; completion refused
+`OPERATION_STATE`, with four UNKNOWN records and no receipts. After the group
+exemption, both parts verified with two exact receipts and zero UNKNOWNs. A
+two-checkout restore held before its own verification likewise changed from
+`REVISION_CHANGED` and six UNKNOWNs to two receipts and zero UNKNOWNs. An actual
+daemon kill/restart retained the previous-generation group's quarantine, and a
+real native two-checkout patch retained reconnect quarantine even when admitted
+by the current generation. Resume still refused new writer work while the lead
+group awaited completion; exemption does not authorize overlapping native work.
+These cases pre-admitted fixture checkout identities and scoped snapshots to
+fixture files; they exercise native project membership, admission, reconciliation
+and receipts, but do not remeasure Git checkout discovery. The existing unit-S
+startup/later snapshot, quarantine, restore, completion-only, same-unit editor
+and checkout-restore recipes were repeated on this code. The 27-writer numbers
+above are the preceding accepted run, not a new measurement of this group fix.
+
+First-switch migration used 700,000 journal rows (2,583,617,788 JSON bytes;
+2,852,339,712-byte SQLite ledger), including 15,000 legacy tool requests with
+durable completed responses and 57% text deltas. Skipping redundant obligations
+reduced replay from 21.81 to 19.71 s and explicit transaction commits from
+15,432 to 392; obligation writes fell from 30,000 to zero. Applied-prefix batch
+writes remained 28,000. Event-loop delay p99/max fell from 3.02/278.86 ms to
+2.41/7.72 ms. Real lead Pre p50/p99/max changed from 75.82/356.34/1205.27 ms
+(109 samples) to 87.76/132.88/132.88 ms (99), with every lifecycle verified.
+
+Uncertain-input reads retain ordered queue/status fences around observation and
+recheck the tail before treating absence as evidence. An exited writer is read
+through an owned temporary app-server without loading/resuming its thread or
+dispatching its queue; cleanup is covered by the stop fence. On 0.163.0 an exited
+writer with two durable queued submissions remained unloaded before and after
+each reader call: queue/list, thread/read, turns/list and items/list, then
+queue/delete of exactly one submission. The other submission remained queued,
+no item or turn/started notification arrived, and the rollout task_started count
+stayed at two. This establishes the current reader call set's behavior on the
+pinned native version, not a guarantee for future native releases. Raw rollout access
+is supplementary diagnostics and policy readback only: complete-record offsets,
+hashed user-text facts and compact turn-context policy facts preserve damaged-record
+and missing-client-ID warnings and workflow policy verification. Reads serialize
+per actor, and batches yield between durable updates. Unchanged compressed files
+reuse those facts without reopening/decompressing. No unproven input is
+automatically resent.
 
 On 2026-10-22, a forced switch with 26 writers across 4 disposable checkouts
 (3,700 files each, real Codex 0.163.0 and a scripted model) took 66.4 s before this
@@ -1041,8 +1463,9 @@ both had zero quarantines or resume timeouts. The slowest root resume was 0.117 
 before and 0.094 s with metadata-only resume. The latter run sampled load up to
 18.7 and had 26 reconciles active together. These measurements do not establish
 an overall speedup, but leave ample headroom in the existing 60 s native timeout;
-they do not justify an additional concurrency limit or a longer timeout. The
-fixture's short histories are not the live incident's histories. Injected lost
+those short-history measurements alone did not justify a concurrency limit or a
+longer timeout. The later long-history measurements above size the new bound.
+Injected lost
 resume responses separately exercised automatic recovery: the initial pass ended
 at 60.8 s from `recovery/start`, and both transient quarantines healed by 62.7 s;
 a persistent timeout and a permanent policy failure stayed quarantined.

@@ -534,6 +534,8 @@ Set these in the environment Claude Code starts with. Every one is optional.
 | `SOFTWARE_WORKFLOWS_STATE` | The writer coordinator's state: its ledger and run records (default `~/.local/state/software-workflows`). |
 | `SOFTWARE_WORKFLOWS_RUNTIME` | Where the coordinator's sockets live (default `/tmp/c1-<uid>`). Keep it short: macOS limits a socket path to 104 bytes. |
 | `SOFTWARE_WORKFLOWS_PYTHON` | The Python (3.11+) the coordinator daemon runs on (default: the server's). |
+| `SOFTWARE_WORKFLOWS_RECOVERY_CONCURRENCY` | How many writers the coordinator recovers at once (default 4). A full read of a writer's history takes one of these slots. A positive integer; a running coordinator keeps the value it started with. |
+| `SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY` | How many short history reads run at once beside recovery (default 2): a live writer's catch-up, a message's delivery check, settling a resume's or a cancel's inputs. A positive integer; a running coordinator keeps the value it started with. |
 
 The server's venv lives in the plugin's data directory
 (`~/.claude/plugins/data/software-workflows-agent-teams/venv/`) and survives updates. A new one is

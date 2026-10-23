@@ -577,11 +577,15 @@ class Ledger:
                 "git_common": common, "object_format": gitio.text(root, ["rev-parse", "--show-object-format"])}
 
     async def reconcile(self, checkout, paths=None, reason="unexplained filesystem change", ignore_pending=True, attribute=None,
-                        on_observed=None):
+                        on_observed=None, preserve_leads=False, settling_operation=None, guard=None):
         """Record what differs from the ledger, path by path (the whole checkout without `paths`). What is outside the
         ledger (unwatched) is let go instead (release), and a path that cannot be read as an ordinary file
-        (UNREADABLE) is that path's UNKNOWN."""
+        (UNREADABLE) is that path's UNKNOWN. Recovery may preserve current-generation
+        lead holds; a settlement excludes its own operation from that protection.
+        A caller requiring a complete snapshot supplies a guard, rechecked after IO."""
         async with self.lock(checkout["id"]):
+            if guard:
+                guard()
             unreadable, listed = {}, None
             try:
                 if paths is None:
@@ -611,9 +615,12 @@ class Ledger:
                         self.store.save(checkout)
                 raise
             outside = await self.outside(checkout, actual, unreadable, listed)
+            if guard:
+                guard()
             with self.store.transaction():
                 result = self.apply_observation(checkout, paths, actual, reason, ignore_pending, attribute,
-                                                transaction=False, outside=outside, unreadable=unreadable)
+                                                transaction=False, outside=outside, unreadable=unreadable,
+                                                preserve_leads=preserve_leads, settling_operation=settling_operation)
                 if on_observed:
                     on_observed()  # completion and its byte observation commit together, before any await
         await self.notify_released()
@@ -740,16 +747,33 @@ class Ledger:
         record["notices"] = sent
         self.store.save(record)
 
+    def current_lead(self, operation):
+        """A lead edit/restore admitted here still owns its settlement, including
+        a group's parent and parts (prepare gives each the same kind/generation).
+        Native recovery must leave it alone; its own verification or failure
+        still settles it. Earlier generations retain their crash-gap treatment."""
+        return (operation["kind"] in ("lead-edit", "restore")
+                and operation.get("generation") == self.store.generation)
+
     def apply_observation(self, checkout, paths, actual, reason, ignore_pending=True, attribute=None, transaction=True, outside=(),
-                          unreadable=None):
+                          unreadable=None, preserve_leads=False, settling_operation=None):
         pending = set()
-        if ignore_pending:
+        if ignore_pending or preserve_leads:
             from .lead_calls import active
+            # Decide after the asynchronous scan, immediately before recording
+            # any bytes. Reception/admission in an earlier generation is not
+            # evidence: forced recovery still observes those crash-gap paths.
             for record in active(self.store, checkout["id"]):
-                pending.update(record.get("paths") or paths)
+                if settling_operation and record.get("operation") == settling_operation:
+                    continue
+                if ignore_pending or record.get("generation") == self.store.generation:
+                    pending.update(record.get("paths") or paths)
             for operation in self.store.live_operations(checkout["id"]):
+                if settling_operation and settling_operation in (operation["id"], operation.get("parent_operation")):
+                    continue
                 if (operation["state"] in ("prepared", "allowed", "running") or operation.get("executing")) and operation["kind"] in ("patch", "lead-edit", "restore"):
-                    pending.update(operation["paths"])
+                    if ignore_pending or self.current_lead(operation):
+                        pending.update(operation["paths"])
         context = [r["id"] for r in self.store.held_custody(checkout["id"])]
         # The caller's proof is checked again after the scan, with nothing awaited before the writes.
         if attribute and attribute.get("still_quiet") and not attribute["still_quiet"]():
@@ -1137,7 +1161,11 @@ class Ledger:
         async def reconcile(key, paths):
             checkout = self.store.get(key)
             try:
-                await self.reconcile(checkout, paths=None if "*" in paths else sorted(paths), reason=reason, ignore_pending=False)
+                # A command's quarantine can scan every participant. Preserve
+                # unrelated live lead calls, but observe this operation's own
+                # bytes even while its host-call hold awaits settlement.
+                await self.reconcile(checkout, paths=None if "*" in paths else sorted(paths), reason=reason,
+                                     ignore_pending=False, preserve_leads=True, settling_operation=operation["id"])
             except (OSError, CoordinatorError):
                 checkout["quarantine"] = "filesystem reconciliation incomplete"
                 self.store.save(checkout)

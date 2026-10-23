@@ -464,12 +464,10 @@ class Runs:
         connection = self.daemon.connections.get(ident)
         return bool(connection and not connection.closed and (self.store.get(ident, required=False) or {}).get("state") == "connected")
 
-    async def ordered_reads(self, connection, thread, queue, turns=True):
-        """The thread read in its own order, after every input sent to it on this app-server before: native runs a
-        thread's requests one at a time in arrival order, across connections, and drops a closed connection's queued
-        ones (request_serialization.rs). Its queue when asked, its status, then its turns with their items (unless
-        `turns` is false and a turn runs). One read cannot tell a running turn, as native builds its turns before it
-        reads the status. Returns (reads, None) or (None, code)."""
+    async def ordered_reads(self, connection, thread, queue, turns=True, inputs=(), actor=None):
+        """Keep ordered queue/status fences around paginated observation. Native pages
+        are not ordered thread requests. A tail that changes during the scan counts as
+        active/uncertain, never as evidence that an input is absent."""
         from .native import page
         try:
             entries = {}
@@ -478,15 +476,37 @@ class Runs:
                     entries.update({e.get("clientUserMessageId"): e["id"] for e in result["data"]})
             status = await connection.call("thread/read", {"threadId": thread, "includeTurns": False})
             active = (status["thread"].get("status") or {}).get("type") == "active"
-            history = []
+            actors = list(self.store.selected("SELECT * FROM records WHERE kind='actor' AND json_extract(data,'$.thread')=?", (thread,)))
+            actor = actor or next((a for a in actors if self.daemon.connections.get(a.get("listener")) is connection), None)
+            if actor is None:
+                raise CoordinatorError("HISTORY_BINDING", "Input history has no current actor binding")
+            history = {}
             if turns or not active:
-                read = await connection.call("thread/read", {"threadId": thread, "includeTurns": True})
-                history = read["thread"].get("turns") or []
+                await self.daemon.history.observe(self.store.get(actor["listener"]), actor, connection)
+                read = await connection.call("thread/read", {"threadId": thread, "includeTurns": False})
                 active = active or (read["thread"].get("status") or {}).get("type") == "active"
+                tail = await connection.call("thread/turns/list", {"threadId": thread, "itemsView": "notLoaded",
+                                                                  "sortDirection": "desc", "limit": 1})
+                latest = tail["data"][0]["id"] if tail["data"] else None
+                cp = self.daemon.history.checkpoint(actor)
+                active = active or latest != cp.get("boundary")
+                for item in inputs:
+                    found = self.daemon.history.input(actor, item["client"])
+                    known = self.daemon.history.turn(actor, item["turn"]) if item.get("turn") else None
+                    for fact in (found, known):
+                        if fact:
+                            history.setdefault(fact["turn"], {"id": fact["turn"], "status": fact["status"], "items": []})
+                    if found:
+                        history[found["turn"]]["items"].append({"type": "userMessage", "clientId": item["client"]})
+                if latest:
+                    fact = self.daemon.history.turn(actor, latest)
+                    if fact:
+                        history.setdefault(latest, {"id": latest, "status": fact["status"], "items": []})
         except (CoordinatorError, OSError) as exc:
             return None, getattr(exc, "code", type(exc).__name__)
-        return {"queue": entries, "active": active, "turns": history,
-                "running": next((t["id"] for t in reversed(history) if t["status"] == "inProgress"), None)}, None
+        active = active or any(t["status"] == "inProgress" for t in history.values())
+        return {"queue": entries, "active": active, "turns": list(history.values()),
+                "running": next((t["id"] for t in history.values() if t["status"] == "inProgress"), None)}, None
 
     @staticmethod
     def in_history(turns, client):
@@ -503,7 +523,7 @@ class Runs:
         its finish, and an abort drops it (tasks/mod.rs on_task_finished, abort_all_tasks). Without its record, such an
         input is unproven: history is native's reading of the rollout, which lacks what native failed to write."""
         reads, error = await self.ordered_reads(connection, root["thread"], any(i["method"] == "thread/queue/add" for i in items),
-                                                turns=mode != "background")
+                                                turns=mode != "background", inputs=items)
         if reads is None:
             return [(i, ("ambiguous", "its thread could not be read: " + error, root["listener"], False)) for i in items]
         outcomes = []
@@ -534,57 +554,52 @@ class Runs:
         return outcomes
 
     async def locate_saved(self, run, root, ident, items, unqueued=()):
-        """Inputs sent to an app-server that has exited: its rollout is final, and none can start a turn/start's or a
-        steer's input now, as native keeps it only in that process. One whose client id's record the rollout holds
-        entered that record's turn. One it holds no record of is unproven, as native goes on from memory when it fails
-        to write a record (core session/mod.rs persist_rollout_items): only the lead sends it again (a resume, a
-        message retry), told what the rollout and the log show of it (unproven_reason). A queued one stays in native's
-        durable queue (it survives restarts: thread-store/src/queue_store.rs) until a turn starts with it, and leaves
-        it before that turn records it (ext/queue/src/service.rs dispatch_if_idle): unproven as well once the queue
-        did not hold it when read on an app-server ended since (`unqueued`). Otherwise the queue is read on the
-        replacement, which dispatches a resumed thread's queue itself; where neither its queue nor its history holds
-        the input, the replacement is ended too, as it may be starting it. The replacement's history is native's own
-        reading of the rollout. A turn without an end in the rollout ended with that process."""
-        wanted = {i["key"]: (i["client"], i["texts"], i["needle"], i.get("since")) for i in items}
-        saved = await asyncio.to_thread(rollout.scan, run.get("rollout"), root.get("thread"), wanted)
+        """Read an exited writer's saved history through native without resuming it.
+
+        A replacement that already runs retains the old queue/status ordering rules.
+        Otherwise an owned, temporary reader queries the unloaded thread; its durable
+        queue cannot dispatch. Raw rollout facts supplement absence with diagnostics,
+        never replace native cursors or authorize an automatic resend.
+        """
         replacement = root.get("listener") if root.get("listener") != ident else None
         if replacement and not (self.connected(replacement) and await self.app_server_runs(replacement)):
             replacement = None
-        reads, outcomes = None, []
+        try:
+            if replacement:
+                reads, error = await self.ordered_reads(self.daemon.connections[replacement], root["thread"], True, inputs=items)
+            else:
+                from .recovery import replay_native
+                await replay_native(self.daemon, self.store.get(root["listener"]))
+                async with self.daemon.history.offline(root) as connection:
+                    reads, error = await self.ordered_reads(connection, root["thread"], True, inputs=items, actor=root)
+        except (CoordinatorError, OSError) as exc:
+            reads, error = None, getattr(exc, "code", type(exc).__name__)
+        if reads is None:
+            return [(i, ("wait", "saved native history could not be read: " + error, None)) for i in items]
+        wanted = {i["key"]: (i["client"], i["texts"], i["needle"], i.get("since")) for i in items
+                  if not self.in_history(reads["turns"], i["client"])}
+        cp = self.daemon.history.checkpoint(root) or {}
+        path = cp.get("identity", {}).get("path") or run.get("rollout")
+        saved = await rollout.diagnose(self.store, root, path, root.get("thread"), wanted) if wanted else {}
+        outcomes = []
         for item in items:
-            turn = saved["found"].get(item["key"]) if saved["readable"] else None
-            if turn:
-                outcomes.append((item, ("entered", turn, saved["turns"].get(turn) or "interrupted", "rollout")))
-                continue
-            if saved["readable"] and (item["method"] != "thread/queue/add" or item["key"] in unqueued):
-                outcomes.append((item, ("unproven", "its app-server exited, and its rollout holds no record of it"
-                                        + (", nor native's queue read after it" if item["key"] in unqueued else "") + ", "
-                                        + self.unproven_reason(run, root, ident, item, saved))))
-                continue
-            # Native's durable queue, or the thread's history when the rollout cannot be read: on the replacement.
-            if not replacement:
-                outcomes.append((item, ("wait", "a replacement app-server must read it: " + (saved.get("reason") or "native's queue"), None)))
-                continue
-            if reads is None:
-                reads, error = await self.ordered_reads(self.daemon.connections[replacement], root["thread"], True)
-                if reads is None:
-                    outcomes += [(i, ("wait", "the replacement could not read it: " + error, None)) for i in items[items.index(item):]]
-                    break
             turn = self.in_history(reads["turns"], item["client"])
             if turn:
-                outcomes.append((item, ("entered", turn["id"], None if turn["status"] == "inProgress" else turn["status"], "history")))
+                status = turn["status"]
+                if status == "inProgress":
+                    status = None if replacement else "interrupted"
+                outcomes.append((item, ("entered", turn["id"], status, "history")))
             elif item["method"] == "thread/queue/add" and item["client"] in reads["queue"]:
                 outcomes.append((item, ("queued", reads["queue"][item["client"]])))
-            elif reads["active"]:
+            elif replacement and reads["active"]:
                 outcomes.append((item, ("wait", "a turn runs on the replacement that may have taken it", reads["running"])))
-            elif item["method"] == "thread/queue/add" and item["key"] not in unqueued:
+            elif replacement and item["method"] == "thread/queue/add" and item["key"] not in unqueued:
                 outcomes.append((item, ("ambiguous", "native's queue no longer holds it, and the replacement may be starting it",
                                         replacement, True)))
             else:
-                # Here only where the rollout cannot be read: the replacement's history is native's reading of it.
-                outcomes.append((item, ("unproven", "its app-server exited, its rollout cannot be read (" + saved["reason"]
-                                        + "), and neither its history nor native's queue holds it, "
-                                        + self.unproven_reason(run, root, ident, item))))
+                diagnostic = "" if saved.get("readable") else " (rollout diagnostics unavailable: " + saved.get("reason", "unknown") + ")"
+                outcomes.append((item, ("unproven", "its app-server exited, and neither saved native history nor its queue holds it"
+                                        + diagnostic + ", " + self.unproven_reason(run, root, ident, item, saved))))
         return outcomes
 
     def unproven_reason(self, run, root, ident, item, saved=None):
@@ -594,7 +609,7 @@ class Runs:
         its rollout show is named: a failure of its session's or its rollout writer's that native logged from the
         send on, or that its log shows nothing of native's session after the send (rollout.native_mark), for a queued
         input the same of each of its thread's app-servers; damage to the rollout after the input was sent; and a user
-        message holding its text without its client id's record (rollout.scan)."""
+        message holding its text without its client id's record (rollout.diagnose)."""
         sent, told = item.get("sent"), []
         hosts = [ident]
         if item["method"] == "thread/queue/add":
@@ -689,9 +704,14 @@ class Runs:
             elif outcome[0] == "queued" and mode == "cancel":
                 connection = self.daemon.connections.get(root["listener"])
                 try:
-                    if not connection or connection.closed:
+                    params = {"threadId": root["thread"], "queuedSubmissionId": outcome[1]}
+                    if connection and not connection.closed:
+                        deleted = await connection.call("thread/queue/delete", params)
+                    elif not await self.app_server_runs(root["listener"]):
+                        async with self.daemon.history.offline(root) as reader:
+                            deleted = await reader.call("thread/queue/delete", params)
+                    else:
                         raise CoordinatorError("LISTENER_RECOVERING", "The writer's app-server is not connected")
-                    deleted = await connection.call("thread/queue/delete", {"threadId": root["thread"], "queuedSubmissionId": outcome[1]})
                 except (CoordinatorError, OSError) as exc:
                     self.store.event("message/cancel_refused", ident, {"queue_id": outcome[1], "code": getattr(exc, "code", type(exc).__name__)})
                     return

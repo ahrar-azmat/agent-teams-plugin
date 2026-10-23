@@ -57,6 +57,15 @@ def call_source(operation):
     return (operation.get("result_ready") or {}).get("source") or operation.get("native", {}).get("source")
 
 
+# A 27-writer, 8,998-events/min fixture made 9,181 separate prefix commits.
+# Batching reduced those writes to 2,134. Prefix replay is idempotent: schedule
+# a flush after 100 ms, or flush immediately at 256 applied notifications, and
+# commit all affected listeners together. Receipts and request
+# obligations remain synchronous and durable before queueing.
+NATIVE_APPLIED_FLUSH_S = 0.1
+NATIVE_APPLIED_BATCH = 256
+
+
 class Daemon:
     def __init__(self, root):
         self.store = Store(root)
@@ -64,6 +73,8 @@ class Daemon:
         self.custody = Custody(self.store, self.ledger)
         self.connections, self.queues, self.workers, self.tasks = {}, {}, {}, set()
         self.listener_requests = {}
+        self.native_progress, self.native_progress_count = {}, 0
+        self.native_progress_flush = None
         # Listener id -> the task following that listener's own log, and how far it was read.
         self.log_tails, self.log_offsets = {}, {}
         self.request_locks, self.actor_locks, self.unit_locks = KeyedLocks(), KeyedLocks(), KeyedLocks()
@@ -74,6 +85,11 @@ class Daemon:
         self.readmitting = set()  # runs whose writer app-server is being re-admitted or reconciled again
         self.gap_reconciles = set()  # transport-gap reconciles under way: a drain waits for them, as for readmitting
         self.listener_reconciles = {}  # invocation -> run/listener/start; includes lock waiters and nested calls
+        from .recovery import RECOVERY_CONCURRENCY
+        self.recovery_capacity = asyncio.Semaphore(RECOVERY_CONCURRENCY)
+        self.recovery_holders = set()
+        self.recovery_limit = RECOVERY_CONCURRENCY
+        self.recovery_active = self.recovery_queued = 0
         self.ready = False
         self.recovery_barrier = True
         # (kind, id) -> asyncio.Event: a run, unit or checkout startup recovery is still reconciling while calls are
@@ -95,6 +111,8 @@ class Daemon:
         self.ledger.messages = self.messages  # a release outside the ledger tells the leads (Ledger.notify_released)
         from .writer import Writer
         self.writer = Writer(self)
+        from .history import History
+        self.history = History(self)
         from .leases import Leases
         self.leases = Leases(self.store.root)
         from .runs import Runs
@@ -205,6 +223,10 @@ class Daemon:
                 # those now silent (reported, never ended): the first sign of either is here, not a blocked lead.
                 "child_watcher": self.child_watcher, "recovering": recovering_counts(self),
                 "listener_reconciles": list(self.listener_reconciles.values()), "startup_recovery": startup_counts(self.store),
+                "recovery_capacity": {"limit": self.recovery_limit, "active": self.recovery_active, "queued": self.recovery_queued},
+                "history_capacity": {"limit": self.history.incremental_limit, "active": self.history.incremental_active,
+                                     "queued": self.history.incremental_queued},
+                "native_decode": dict(native.DECODE_METRICS), "history_observers": self.history.active,
                 "lead_edits": self.pending_lead_edits(),
                 "lead_edit_legacy_limit": legacy_status(self.store),
                 "ended": dict(self.ended), "silent": len(self.silent),
@@ -785,6 +807,20 @@ class Daemon:
     async def attach(self, listener):
         ident = listener["id"]
         await self.detach_listener(ident)
+        self.flush_native_progress()
+        # New notifications cannot prove that an older incarnation's received
+        # journal suffix was applied. Hold its high-water mark before opening
+        # intake; replay_native clears it only after covering that entire suffix.
+        key = "native_applied:" + ident
+        applied = self.store.get(key, required=False) or {}
+        received = self.store.db.execute("SELECT max(seq) FROM events WHERE kind='native' AND subject=?",
+                                         (ident,)).fetchone()[0]
+        if received is not None and received > applied.get("sequence", 0):
+            progress = {"sequence": applied.get("sequence", 0),
+                        "pending": max(received, applied.get("pending", 0))}
+            if applied.get("failed"):
+                progress["failed"] = applied["failed"]
+            self.store.put("native_applied", key, progress, ident)
         tail = self.log_tails.get(ident)
         if not tail or tail.done():
             self.log_tails[ident] = self.background(self.tail_native_log(ident))
@@ -792,9 +828,15 @@ class Daemon:
         self.queues[ident] = queue
         self.listener_requests[ident] = set()
         def inbound(message):
-            # Ordered, durable evidence before scheduling expensive processing.
-            self.store.event("native", ident, message)
-            queue.put_nowait(message)
+            # Receipt and ownership must commit together. Replay can run while the
+            # notification worker is behind; a live request is still owned by this
+            # generation even before its handler has been scheduled.
+            with self.store.transaction():
+                sequence = self.store.event("native", ident, message)
+                if "id" in message:
+                    self.store.put("native_obligation", "native_obligation:" + str(sequence),
+                        {"sequence": sequence, "generation": self.store.generation, "state": "pending"}, ident)
+            queue.put_nowait((sequence, message))
         from .admission import Admission
         schema, _ = await Admission(self.store).schema()
         try:
@@ -959,9 +1001,9 @@ class Daemon:
             Path(listener["log"]).unlink(missing_ok=True)
             self.log_offsets.pop(listener["id"], None)
 
-    async def resolve_actor(self, listener, thread, session=None):
+    async def resolve_actor(self, listener, thread, session=None, connection=None):
         async with self.actor_locks.hold((listener["id"], thread)):
-            return await self.resolve_actor_locked(listener, thread, session)
+            return await self.resolve_actor_locked(listener, thread, session, connection)
 
     async def discover_descendants(self, listener):
         connection = self.connections[listener["id"]]
@@ -973,14 +1015,14 @@ class Daemon:
                 for entry in page["data"]:
                     await self.resolve_actor(listener, entry["id"])
 
-    async def resolve_actor_locked(self, listener, thread, session=None):
+    async def resolve_actor_locked(self, listener, thread, session=None, connection=None):
         for actor in self.store.all("actor", listener["unit"]):
             if actor.get("thread") == thread and actor.get("listener") == listener["id"]:
                 return actor
         deadline = asyncio.get_running_loop().time() + 5
         while True:
             try:
-                response = await self.connections[listener["id"]].call("thread/read", {"threadId": thread, "includeTurns": False})
+                response = await (connection or self.connections[listener["id"]]).call("thread/read", {"threadId": thread, "includeTurns": False})
                 break
             except CoordinatorError as exc:
                 if exc.code != "NATIVE_RPC" or asyncio.get_running_loop().time() >= deadline:
@@ -994,7 +1036,7 @@ class Daemon:
             raise CoordinatorError("ACTOR_NAMESPACE", "Native thread cannot be bound to this listener's root")
         if session and session != root:
             raise CoordinatorError("ACTOR_SESSION", "Hook session does not match native root")
-        parent = await self.resolve_actor(listener, info["parentThreadId"])
+        parent = await self.resolve_actor(listener, info["parentThreadId"], connection=connection)
         root_actor = self.store.get(listener["actor"])
         unit = self.store.get(root_actor["unit"])
         if unit.get("project_revision") and info.get("projectId") not in (None, unit["project"]):
@@ -1227,20 +1269,65 @@ class Daemon:
                         self.custody.release_held(member)
             self.custody.condition.notify_all()
 
+    def flush_native_progress(self):
+        if not self.native_progress:
+            return
+        # No awaits: a listener failure or a replay cannot interleave with the
+        # validation and commit. A crash before this commit safely repeats a suffix.
+        with self.store.transaction():
+            for ident, sequence in self.native_progress.items():
+                applied = self.store.get("native_applied:" + ident, required=False) or {}
+                if (not applied.get("failed") and not applied.get("pending")
+                        and sequence > applied.get("sequence", 0)):
+                    self.store.put("native_applied", "native_applied:" + ident, {"sequence": sequence}, ident)
+        self.native_progress.clear()
+        self.native_progress_count = 0
+
+    def applied_native(self, ident, sequence):
+        self.native_progress[ident] = max(sequence, self.native_progress.get(ident, 0))
+        self.native_progress_count += 1
+        if self.native_progress_count >= NATIVE_APPLIED_BATCH:
+            self.flush_native_progress()
+        if self.native_progress_flush is None or self.native_progress_flush.done():
+            async def flush():
+                await asyncio.sleep(NATIVE_APPLIED_FLUSH_S)
+                self.flush_native_progress()
+            self.native_progress_flush = self.background(flush())
+
     async def native_worker(self, initial, queue):
         while True:
-            message = await queue.get()
+            sequence, message = await queue.get()
             listener = self.store.get(initial["id"])
             try:
                 if "id" in message:
-                    task = self.background(self.native_request(listener, message))
+                    # The worker cannot await a tool that may itself need notifications.
+                    # Intake already durably recorded ownership with the journal row.
+                    # Never overwrite a request's ownership/state during dequeue.
+                    obligation = self.store.get("native_obligation:" + str(sequence))
+                    task = self.background(self.apply_native_request(listener, message, obligation))
                     pending = self.listener_requests.setdefault(listener["id"], set())
                     pending.add(task)
                     task.add_done_callback(pending.discard)
                 else:
                     await self.notification(listener, message["method"], message.get("params", {}))
+                key = "native_applied:" + listener["id"]
+                applied = self.store.get(key, required=False) or {}
+                # Failures freeze the contiguous applied prefix. Recovery replays the
+                # unapplied evidence before it can establish a newer history anchor.
+                if not applied.get("failed") and not applied.get("pending"):
+                    self.applied_native(listener["id"], sequence)
+                    params = message.get("params", {})
+                    if params.get("threadId") and message.get("method") in ("item/completed", "turn/completed", "thread/reverted"):
+                        self.history.schedule(listener, params["threadId"])
             except Exception as exc:
                 code = getattr(exc, "code", type(exc).__name__)
+                key = "native_applied:" + listener["id"]
+                applied = self.store.get(key, required=False) or {}
+                self.native_progress.pop(listener["id"], None)
+                progress = {"sequence": applied.get("sequence", 0), "failed": sequence}
+                if applied.get("pending"):
+                    progress["pending"] = applied["pending"]
+                self.store.put("native_applied", key, progress, listener["id"])
                 self.store.event("native/reconcile_failure", listener["id"], {"code": code})
                 from .ledger import UNREADABLE
                 details = getattr(exc, "details", None) or {}
@@ -1259,6 +1346,17 @@ class Daemon:
                                        {"listener": listener["id"], "code": code})
             finally:
                 queue.task_done()
+
+    async def apply_native_request(self, listener, message, obligation):
+        try:
+            await self.native_request(listener, message)
+        except BaseException:
+            obligation.update(state="failed")
+            self.store.save(obligation)
+            raise
+        else:
+            obligation.update(state="completed")
+            self.store.save(obligation)
 
     async def native_request(self, listener, message):
         connection = self.connections.get(listener["id"])
@@ -1296,6 +1394,10 @@ class Daemon:
         await connection.send({"id": message["id"], "result": response})
 
     async def notification(self, listener, method, params):
+        if method == "thread/reverted":
+            actor = await self.resolve_actor(listener, params["threadId"])
+            self.history.invalidate(actor, "thread_reverted")
+            return
         if method == "coordinator/transportGap":
             if listener["state"] not in ("stopping", "stopped"):
                 listener.update(state="disconnected", recovery_state="reconciling")
@@ -1821,6 +1923,7 @@ class Daemon:
         methods = [method for task, method in self.inflight.items() if task is not asyncio.current_task()]
         counts = {
             "recovery": int(not self.ready) + len(self.recovering),  # writers, units, checkouts startup recovery is still reconciling
+            "history": self.history.active + len(self.history.scheduled),
             # One waiting only for the lead's decision on an unproven input runs nothing (Runs.awaiting_lead).
             "workflows": sum(r["state"] not in TERMINAL | {"idle"} and not self.settling_on_outcomes(r) and not self.runs.awaiting_lead(r)
                              for r in self.store.all("run") if r.get("workflow") or r["state"] == "admitting"),

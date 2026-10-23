@@ -289,8 +289,12 @@ async def reconcile_unadmitted(daemon, record):
             with store.transaction():
                 observed(outside=True)  # even an unreadable ignored file needs no byte observation
         else:
+            # This completion has no hold of its own. Do not observe a newer
+            # admitted call's bytes, or acknowledge a partial observation.
+            from .recovery import refuse_executing
             await daemon.ledger.reconcile(checkout, record["paths"],
-                reason="lead post hook without prepared intent", ignore_pending=False, on_observed=observed)
+                reason="lead post hook without prepared intent", ignore_pending=False, on_observed=observed,
+                guard=lambda: refuse_executing(store, checkout["id"], record["paths"]))
         forget_marker(store, record)
     except BaseException as exc:
         current = store.get(record["id"])

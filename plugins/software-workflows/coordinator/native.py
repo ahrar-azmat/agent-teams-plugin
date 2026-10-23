@@ -14,6 +14,13 @@ import time
 from .client import CoordinatorError, clean_environment
 
 
+# Count wire JSON at the decode boundary, including late responses. These counters
+# contain lengths/timings only; no native payloads or credentials are retained.
+DECODE_METRICS = {"json_bytes": 0, "history_json_bytes": 0, "messages": 0,
+                  "history_responses": 0, "max_json_bytes": 0, "max_decode_seconds": 0}
+HISTORY_METHODS = {"thread/turns/list", "thread/items/list"}
+
+
 def environment(**overrides):
     # These are the CALLER's tool-routing identities, not user configuration.
     # Inheriting them can route a nested CLI's tools through the caller and bypass
@@ -332,6 +339,8 @@ class Connection:
     def __init__(self, reader, writer, on_event, schema=None):
         self.reader, self.writer, self.on_event, self.schema = reader, writer, on_event, schema
         self.pending, self.counter = {}, 0
+        self.request_methods = {}  # retained through a timeout until its late response or disconnect
+        self.metrics = dict.fromkeys(DECODE_METRICS, 0)
         self.send_lock = asyncio.Lock()
         self.closed = False
         self.receiver = asyncio.create_task(self.receive())
@@ -382,13 +391,16 @@ class Connection:
         ident = self.counter
         future = asyncio.get_running_loop().create_future()
         self.pending[ident] = future
+        self.request_methods[ident] = method
         try:
             await self.send({"id": ident, "method": method, "params": params})
             response = await asyncio.wait_for(future, timeout)
             if "error" in response:
                 error = response["error"]
-                raise CoordinatorError("NATIVE_RPC", error.get("message", "Native refusal"),
-                                       {"method": method, "native_code": error.get("code")})
+                details = {"method": method, "native_code": error.get("code")}
+                if method in ("thread/turns/list", "thread/items/list") and params.get("cursor") is not None:
+                    details["history_cursor"] = True
+                raise CoordinatorError("NATIVE_RPC", error.get("message", "Native refusal"), details)
             return response["result"]
         except asyncio.TimeoutError as exc:
             raise CoordinatorError("NATIVE_UNCERTAIN", "Native RPC result lost; reconcile before retry",
@@ -435,8 +447,21 @@ class Connection:
                     raise ValueError("Invalid native data frame")
                 if not fin:
                     continue
+                size = sum(map(len, chunks))
+                for metrics in (self.metrics, DECODE_METRICS):
+                    metrics["json_bytes"] += size
+                    metrics["messages"] += 1
+                    metrics["max_json_bytes"] = max(metrics["max_json_bytes"], size)
+                began = time.perf_counter()
                 message = json.loads(b"".join(chunks).decode("utf-8"))
+                decode_seconds = time.perf_counter() - began
                 chunks, fragmented = [], False
+                method = self.request_methods.pop(message.get("id"), None) if "method" not in message else None
+                for metrics in (self.metrics, DECODE_METRICS):
+                    metrics["max_decode_seconds"] = max(metrics["max_decode_seconds"], decode_seconds)
+                    if method in HISTORY_METHODS:
+                        metrics["history_json_bytes"] += size
+                        metrics["history_responses"] += 1
                 if "id" in message and "method" not in message:
                     future = self.pending.get(message["id"])
                     if future and not future.done():
@@ -444,10 +469,12 @@ class Connection:
                 else:
                     # Callback only journals/enqueues. Never await a hook/tool here.
                     self.on_event(message)
+                await asyncio.sleep(0)
         except (OSError, ValueError, asyncio.IncompleteReadError, MemoryError) as exc:
             self.on_event({"method": "coordinator/transportGap", "params": {"error": type(exc).__name__}})
         finally:
             self.closed = True
+            self.request_methods.clear()
             for future in self.pending.values():
                 if not future.done():
                     future.set_exception(CoordinatorError("NATIVE_DISCONNECTED", "Native connection closed", operational=True))
@@ -487,6 +514,7 @@ async def page(connection, method, params):
         if cursor in seen:
             raise CoordinatorError("HISTORY_CURSOR", "Native pagination repeated a cursor")
         seen.add(cursor)
+        await asyncio.sleep(0)
 
 
 def coordinator_hooks(listed, roots, command=None, expected=None):

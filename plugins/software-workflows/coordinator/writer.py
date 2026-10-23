@@ -7,13 +7,11 @@ the lead's resume sends it again.
 """
 import asyncio
 import json
-import os
 from pathlib import Path
-import stat
 import time
 
 from .client import CoordinatorError
-from . import participants
+from . import participants, rollout
 from .locks import KeyedLocks
 from .store import uid, digest
 
@@ -28,43 +26,6 @@ def image_paths(images):
     if missing:
         raise CoordinatorError("RESUME_IMAGES", "Not delivered: image paths must exist", {"missing": missing})
     return list(dict.fromkeys(str(Path(p).resolve()) for p in values))
-
-
-def rollout_policy(path, thread):
-    """Read only policy fields from this native thread's own recorded rollout."""
-    result = {"verified": False, "source": "native rollout turn_context", "turns": []}
-    if not path or not thread or not Path(path).name.endswith("-" + thread + ".jsonl"):
-        return dict(result, reason="native thread did not supply a matching rollout path")
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(descriptor, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-                return dict(result, reason="rollout is not an owned regular file")
-            while True:
-                line = stream.readline(16 * 1024 * 1024 + 1)
-                if not line:
-                    break
-                if len(line) > 16 * 1024 * 1024:
-                    return dict(result, reason="rollout record exceeds bounded reader")
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue  # An appending writer may have an unfinished last line.
-                if record.get("type") != "turn_context":
-                    continue
-                payload = record.get("payload", {})
-                sandbox = payload.get("sandbox_policy", {})
-                result["turns"].append({"turn": payload.get("turn_id"), "model": payload.get("model"),
-                    "effort": payload.get("effort"), "approval_policy": payload.get("approval_policy"),
-                    "sandbox": sandbox.get("type") if isinstance(sandbox, dict) else sandbox})
-    except OSError as exc:
-        return dict(result, reason=type(exc).__name__)
-    result["verified"] = bool(result["turns"]) and all(t["approval_policy"] == "never" and
-        t["sandbox"] == "danger-full-access" for t in result["turns"])
-    if not result["verified"]:
-        result["reason"] = "no recorded turn contexts or unexpected native policy"
-    return result
 
 
 def descriptor(value):
@@ -294,7 +255,7 @@ class Writer:
             if self.daemon.draining:
                 return
             root = self.store.get(run["root_actor"])
-            readback = await asyncio.to_thread(rollout_policy, run.get("rollout"), root.get("thread"))
+            readback = await rollout.policy(self.store, root, run.get("rollout"), root.get("thread"))
             if self.daemon.draining:
                 return  # the phase stays settling; the next daemon judges it again
             # Read after every await above. A cancel requested meanwhile (run/interrupt does not wait for this lock)

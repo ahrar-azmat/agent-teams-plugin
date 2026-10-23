@@ -1,6 +1,7 @@
 """Generation-fenced recovery. Never replay an uncertain mutation or continue a turn."""
 import asyncio
 import base64
+from contextlib import asynccontextmanager
 import errno
 import json
 import math
@@ -23,6 +24,20 @@ READMIT_DRAIN_S = 45
 # transient failures seen are an app-server start or one RPC, each 1-3 s), then doubling to 5 min, so one that keeps
 # failing costs at most about a dozen app-server starts an hour. Its unit's work waits meanwhile.
 RECONCILE_RETRY_FIRST_S, RECONCILE_RETRY_MAX_S = 5, 300
+# 2026-10-23, real Codex 0.163.0, 27 synthetic histories totalling 1,997.85 MB:
+# limits 1/2/4 completed start+resume+bootstrap in 77.0/45.5/33.3 s. At 4, full
+# status p99/max were 15.8/27.1 ms; actual lead PreToolUse p99/max 145/156 ms;
+# the slowest resume was 3.24 s (over 3x headroom against the native 10 s answer
+# budget). Unbounded 2.4.5 reached 20.75 s resumes and seven history timeouts.
+# Use the highest measured candidate, 4. This history-component fixture used a
+# pre-provisioned ledger/lease; it does not measure admission or filesystem scans.
+# Re-measure for other hosts/workloads; README and r246-r contain the raw evidence.
+RECOVERY_CONCURRENCY = 4
+_capacity = os.environ.get("SOFTWARE_WORKFLOWS_RECOVERY_CONCURRENCY")
+if _capacity is not None:
+    if not _capacity.isascii() or not _capacity.isdecimal() or int(_capacity) < 1:
+        raise CoordinatorError("CONFIG", "SOFTWARE_WORKFLOWS_RECOVERY_CONCURRENCY must be a positive integer")
+    RECOVERY_CONCURRENCY = int(_capacity)
 RUNTIME_NOTE = ("Values the old app-server held in its tool runtime (code-mode variables and functions) are gone: "
                 "only the thread's history carries over.")
 
@@ -130,19 +145,138 @@ async def _registered_reconcile(daemon, listener, advance, invocation):
         if listener.get("root_thread") and listener["state"] in ("dead", "stopped") and bound and bound != listener["id"]:
             listener = store.get(bound)
         invocation["listener"] = listener["id"]
-        try:
-            notice = await reconcile_pass(daemon, listener)
-        except Exception as exc:
-            reconcile_failed(daemon, listener, exc)
-            if startup_obligation(store, listener["run"]):
-                quarantine_failed(daemon, listener, exc)
-            raise
+        invocation["phase"] = "queued"
+        async with capacity(daemon):
+            invocation["phase"] = "active"
+            try:
+                notice = await reconcile_pass(daemon, listener)
+            except Exception as exc:
+                reconcile_failed(daemon, listener, exc)
+                if startup_obligation(store, listener["run"]):
+                    quarantine_failed(daemon, listener, exc)
+                raise
     # Outside the reconcile lock: advancement may need another reconcile. Unproven inputs are never resent.
     run = store.get(listener["run"])
     if advance and run.get("workflow"):
         await daemon.writer.advance(run["id"])
     if notice:
         await daemon.messages.notify(listener["actor"], notice)
+
+
+@asynccontextmanager
+async def capacity(daemon):
+    """Queueing has no deadline, retry or quarantine of its own. The caller remains
+    registered with the stop fence; recursive replacement reuses this one slot."""
+    task = asyncio.current_task()
+    if task in daemon.recovery_holders:
+        yield
+        return
+    daemon.recovery_queued += 1
+    try:
+        await daemon.recovery_capacity.acquire()
+    finally:
+        daemon.recovery_queued -= 1
+    daemon.recovery_active += 1
+    daemon.recovery_holders.add(task)
+    try:
+        yield
+    finally:
+        daemon.recovery_active -= 1
+        daemon.recovery_holders.remove(task)
+        daemon.recovery_capacity.release()
+
+
+async def replay_native(daemon, listener):
+    """Apply journal evidence in short batches; a crash repeats only the unapplied
+    suffix. SQLite and effect commits stay on the daemon's event-loop thread."""
+    store, incarnation = daemon.store, listener
+    while True:
+        # A server request runs outside the serial notification worker. Its durable
+        # obligation, rather than receipt/dequeue, permits the applied prefix to pass.
+        # After a crash never execute it again: expose uncertainty and let a repeated
+        # native request receive the existing DYNAMIC_UNCERTAIN response path.
+        after = ""
+        while True:
+            obligations = list(store.selected("SELECT * FROM records WHERE kind='native_obligation' AND parent=? "
+                                               "AND json_extract(data,'$.state') IN ('pending','failed') "
+                                               "AND id>? ORDER BY id LIMIT 25", (incarnation["id"], after)))
+            if not obligations:
+                break
+            for obligation in obligations:
+                if (obligation["state"] == "failed" or obligation["state"] == "pending"
+                        and obligation["generation"] != store.generation):
+                    row = store.db.execute("SELECT data FROM events WHERE seq=?", (obligation["sequence"],)).fetchone()
+                    if row:
+                        request_uncertain(daemon, incarnation, json.loads(row["data"]), obligation)
+                await asyncio.sleep(0)
+            after = obligations[-1]["id"]
+        key = "native_applied:" + incarnation["id"]
+        sequence = (store.get(key, required=False) or {}).get("sequence", 0)
+        while True:
+            rows = store.db.execute("SELECT seq,data FROM events WHERE kind='native' AND subject=? AND seq>? "
+                                    "ORDER BY seq LIMIT 25", (incarnation["id"], sequence)).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                notification = json.loads(row["data"])
+                params, method = notification.get("params", {}), notification.get("method")
+                if "id" in notification:
+                    obligation = store.get("native_obligation:" + str(row["seq"]), required=False)
+                    # Older daemons had no obligation records. Their durable response
+                    # already proves completion; migration must not add two writes and
+                    # a transaction for every previously completed tool request.
+                    completed = False
+                    if method == "item/tool/call":
+                        dynamic = store.get("dynamic:" + incarnation["id"] + ":" + params["threadId"]
+                                            + ":" + params["callId"], required=False)
+                        completed = bool(dynamic and dynamic.get("response") is not None)
+                    if not obligation and not completed:
+                        store.put("native_obligation", "native_obligation:" + str(row["seq"]),
+                            {"sequence": row["seq"], "generation": store.generation, "state": "pending"}, incarnation["id"])
+                        obligation = store.get("native_obligation:" + str(row["seq"]))
+                        request_uncertain(daemon, incarnation, notification, obligation)
+                elif method == "hook/completed":
+                    daemon.record_hook_evidence(listener, params, history=True)
+                elif method in ("item/started", "item/completed") and params.get("item", {}).get("type") in (
+                        "fileChange", "commandExecution", "mcpToolCall"):
+                    operation = daemon.find_operation(listener, params["threadId"], params["turnId"], params["item"]["id"], history=True)
+                    field = "completed_item" if method == "item/completed" else "started_item"
+                    if operation and (field == "completed_item" or not operation.get(field)):
+                        operation[field] = params["item"]
+                        store.save(operation)
+                        if field == "completed_item":
+                            daemon.ledger.end_execution(operation)
+                sequence = row["seq"]
+                await asyncio.sleep(0)
+            applied = store.get(key, required=False) or {}
+            progress = {"sequence": max(sequence, applied.get("sequence", 0))}
+            if applied.get("failed", 0) > sequence:
+                progress["failed"] = applied["failed"]
+            if applied.get("pending", 0) > sequence:
+                progress["pending"] = applied["pending"]
+            store.put("native_applied", key, progress, incarnation["id"])
+            await asyncio.sleep(0)
+        if not incarnation.get("replaces"):
+            break
+        incarnation = store.get(incarnation["replaces"])
+
+
+def request_uncertain(daemon, listener, message, obligation):
+    store, params = daemon.store, message.get("params", {})
+    with store.transaction():
+        uncertain = True
+        if message.get("method") == "item/tool/call":
+            ident = "dynamic:" + listener["id"] + ":" + params["threadId"] + ":" + params["callId"]
+            existing = store.get(ident, required=False)
+            uncertain = not (existing and existing.get("response"))
+            if not existing:
+                store.put("dynamic", ident, {"state": "uncertain", "native": params}, listener["unit"])
+        if uncertain:
+            for checkout in participants.checkout_ids(store, listener["unit"]):
+                store.unknown(checkout, "*", "native server request interrupted before durable completion",
+                              {"listener": listener["id"], "sequence": obligation["sequence"]})
+        obligation.update(state="uncertain" if uncertain else "completed")
+        store.save(obligation)
 
 
 def reconcile_failed(daemon, listener, exc):
@@ -195,7 +329,7 @@ def retryable_failure(info):
     if code == "ADMISSION_FAILED":
         cases = info.get("cases") or []
         return bool(cases) and all(retryable_failure(case["error"]) for case in cases)
-    if code in {"NATIVE_UNCERTAIN", "NATIVE_DISCONNECTED", "LISTENER_SILENT", "TimeoutError",
+    if code in {"NATIVE_UNCERTAIN", "NATIVE_DISCONNECTED", "LISTENER_SILENT", "TimeoutError", "HISTORY_CHANGED", "HISTORY_APPLY_PENDING",
                 "ConnectionError", "ConnectionResetError", "ConnectionRefusedError", "BrokenPipeError", "EOFError",
                 "EXCLUSIVE_WRITER", "CUSTODIAN_LOST", "LEASE_UNCERTAIN", "PROBE_TIMEOUT",
                 "RESTORE_CUSTODY", "RESTORE_EXECUTING", "UNSTABLE_SNAPSHOT", "RECOVERY_BUSY", "REPLACEMENT_UNBOUND"}:
@@ -489,6 +623,11 @@ async def _reconcile_listener(daemon, listener):
         await answers(daemon, listener)  # attached and silent: reported, and this pass refused (LISTENER_SILENT)
     for operation in list(store.all("operation", actor["unit"])):
         if operation.get("parts") and operation["state"] in ("prepared", "allowed", "running"):
+            if daemon.ledger.current_lead(operation):
+                # A writer reconnect does not interrupt this daemon's lead edit
+                # or restore. Quarantining its parent would also quarantine and
+                # observe every part before the snapshot can preserve them.
+                continue
             await daemon.ledger.quarantine(operation, "cross-checkout operation interrupted by native reconnect",
                                            executing=await may_execute(daemon, operation))
     unsubmitted = not run.get("workflow") and not run.get("task") and not run.get("production_started") and not run.get("phases")
@@ -616,24 +755,7 @@ async def _reconcile_listener(daemon, listener):
     native.coordinator_hooks(listed, roots, expected=listener.get("hooks", []))
     # The receive loop fsynced these notifications before scheduling processing.
     # Recover evidence that was received durably but not yet applied to an intent.
-    incarnation = listener
-    while True:
-        for row in store.db.execute("SELECT data FROM events WHERE kind='native' AND subject=? ORDER BY seq", (incarnation["id"],)):
-            notification = json.loads(row[0])
-            params, method = notification.get("params", {}), notification.get("method")
-            if method == "hook/completed":
-                daemon.record_hook_evidence(listener, params, history=True)
-            elif method in ("item/started", "item/completed") and params.get("item", {}).get("type") in ("fileChange", "commandExecution", "mcpToolCall"):
-                operation = daemon.find_operation(listener, params["threadId"], params["turnId"], params["item"]["id"], history=True)
-                key = "completed_item" if method == "item/completed" else "started_item"
-                if operation and (key == "completed_item" or not operation.get(key)):
-                    operation[key] = params["item"]
-                    store.save(operation)
-                    if key == "completed_item":
-                        daemon.ledger.end_execution(operation)
-        if not incarnation.get("replaces"):
-            break
-        incarnation = store.get(incarnation["replaces"])
+    await replay_native(daemon, listener)
     # Failed results it wrote while no daemon read its log, judged with every item replayed above
     # (its log is not followed while it reconciles).
     await daemon.settle_native_log(listener["id"])
@@ -641,7 +763,14 @@ async def _reconcile_listener(daemon, listener):
     # may have been missed; thread/read supplies the native ancestry.
     await daemon.discover_descendants(listener)
     history_threads = []
-    for child in ancestry_order(list(store.all("actor", actor["unit"]))):
+    seen_threads = set()
+    while True:
+        work = [a for a in ancestry_order(list(store.all("actor", actor["unit"])))
+                if a["kind"] != "lead" and a["thread"] not in seen_threads]
+        if not work:
+            break
+        child = work[0]
+        seen_threads.add(child["thread"])
         if child["kind"] == "lead":
             continue
         if unsubmitted and child["thread"] == listener["root_thread"]:
@@ -661,53 +790,24 @@ async def _reconcile_listener(daemon, listener):
             # Native 0.163.0 children inherit roots and ancestry, but their own
             # project_id is null. Preserve that observed association on resume.
             verify_thread(child_response, dict(unit, project=child.get("native_project")), child.get("cwd", cwd), roots)
-        turns, recorded = [], child.get("active_turn")
-        async for result in native.page(connection, "thread/turns/list", {"threadId": child["thread"], "itemsView": "full", "sortDirection": "asc"}):
-            for turn in result["data"]:
-                turns.append(turn)
-                store.event("recovery/turn", child["id"], {"id": turn["id"], "status": turn["status"], "itemsView": turn.get("itemsView")})
-                if turn["status"] == "inProgress":
-                    child["active_turn"] = turn["id"]
-                elif child.get("active_turn") == turn["id"]:
-                    child["active_turn"] = None
-                    child["state"] = turn["status"]
-        async for result in native.page(connection, "thread/items/list", {"threadId": child["thread"], "sortDirection": "asc"}):
-            for entry in result["data"]:
-                item, turn = entry["item"], entry["turnId"]
-                if entry.get("completedAtMs"):
-                    daemon.writer.observe(child, "item/completed", {"threadId": child["thread"], "turnId": turn, "item": item})
-                if item["type"] == "userMessage" and item.get("clientId"):
-                    daemon.messages.entered(child["id"], item["clientId"], {"history": True, "turn": turn, "item": item["id"]})
-                if item["type"] == "subAgentActivity":
-                    await daemon.resolve_actor(listener, item["agentThreadId"])
-                if item["type"] in ("fileChange", "commandExecution", "mcpToolCall"):
-                    operation = daemon.find_operation(listener, child["thread"], turn, item["id"], history=True)
-                    if operation and entry.get("completedAtMs"):
-                        operation["completed_item"] = item
-                        store.save(operation)
-                        daemon.ledger.end_execution(operation)
-                    elif not operation:
-                        for checkoutid in participants.checkout_ids(store, child["unit"]):
-                            store.unknown(checkoutid, "*", "history contains an unaccounted effect-capable item", {"item": item["id"], "listener": listener["id"]})
-        history_threads.append({"actor": child["id"], "thread": child["thread"], "turns": len(turns), "items_complete": True})
-        metadata = await connection.call("thread/read", {"threadId": child["thread"], "includeTurns": False})
-        if metadata["thread"].get("status", {}).get("type") == "idle":
-            child["active_turn"] = None
-            child["state"] = "idle"
-        store.save(child)
-        for turn in turns:
-            if turn["status"] != "inProgress":
-                daemon.writer.observe(child, "turn/completed", {"threadId": child["thread"], "turn": turn})
+        recorded = child.get("active_turn")
+        observed = await daemon.history.observe(listener, child, connection)
+        history_threads.append(observed)
+        child = store.get(child["id"])
+        last = observed.get("last_turn")
         run = store.get(child["run"])
-        if (child["kind"] == "root" and turns and turns[-1]["status"] != "inProgress" and not child.get("active_turn")
+        if (child["kind"] == "root" and last and last["status"] != "inProgress" and not child.get("active_turn")
                 and (recorded or run["state"] == "running") and not run.get("phases") and not run.get("workflow")
                 and not run.get("cancel_requested")):
-            # A plain run's state is its root's last turn's, as when the daemon reads the end (Daemon.notification): one
-            # that ended while no daemon read this app-server shows only in history. One with phases is the writer's.
-            run["state"] = turns[-1]["status"]
+            run["state"] = last["status"]
             store.save(run)
     for operation in list(store.all("operation", actor["unit"])):
         if operation["state"] in ("prepared", "allowed", "running"):
+            if daemon.ledger.current_lead(operation):
+                # A lead attached to this writer's unit can still be editing.
+                # Its own completion settles it; only earlier generations have
+                # a crash gap. Recovery's snapshot preserves the same hold.
+                continue
             if operation.get("parent_operation"):
                 continue
             if operation["kind"] == "patch" and operation.get("hook_valid") and operation.get("post_hook") and operation.get("completed_item"):
@@ -726,7 +826,8 @@ async def _reconcile_listener(daemon, listener):
     history = {"completed": time.time(), "threads": history_threads}
     history["event"] = store.event("recovery/history", listener["id"], dict(history, run=listener["run"]))
     # A failing checkout must not leave sibling scans running after this invocation leaves the stop fence.
-    results = await asyncio.gather(*(daemon.ledger.reconcile(store.get(key), ignore_pending=False, reason="recovery snapshot")
+    results = await asyncio.gather(*(daemon.ledger.reconcile(store.get(key), ignore_pending=False, preserve_leads=True,
+                                                          reason="recovery snapshot")
                                     for key in participants.checkout_ids(store, actor["unit"])), return_exceptions=True)
     for result in results:
         if isinstance(result, BaseException):
@@ -1327,10 +1428,19 @@ def refuse_executing(store, checkout, paths=None):
     """A restore must not race a call whose host can still write."""
     from .lead_calls import refuse
     refuse(store, checkout, paths, code="RESTORE_EXECUTING")
-    executing = [o["id"] for o in store.live_operations(checkout) if o.get("executing")]
+    from .custody import normalize, overlaps
+    root = store.get(checkout)
+    executing = []
+    for operation in store.live_operations(checkout):
+        lead = (operation["kind"] in ("lead-edit", "restore")
+                and operation["state"] in ("prepared", "allowed", "running"))
+        if operation.get("executing") or lead and (paths is None or any(
+                overlaps(normalize(root, a)["key"], normalize(root, b)["key"])
+                for a in paths for b in operation["paths"])):
+            executing.append(operation["id"])
     if executing:
-        raise CoordinatorError("RESTORE_EXECUTING", "A quarantined patch may still be writing; its paths stay held "
-                               "until its handler's end is reported or its app-server stops", {"operations": executing})
+        raise CoordinatorError("RESTORE_EXECUTING", "An admitted or quarantined write may still be executing or settling",
+                               {"operations": executing})
 
 
 def baseline_of(head, index):
@@ -1455,7 +1565,8 @@ async def restore_unknown(daemon, params):
         data = store.read_blob(known["blob"]) if known["blob"] else None
         mode = known["mode"] if data is not None else None
     # The read records what is there now: a restore replaces bytes it has seen.
-    await daemon.ledger.reconcile(checkout, [path], ignore_pending=False)
+    await daemon.ledger.reconcile(checkout, [path], ignore_pending=False,
+                                  guard=lambda: refuse_executing(store, checkout["id"], [path]))
     change = {"mode": mode}
     if data is not None:
         change["bytes_base64"] = base64.b64encode(data).decode()
@@ -1521,7 +1632,8 @@ async def restore_checkout(daemon, actor, unknown, revisions):
     if daemon.custody.active(checkout["id"]):
         raise CoordinatorError("RESTORE_CUSTODY", "Reconcile all terminals and descendants first")
     refuse_executing(store, checkout["id"])
-    await daemon.ledger.reconcile(checkout, ignore_pending=False)
+    await daemon.ledger.reconcile(checkout, ignore_pending=False,
+                                  guard=lambda: refuse_executing(store, checkout["id"]))
     held = {r[0] for r in store.db.execute("SELECT path FROM heads WHERE checkout=?", (checkout["id"],))}
     paths = held - await daemon.ledger.unwatched(checkout, held)
     if not paths or not isinstance(revisions, dict) or set(revisions) != paths:
@@ -1563,7 +1675,10 @@ async def restore_checkout(daemon, actor, unknown, revisions):
     mark = uid("restore")
     result = await daemon.lead_edit({"actor": actor["id"], "changes": changes, "cwd": checkout["root"]}, restore=True, mark=mark)
     try:
-        after = await daemon.ledger.reconcile(checkout, ignore_pending=False, reason="after a checkout-wide restore")
+        # Resolution needs the whole checkout. Refuse a lead admitted during
+        # the restore's awaits instead of silently resolving a partial scan.
+        after = await daemon.ledger.reconcile(checkout, ignore_pending=False, reason="after a checkout-wide restore",
+                                              guard=lambda: refuse_executing(store, checkout["id"]))
         now = await baselines()
         images = {path: store.head(checkout["id"], path) or {"id": None, "blob": None, "mode": None} for path in paths}
         resolved = not after["unknowns"] and await asyncio.to_thread(

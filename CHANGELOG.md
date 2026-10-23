@@ -3,6 +3,135 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.6] — 2026-10-23
+
+Recovery reads native history from where it last stopped, a page at a time, and recovers at most four writers at
+once. This fixes the two known limits 2.4.5's live switch exposed:
+- 27 recovering writers saturated the daemon for about 5 minutes;
+- a writer whose 247 MB history timed out was retried every 5 minutes for good.
+
+A lead's edit made while a writer of the same checkout reconciles is no longer quarantined. Each change has a real
+run on Codex 0.163.0 (coordinator/VERIFY.md, 2.4.6).
+
+### Fixed: recovering many writers saturated the daemon (a 2.4.5 known limit)
+- At 2.4.5's switch, 27 writers recovered at once:
+  - `daemon/status` took 20 to 25 s for about 5 minutes, past the lead hooks' 14 s;
+  - app-servers answered in up to 20.5 s, against their 10 s bound, so writers were quarantined.
+
+  Each recovery read its writer's whole history, decoded on the daemon's event loop.
+- Now at most 4 writers are recovered at once (`SOFTWARE_WORKFLOWS_RECOVERY_CONCURRENCY`, a positive integer,
+  default 4). A full history read takes one of those slots. Waiting for a slot has no timeout, retry or quarantine
+  of its own.
+- Short reads have a lane of their own (`SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY`, default 2). These are a live
+  writer's catch-up, a message's delivery check, and settling a resume's or a cancel's inputs. With all 4 recovery
+  slots held by 151 MB histories, they finished in 6 to 61 ms; sharing the slots, they waited 2.8 s.
+- `daemon/status` shows both lanes (`recovery_capacity` and `history_capacity`, each with limit, active and
+  queued), the observers running (`history_observers`), and the JSON bytes decoded (`native_decode`).
+- 27 writers holding 1,997.86 MB of synthetic histories, with a 2.66 GB journal:
+
+  | | 2.4.5 | 2.4.6 |
+  |---|---|---|
+  | First recovery | 89.4 s, 7 writers quarantined | 45 to 65 s, all 27 recovered (88 s once, with the host at load average 11) |
+  | Restart after a hard kill | 67.5 s, the same 7 still pending | 1.2 to 1.5 s, all recovered |
+  | History decoded on that restart | 915 MB | 32 to 46 KB |
+
+  During the 2.4.6 first recovery, `daemon/status` p99 stayed under 32 ms, lead PreToolUse p99 under 0.55 s and
+  writer PreToolUse p99 under 0.23 s, against the hooks' 14 s. There were no hook warnings.
+
+### Fixed: a long history was retried for good (a 2.4.5 known limit)
+- Recovery asked native for every turn with all its items in one response: `thread/turns/list` with `itemsView`
+  "full", then all of `thread/items/list`. A 247 MB history could not answer within `native.call`'s 60 s, and the
+  writer was retried every 5 minutes, starting an app-server each time.
+- Now turns are listed without their items, 25 at a time, and each turn's items are read 25 at a time. A durable
+  checkpoint per writer (`native_history`) holds a native cursor saying where reading stopped. A position is saved
+  only after everything before it has been applied.
+- Any of these starts a full re-read:
+  - a checkpoint that is missing or malformed;
+  - a cursor native refuses, whatever native's wording;
+  - a `thread/reverted` notification;
+  - a replaced or truncated rollout file.
+- A 251 MB history was read in 2.67 s (30,002 items), where 2.4.5 timed out at 60 s. The next read of the idle
+  thread decoded 1,092 bytes.
+- A thread that native keeps in `historyMode` "legacy" is refused with `NATIVE_HISTORY_UNSUPPORTED`. The coordinator
+  starts writer threads without naming a mode, and on Codex 0.163.0 every such thread in these runs was
+  "paginated". A thread started "legacy", whether asked for or by a configuration these runs did not use, is refused.
+
+### Fixed: a lead's edit was quarantined while a writer of its checkout reconciled
+- After every reconcile, a writer's recovery records what changed in its unit's checkouts. It also recorded a
+  lead's edit whose PostToolUse had not yet settled. The edit then failed its own check with `REVISION_CHANGED`,
+  was quarantined, and left its file UNKNOWN. This happened at every writer reconcile, including the 27 at a live
+  switch.
+- Now that snapshot leaves out paths held by lead calls this daemon admitted. Those settle through their own check,
+  as with no reconcile running. A call an earlier daemon admitted is judged as before: its intent is no proof.
+- A command's quarantine scan also keeps unrelated lead calls, and still records its own bytes.
+- A restore, and a lead PostToolUse with no hold of its own, refuse or wait while an overlapping admitted call can
+  still write. A restore used to apply its snapshot first and only then find the conflict.
+- A lead edit or restore spanning two checkouts is kept the same way. A writer's reconnect used to quarantine such
+  a group while it was unfinished, leaving 4 to 6 UNKNOWNs on its two paths. It now completes, with a receipt in each
+  checkout.
+  A group an earlier daemon admitted, and a native writer's, are quarantined as before.
+- 27 writers with changing lead Writes: every Write verified (141 to 204 in a run), with no path UNKNOWN. Before
+  the fix, the same run had one quarantined with `REVISION_CHANGED`, two paths left UNKNOWN, and 111 later
+  admissions refused.
+
+### Fixed during review: a command that finished after its turn
+- A code-mode command can keep running after its turn ends, and native lists it only once it completes. A turn now
+  stays under observation while any call admitted in it lacks its completion. When the call's end shows (its
+  result, its Post hook, or its app-server's exit) and its completion is not after the turn's last read item,
+  that turn alone is read again, once.
+- On real 0.163.0: a command finished while the daemon was down, after its turn ended and a newer turn had moved
+  the checkpoint. Its completion was applied at restart, its custody released, with no UNKNOWN. Before the fix the
+  completion was missed and custody stayed held.
+
+### Changed: the notification journal is replayed from where it was applied
+- Recovery replayed every journaled notification of a writer at every reconcile. Each listener now has an applied
+  prefix (`native_applied`):
+  - recovery replays only what lies past it, 25 rows at a time, yielding between rows;
+  - the prefix moves in one transaction every 100 ms or 256 notifications;
+  - a failed notification freezes it until a recovery replays what follows;
+  - a reconnect first holds it at the last notification received before.
+- A tool call native sends (`item/tool/call`) is recorded as owned by the daemon that received it, in the same
+  transaction as its journal row. A replay never takes such a call from its handler.
+- A daemon killed while a tool call ran no longer leaves it silently pending:
+  - the next daemon records a `*` UNKNOWN, "native server request interrupted before durable completion";
+  - a repeated request is answered `DYNAMIC_UNCERTAIN`;
+  - the tool is never run again.
+- The first reconcile after upgrading replays each writer's 2.4.5 journal once. A 700,000-row journal of the live
+  shape (2.58 GB, 15,000 completed tool calls) took 19 to 20 s, with event-loop delay p99 2.4 ms (25.5 s and
+  4.9 ms with the host at load average 11). A tool call 2.4.5 already answered gets no new record.
+
+### Changed: rollout files are read incrementally
+- Policy readback (a workflow phase's) and input diagnostics read a writer's rollout from where they last stopped:
+  - the position is a complete-record offset;
+  - only small facts are kept: hashed user texts and turn-context policy;
+  - an unchanged compressed rollout is not opened again.
+- They no longer decide where an input went; native's own history does that. The rollout's facts (damage, an
+  unmatched text) are told to the lead as before and never taken as proof.
+
+### Changed: an exited writer's inputs are read through a temporary app-server
+- An input sent to a writer whose app-server has exited is looked up in native's own history. The coordinator
+  starts a temporary app-server of its own to read it, and stops it after.
+- On 0.163.0 that reader leaves the thread unloaded, and never starts a queued input. With two queued inputs,
+  reading the queue, the thread, its turns and its items, then deleting one entry, left the other queued. No turn
+  started.
+- A cancel deletes a queued input of an exited writer through the same reader. Before, it was refused while the
+  writer's app-server was not connected.
+
+### Known limits
+- A direct `operation/prepare`, the two-step editor protocol, has no lifetime of its own. An editor that disappears
+  without `operation/complete` leaves its operation prepared: it holds its paths and refuses a draining stop until it
+  is completed, or a later daemon takes it as a crash gap. The plugin's lead hooks and the daemon's `lead-edit`
+  settle their own.
+- A malformed `SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY` stops the daemon from starting, but the error does not name
+  it: `DAEMON_STARTUP`, "ValueError". `SOFTWARE_WORKFLOWS_RECOVERY_CONCURRENCY` names itself (`CONFIG`).
+
+Not measured:
+- an unfinished code-mode item followed by hundreds of large outputs, as native would naturally persist it (the run
+  used a synthesized projection read through the real app-server);
+- a day-long soak;
+- a cold supervisor and admission launch;
+- arbitrary single-item sizes (native's pages bound item counts, not bytes).
+
 ## [software-workflows 2.4.5] — 2026-10-23
 
 The office opens by itself, and Claude no longer runs a log tail. Three of 2.4.4's known limits are fixed: a lead edit

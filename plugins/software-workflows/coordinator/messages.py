@@ -201,12 +201,9 @@ class Messages:
                 if exc.code == "NATIVE_RPC" and (str(exc).startswith("expected active turn id") or str(exc) == "no active turn to steer"):
                     message = self.store.get(ident)
                     if message["state"] == "persisted" and message["delivery"] == "uncertain":
-                        target["active_turn"] = None
-                        async for turns in page(connection, "thread/turns/list", {"threadId": target["thread"], "itemsView": "full"}):
-                            for turn in turns["data"]:
-                                if turn["status"] == "inProgress":
-                                    target["active_turn"] = turn["id"]
-                        self.store.save(target)
+                        await self.daemon.history.observe(listener, target, connection)
+                        target = self.store.get(target["id"])
+                        message = self.store.get(ident)
                         message["delivery"] = "pending"
                         self.store.save(message)
                 return
@@ -323,10 +320,8 @@ class Messages:
             return None, {}
         status = None
         try:
-            async for result in page(connection, "thread/turns/list", {"threadId": actor["thread"], "sortDirection": "desc", "itemsView": "notLoaded"}):
-                status = next((t["status"] for t in result["data"] if t["id"] == turn), None)
-                if status:
-                    break
+            await self.daemon.history.observe(self.store.get(actor["listener"]), actor, connection)
+            status = (self.daemon.history.turn(actor, turn) or {}).get("status")
         except (CoordinatorError, OSError):
             return None, {}
         if status == "inProgress" and same:
@@ -578,11 +573,7 @@ class Messages:
         connection = self.daemon.connections.get(target["listener"])
         if not connection or connection.closed:
             return
-        async for result in page(connection, "thread/items/list", {"threadId": target["thread"], "sortDirection": "asc"}):
-            for entry in result["data"]:
-                item = entry["item"]
-                if item.get("type") == "userMessage" and item.get("clientId") in (message["native_id"], message["native_id"] + ":relay"):
-                    self.entered(target["id"], item["clientId"], {"history": True, "turn": entry["turnId"], "item": item["id"]})
+        await self.daemon.history.observe(self.store.get(target["listener"]), target, connection)
         async for queued in page(connection, "thread/queue/list", {"threadId": target["thread"]}):
             if any(entry.get("clientUserMessageId") in (message["native_id"], message["native_id"] + ":relay") for entry in queued["data"]):
                 current = self.store.get(message["id"])

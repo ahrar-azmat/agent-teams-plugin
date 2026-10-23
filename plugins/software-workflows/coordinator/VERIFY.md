@@ -12642,3 +12642,126 @@ writers. Sales_Profiler's four writers were mid-turn when 2.4.5 was installed at
 
 The 26-writer measurement above found no need for a bound on concurrent recoveries. This switch, with real
 histories, shows the need (CHANGELOG.md, known limits).
+
+## 2.4.6
+
+Every change below was run for real on the checkout: one codebase, no copies, disposable state for every daemon,
+and native writers on the installed Codex 0.163.0 app-server with the fixture model.
+- Baselines are 2.4.5's installed copy.
+- A round's reds are the tree before that round's fix, as the writer measured them.
+- The writer's commands are the `COMMAND_JSON` records in `r246-r/acceptance-report.log`. Its round reports are
+  `r246-r/round2/review-report.log` to `round5/review-report.log`, with `r246-r/regression-comparison.log`.
+- The lead re-ran the writer's decisive greens from those records, one at a time, each batch's summary beside its
+  logs (all under the lead's scratchpad):
+  - `r246-lead/logs`: the round-2 tree;
+  - `r246-lead/logs3`: the round-4 tree;
+  - `r246-lead/logs5` to `logs7`: the release tree, every decisive case of rounds 1 to 5.
+- The release-tree runs shared the host with the user's live coordinator and its writers: load average 10 to 12,
+  `fseventsd` at 99 % CPU, a virtual machine at 30 to 140 %. Their outcomes match the earlier runs'. Their
+  latencies, sample counts and decoded bytes varied; each run's values are in the tables.
+
+No test files were added.
+
+### Recovery capacity and paged history (unit R, round 1)
+27 writers holding 1,997.86 MB of synthetic native histories, plus a 2.66 GB journal (321,357 rows). Each was run
+as a separate `Daemon.serve` with real native hooks, then SIGKILLed and restarted on the same state:
+
+| | 2.4.5 | 2.4.6, the writer | 2.4.6, the lead: round-2 / round-4 trees | 2.4.6, the lead: release tree, loaded host |
+|---|---|---|---|---|
+| first recovery | 89.44 s, 7 writers quarantined | 46.62 s (round 1), 45.22 s (round 3), 52.49 s (round 4); all recovered | 57.10 / 55.06 s | 88.26 / 65.01 s |
+| | | | all 27 reconciled; 0 quarantines, slow answers or hook warnings | the same |
+| restart after the hard kill | 67.48 s, the same 7 pending | 1.227 / 1.54 / 1.324 s | 1.17 / 1.32 s | 1.41 / 1.25 s |
+| history decoded on that restart | 915 MB | 32,478 / 42,727 / 42,727 bytes | 46,028 / 42,727 bytes | 44,932 / 42,727 bytes |
+| full `daemon/status` p99 during the first recovery | — | 14.81 ms | 20.6 / 18.4 ms | 31.1 / 23.2 ms |
+| lead PreToolUse p99, Python 3.9 | — | 209.96 ms | 197.2 / 243.7 ms | 543.2 / 204.6 ms |
+| writer PreToolUse p99 | — | 112 ms | 101 / 105 ms | 222 / 129 ms |
+
+Other round-1 results:
+- One 251,241,389-byte history: 2.4.5's full read hit the 60 s timeout; 2.4.6 read 30,002 items in 2.67 s, and
+  the next idle read decoded 1,092 bytes.
+- 300 native turns with a 16 MB item: bootstrap 0.729 s, the next read 0 items in 0.0047 s.
+- Limits 1/2/4 recovered the 27 in 77.0/45.5/33.3 s. The default is 4, the highest candidate measured, with the
+  slowest resume at 3.24 s against native's 10 s answer bound.
+
+### The lead's round-2 findings
+| Case | Before the fix | 2.4.6 | The lead's re-runs |
+|---|---|---|---|
+| a live `item/tool/call` reached by replay while the worker is held | `*` UNKNOWN, `DYNAMIC_UNCERTAIN`, tool not run | one dispatch, success, no UNKNOWN | the same, on the round-2, round-4 and release trees |
+| daemon SIGKILLed mid-tool | — | after restart: obligation `uncertain`, one `*` UNKNOWN "native server request interrupted before durable completion", `DYNAMIC_UNCERTAIN` on repeat, tool never run again | the same, on all three |
+| exited writer with two queued inputs, read through the temporary reader | only an empty queue had been tested | thread unloaded before and after queue/list, thread/read, turns/list, items/list and queue/delete of one entry; the other still queued; `task_started` unchanged | the same, round-2 and release trees |
+| a stored cursor refused, with native's message reworded | `NATIVE_RPC` escaped | fresh bootstrap, native's code and message recorded; a cursor-free refusal still raises | the same, round-2 and release trees |
+| all 4 recovery slots held by 150.75 MB bootstraps | short work waited 2.8 s | delivery 7.6 ms, resume settlement 6.8 ms, catch-up 54.3 ms | 7.1 / 6.1 / 53.7 ms; release tree 14.0 / 14.6 / 60.7 ms |
+| 27 writers, 20 waves, streamed deltas | — | 21,165 events/min; lead Pre p99 583 ms, writer Pre p99 512 ms; no warnings | 21,063 / 21,093 events/min, lead Pre p99 556 / 661 ms, writer Pre p99 582 / 679 ms; release tree (both recipes) 21,085 / 21,035 events/min, 606 / 767 ms, 588 / 690 ms; no warnings, 0 quarantines |
+| one unfinished command before 200 completed 64 KB outputs, plus 6 × 50 more | 148.0 MB read for 19.66 MB new | 19.75 MB; 51 items and 9 RPCs per batch | 3.29 MB per batch; release tree 19.75 MB in all |
+| applied-prefix writes, 27 writers | 9,181 rows | 2,134 rows | 2,143 rows; release tree 2,377 for 9,182 journal rows |
+| first replay of a 700,000-row 2.4.5 journal (15,000 completed tool calls) | 21.81 s, 30,000 obligation writes | 19.71 s, none | 19.04 s, none; event-loop delay p99 2.4 ms, max 13.9 ms. Release tree, loaded host: 25.51 s, none; p99 4.9 ms, max 170 ms; 0 UNKNOWN |
+| a rollout named `-<thread>-x.jsonl`; a non-`C1_MESSAGE` needle | accepted; silently ignored | refused; `ValueError` | the same, round-2 and release trees |
+
+### Review turn 58: a command that finished after its turn (round 3)
+| Case | Before the fix | 2.4.6 | The lead's re-runs |
+|---|---|---|---|
+| a code-mode command still running after turn A ended; turn B moved the checkpoint; the daemon SIGKILLed; the command completed; restart | completion missed; custody held | `completed_item` applied, execution ended, custody released, no UNKNOWN | the same, round-4 and release trees |
+| an open obligation while new output arrives | — | 9.94 MB read for 9.83 MB new; 0 closure reads | the same |
+| a completion that lands before the turn's applied tail | missed | one 503-item read of that turn; later reads 1,087 bytes, 0 closure reads | the same |
+| an executor that ended without completion | — | one closure read, then small reads; custody and its uncertainty kept | the same |
+
+### Lead edits during a writer's reconcile (unit S)
+| Case | Before the fix | 2.4.6 | The lead's re-runs |
+|---|---|---|---|
+| changing Writes during startup recovery and a later reconcile | both quarantined `REVISION_CHANGED` | both verified, no UNKNOWN | the same, round-4 and release trees |
+| a command's quarantine scan beside a lead Write | the lead Write quarantined | lead verified; the command's own UNKNOWN kept | the same |
+| a restore racing a lead edit | the restore damaged the lead's base, then refused | refused before applying; lead verified | the same |
+| a PostToolUse with no hold of its own | observed another call's bytes | waited; lead verified; retry completed | the same |
+| a lead attached to the writer's own unit | treated as a crash gap | pending, then verified through `operation/complete` | the same |
+| an earlier generation's call (control) | quarantined | quarantined | the same |
+| 27 writers with changing lead Writes | 1 `REVISION_CHANGED`, 2 path UNKNOWNs, 111 admissions refused | 137/137 verified at first recovery, 141/141 with the restart's; 0 UNKNOWN | the same (round-4 tree); release tree 200/200 and 159/159 at first recovery, 204/204 and 163/163 with the restart's; 0 UNKNOWN |
+
+### Review turn 59: a lead group spanning two checkouts (round 5)
+A writer's reconnect quarantined any unfinished cross-checkout operation before the reconcile's snapshot could
+leave it alone, including a lead edit or restore this daemon admitted. Both sites that decide this now use one
+predicate (`Ledger.current_lead`): a lead edit or restore of the serving generation. The writer's sweep of every
+site that quarantines, settles or snapshots an operation is `r246-r/round5/recovery-sweep.log` (32 sites).
+
+| Case | Before the fix | 2.4.6 | The lead's re-run |
+|---|---|---|---|
+| a lead edit across two checkouts, unfinished while a writer of its unit reconnects | the group and both parts quarantined; its completion refused `OPERATION_STATE`; 4 UNKNOWN, 0 receipts | the group and both parts verified through `operation/complete`; a receipt in each checkout, 0 UNKNOWN | the same |
+| a restore across two checkouts | quarantined at the reconnect, then `REVISION_CHANGED`; 6 UNKNOWN, 0 receipts | verified; a restore receipt in each checkout, 0 UNKNOWN | the same |
+| an earlier generation's group after a real daemon kill (control) | quarantined; `OPERATION_STATE`; 4 UNKNOWN | the same | the same |
+| a native writer's `apply_patch` across two checkouts (control) | — | still quarantined at the reconnect; 4 UNKNOWN, 0 receipts | the same |
+
+The six unit-S cases above were re-run on the release tree too (`r246-lead/logs5`), all as recorded.
+
+### Review findings (Codex code_review, session 01a14eac, turns 58 to 60)
+- Turn 58, MEDIUM, blocking: a code-mode command completing after its turn could be skipped once the checkpoint
+  passed that turn. Fixed in round 3.
+- Turn 59, MEDIUM, blocking: a current-generation lead edit spanning two checkouts was still quarantined, by the
+  earlier cross-checkout loop of a writer's reconcile. Fixed in round 5.
+- Turn 60, of round 5: "Ship it", no new findings. Codex checked the four round-5 results against the current
+  source hashes, and found turn 58's and turn 59's findings fixed. It refuted one claim of the lead's hypothesis:
+  that every current-generation lead operation has an owner that settles it. A direct `operation/prepare` has
+  none (a known limit, below).
+
+### Static checks on the release tree
+`r246-lead/static_checks.py`, with the version at 2.4.6 (`r246-lead/static-final`):
+- every plugin `.py` compiles in memory under Python 3.15 (66 files), and the 14 hook-run files under the system
+  Python 3.9.6;
+- `coordinator/hooks.py --check`: exit 0, compatible, protocol `jsonl-v1`;
+- ruff (F821, F822, F823, F811, F841, F401): 35 findings against 2.4.5's 36, none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: exit 0.
+
+### Known limits
+- A direct `operation/prepare` (the two-step editor protocol) has no lifetime of its own. An editor that disappears
+  without `operation/complete` leaves its operation prepared: it holds its paths and refuses a draining stop, until
+  it is completed or a later daemon takes it as a crash gap. The plugin's lead hooks and the daemon's `lead-edit`
+  settle their own (review turn 60).
+- A malformed `SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY` is refused at start without naming itself. With `abc` or `0`
+  the start exits 3 with `DAEMON_STARTUP` and the message `ValueError`, and `" 2"` is taken as 2.
+  `SOFTWARE_WORKFLOWS_RECOVERY_CONCURRENCY` refuses all three with `CONFIG` and its own name
+  (`r246-lead/cfgprobe/probe.log`, disposable daemons). The lead found it after the review.
+Not measured:
+- an unfinished code-mode item followed by hundreds of large outputs, as native would naturally persist it (the run
+  used a synthesized projection read through the real app-server);
+- a day-long soak;
+- a cold supervisor and admission launch (the fixtures pre-admit writers and scope the filesystem scan);
+- arbitrary single-item sizes.
