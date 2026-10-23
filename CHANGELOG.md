@@ -299,6 +299,16 @@ quarantined. Each fix has a real run (coordinator/VERIFY.md, 2.4.5).
   upgrading.
 - A lead file call open while the daemon is replaced (a version switch, a worker restart) keeps its hold until it
   ends, but its edit is quarantined: its file is left UNKNOWN, for a restore or a narrow.
+- A daemon that recovers many writers at once is saturated while it does. Measured at the live switch on 10-23 with
+  27 writers (coordinator/VERIFY.md, 2.4.5):
+  - For about 5 minutes `daemon/status` took 20 to 25 s, past the lead hooks' 14 s. A lead edit then would run
+    without admission and leave its file UNKNOWN; none did.
+  - App-servers answered in up to 20.5 s, against their 10 s bound, so writers were quarantined. All but one healed
+    within 25 minutes.
+
+  A bound on concurrent recoveries, sized from this measurement, is planned for 2.4.6.
+- A writer whose native thread keeps failing recovery (`thread/turns/list` answering `NATIVE_UNCERTAIN`) is retried
+  every 5 minutes for good, and each retry starts an app-server.
 
 ## [software-workflows 2.4.4] — 2026-10-22
 

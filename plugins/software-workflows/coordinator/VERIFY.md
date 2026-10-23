@@ -12609,3 +12609,35 @@ The office review (Codex code_review, session 01a14f98) said "Do not ship" at tu
 | MEDIUM (turn 8, the start finding): a start that returned at its 10 s give-up, with the office answering just after, still completed the claim | start() reports `shown` only after finding the office up and opening it if asked; only that completes the claim |
 | LOW (turn 8): the sweep read a marker's age before taking its lock | age and identity checked again under the lock |
 | LOW (turn 9): a claim could lock a marker the sweep had removed and another hook had made again | after locking, the claim checks that its file is still the one the path names, and otherwise opens the path again |
+
+### The live switch, 2.4.4 to 2.4.5 (10-23)
+The user's coordinator, read from its ledger (read-only) and `daemon/status`: a 4.67 GB ledger and 23 connected
+writers. Sales_Profiler's four writers were mid-turn when 2.4.5 was installed at 05:47.
+- `projects/switch245.py`, the 10-22 method, judged quiet from the ledger and then sent SIGTERM. In 90 minutes no
+  30 s sample was quiet, and nothing was signalled. Its quiet check also read every operation record (519 MB, about
+  4 s), so its verdict and its signal were seconds apart.
+- `projects/switch245b.py` asked 2.4.4 itself, through the 2.4.5 client's own `ensure()`. The daemon decides on its
+  event loop, and once it accepts it admits nothing new. It refused 205 times in 29 minutes (`NOT_QUIESCENT`: writer
+  turns, custody, operations, deliveries, lead hooks) and accepted at 07:55. 2.4.5 served at once, with
+  upgrade.lock held across the switch.
+- 2.4.5 recovered all 27 writers, 27 units and 4 checkouts in 7.5 minutes, and 26 writers stay connected. The drain
+  left no 2.4.4 app-server running. Neither the daemon nor the app-servers carry session or gate variables or shims.
+- For about 5 minutes the 27 recoveries saturated the daemon:
+  - `daemon/status` took 20 to 25 s, and one call took over 30 s;
+  - the worker used 70 to 116 % CPU, and the load average reached 40;
+  - app-servers answered in up to 20.5 s, against their 10 s bound.
+
+  Lead hooks have 14 s, so a lead edit in that window would have run without admission. None did: the 13 UNKNOWNs
+  recorded were startup `*` markers, each resolved when its writer healed.
+- Startup quarantines: 69 recorded (`NATIVE_UNCERTAIN`, `LISTENER_SILENT`, all retryable), 61 retries and 16
+  recoveries. 13 were pending when recovery ended, and 1 was left after 25 minutes.
+  - The 4 writers that 2.4.4's switch had left quarantined since 10-22 were healed by replacement.
+  - The last is the writer of a run that has been failed since 10-20. About 60 s into each retry, its
+    `thread/turns/list` returns `NATIVE_UNCERTAIN`, and it is retried every 5 minutes.
+- The unresolved UNKNOWNs were the same before and after the switch:
+  - 3 on Smartpay_Backend, from 10-20;
+  - 7 path UNKNOWNs on Sales_Profiler, from its lead's commands;
+  - one `*` (`E_SNAPSHOT`) that 2.4.4 recorded at 07:31, while the switch waited.
+
+The 26-writer measurement above found no need for a bound on concurrent recoveries. This switch, with real
+histories, shows the need (CHANGELOG.md, known limits).
