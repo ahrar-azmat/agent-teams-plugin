@@ -12637,7 +12637,8 @@ writers. Sales_Profiler's four writers were mid-turn when 2.4.5 was installed at
 - The unresolved UNKNOWNs were the same before and after the switch:
   - 3 on Smartpay_Backend, from 10-20;
   - 7 path UNKNOWNs on Sales_Profiler, from its lead's commands;
-  - one `*` (`E_SNAPSHOT`) that 2.4.4 recorded at 07:31, while the switch waited.
+  - one `*` ("native evidence processing failed", `UNSTABLE_SNAPSHOT`) that 2.4.4 recorded at 07:31, while the
+    switch waited.
 
 The 26-writer measurement above found no need for a bound on concurrent recoveries. This switch, with real
 histories, shows the need (CHANGELOG.md, known limits).
