@@ -14,14 +14,13 @@ FILES = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 CALL_SECONDS = 3
 # Stay below hooks.json's 15 s including parsing/output. Reserve a full call
 # for the retry, and another for Bash's arm; waiting never consumes either.
-# PostToolBatch has the same 15 s: it starts a daemon call only while a whole
-# one fits before HOOK_SECONDS, so a hung daemon ends it by 14 s (four calls at
-# most), and a batch whose calls all settled at their Posts calls nothing.
+# PostToolBatch submits all completions in one call. Only the released-daemon
+# fallback spends this budget on per-call requests; it starts one only while a
+# full CALL_SECONDS fits. Registered file calls are included even if unmarked.
 HOOK_SECONDS = 14
 # A lead call the coordinator may hold something of until its Post or the batch settles it leaves a marker here
-# (marker): PostToolBatch asks the daemon about those calls only. A marker its session never settled (one ended
-# mid-call, or a daemon down at both) is dropped by a later Pre once a day old, a sweep at most hourly: one dropped
-# early only leaves its record to its own deadline, as every lead call was left before 2.4.4.
+# (marker): PostToolBatch visits these first, then unmarked registered file calls. File-call markers
+# have no age limit; terminal evidence, never age, releases their durable holds.
 MARKERS = "lead-hooks"
 MARKER_AGE_S, SWEEP_S = 24 * 3600, 3600
 
@@ -91,8 +90,9 @@ def unavailable(session, state):
 
 
 def live_view(tool_input):
-    """The live-view tail live_view_nudge.py asks a lead to start: it reads one log file and writes only its own
-    output, so it cannot touch a checkout. It is no coordinated call: no record, no scan, no window held."""
+    """The live-view tail (live_view_nudge.LIVE_VIEW_COMMAND), which a lead on an older plugin version was asked to
+    start and a person may still run: it reads one log file and writes only its own output, so it cannot touch a
+    checkout. It is no coordinated call: no record, no scan, no window held."""
     command = (tool_input or {}).get("command")
     if not isinstance(command, str):
         return False
@@ -125,7 +125,7 @@ def marker(state, payload):
     return os.path.join(state, MARKERS, hashlib.sha256((session + "\0" + call).encode()).hexdigest())
 
 
-def mark(path):
+def mark(path, tool):
     directory = os.path.dirname(path)
     try:
         os.mkdir(directory, 0o700)
@@ -134,7 +134,9 @@ def mark(path):
     info = os.lstat(directory)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise OSError("unusable marker directory")
-    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        json.dump({"tool": tool}, stream)
     stamp, now = os.path.join(directory, ".swept"), time.time()
     try:
         if now - os.lstat(stamp).st_mtime < SWEEP_S:
@@ -146,8 +148,11 @@ def mark(path):
     for name in os.listdir(directory):
         try:
             if not name.startswith(".") and now - os.lstat(os.path.join(directory, name)).st_mtime > MARKER_AGE_S:
-                os.unlink(os.path.join(directory, name))
-        except OSError:
+                fd = os.open(os.path.join(directory, name), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd) as stream:
+                    if stat.S_ISREG(os.fstat(stream.fileno()).st_mode) and json.load(stream).get("tool") == "Bash":
+                        os.unlink(os.path.join(directory, name))
+        except (OSError, ValueError, AttributeError):
             pass
 
 
@@ -163,15 +168,39 @@ def answered(exc):
     """Whether a failed hook call reached a daemon that decided it (a refusal): it holds nothing more of it for the
     batch to settle. A connection failure or a failure the daemon reports leaves that open."""
     from coordinator.client import CoordinatorError
-    return isinstance(exc, CoordinatorError) and not exc.operational
+    return isinstance(exc, CoordinatorError) and exc.answered and not exc.operational
+
+
+def file_result(result, event):
+    """Normalize only the released 2.4.4 completion shapes, never a Pre.
+
+    A reply carrying modern lifetime fields must satisfy the modern schema;
+    malformed fields cannot fall back to a legacy completion acknowledgment.
+    """
+    if not isinstance(result, dict):
+        return None
+    if event in ("PostToolUse", "PostToolUseFailure", "PostToolBatch") and "settled" not in result:
+        if (set(result) in ({"operation", "state"}, {"operation", "state", "duplicate"})
+                and isinstance(result["operation"], str) and result["operation"]
+                and result["state"] in ("verified", "no_effect", "uncertain")
+                and ("duplicate" not in result or result["duplicate"] is True)):
+            return dict(result, coordinated=True, settled=True)
+        if event == "PostToolBatch" and result == {"coordinated": True, "state": "unrecorded"} and type(result["coordinated"]) is bool:
+            return dict(result, settled=True)
+    if (type(result.get("coordinated")) is not bool or
+            "settled" in result and type(result["settled"]) is not bool):
+        return None
+    return result
 
 
 def batch(payload, state, deadline):
-    """PostToolBatch: every call of the batch has resolved. A lead call no Post hook settled (another hook, a
-    permission or the user refused it, or its Post was lost: the host sends neither Post event for a refused call)
-    is settled now, one call at a time while the hook's time lasts; any left over keep their deadlines. Only a call
-    whose marker is left is asked about: one its Post settled, or one never coordinated, costs a stat."""
-    found = []
+    """Submit every completion together, before spending time on individual observations.
+
+    The daemon persists the whole batch and retries unfinished observations even
+    when this hook times out. Only a released daemon's METHOD reply selects the
+    older per-call protocol. Marked calls precede unmarked registered file calls.
+    """
+    found, unmarked = [], []
     for call in payload.get("tool_calls") or []:
         if not isinstance(call, dict) or call.get("tool_name") not in FILES | {"Bash"}:
             continue
@@ -180,23 +209,76 @@ def batch(payload, state, deadline):
         path = marker(state, data)
         if path and os.path.lexists(path):
             found.append((data, path))
+        elif data["tool_name"] in FILES and registered(data, state):
+            unmarked.append((data, path))
+    found.extend(unmarked)
     if not found:
         return None
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    receipt = None
     try:
-        from coordinator.client import Client
+        from coordinator.lead_outbox import persist, acknowledge
+        receipt = persist(state, [data for data, path in found])
+    except Exception:
+        pass  # never create or repair an unsafe/unwritable state directory
+    def acknowledged(indices=None):
+        if receipt:
+            try:
+                acknowledge(state, receipt, indices)
+            except OSError:
+                pass  # durable daemon/call identities make a later import idempotent
+    try:
+        from coordinator.client import Client, CoordinatorError
         client = Client(state, timeout=CALL_SECONDS)
     except Exception:
         return None
-    for data, path in found:
+    try:
+        reply = client.call("lead-hook/batch", {"calls": [data for data, path in found]})
+    except CoordinatorError as exc:
+        if not exc.answered or exc.code != "METHOD":
+            return None  # a lost answer may already be durable; never resubmit piecemeal
+    except Exception:
+        return None
+    else:
+        if (receipt and isinstance(reply, dict) and reply.get("received") is True and
+                reply.get("batch") == "lead_batch_" + receipt[0][len("batch-"):]):
+            acknowledged()  # all input bodies now have a durable daemon owner
+        results = reply.get("results") if isinstance(reply, dict) else None
+        if not isinstance(results, list) or len(results) != len(found):
+            return None
+        for (data, path), entry in zip(found, results):
+            if (not isinstance(entry, dict) or entry.get("session_id") != data.get("session_id") or
+                    entry.get("tool_use_id") != data.get("tool_use_id")):
+                continue
+            if entry.get("state") == "refused" and isinstance(entry.get("error"), dict) and entry["error"].get("kind") == "refusal":
+                unmark(path)
+                continue
+            if "result" not in entry:
+                continue
+            result = entry["result"]
+            if data["tool_name"] in FILES:
+                result = file_result(result, "PostToolBatch")
+                if result is None or not result.get("settled"):
+                    continue
+            elif not isinstance(result, dict):
+                continue
+            unmark(path)
+        return None
+    for index, (data, path) in enumerate(found):
         if time.monotonic() > deadline - CALL_SECONDS:
             break
         try:
-            client.call("lead-hook/dispatch", {"payload": data})
+            result = client.call("lead-hook/dispatch", {"payload": data})
         except Exception as exc:
             if not answered(exc):
-                continue  # its deadline still ends what it holds
+                continue  # only an answered, non-operational refusal ends an item
+        else:
+            if data["tool_name"] in FILES:
+                result = file_result(result, "PostToolBatch")
+                if result is None or not result.get("settled"):
+                    continue
         unmark(path)
+        acknowledged([index])
     return None
 
 
@@ -220,6 +302,43 @@ def replacement_call(client, method, params, deadline, reserve=0):
         return client.call(method, params)
 
 
+def file_denied(event, reason):
+    return {"hookSpecificOutput": {"hookEventName": event, "permissionDecision": "deny",
+                                  "permissionDecisionReason": reason}}
+
+
+def host_identity():
+    """Capture the actual host birth in Pre, before the daemon or a file scan can wait."""
+    from coordinator.processes import identity
+    named, parent = os.environ.get("CLAUDE_PID", ""), os.getppid()
+    if not named.isdigit() or int(named) <= 1 or int(named) != parent:
+        return {"unavailable": "CLAUDE_PID is not this hook's parent"}
+    try:
+        current = identity(parent)
+        if current and not current["zombie"] and os.getppid() == parent:
+            return {"pid": parent, "parent": parent, "birth": current["birth"]}
+    except Exception as exc:
+        return {"unavailable": getattr(exc, "code", type(exc).__name__)}
+    return {"unavailable": "host ended before its birth was captured"}
+
+
+def transcript_identity(path):
+    result = {"path": path, "cursor": 0}
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return result
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+                result["file"] = [info.st_dev, info.st_ino]
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # an asynchronously created transcript may not exist yet
+    return result
+
+
 def main():
     deadline = time.monotonic() + HOOK_SECONDS
     payload = json.load(sys.stdin)
@@ -238,7 +357,8 @@ def main():
         return batch(payload, state, deadline)
     if tool not in FILES | {"Bash"} or tool == "Bash" and live_view(payload.get("tool_input")):
         return None
-    if not registered(payload, state):
+    pending = marker(state, payload)
+    if not (event != "PreToolUse" and pending and os.path.lexists(pending)) and not registered(payload, state):
         return None
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
     try:
@@ -246,28 +366,35 @@ def main():
     except Exception:
         return unavailable(session, state)
     try:
-        data = {key: payload[key] for key in ("cwd", "session_id", "tool_use_id", "tool_name", "tool_input", "hook_event_name", "tool_response") if key in payload}
+        data = {key: payload[key] for key in ("cwd", "session_id", "tool_use_id", "tool_name", "tool_input", "hook_event_name", "tool_response", "transcript_path") if key in payload}
         if tool == "Bash":
             # How long the host lets this call run: the coordinator cannot read the host's environment.
             data["bash_limits"] = {k: os.environ[k] for k in ("BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS") if k in os.environ}
+        elif event == "PreToolUse":
+            data["host"] = host_identity()
+            data["transcript"] = transcript_identity(payload.get("transcript_path"))
         client = Client(state, timeout=CALL_SECONDS)
         bash_pre = tool == "Bash" and event == "PreToolUse"
         pending = marker(state, payload)
         if pending and event == "PreToolUse":
             try:
-                mark(pending)  # before the call: the daemon may hold something of it even when its answer is lost
+                mark(pending, tool)  # before RPC: an uncertain reply may already have acquired durable exclusion
             except OSError:
                 pending = None
         try:
             result = replacement_call(client, "lead-hook/dispatch", {"payload": data}, deadline,
                                       reserve=CALL_SECONDS if bash_pre else 0)
         except Exception as exc:
-            if answered(exc) or event == "PreToolUse" and isinstance(exc, (FileNotFoundError, ConnectionRefusedError)):
+            if ((tool not in FILES or event == "PreToolUse") and answered(exc) or event == "PreToolUse" and
+                    isinstance(exc, (FileNotFoundError, ConnectionRefusedError))):
                 unmark(pending)  # decided, or a Pre that never reached a daemon: nothing of it is held
             raise
+        if tool in FILES:
+            result = file_result(result, event)
         if not isinstance(result, dict):
             return unavailable(session, state)
-        if event != "PreToolUse" or not result.get("coordinated", True):
+        if (tool in FILES and (result.get("settled") or not result.get("coordinated", True)) or
+                tool not in FILES and (event != "PreToolUse" or not result.get("coordinated", True))):
             unmark(pending)  # its Post settled it, or nothing of it is held
         token = result.pop("arm", None) if tool == "Bash" and event == "PreToolUse" else None
         if token:
@@ -290,14 +417,11 @@ def main():
         return {"hookSpecificOutput": {"hookEventName": event,
                 "additionalContext": "Coordinator lead operation: " + json.dumps(result, ensure_ascii=True) + note}}
     except CoordinatorError as exc:
-        # Only authoritative refusals may deny: a claim conflict, and a repository whose part of the
-        # unit is already published (an edit there could only become UNKNOWN). Infrastructure failures
-        # and uncalibrated adapters allow the edit and retain UNKNOWN semantics.
-        published = exc.code == "PREFIX_PUBLISHED" and not exc.operational
-        if event == "PreToolUse" and tool in FILES and (published or exc.code == "CLAIM_CONFLICT" and not exc.operational
-                                                       and exc.details.get("conflicts")):
-            return {"hookSpecificOutput": {"hookEventName": event, "permissionDecision": "deny",
-                    "permissionDecisionReason": str(exc) + " " + json.dumps(exc.details)}}
+        # Availability policy: only the coordinator's explicit refusal denies a
+        # file call. An unavailable answer grants no attribution, but permits it.
+        if event == "PreToolUse" and tool in FILES and answered(exc):
+            return file_denied(event, str(exc) + " " + json.dumps(exc.details))
+        published = exc.code == "PREFIX_PUBLISHED" and answered(exc)
         if published:  # a Bash call may only read: it runs, and what it changes there is UNKNOWN
             return {"hookSpecificOutput": {"hookEventName": event, "additionalContext":
                     "Coordinator refused to record this call: " + str(exc) + " " + json.dumps(exc.details)

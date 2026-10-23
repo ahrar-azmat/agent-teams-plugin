@@ -822,29 +822,34 @@ _native = {"listing": [], "records": {}, "answers": {}, "at": -NATIVE_LIST_S, "e
 _native_lock = threading.Lock()
 
 
-def coordinator_client():
-    """The writer coordinator's client (../coordinator, loaded by path under a private package name), or
-    None when its state directory does not exist: the coordinator never ran on this machine."""
-    state = os.environ.get("SOFTWARE_WORKFLOWS_STATE") or os.path.expanduser("~/.local/state/software-workflows")
-    if not os.path.isdir(state):
-        return None
+def coordinator_module(name):
+    """A module of the writer coordinator (../coordinator), loaded by path under a private package name."""
     import importlib
     import importlib.util
-    name = "software_workflows_coordinator"
-    if name not in sys.modules:
+    package = "software_workflows_coordinator"
+    if package not in sys.modules:
         root = ROOT / "coordinator"
-        spec = importlib.util.spec_from_file_location(name, str(root / "__init__.py"),
+        spec = importlib.util.spec_from_file_location(package, str(root / "__init__.py"),
                                                       submodule_search_locations=[str(root)])
         if spec is None or spec.loader is None:
             raise ImportError(str(root))
         mod = importlib.util.module_from_spec(spec)
-        sys.modules[name] = mod
+        sys.modules[package] = mod
         try:
             spec.loader.exec_module(mod)
         except BaseException:
-            sys.modules.pop(name, None)
+            sys.modules.pop(package, None)
             raise
-    return importlib.import_module(name + ".client").Client(state=state, timeout=NATIVE_TIMEOUT_S)
+    return importlib.import_module(package + "." + name)
+
+
+def coordinator_client():
+    """The writer coordinator's client, or None when its state directory does not exist: the
+    coordinator never ran on this machine."""
+    state = os.environ.get("SOFTWARE_WORKFLOWS_STATE") or os.path.expanduser("~/.local/state/software-workflows")
+    if not os.path.isdir(state):
+        return None
+    return coordinator_module("client").Client(state=state, timeout=NATIVE_TIMEOUT_S)
 
 
 def native_runs(fresh=False):
@@ -1319,12 +1324,18 @@ def compose_nudge(text, images, files, cwd):
 def spawn_detached(argv, log_path):
     """Start argv with launchd as its parent: its own session, and no longer anyone's descendant here,
     so neither this server's exit nor a Claude Code restart (which ends a task's tree by parent pid)
-    reaches it."""
+    reaches it. It outlives the Claude session that started it, so it gets none of that session's
+    variables (its push gate, its git shims, its tokens), as the coordinator's daemon does.
+    The middle process runs isolated (-I) in the office's own folder. `python -c` would otherwise put
+    the current folder first on sys.path, and a project holding a subprocess.py would run it here.
+    That project is wherever the session's first Codex call happened, since the hook starts the
+    office from there."""
     middle = ("import os, subprocess, sys\n"
               "p = subprocess.Popen(%r, stdin=subprocess.DEVNULL, stdout=open(%r, 'ab'),\n"
               "                     stderr=subprocess.STDOUT, start_new_session=True)\n"
               "os._exit(0)\n") % (argv, str(log_path))
-    r = subprocess.run([sys.executable, "-c", middle], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    r = subprocess.run([sys.executable, "-I", "-c", middle], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                       cwd=str(HERE), env=coordinator_module("client").clean_environment())
     if r.returncode:
         raise RuntimeError((r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1])
 
@@ -1413,15 +1424,34 @@ def reply_json(res):
 
 
 def message_outcome(run, message, progress=None):
-    """(how far a message sent to a native run got, why the wait stopped). How far, from its own
-    delivery events: entered_context (in the turn), turn_ended, delivery_uncertain, submitted or
-    persisted. Why: "event" for one of the first three, "ended" once the run reads stopped twice, a
-    poll apart, "unreachable" when the coordinator cannot say twice, "deadline" at the call budget;
-    only "ended" proves the turn is over. A running turn takes a steer at its next model request,
-    which at max effort can be minutes away (measured: 36 s on a fixture whose answer was held
-    50 s), so this waits for the turn, within the run's budget."""
-    deadline, cursor, kinds, ended, unread = time.time() + call_timeout(), 0, set(), 0, 0
+    """(how far a message sent to a native run got, why the wait stopped).
+
+    How far, from its own delivery events:
+    - entered_context: it is in the turn;
+    - delivery_unproven: its start's outcome was lost, so it may have run, and only the lead's
+      message/retry sends it again;
+    - cancelled: its run was cancelled, or its unit closed, before the turn took it;
+    - turn_ended, delivery_uncertain, submitted or persisted.
+
+    Why the wait stopped:
+    - "event": one of the first four, in its events or in its own record;
+    - "ended": the run read stopped, and the note's own record says it is not in flight: it waits for
+      the writer's next turn (reached then reads persisted);
+    - "unreachable": the coordinator could not say, twice;
+    - "deadline": the call's budget ran out.
+
+    Events alone cannot end the wait at the run's stop. The run's status follows its turns, not its
+    deliveries. A note in flight has no event that says so:
+    - its send's answer may still be awaited (the coordinator saves "submitting" without an event);
+    - or Codex had it (submitted, or delivery_uncertain when the send's result was lost), and the
+      coordinator settles it from the thread's history after the turn, as entered, unproven or cancelled,
+      or sends it back to wait for the next turn.
+    So once the run reads stopped, the note's own record decides (message_record). A running turn takes a
+    steer at its next model request, which at max effort can be minutes away (measured: 36 s on a
+    fixture whose answer was held 50 s), so this waits for the turn, within the run's budget."""
+    deadline, cursor, kinds, stopped, unread, check, unknown = time.time() + call_timeout(), 0, set(), 0, 0, 2, 0
     while True:
+        fresh = True
         try:
             while True:
                 page = coordinator_client().call("run/events", {"run": run, "cursor": cursor, "limit": 400}) or {}
@@ -1430,24 +1460,51 @@ def message_outcome(run, message, progress=None):
                 if not page.get("more"):
                     break
         except Exception:
-            pass
-        reached = next((k.split("/", 1)[1] for k in ("message/entered_context", "message/turn_ended", "message/delivery_uncertain",
-                                                     "message/submitted") if k in kinds), "persisted")
+            fresh = False  # a read that failed proves nothing: it counts as the coordinator not answering
+        reached = next((k.split("/", 1)[1] for k in ("message/entered_context", "message/delivery_unproven", "message/cancelled",
+                                                     "message/turn_ended", "message/delivery_uncertain", "message/submitted")
+                        if k in kinds), "persisted")
         if progress:
             progress(reached)
-        if reached in ("entered_context", "turn_ended", "delivery_uncertain"):
+        if reached in ("entered_context", "delivery_unproven", "cancelled", "turn_ended"):
             return reached, "event"
         if time.time() >= deadline:
             return reached, "deadline"
-        # the turn's end is read twice, a poll apart, so an echo recorded as it ended is not missed
         st = native_state(run)
-        unread = unread + 1 if st in ("UNREACHABLE", "?") else 0
-        ended = ended + 1 if st not in LIVE and not unread else 0
+        unread = unread + 1 if st in ("UNREACHABLE", "?") or not fresh else 0
         if unread >= 2:
             return reached, "unreachable"
-        if ended >= 2:
-            return reached, "ended"
+        stopped = stopped + 1 if st not in LIVE and not unread else 0
+        if stopped >= check:
+            # Read at 2, 4, 8 ... stopped polls and then a minute apart, so a long wait costs the coordinator little:
+            # records/list decodes every message (12 ms for the 2,087 of the live ledger, measured 10-22).
+            record = message_record(message)
+            unknown = 0 if record else unknown + 1
+            if unknown >= 2:
+                return reached, "unreachable"
+            outcome = record and (("entered_context" if record.get("state") in ("entered_context", "acknowledged") else None)
+                                  or {"unproven": "delivery_unproven", "cancelled": "cancelled"}.get(record.get("delivery")))
+            if outcome:
+                return outcome, "event"
+            if record and record.get("delivery") not in ("submitting", "submitted", "uncertain", "injecting"):
+                return "persisted", "ended"
+            check = stopped + (1 if not record else min(stopped, 60))
+        elif not stopped:
+            check, unknown = 2, 0
         time.sleep(1)
+
+
+def message_record(ident):
+    """The coordinator's own record of a message (its state and delivery), or None when it cannot say. records/list
+    pages a kind's records in id order after a cursor; message ids end in a hex digit, so the cursor just below this
+    id finds it among the first 16."""
+    if not ident:
+        return None
+    try:
+        page = coordinator_client().call("records/list", {"kind": "message", "cursor": ident[:-1], "limit": 16}) or {}
+    except Exception:
+        return None
+    return next((r for r in page.get("data") or [] if r.get("id") == ident), None)
 
 
 def run_action(aid):
@@ -1518,18 +1575,24 @@ def run_action(aid):
                                                lambda r: a.get("delivery") == r or save(delivery=r))
                 if reached == "entered_context":
                     save(status="done", delivery=reached, run_status=native_state(run), ended=time.time())
+                elif reached == "delivery_unproven":
+                    # Never advise sending again: a new Send is a new message, and this one may already have run.
+                    save(status="unproven", delivery=reached, run_status=native_state(run), ended=time.time(),
+                         error="the coordinator cannot prove whether Codex received it, so it may already have run. "
+                               "Nothing sends it again on its own: read the stream first, because a new Send could run it twice")
+                elif reached == "cancelled":
+                    save(status="dropped", delivery=reached, run_status=native_state(run), ended=time.time(),
+                         error="its run was cancelled (or its unit closed) before the turn took it, so nothing delivers it now")
                 elif why in ("unreachable", "deadline"):
                     # the turn's end is not known: never advise sending again what may still enter it
                     save(status="unconfirmed", delivery=reached, run_status=native_state(run), ended=time.time(),
                          error=("the coordinator stopped answering" if why == "unreachable" else
                                 "no outcome within the call's budget") + f" while the note read {reached}; it may still enter the turn")
-                else:
-                    save(status="unconfirmed" if reached == "delivery_uncertain" else "held", delivery=reached,
-                         run_status=native_state(run), ended=time.time(),
+                else:  # never sent before the run stopped, or the turn ended before taking it
+                    save(status="held", delivery=reached, run_status=native_state(run), ended=time.time(),
                          error={"persisted": "the turn ended before it was sent; it waits for the writer's next turn",
-                                "submitted": "Codex had it, but the turn ended before taking it; send it again to deliver it",
-                                "turn_ended": "the turn ended (or was paused) before taking it; send it again to deliver it",
-                                "delivery_uncertain": "the coordinator could not tell whether it reached the turn"}[reached])
+                                "turn_ended": "the turn ended (or was paused) before taking it; send it again to deliver it"}
+                         .get(reached, "the run stopped before the turn took it"))
                 return
         if a["kind"] in ("resume", "interrupt"):
             why = handoff_refusal(group_of(run, journal.refresh(), processes()), run)
@@ -1945,7 +2008,7 @@ def serve(port, open_browser=False):
     url = f"http://127.0.0.1:{port}/"
     write_json(STATE / "server.json", {"pid": os.getpid(), "pid_start": _proc_start(os.getpid()), "port": port,
                                        "url": url, "root": str(ROOT), "version": plugin_version(),
-                                       "started": time.time()})
+                                       "python": os.path.realpath(sys.executable), "started": time.time()})
     print(f"Codex Office {plugin_version()}: {url}  (journal {LOG_DIR}; Ctrl-C stops the office — actions in flight keep running)",
           flush=True)
     if open_browser:
@@ -2000,14 +2063,22 @@ def locked(fn):
             return 0
 
 
-def start(port, open_browser):
+def start(port, open_browser, outcome=None):
     """Start the office detached (launchd its parent), or find the one already running. An office
-    started by another version of the plugin is replaced, so the page always matches this server."""
+    started by another version of the plugin is replaced, so the page always matches this server; so
+    is one whose Python was removed under it (a Homebrew upgrade deletes the old version's files, and
+    the office then fails every request that imports a module it had not loaded yet). outcome, when
+    given, gets "shown": True once this start found the office up and opened it if asked; a start that
+    gave up never sets it, even if the office answers later."""
     info = running()
     me = f"python3 {_sh(Path(__file__).resolve())}"
     data = f" --data {_sh(DATA)}"
     if info and info.get("root") != str(ROOT):
         print(f"Replacing the office of plugin {info.get('version')} ({info.get('root')}).")
+        stop()
+        info = None
+    elif info and info.get("python") and not os.path.exists(info["python"]):
+        print(f"Replacing the office whose Python ({info['python']}) is no longer installed.")
         stop()
         info = None
     if not info:
@@ -2035,6 +2106,8 @@ def start(port, open_browser):
             webbrowser.open(info["url"])
         except Exception:  # a headless or sandboxed shell has no browser; the address is printed above
             pass
+    if outcome is not None:
+        outcome["shown"] = True
     print(f"It keeps running after this session. Status: {me} status{data}\nStop: {me} stop{data}")
     return 0
 
@@ -2047,6 +2120,14 @@ def main():
     ap.add_argument("--port", type=int, default=int(os.environ.get("CODEX_OFFICE_PORT") or 8765))
     ap.add_argument("--data", help="the plugin's data directory (default: $CLAUDE_PLUGIN_DATA)")
     ap.add_argument("--open", action="store_true", help="open the office in the browser")
+    # hooks/office_autostart.py's starts (--autostart), and its claim of a session's first start
+    # (--session-marker), which this process inherits locked. A start that leaves the office running
+    # writes "done" into the marker, so the session opens the office no more. Otherwise the marker is left
+    # not done, and unlocked once this process exits: the session's next Codex call tries again (and opens
+    # the office then). An automatic start that fails also leaves autostart.failed, which that call tells
+    # the person about, once. Any start that leaves the office running clears it.
+    ap.add_argument("--autostart", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--session-marker", help=argparse.SUPPRESS)
     args = ap.parse_args()
     words = (args.command or "").split()
     args.command = words[0].lower() if words else "start"
@@ -2067,7 +2148,30 @@ def main():
         print(f"Codex Office {info['version']} is running: {info['url']} (pid {info['pid']})" if info
               else "Codex Office is not running.")
         return 0
-    return locked(lambda: start(args.port, args.open))
+    # Only a start that found the office up, and opened it if asked, completes the session's claim. locked() skips
+    # start() when the lock stays held, and a start that gave up returns without it.
+    outcome = {}
+    code = locked(lambda: start(args.port, args.open, outcome))
+    if running():
+        try:
+            os.unlink(STATE / "autostart.failed")
+        except OSError:
+            pass
+        if args.session_marker and outcome.get("shown"):
+            try:
+                fd = os.open(args.session_marker, os.O_WRONLY | os.O_NOFOLLOW)
+                try:
+                    os.write(fd, b"done\n")
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
+    elif args.autostart:
+        try:
+            write_json(STATE / "autostart.failed", {"time": time.time(), "log": str(STATE / "autostart.log")})
+        except OSError:
+            pass
+    return code
 
 
 if __name__ == "__main__":

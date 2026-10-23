@@ -576,7 +576,8 @@ class Ledger:
                 "git_directory": git_directory,
                 "git_common": common, "object_format": gitio.text(root, ["rev-parse", "--show-object-format"])}
 
-    async def reconcile(self, checkout, paths=None, reason="unexplained filesystem change", ignore_pending=True, attribute=None):
+    async def reconcile(self, checkout, paths=None, reason="unexplained filesystem change", ignore_pending=True, attribute=None,
+                        on_observed=None):
         """Record what differs from the ledger, path by path (the whole checkout without `paths`). What is outside the
         ledger (unwatched) is let go instead (release), and a path that cannot be read as an ordinary file
         (UNREADABLE) is that path's UNKNOWN."""
@@ -610,7 +611,11 @@ class Ledger:
                         self.store.save(checkout)
                 raise
             outside = await self.outside(checkout, actual, unreadable, listed)
-            result = self.apply_observation(checkout, paths, actual, reason, ignore_pending, attribute, outside=outside, unreadable=unreadable)
+            with self.store.transaction():
+                result = self.apply_observation(checkout, paths, actual, reason, ignore_pending, attribute,
+                                                transaction=False, outside=outside, unreadable=unreadable)
+                if on_observed:
+                    on_observed()  # completion and its byte observation commit together, before any await
         await self.notify_released()
         return result
 
@@ -739,6 +744,9 @@ class Ledger:
                           unreadable=None):
         pending = set()
         if ignore_pending:
+            from .lead_calls import active
+            for record in active(self.store, checkout["id"]):
+                pending.update(record.get("paths") or paths)
             for operation in self.store.live_operations(checkout["id"]):
                 if (operation["state"] in ("prepared", "allowed", "running") or operation.get("executing")) and operation["kind"] in ("patch", "lead-edit", "restore"):
                     pending.update(operation["paths"])
@@ -856,6 +864,10 @@ class Ledger:
         from .locks import held
         async with held(self.lock(checkout["id"]), deadline):
             from .custody import interfering
+            from .lead_calls import conflict, refuse
+            own_call = (native or {}).get("lead_hook")
+            refuse(self.store, checkout["id"], endpoints, own_call,
+                   "RESTORE_EXECUTING" if kind == "restore" else "CLAIM_CONFLICT")
             started = time.time()
             if paths and interfering(self.store, checkout, paths):
                 raise CoordinatorError("CUSTODY_CONFLICT", "Command custody overlaps the intended mutation")
@@ -865,6 +877,12 @@ class Ledger:
                     continue  # a restore replaces what a quarantined operation left, once native cannot still write it
                 existing = [normalize(checkout, path)["key"] for path in operation["paths"]]
                 if any(overlaps(a, b) for a in keys for b in existing):
+                    if operation["kind"] == "lead-edit" and operation.get("executing"):
+                        # Also cover the unreleased executing-operation format,
+                        # even before it has a corresponding lifetime record.
+                        raise conflict([{"id": operation["native"].get("lead_hook") or operation["id"],
+                            "unit": operation.get("unit"), "checkout": checkout["id"], "paths": operation["paths"],
+                            "operation": operation["id"]}], "RESTORE_EXECUTING" if kind == "restore" else "CLAIM_CONFLICT")
                     raise CoordinatorError("OPERATION_BUSY", "An overlapping operation is unreconciled", {"operation": operation["id"]})
             pre = {}
             for path in endpoints:
@@ -880,6 +898,8 @@ class Ledger:
                 require_writable(self.store, actor["unit"], checkout["id"])
             if paths and interfering(self.store, checkout, paths, since=started):
                 raise CoordinatorError("CUSTODY_CONFLICT", "Command custody changed during pre-image capture")
+            refuse(self.store, checkout["id"], endpoints, own_call,
+                   "RESTORE_EXECUTING" if kind == "restore" else "CLAIM_CONFLICT")
             bases = {}
             for path in paths:
                 image = pre[path]

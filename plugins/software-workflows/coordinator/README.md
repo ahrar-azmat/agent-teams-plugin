@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.4 / P1
+# Writer coordinator — software-workflows 2.4.5 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -446,14 +446,30 @@ recovery, workflows, writer turns, custody, deliveries, live lead hooks,
 pending operations or mutating RPCs would be interrupted. Publication RPCs are
 also counted separately. Mail to a lead-mode run's actor is no delivery: the lead
 reads it through its inbox, and no native turn starts for it. This refusal leaves
-admission unchanged. Otherwise,
+admission unchanged. A Claude file call with a host birth or transcript path has
+no time limit on this hold. Legacy hooks supplying neither channel keep the
+120-second quarantine limit described under Claude lead edit hooks; after that
+limit their claims and UNKNOWN remain, but they no longer prevent a stop.
+`details.lead_edits` names its session, tool-use id, operation, paths, host birth,
+phase and the evidence or byte settlement it awaits; `daemon/status.lead_edits`
+reports the same information. The daemon never ends the user's Claude process to
+make a stop succeed. Its file-call observer and completion RPCs continue during a
+drain. Otherwise,
 new mutations receive retryable `DAEMON_DRAINING` while admitted requests and
 completion calls finish. RPC settlement has a one-second bound; a timeout returns
 `NOT_QUIESCENT` and immediately resumes admission without cancelling the requests.
-Once settled, the daemon closes admission, detaches listeners and releases leases
-before stopping. Re-admissions and transport-gap reconciles under way end first, and
-none starts while it drains: a writer whose connection drops then is left failed, for
-the next daemon's recovery (or this one's maintenance, if the stop is refused). Listener identity and settlement safeguards still apply.
+Every listener reconcile is counted from entry, including time waiting for its
+run's lock and work finishing after its caller is cancelled. The drain waits for
+these invocations too; `NOT_QUIESCENT` names their runs, listeners and start times
+in `details.listener_reconciles`. Once settled, closing admission and taking the
+listener snapshot happen without yielding. The shared reconcile entry point then
+refuses `DAEMON_DRAINING`, including maintenance settling a cancel, a resume,
+re-admission, transport-gap recovery and a startup-quarantine retry. Nothing can
+replace a writer outside the stop's snapshot. The daemon stops those listeners
+and releases leases before stopping. Existing cancel, re-admission and transport-gap
+guards also refuse new work during draining; a dropped connection is left failed
+for the next daemon (or maintenance if the stop is refused). Backoff waiting alone
+does not prevent a stop. Listener identity and settlement safeguards still apply.
 
 Host hooks use three-second client calls within a fourteen-second budget, below
 their fifteen-second host timeout. If a call encounters an unavailable or draining
@@ -465,7 +481,7 @@ Bash window that belonged to the retired generation.
 
 | Method | Parameters and result |
 |---|---|
-| `daemon/status` | Optional `checkout`, `brief`; generation, PID/birth, `boot`, `capabilities`, `draining`, readiness, version, `child_watcher`, `recovering` (the writers, units and checkouts startup recovery is still reconciling), `ended` (writer app-servers the coordinator ended, by reason), `silent` (those not answering now), and unless `brief` the writers (each with its app-server's admitted `capabilities` and, when its probe fell back, `capability_fallback`) with their claims, custody, pending requests and messages. |
+| `daemon/status` | Optional `checkout`, `brief`; generation, PID/birth, `boot`, `capabilities`, `draining`, readiness, version, `child_watcher`, `recovering` (finite initial startup scopes), `listener_reconciles` (active invocations, each with `run`, `listener`, Unix `started` time), `startup_recovery` (outstanding incident counts: `pending`, `retryable`, `permanent`), `ended` (writer app-servers the coordinator ended, by reason), `silent` (those not answering now), and unless `brief` the writers (each with its app-server's admitted `capabilities` and, when its probe fell back, `capability_fallback`) with their claims, custody, pending requests and messages. |
 | `checkout/register` | `path`; serializes canonical registration and returns only a ready, complete baseline. Pre-existing dirty bytes are UNKNOWN. |
 | `checkout/reconcile` | `checkout`, optional `paths`; returns new UNKNOWN IDs and scanned count. `resolve_quarantine:true` with a full scan clears a resolved I/O quarantine, never UNKNOWN history. |
 | `checkout/revisions` | `checkout`, optional `path`, `cursor`, `limit`; paginated immutable revision records. |
@@ -754,14 +770,19 @@ The replacement is reconciling from the save that makes it findable until its
 reconcile ends: a call that arrives for it waits for that until its hook's cutoff,
 then is refused `LISTENER_RECOVERING`, and deliveries and submissions wait. Every
 reconcile of a run's writer holds one lock for the run
-(recovery, resume, re-admission, cancel, a transport gap) and reconciles the
+(recovery, resume, re-admission, cancel, a transport gap, a quarantine retry) and reconciles the
 incarnation that is current once it holds it, so one replacement owns each
-transition. A reconcile that fails after recovery marks the writer failed
+transition. Binding its successor records the predecessor as `state:"dead"`,
+`recovery_state:"replaced"`, with `replaced_by` naming that successor; the successor
+retains `replaces`, and `listener/replaced` records the transition. Startup repairs
+older `dead/reconciling` records only when durable replacement lineage proves it.
+A reconcile that fails after recovery marks the writer failed
 (`listener/reconcile_failed`), and maintenance reconciles it again after 5 s,
 doubling to 5 min; its unit's work waits meanwhile. A finished run's writer is retried
 only while work is owed to it: its unit is not quiet, or a native delivery to one of its
 writers is in flight or pending with a wake. A lead's mail never counts, since a lead
-reads it through its inbox. Otherwise its next resume reconciles it. At startup, a
+reads it through its inbox. An outstanding retryable startup incident is always
+work owed, including for completed, failed or blocked runs. Otherwise its next resume reconciles it. At startup, a
 checkout whose lease is refused (a writer outside the coordinator took it while no
 daemon ran) fails only its own writers' recovery, each quarantined with an UNKNOWN;
 every other checkout recovers, and the record of a start that never got a thread is
@@ -1009,9 +1030,56 @@ reconciled after every run in it, each unit's publications and owned index locks
 after its runs and checkouts, and messages last. Measured with 13 writers in 4
 checkouts, the daemon served after about 2 s and recovery completed after about 55 s
 (VERIFY.md). A plain run whose turn ended while no daemon read its app-server takes
-that turn's state from history. A writer whose startup reconcile fails is quarantined
-with a checkout-wide UNKNOWN in each of its unit's checkouts; a resume reconciles it
-again, and is refused `RECOVERY_UNKNOWN` until that UNKNOWN is narrowed or restored.
+that turn's state from history. Recovery resumes use `excludeTurns:true`: policy,
+identity and ancestry are checked from the response, and full turns and items are
+still read through pagination afterward.
+
+On 2026-10-22, a forced switch with 26 writers across 4 disposable checkouts
+(3,700 files each, real Codex 0.163.0 and a scripted model) took 66.4 s before this
+change and 68.5 s afterward from daemon launch to initial recovery completion;
+both had zero quarantines or resume timeouts. The slowest root resume was 0.117 s
+before and 0.094 s with metadata-only resume. The latter run sampled load up to
+18.7 and had 26 reconciles active together. These measurements do not establish
+an overall speedup, but leave ample headroom in the existing 60 s native timeout;
+they do not justify an additional concurrency limit or a longer timeout. The
+fixture's short histories are not the live incident's histories. Injected lost
+resume responses separately exercised automatic recovery: the initial pass ended
+at 60.8 s from `recovery/start`, and both transient quarantines healed by 62.7 s;
+a persistent timeout and a permanent policy failure stayed quarantined.
+
+A writer whose startup reconcile fails is quarantined with a checkout-wide UNKNOWN
+in each participant checkout. A durable `startup_recovery` incident belongs to the
+run and retains those exact UNKNOWN IDs across replacement attempts. Maintenance
+retries temporary native/transport failures (`NATIVE_UNCERTAIN`,
+`NATIVE_DISCONNECTED`, `LISTENER_SILENT`), temporary resource or lease contention,
+and admission failures whose failed probes all report temporary errors. Policy,
+project, schema, configuration and missing-history refusals remain quarantined;
+an operational error alone is not evidence that retrying can help.
+
+Retries run in the background, even for terminal runs, after 5 s, doubling to
+300 s, with no attempt limit. `SOFTWARE_WORKFLOWS_RECONCILE_RETRY_FIRST_S` and
+`SOFTWARE_WORKFLOWS_RECONCILE_RETRY_MAX_S` configure these existing delays; both
+must be positive finite seconds and the maximum must be at least the first delay.
+`listener/reconcile_failed` records the code, classification, attempt count and
+chosen delay; `listener/startup_retry`, `listener/startup_quarantined` and
+`listener/startup_recovered` record the incident's progress. Waiting incidents
+do not hold the initial `recovering` barrier. Startup adopts older quarantines
+and their UNKNOWNs, including those already narrowed by a lead.
+
+Each retry completes the same history, admission and replacement checks as a
+successful startup. An attached connection is resumed again when its earlier
+attempt failed; stale hooks are replaced once the unit is quiet. After native
+history is complete, each participant's bytes are read under its ledger lock,
+with custody and executing-write safeguards. A `recovery_resolution` record and
+`unknown/recovery_resolved` event name the history evidence, scan and exact startup
+UNKNOWNs resolved. Both resolution links refer to that record; the immutable
+UNKNOWN rows remain. Existing lead resolutions are preserved. Other writers'
+UNKNOWNs and unrelated gaps are not resolved; differing or unreadable paths retain
+their own UNKNOWNs. A failed scan leaves recovery owed. Only after these reads does
+the current listener become reconciled and the incident complete. Workflow
+advancement then runs outside the writer lock; unproven input is never resent.
+A lead resume still reconciles first and refuses `RECOVERY_UNKNOWN` for remaining
+UNKNOWNs that require an explicit lead decision.
 
 A call for a run (`run/resume`, `run/terminate-terminal`), a unit's lifecycle
 (`unit/seal`, `unit/review-record`, `unit/publish`, `unit/reopen`, `unit/recover`)
@@ -1033,7 +1101,14 @@ submitting a newer PID or an after-the-fact content hash.
 
 UNKNOWN is permanent history. To resolve it, first reconcile custody and stop
 active writers, reopen a sealed unit if necessary, then restore with
-`unknown/restore`. A restore found at the baseline afterwards (every path of it, for
+`unknown/restore`. An admitted Claude file call on the selected paths refuses
+`RESTORE_EXECUTING` until its end signal and byte settlement, even after 120 seconds
+or a daemon restart. The legacy exception for a hook with neither host birth nor
+transcript path ends that lifetime hold at its 120-second quarantine limit, so its
+UNKNOWN can then be restored. This check also precedes an outside-ledger release, and is
+rechecked at mutation admission; quarantine alone never makes a running call safe
+to restore. The error names the calls and the evidence they await. A restore found
+at the baseline afterwards (every path of it, for
 a checkout-wide gap) resolves the UNKNOWN. It is read again while it still holds
 its claims, must show the restore's own revision, and that revision must still be
 the head when the resolution commits. A restore resolves only the UNKNOWNs and
@@ -1183,7 +1258,12 @@ inherited, inode-verified venv `.in-use` descriptor also survives worker replace
 Queued/uncertain deliveries, process custody, a live operation and a patch native
 may still be writing (`executing`) retain
 exclusion, whatever the run's state; a stop releases it after every app-server has
-exited. An effect-capable Pre hook holds it, under the lock its release takes, until
+exited and every admitted Claude file call has ended and settled (or reached the
+explicit legacy no-end-evidence limit below). A lead file
+call reserves its paths before admission can wait and takes the compatibility
+lease before its Pre allows execution. Its durable lifetime retains that lease
+even when its operation is quarantined, including during stop and recovery.
+An effect-capable Pre hook holds it, under the lock its release takes, until
 its operation is recorded, and takes it back if a run's end released it: a cell's call
 can still wait in its hook after its turn. While a writer outside the coordinator holds
 the checkout, the call is refused (`EXCLUSIVE_WRITER`). Pre-production startup/admission failures clean up and name
@@ -1330,23 +1410,82 @@ unrelated checkout.
 Write, literal Edit and ordered MultiEdit prepare a complete intended image and
 bind it to checkout/session/tool-use identity before the host edit. Successful
 completion verifies bytes, mode and preconditions; duplicate posts are idempotent.
-Ambiguous replacements, failure, missing pre/post events or altered inputs grant
-no receipt. An edit that failed (PostToolUseFailure) or never ran (its batch shows
-it with no Post), and is still at its pre-image, is settled as no effect; any other
-bytes are quarantined (UNKNOWN). A prepared edit that no Post or batch settles within
-120 seconds is quarantined. Elapsed time is no evidence that the host will not still
-run it: a permission prompt or a slower PreToolUse hook can hold the call longer. It
-stays live, so overlapping operations are refused (`OPERATION_BUSY`) and its claim
-cannot be handed back. A Post that comes later grants no receipt: the lead restores
-the path (`unknown/restore`) and makes the edit again. During recovery such an edit
-is quarantined.
+Ambiguous replacements, failure, missing admission or altered inputs grant no
+receipt. An edit that failed or did not reach its intended image settles as no
+effect only if its bytes still match its pre-image; partial or unexplained changes
+are UNKNOWN. With a usable host birth or transcript path, a prepared edit that no
+Post or batch settles within 120 seconds stays admitted: elapsed time neither quarantines nor ends it. A
+permission prompt or a slower PreToolUse hook can hold the call indefinitely.
+`lead_hook.execution` records its lifetime separately from its operation's receipt
+state. From admission through byte settlement, it refuses overlapping operations
+(including another call in its own unit), handback, stop, other leads' quiet
+windows, and restoration of its paths (`RESTORE_EXECUTING`), and retains the
+checkout's compatibility lease. A refusal to record an overlapping file operation
+is a host `permissionDecision: deny`, not an allowing warning.
+
+The first PostToolUse, PostToolUseFailure, PostToolBatch, matching transcript
+`tool_result`, or verified host exit ends the call. Pre captures `CLAUDE_PID` only
+when it is the hook's parent, including its kernel birth identity. An absent or
+reused PID, or that process as a zombie, proves the original host exited; a stopped
+or uninspectable process does not. An interrupted call on Claude Code 2.1.306 sends
+no Post and no batch: its transcript result is needed while the session remains
+alive. The observer reads complete JSONL lines from the owned regular transcript,
+without following a symlink, matching session and tool-use ids. Missing files are
+retried; an unreadable, replaced, truncated or incomplete transcript is no proof
+of completion. A cursor never skips an incomplete line or a result preceding a
+delayed admission. Both successful and failed results end the call.
+
+Every terminal source uses the same serialized, idempotent settlement. Expected
+bytes and modes with intact preconditions receive an exact receipt; unchanged
+pre-images can settle as no effect; partial or unexplained effects are UNKNOWN.
+A failed result never proves that no bytes were written. The lifetime hold stays
+until settlement is durable, including when I/O fails and must be retried. A late
+or duplicate event cannot revive a call or credit it twice. Input changes can end
+the lifetime but cannot acquire authorship.
+
+Startup restores these holds and attempts to recover their leases before serving.
+One call's failed settlement, such as an unreadable target, retains its hold and
+records `lead_hook/recovery_failed`; it does not prevent the daemon serving other
+checkouts. Status names its `observation_problem`, and the observer retries until
+its bytes can be settled. A legacy hook left `prepared` after its operation's
+`verified`, `denied`, `resolved` or `reconciled` commit is finished from that durable
+outcome, without a new receipt or lifetime hold (`lead_hook/recovered_terminal`).
+If an older state held no lease and another writer already owns it, the hold stays,
+`daemon/status.lead_edits` names `lease_problem`, and the observer retries acquisition;
+new file admissions still require the lease. An unfinished edit
+across daemon replacement is quarantined, preserving UNKNOWN rather than repairing
+its attribution with matching bytes, and remains held until its host call ends.
+Recovery also imports the `executing` lead edits left by the unreleased turn-44
+implementation, including ones already quarantined. Their terminal evidence ends
+execution and permits restoration; their UNKNOWN history stays. A missing legacy
+path scope conservatively holds the checkout.
 Encoding/BOM and CRLF preservation are checked by expected bytes; host behavior
 that differs is refused or quarantined, never adopted after the fact.
+
+**Legacy availability limit:** long-running sessions keep their older installed
+hooks until restarted. Exactly those admitted or migrated calls supplying neither
+a usable host birth nor an absolute transcript path use
+`lead_calls.LEGACY_FILE_CALL_SECONDS = 120`, inherited from 2.4.3/2.4.4's
+maintenance threshold `now - operation.created > 120` (the separate hook-record
+deadline was 180 seconds). At 120 seconds from admission, without a Post or batch, the operation
+is quarantined and its claims and UNKNOWN remain. Its lifetime holds on the lease,
+stop, other leads' quiet windows and restoration end. A late Post never creates an
+exact receipt. This is an availability limit, **not evidence that the tool ended**;
+an old tool can still write after it. `lead_hook/legacy_limit` records the reason,
+call, paths, elapsed timestamps and cumulative use count in the same transaction
+that ends the hold; `daemon/status.lead_edit_legacy_limit` exposes its count and
+latest use. While waiting, `lead_edits` names its deadline and reason. A missing or
+temporarily unreadable transcript does not turn a modern call into a timed call:
+having its path is enough to retain the no-timer rule.
+Migration retains the operation's creation time, or reconstructs admission from
+an old hook's 180-second deadline. If neither timestamp survived, it starts the
+120-second legacy allowance at recovery rather than inventing an earlier admission.
 
 **NotebookEdit is UNVERIFIED and not recorded**, including insertion. Its native
 cell ID and serializer have not been calibrated through the installed host. On a
 path another unit claims it is denied as CLAIM_CONFLICT; elsewhere the host's
-edit goes ahead unrecorded, so what it wrote reconciles as UNKNOWN. The
+edit goes ahead without an exact receipt, with a lifetime reservation and lease,
+so what it wrote reconciles as UNKNOWN after its end. The
 refusal names a full-file Write route. Direct hook observations are not evidence
 of the host's encoding/serialization behavior; see VERIFY.md for coverage.
 
@@ -1354,28 +1493,107 @@ Claude Code (2.1.306, measured) sends neither PostToolUse nor PostToolUseFailure
 a call that another PreToolUse hook denied (the push gate, a project hook), that a
 permission refused, or that the user rejected. Such a call shows only in
 PostToolBatch's `tool_calls`, sent once every call of a batch has resolved; without
-it, the call's record would hold every lead's quiet window and `daemon/stop`
-(`lead_hooks`) until its deadline, up to 180 s. Each lead call the coordinator may
+it, a Bash call's record holds every lead's quiet window and `daemon/stop`
+(`lead_hooks`) until its deadline, up to 180 s; file calls instead await one of the
+terminal signals above. Each lead call the coordinator may
 hold something of leaves a marker in `<state>/lead-hooks/`, named by the SHA-256 of
 its session and tool-use id, made before its Pre's call and removed once a Post
-settles the call or the daemon decides it. PostToolBatch asks the daemon
-(`lead-hook/dispatch`) only about calls whose marker is left, one at a time while its
-time lasts; the daemon admits these as completion calls during a drain, as it does a
-Post. Each is settled as its Post would be, from what shows. A Bash call is
+settles the call or the daemon definitively refuses its admission. PostToolBatch sends
+one `lead-hook/batch` request containing the Bash calls whose marker is left and every
+file call in a registered checkout, marked ones first
+(a file call whose Pre never reached the daemon may have left none). Before its first
+daemon call, the hook writes every completion to a private outbox directory under
+`lead-hooks/batch-<digest>/`: mode 0700, with one mode-0600 input file per item. A
+directory rename commits the complete outbox atomically. Verified directory/file
+descriptors refuse symlinks, foreign ownership and non-private permissions; the hook
+never creates or repairs an unsafe state directory. No daemon, a timed-out request,
+or the released daemon's `METHOD` reply leaves the outbox available to a later daemon.
+The daemon imports it after startup and during observation, without another host event.
+An acknowledgment removes input files: the whole outbox after durable batch receipt,
+or individual files as the released-daemon fallback acknowledges them. A fallback
+that exhausts its hook budget leaves every unsent or uncertain item in the outbox.
+Staging names include the producer hook's PID and kernel birth identity before any
+item is written. A live producer's stage is never taken. After that exact process
+exits (including PID reuse), the next scan imports every complete JSON item, even
+if the producer died before the manifest or directory rename. A partial final item
+is discarded only from an abandoned stage; after durable receipt, the entire stage
+is removed. No elapsed-time rule decides ownership, and an error while publishing
+does not erase already-written completions.
+
+Before observing an individual call, the daemon atomically commits a small
+`lead_batch` header and independent `lead_batch_item` records. Each item uses its
+host-call lock and the usual completion handler. A result or non-operational refusal
+ends delivery; an operational failure retries. Once the call's own `lead_hook`
+record contains end evidence or a pending byte observation, that record alone owns
+the retry. Delivery then keeps its owner acknowledgment, not another copy of the
+input. Completed/refused items retain identities, paths, input digests and outcomes;
+they drop input bodies. Startup also converts and compacts round-5 batch records,
+including already-completed ones.
+
+Batch attempts and every observer-started call settlement run as independent guarded
+jobs under their host-call locks. This includes admitted calls with saved end evidence,
+transcript or host-exit evidence, the legacy limit and unadmitted byte observations.
+The shared observer only schedules; it never awaits their probe, lease or settlement
+I/O. Read-only transcript/host probes have separate keyed jobs from settlement retries;
+they run before taking the host-call lock and do not count as mutations in flight.
+A Post, Failure or batch can therefore settle the same call while its probe is stalled.
+Saved end evidence also starts settlement retries independently of an outstanding
+probe, including after the first settlement fails. Probe reads use daemon threads
+outside the filesystem executor, with no cancellation shield: shutdown cancels their
+waiting jobs without joining a stalled read, so the worker exits and releases its lock
+for replacement. A late result is ignored if its future was cancelled or its loop closed.
+The probe thread only reads its snapshot; ledger changes stay on the event loop.
+Under the host-call lock, the settlement job reloads the record and uses
+a probe's evidence, cursor, problem or error only if its revision is unchanged;
+otherwise it discards that result. Actual settlement remains serialized under the
+lock. A failed read, acknowledgment or problem save cannot stop that observer or make
+it wait for another call's filesystem work, including in another checkout. Operational
+delivery/observation retries and outbox polling use a 3 s interval, derived from the
+hook's 3 s RPC timeout; it bounds repeated work and never expires a completion.
+Pending-item indexes avoid rereading finished history. Stored batch-item JSON decoding,
+hashing, serialization and outbox filesystem work run off the daemon event loop; SQLite
+transactions stay on its owning thread. RPC envelope decoding and idempotency hashing
+run inline, so even a fully occupied filesystem worker pool cannot delay decoding or
+admission of status requests and immediate refusals. The 25-settled-Write plus unreadable-target
+probe decoded no queued input bytes during a four-second retry interval and retained
+about 17 KB of identity/acknowledgment data, compared with round 5's 350 MB of repeated
+decoding and 834 KB of retained inputs. A disconnected or timed-out hook does not
+cancel a received request. The daemon admits a batch during a drain as it does a Post.
+Each is settled as its Post would be, from what shows. A Bash call is
 reconciled with no `lead-command` credit: a batch is no evidence the command ran, so
 what changed in its window is nobody's, as at its deadline. An edit is decided by its
 bytes: no effect at its pre-image, verified at its intended image, quarantined
-otherwise. A batch whose calls all settled at their Posts makes no daemon call and
-no scan. Its timeout is the other lead hooks' 15 s, under the same budget: a 3 s
-daemon call starts only while a whole one fits before 14 s, so a hung daemon ends
-the batch by 14 s after at most four calls, and a call left over keeps its own
-deadline. A marker its session never settled (a session that ended mid-call, or a
-daemon down at both events) is dropped by a later Pre once it is a day old, in a
-sweep at most hourly; one dropped early only leaves its record to its own deadline.
+otherwise. Already-settled file calls add no scan and share one daemon round trip:
+measured through the real Python 3.9 hook entry point, batches of 1, 3 and 5 took
+median 0.068, 0.078 and 0.067 s, against 0.045, 0.043 and 0.048 s with the installed
+2.4.4 hook, which asked about none. With the worker stopped, each size returned in about 3.06 s;
+after continuing the worker, all received completions were processed. Leftovers are
+durably pending, including calls with no earlier admission or host metadata.
+A batch containing only already-settled Bash calls still makes no daemon call.
+`HOOK_SECONDS` remains 14, below the host's 15 s timeout. Only an answered `METHOD`
+refusal selects the older per-call protocol during a switch to a released 2.4.4
+daemon; that fallback retains its existing per-call budget and its durable outbox
+retains the unacknowledged tail across replacement. Only a
+marker identified as Bash may be removed by the daily age sweep; file markers
+remain until a definitive acknowledgment or durable settlement.
 
-The live-view tail that `hooks/live_view_nudge.py` asks a lead to start
-(`tail -F "$HOME/.claude/logs/codex-oracle/stream.log"`, in the background) reads one
-log file and writes only its own output, so it cannot touch a checkout. A lead Bash
+Legacy file-hook saves are not replaced by completion-only records. The released
+2.4.4 states `verified`, `no_effect`, `failed` and `unrecorded` already record a
+processed completion; `outside` already ended coordination without a ledger
+observation. Startup and delayed Posts/batches preserve these saves and their
+operation links without reading later bytes. A terminal operation also ends
+an older `prepared` save left behind by a crash. `uncertain` needs its cause:
+the first quarantine UNKNOWN naming its operation carries a bare exception code
+or class name after a failed Post verification, which proves completion. The
+maintenance gap and recovery quarantine reasons do not. Without completion evidence,
+`received`, `prepared` and `uncertain` retain their lifetime rules, including the
+legacy availability limit when neither end-evidence channel exists. A refused call
+still needs a Post to prove it ran; a batch alone never creates its observation.
+
+The live-view tail (`tail -F "$HOME/.claude/logs/codex-oracle/stream.log"`; until 2.4.5
+a hook asked each lead to start it in the background, and a session on an older plugin
+version still may) reads one log file and writes only its own output, so it cannot
+touch a checkout. A lead Bash
 call that is exactly that command is not coordinated: no record, no scan, no window
 held. Exactly means three words: `tail`; `-F` or `-f`; and that log path spelled with
 `$HOME`, `${HOME}`, `~` or the home directory. Any other shape, such as a pipe, a
@@ -1404,9 +1622,48 @@ their Post is UNKNOWN. Post
 ends, what changed outside other units' claims is recorded as `lead-command` for
 the lead's unit; otherwise it is UNKNOWN. A second completion for the same call
 attributes nothing. On a checkout whose Pre takes longer than 3 s (a reconcile
-of tens of thousands of files), no lead command is credited. When the coordinator is down, lead edits are allowed with one
-warning per session in private external warning state. Later reconciliation must
-expose unexplained effects. No supplied transcript path is read.
+of tens of thousands of files), no lead command is credited. An unavailable
+coordinator gives Bash and file calls one warning per session in private external
+warning state: lead edits are allowed, and later reconciliation exposes unexplained
+changes as UNKNOWN. File Pre denies only an explicit refusal answered by the daemon
+(`CoordinatorError` from its validated error envelope, with `kind:"refusal"`,
+`operational=False`), including claim and
+operation conflicts, published prefixes, changed checkout identity, and rewritten
+or uncertain calls. Client import failures, no daemon, RPC timeouts/lost replies,
+local client/endpoint/state validation failures, malformed results and operational failures (including `RECOVERING` and
+`DAEMON_DRAINING` without an upgrade owner) allow the call with that warning. A
+failed admission does not invent exclusion or let a later Post earn a receipt.
+Its first Post or Failure immediately reconciles exactly its paths as UNKNOWN if
+the bytes changed; an operational failure's batch does the same. A refusal without
+a Post gets no such observation: a batch alone does not prove it ran. The observation
+and completion acknowledgment commit together, so repeated Posts do not scan again.
+If the observation fails, it retries without restoring any lifetime hold or lease.
+A completion with no Pre record uses that same durable observation directly,
+before any admission, attachment, unit, claim or compatibility lease. Its Post,
+Failure or batch reconciles only the reported file's path, once; a
+legacy writer can keep its lock throughout. Unchanged bytes create no UNKNOWN.
+Read or checkout-identity failures leave a pending observation for the observer;
+outside-ledger and unregistered paths need no byte observation. File batches
+include registered paths even when no marker remains, since an unavailable Pre
+may have left none. Existing completed records make these repeat batches inert;
+an explicit refusal without a Post still gets no observation from a batch alone.
+An admission that completed but lost its reply retains all its lifetime holds.
+Open-call overlap refusals use `CLAIM_CONFLICT` with named holders, including the
+same session/unit and an admitting call with no unit yet, so installed 2.4.4 hooks
+also deny them. During a daemon switch, the current hook recognizes the released
+2.4.4 completion reply shapes and removes their markers without an unavailable warning.
+Local security failures still prevent all contact with an untrusted endpoint;
+they allow the file call, with the same once-per-session unavailable warning.
+Unregistered and outside-ledger files remain outside coordination.
+
+**Known limit (HIGH):** the registered Pre hook has a 15-second host timeout and
+no `onFailure:"block"`, as in 2.4.4. If Claude Code times it out before admission,
+the host discards its output and can run the file call without exclusion. The
+availability policy also permits a call when its coordinator RPC answer is
+unavailable. No missing admission is reconstructed as an exact receipt: unexplained
+bytes become UNKNOWN on reconciliation. This can race another writer, a stop or
+restore; the no-timer lifetime guarantee applies to admitted calls. The registration
+is unchanged. See [Claude Code's timeout behavior](https://code.claude.com/docs/en/hooks#timeouts).
 
 ## Observational gate query (Python 3.9)
 

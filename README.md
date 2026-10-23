@@ -155,9 +155,10 @@ moves it to the background and it returns as a task notification; that is normal
 A run lives on a file-backed spool, so `/mcp` → Reconnect or a server restart detaches it instead
 of killing it, and `codex_resume_run` collects the answer at no model cost. `codex_runs` shows every
 run (RUNNING, DETACHED, ok, error, cancelled, timeout), and `codex_run_log` shows its live log in
-the conversation. To watch runs as they happen, ask Claude to "run mcp-live in the background", or
-`tail -F ~/.claude/logs/codex-oracle/stream.log` in a terminal. A hook reminds Claude to start that
-view at a session's first Codex call.
+the conversation. To watch runs as they happen, use the Codex Office. It opens in your browser by
+itself at a session's first Codex call (see [The Codex Office](#the-codex-office)). You can also run
+`tail -F ~/.claude/logs/codex-oracle/stream.log` in a terminal of your own. Neither one adds anything
+to Claude's context.
 
 **Run budget.** A run is stopped at its wall-clock budget: 3 hours by default (healthy runs take 4–30
 minutes). Set `CODEX_ORACLE_MAX_RUNTIME_S` (300 to 12600 seconds) in the environment Claude Code
@@ -299,9 +300,14 @@ Known limits, measured on macOS:
 
 ## The Codex Office
 
-`/software-workflows:office` opens a pixel-art office in your browser, at
-`http://127.0.0.1:8765/`. Every Codex run on this machine is a worker at a desk, from every
-session and project.
+The Codex Office is a pixel-art office in your browser, at `http://127.0.0.1:8765/`. Every Codex
+run on this machine is a worker at a desk, from every session and project.
+
+**It opens by itself.** The first time a Claude Code session uses a Codex tool, the plugin starts the
+office in the background and opens it in your browser, once per session. Later Codex calls in the
+same session only restart it if it has stopped. An office left over from an older plugin version, or
+one whose Python was removed by an upgrade, is replaced. This puts nothing into Claude's context, so
+watching your runs costs no tokens. `/software-workflows:office` still starts it by hand.
 
 - **Live workers** face their monitor and type. A bubble shows what they're doing right now:
   thinking, a command, a web search, a file edit, or waiting for capacity.
@@ -385,9 +391,57 @@ session or restarting Claude Code stops none of them. Manage the office with the
 - `/software-workflows:office status`
 - `/software-workflows:office stop`
 
-Only you can run the command; Claude cannot start it on its own. The command never puts its argument
-into a shell command: Claude reads it and runs one of three fixed command lines, for start, stop or
-status. One office runs per data directory: a second start finds the first.
+Only you can run the command; Claude cannot run it on its own. The office still starts by itself,
+because the plugin's hook starts it, not Claude. The command never puts its argument into a shell
+command: Claude reads it and runs one of three fixed command lines, for start, stop or status. One
+office runs per data directory: a second start finds the first.
+
+### Office settings
+
+**When the office shows** is the plugin's own setting, `office`. Change it in `/plugin` (Installed,
+software-workflows, Configure options) or in `/config`, where each choice is explained. You can also
+run `claude plugin configure software-workflows@agent-teams`. Claude Code saves it in
+`~/.claude/settings.json` under `pluginConfigs`, and it takes effect in the next session.
+
+| `office` | What it does |
+|---|---|
+| `open` (default) | Start the office on a session's first Codex call, and open it in your browser once per session. |
+| `background` | Start the office the same way, but never open the browser. Visit `http://127.0.0.1:8765/` yourself. |
+| `off` | Never start it automatically. `/software-workflows:office` still starts it. |
+
+Two environment variables cover the rest. Set them under `"env"` in `~/.claude/settings.json`, or
+export them before you start Claude Code.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `SOFTWARE_WORKFLOWS_OFFICE` | unset | `open`, `background` or `off`. When set, it overrides the `office` setting for those sessions: for example, `off` in a shell where no browser should open. |
+| `CODEX_OFFICE_PORT` | `8765` | The first port the office tries. If it is taken, the next 19 are tried, and the address it got is shown in `/software-workflows:office status`. |
+
+A value that isn't one of the three is shown to you once per session, naming which setting holds
+it, and starts nothing.
+
+If an automatic start fails, you're told once per session, with the reason or the log to read:
+`office/autostart.log` in the plugin's data directory. The running office's own log is
+`office/office.log`. Until the office runs, each Codex call tries again, and the browser opens on
+the first start that works. Every 10 minutes a call also checks that the office answers and is this
+plugin's own.
+
+The office runs apart from the session that started it, because it outlives that session. It
+imports nothing from your project's folder, and it doesn't inherit the session's variables (its
+push gate, git shims or tokens). The plugin keeps its per-session records in a private
+`office/sessions` folder of your own. If that folder is a symlink or other users can open it, the
+office is not started and you're told why.
+
+### Reading a worker
+
+Click a worker to open its panel beside the office: the stream of its conversation, its final
+answer, the full prompt Codex received, and its runs. **⤢ Expand** (or the `E` key) widens the panel
+to the whole window, so long answers and streams are easy to read. `E` or `Esc` brings the office
+back. The choice is remembered for the next worker you open.
+
+A note sent to a writer can come back **unproven**. The coordinator could not prove whether Codex
+received it, so it may already have run, and nothing sends it again by itself. Read the stream
+before sending again: a new Send is a new message, and could run it twice.
 
 Uploads, the action records and the running office's record live in the plugin's data directory,
 under `office/`.

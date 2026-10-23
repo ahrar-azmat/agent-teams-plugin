@@ -31,7 +31,7 @@ STOP_DRAIN_S = 1.0
 READ_RPC = {"daemon/status", "checkout/query", "checkout/revisions", "project/status",
             "run/status", "run/list", "run/result", "run/events", "run/terminals",
             "claim/list", "unknown/list", "message/inbox", "unit/status", "unit/diff", "records/list"}
-COMPLETION_RPC = {"operation/complete", "custody/reconcile", "run/interrupt", "run/terminate-terminal", "review/complete"}
+COMPLETION_RPC = {"operation/complete", "custody/reconcile", "run/interrupt", "run/terminate-terminal", "review/complete", "lead-hook/batch"}
 
 
 NATIVE_LOG_POLL_S = 0.05  # a refused call's custody, waited on by the writer's next call, is released this much later
@@ -73,6 +73,7 @@ class Daemon:
         self.admitting_units = {}  # unit -> its writers' hooks being decided (hook, recovery.writer_ready)
         self.readmitting = set()  # runs whose writer app-server is being re-admitted or reconciled again
         self.gap_reconciles = set()  # transport-gap reconciles under way: a drain waits for them, as for readmitting
+        self.listener_reconciles = {}  # invocation -> run/listener/start; includes lock waiters and nested calls
         self.ready = False
         self.recovery_barrier = True
         # (kind, id) -> asyncio.Event: a run, unit or checkout startup recovery is still reconciling while calls are
@@ -115,6 +116,9 @@ class Daemon:
 
     async def _release_lease(self, checkoutid, stopping):
         checkout = self.store.get(checkoutid)
+        from .lead_calls import active
+        if next(active(self.store, checkoutid), None) is not None:
+            return  # A stop cannot end the user's Claude host or waive its file-call exclusion.
         if not checkout.get("compatibility_lease"):
             return
         runs = [r for r in self.store.all("run") if participants.contains(self.store, r["unit"], checkoutid) and r["mode"] == "native"]
@@ -169,7 +173,8 @@ class Daemon:
     def status(self, checkout=None, brief=False):
         """The daemon's identity and readiness; unless brief, every run's writers too. A client checking
         readiness asks for brief: the full answer decodes each run's claims and custody."""
-        from .recovery import recovering_counts
+        from .recovery import recovering_counts, startup_counts
+        from .lead_calls import legacy_status
         writers = []
         for run in [] if brief else self.store.all("run"):
             if checkout and not participants.contains(self.store, run["unit"], checkout):
@@ -199,6 +204,9 @@ class Daemon:
                 # recovery is still reconciling. The writer app-servers it ended (recovery.end_wedged), by reason, and
                 # those now silent (reported, never ended): the first sign of either is here, not a blocked lead.
                 "child_watcher": self.child_watcher, "recovering": recovering_counts(self),
+                "listener_reconciles": list(self.listener_reconciles.values()), "startup_recovery": startup_counts(self.store),
+                "lead_edits": self.pending_lead_edits(),
+                "lead_edit_legacy_limit": legacy_status(self.store),
                 "ended": dict(self.ended), "silent": len(self.silent),
                 "sqlite": sqlite3.sqlite_version, "version": VERSION, **({} if brief else {"writers": writers})}
 
@@ -349,10 +357,12 @@ class Daemon:
         """No turn, custody, admission, live operation, workflow input or native delivery of the unit in flight: its
         app-server can be replaced without cutting work."""
         run = self.store.get(self.store.get(unitid)["run"])
+        from .lead_calls import active
         # Another unit's call being admitted in the same checkout runs on its own app-server: it is no reason to keep
         # this one (counting it left a resume waiting on an unrelated admission).
         return not (any(a.get("active_turn") for a in self.store.all("actor", unitid)) or self.custody.unit_active(unitid)
                     or self.admitting_units.get(unitid)
+                    or any(r.get("unit") == unitid for r in active(self.store))
                     or any(o["state"] in ("prepared", "allowed", "running") or o.get("executing") for o in self.store.all("operation", unitid))
                     or any(p.get("state") in ("submitting", "uncertain") for p in (run.get("phases") or {}).values())
                     or any(m.get("unit") == unitid and m["state"] not in ("entered_context", "acknowledged")
@@ -385,28 +395,38 @@ class Daemon:
             "json_extract(data,'$.state') NOT IN ('entered_context','acknowledged')", (unitid,)))
 
     def readmit(self, runid):
-        """In the background, reconcile a run's writer app-server again: one another release admitted, once its unit
-        is quiet (it is replaced), or one whose reconcile failed, once its retry is due. What waits for it (a
-        message, a prepared input) stays pending until then; maintenance delivers or submits it after. None starts
-        while the daemon drains, and a drain waits for those under way (self.readmitting) before it stops listeners."""
+        """In the background, reconcile a run's writer app-server again. That covers three cases:
+        - one another release admitted, once its unit is quiet (it is replaced);
+        - one whose reconcile failed, once its retry is due;
+        - a finished run's writer that startup recovery still owes (its incident, recovery.startup_obligation).
+        What waits for it (a message, a prepared input) stays pending until then; maintenance delivers or submits it
+        after. None starts while the daemon drains. A drain waits for those under way (self.readmitting, and every
+        reconcile in self.listener_reconciles) before it stops listeners."""
         if runid in self.readmitting or self.draining:
             return
         self.readmitting.add(runid)
         async def replace():
             try:
+                advance = False
                 async with self.writer.locks.hold(runid):
                     if self.draining:
                         return
+                    from .recovery import reconcile_listener, retry_due, startup_obligation
                     run = self.store.get(runid)
                     listener = self.store.get(self.store.get(run["root_actor"])["listener"])
-                    retry = (listener.get("recovery_state") == "failed" and listener["state"] != "quarantined"
-                             and listener.get("retry_at", 0) <= time.time())
-                    if retry or listener["state"] == "connected" and listener.get("recovery_state") != "failed" and \
+                    incident = startup_obligation(self.store, runid)
+                    if retry_due(self, listener) or listener["state"] == "connected" and listener.get("recovery_state") != "failed" and \
                             self.hook_stale(listener) and self.unit_quiet(run["unit"]):
-                        from .recovery import reconcile_listener
+                        if incident:
+                            self.store.event("listener/startup_retry", listener["id"],
+                                {"run": runid, "incident": incident["id"], "retry_at": listener.get("retry_at"),
+                                 "retries": listener.get("recovery_retries", 0)})
                         await reconcile_listener(self, listener, advance=False)
+                        advance = bool(incident and run.get("workflow") and not startup_obligation(self.store, runid))
+                # Writer.advance takes this same non-reentrant writer lock. Match successful startup after releasing it.
+                if advance and not self.draining:
+                    await self.writer.advance(runid)
             except (CoordinatorError, OSError) as exc:
-                # reconcile_listener marked the writer failed, with its next retry (listener/reconcile_failed).
                 self.store.event("listener/readmit_refused", runid, {"code": getattr(exc, "code", type(exc).__name__)})
             finally:
                 self.readmitting.discard(runid)
@@ -1782,15 +1802,18 @@ class Daemon:
 
     def stop_pending(self):
         from .writer import TERMINAL
-        from .intents import FILE_HOOK_S
         now = time.time()
         hooks = []
         for record in self.store.all("lead_hook"):
+            if record.get("execution"):
+                if record["execution"]["phase"] in ("admitting", "open", "settling"):
+                    hooks.append(record)
+                continue
             if record["state"] not in ("received", "prepared", "observed"):
                 continue
-            operation = self.store.get(record.get("operation"), required=False)
-            deadline = record.get("deadline", (operation or {}).get("created", now) + FILE_HOOK_S)
-            if now <= deadline:
+            # Recovery imports unfinished file calls. A legacy record it cannot
+            # interpret remains conservative; only Bash has a host time limit.
+            if record.get("tool") != "Bash" or now <= record.get("deadline", float("inf")):
                 hooks.append(record)
         operations = [o for o in self.store.selected("SELECT * FROM records INDEXED BY window_operation WHERE " + WINDOW_ACTIVE["operation"])
                       if not self.awaiting_outcome(o)]
@@ -1813,6 +1836,10 @@ class Daemon:
         }
         return {key: value for key, value in counts.items() if value}
 
+    def pending_lead_edits(self):
+        from .lead_calls import blockers
+        return blockers(self.store)
+
     async def drain(self, params):
         current = {"pid": os.getpid(), "boot": self.boot, "version": VERSION}
         if "expect" in params and params["expect"] != {"pid": current["pid"], "boot": self.boot}:
@@ -1821,7 +1848,9 @@ class Daemon:
             raise CoordinatorError("DAEMON_DRAINING", "Another stop is draining this daemon", {"retryable": True}, True)
         pending = self.stop_pending()
         if pending:
-            raise CoordinatorError("NOT_QUIESCENT", "Settle pending work before stopping", {"pending": pending})
+            raise CoordinatorError("NOT_QUIESCENT", "Settle pending work before stopping",
+                                   {"pending": pending, "listener_reconciles": list(self.listener_reconciles.values()),
+                                    "lead_edits": self.pending_lead_edits()})
         self.draining = True
         try:
             deadline = time.monotonic() + STOP_DRAIN_S
@@ -1831,12 +1860,16 @@ class Daemon:
                 # An advance that began before the drain sees it at its next step and ends without a turn. A
                 # re-admission or a transport gap's reconcile under way ends first: what it starts is a listener, which
                 # the stop below then stops.
-                if not pending and not tasks and not self.writer.advancing and not self.readmitting and not self.gap_reconciles:
+                if (not pending and not tasks and not self.writer.advancing and not self.readmitting
+                        and not self.gap_reconciles and not self.listener_reconciles):
                     break
                 if time.monotonic() >= deadline:
                     raise CoordinatorError("NOT_QUIESCENT", "RPC drain did not settle; admission resumed",
                                            {"pending": dict(pending, inflight_rpcs=len(tasks), workflow_advances=self.writer.advancing,
-                                                            readmissions=len(self.readmitting), gap_reconciles=len(self.gap_reconciles)),
+                                                            readmissions=len(self.readmitting), gap_reconciles=len(self.gap_reconciles),
+                                                            listener_reconciles=len(self.listener_reconciles)),
+                                            "listener_reconciles": list(self.listener_reconciles.values()),
+                                            "lead_edits": self.pending_lead_edits(),
                                             "wait_seconds": STOP_DRAIN_S})
                 await asyncio.sleep(0.01)
             # No pending completion remains. Fence even new observational RPCs
@@ -1873,8 +1906,12 @@ class Daemon:
             return query(self, params["cwd"], params.get("session_id", ""), params.get("git_common"))
         if method == "daemon/stop":
             return await self.drain(params)
+        if method == "lead-hook/batch":
+            from .lead_batches import submit
+            from .locks import finish
+            return await finish(submit(self, params.get("calls")))
         if not self.ready:
-            raise CoordinatorError("RECOVERING", "Coordinator is reconciling durable state before admitting work")
+            raise CoordinatorError("RECOVERING", "Coordinator is reconciling durable state before admitting work", operational=True)
         if self.recovering:
             from .recovery import recovered
             await recovered(self, method, params)  # a call for a writer, unit or checkout still reconciling waits
@@ -1980,9 +2017,10 @@ class Daemon:
                 return deny(str(exc) + " " + encoded(exc.details))
         if method == "lead-hook/dispatch":
             from .intents import dispatch
+            from .locks import finish
             payload = params["payload"]
             async with self.actor_locks.hold("host:" + digest([payload.get("session_id"), payload.get("tool_use_id")])):
-                return await dispatch(self, payload)
+                return await finish(dispatch(self, payload))
         if method == "lead-hook/armed":
             from .intents import arm
             return await arm(self, params)
@@ -2166,6 +2204,8 @@ class Daemon:
             raw = b"".join(parts)
             if raw.count(b"\n") != 1 or not raw.endswith(b"\n"):
                 raise CoordinatorError("RPC_FRAMING", "One JSONL request per connection is required")
+            # Admission/control RPCs must not queue behind filesystem workers.
+            # Batch-item codec work remains off-loop in lead_batches.
             request = json.loads(raw)
             if set(request) - {"id", "method", "params", "key"}:
                 raise CoordinatorError("RPC_FIELDS", "Unknown RPC envelope field")
@@ -2173,7 +2213,7 @@ class Daemon:
             self.admit_rpc(method, params)
             # Includes requests queued on an idempotency lock, before dispatch.
             self.inflight[asyncio.current_task()] = method
-            fingerprint = digest([method, params])
+            fingerprint = digest([method, params]) if key else None
             if key is not None and (not isinstance(key, str) or not key):
                 raise CoordinatorError("RPC_KEY", "An idempotency key must be a nonempty string")
             async with self.request_locks.hold(key):
@@ -2257,23 +2297,27 @@ class Daemon:
                         await self.settle_actor(actor)
                     except (CoordinatorError, OSError):
                         pass  # custody remains held; no optimistic release
-            from .recovery import settle_lead_command, watch_answers
+            from .recovery import settle_lead_command, watch_answers, retry_due, startup_obligation
             for reservation in held:
                 if (reservation.get("lead_root") and ("checkout", reservation.get("checkout")) not in recovering
                         and self.store.get(reservation["id"])["state"] != "released"):
                     await settle_lead_command(self, reservation)
             watch_answers(self)
-            # A writer whose reconcile failed after recovery holds its unit's work until reconciled again; startup
-            # recovery's failures are quarantined with an UNKNOWN instead, and a resume reconciles those. A finished
-            # run's writer is retried only while work is owed to it (writer_owed), or when it was ended stopped or
-            # behind a dead connection (recovery.end_wedged: its replacement is due now): otherwise its next resume
-            # reconciles it.
+            # A writer whose reconcile failed holds its unit's work until it is reconciled again. Once its retry is
+            # due, it is retried here in either case:
+            # - a startup incident, which stays owed even for a finished run (only a retryable one; one that
+            #   cannot pass stays quarantined for the lead);
+            # - while work is owed to it (writer_owed), or when it was ended stopped or behind a dead connection
+            #   (recovery.end_wedged: its replacement is due now).
+            # Otherwise its next resume reconciles it. Its backoff is no work under way, so it holds no stop; an
+            # attempt it starts enters reconcile_listener's stop fence like any other.
             for listener in list(self.store.selected("SELECT * FROM records WHERE kind='listener' AND "
                                                      "json_extract(data,'$.recovery_state')='failed'")):
-                if (listener["state"] != "quarantined" and listener.get("retry_at", 0) <= time.time()
+                if (retry_due(self, listener)
                         and ("run", listener["run"]) not in recovering
                         and self.store.get(listener["actor"]).get("listener") == listener["id"]
-                        and (listener.get("wedged") or self.writer_owed(listener["unit"]))):
+                        and (startup_obligation(self.store, listener["run"]) or listener.get("wedged")
+                             or self.writer_owed(listener["unit"]))):
                     self.readmit(listener["run"])
             await self.messages.retry()
             # Only runs this loop can act on: every finished run is history. A plain run's prepared continuation
@@ -2304,21 +2348,6 @@ class Daemon:
             for checkout in list(self.store.all("checkout")):
                 if ("checkout", checkout["id"]) not in recovering:
                     await self.release_lease(checkout["id"])
-            for record in list(self.store.selected("SELECT * FROM records WHERE kind='lead_hook' AND "
-                                                   "json_extract(data,'$.state')='prepared' ORDER BY id")):
-                record = self.store.get(record["id"])  # a Post may have settled it during an earlier record's await
-                if record["state"] == "prepared":
-                    operation = self.store.get(record["operation"])
-                    if time.time() - operation["created"] > 120:
-                        record["state"] = "uncertain"
-                        self.store.save(record)
-                        # Elapsed time is no evidence the host will not still run the edit: a permission prompt or a
-                        # slower Pre hook can hold it past this. So it is quarantined, and stays live and excludes its
-                        # paths. (A refused edit was settled before this, at its PostToolBatch.) The 120 s pass keeps a
-                        # call no Post or batch ever settles (a session ended mid-call, a lost Post) from holding stop and
-                        # every lead's quiet window. An edit startup recovery quarantined is not quarantined again.
-                        if operation["state"] == "prepared":
-                            await self.ledger.quarantine(operation, "host pre/post completion gap; late matching bytes are not proof")
 
     async def serve(self):
         from .recovery import recover, recover_writers
@@ -2356,6 +2385,8 @@ class Daemon:
             self.release_upgrade()
             self.background(recover_writers(self, plan))
             self.background(self.maintenance())
+            from .lead_calls import observe
+            self.background(observe(self))
             self.background(self.compact_history())
             await self.stop.wait()
         for task in list(self.tasks):

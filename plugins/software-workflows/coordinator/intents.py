@@ -8,10 +8,9 @@ import codecs
 import hashlib
 import os
 import time
-from pathlib import Path
 
 from .client import CoordinatorError
-from .ledger import hidden, normalize, read_path
+from .ledger import hidden, normalize
 from .locks import KeyedLocks
 from .observations import checkout_at
 from .store import digest, uid
@@ -131,10 +130,6 @@ def bash_deadline(data, limits):
     return time.time() + min(ms(data.get("timeout"), default), ceiling) / 1000 + 60
 
 
-# A lead file edit's own deadline: the daemon's 120 s pre/post gap for prepared edits, plus 60 s.
-FILE_HOOK_S = 180
-
-
 def quiet(daemon, checkout, mine, ident):
     """A global, generation-fenced stamp, without rereading finished history.
 
@@ -207,15 +202,13 @@ def invalidate_windows(daemon):
 
 async def dispatch(daemon, payload):
     tool, event = payload.get("tool_name"), payload.get("hook_event_name")
-    if tool not in FILES | {"Bash"} or event not in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch"):
+    if tool in FILES:
+        from .lead_calls import dispatch as file_call
+        return await file_call(daemon, payload)
+    if tool != "Bash" or event not in ("PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch"):
         raise CoordinatorError("LEAD_HOOK_FIELDS", "Unsupported lead hook event")
     data = payload.get("tool_input") or {}
     target = payload.get("cwd", "")
-    if tool in FILES:
-        value = data.get("notebook_path") if tool == "NotebookEdit" else data.get("file_path")
-        if not isinstance(value, str) or not value:
-            return {"coordinated": False}
-        target = str((Path(target) / value).resolve())
     checkout, changed = checkout_at(daemon.store, target)
     if checkout is None:
         return {"coordinated": False}
@@ -252,10 +245,10 @@ async def dispatch(daemon, payload):
     if fresh:
         # Registered before anything that can wait (attaching a new session, the checkout's other
         # transitions, the ledger): a hook that gives up waiting (its client's 3 s) lets the command
-        # or the edit go ahead, so a call the daemon has received counts as possibly writing from here.
-        deadline = bash_deadline(data, payload.get("bash_limits")) if tool == "Bash" else time.time() + FILE_HOOK_S
+        # go ahead, so a call the daemon has received counts as possibly writing from here.
+        deadline = bash_deadline(data, payload.get("bash_limits"))
         from .lead import session_actors
-        fields = {"tool": tool, "state": "observed" if tool == "Bash" else "received", "input_digest": signature,
+        fields = {"tool": tool, "state": "observed", "input_digest": signature,
                   "generation": daemon.store.generation, "session_id": session, "tool_use_id": call,
                   "checkout": checkout["id"], "reach": [c["id"] for c in reach], "window": None, "deadline": deadline, "arm_deadline": time.time() + 3,
                   "session_actors": session_actors(daemon.store, checkout["id"], session)}
@@ -339,149 +332,12 @@ async def dispatch(daemon, payload):
                     daemon.store.save(record)
                 return dict(result, attribution="lead-command" if "attributed" in result else "UNKNOWN-context-only", executed_again=False)
             answer = {"coordinated": True, "observed": ident, "executed_again": False}
+            from .lead_calls import blockers
+            waiting = blockers(daemon.store)
+            if waiting:
+                answer["quiet_window_blocked_by"] = waiting
             if record and record.get("published_participants"):
                 answer["published_participants"] = record["published_participants"]
             if fresh and record.get("arm"):
                 answer["arm"] = record["arm"]
             return answer
-    from .routing import route, qualified
-    routed = route(daemon.store, actor, target, payload.get("cwd"))
-    path = routed["path"]
-    actor = dict(actor, checkout=routed["checkout"])
-    if event == "PreToolUse":
-        def refused():  # denied: it writes nothing
-            daemon.store.put("lead_hook", ident, {"tool": tool, "state": "refused", "input_digest": signature,
-                             "checkout": checkout["id"]})
-
-        def refuse(conflicts):
-            refused()
-            raise CoordinatorError("CLAIM_CONFLICT", "Scope held by " + conflicts[0]["holder"] +
-                                   "; send a message to that holder or the lead, then request lead-authorized handback",
-                                   {"conflicts": conflicts})
-
-        def outside():
-            current = daemon.store.get(ident)
-            current["state"] = "outside"
-            daemon.store.save(current)
-            return {"coordinated": False, "outside": True}
-        if record and record["state"] == "outside":
-            return {"coordinated": False, "outside": True}
-        unwatched = set()
-        if not record or record["state"] in ("received", "refused"):
-            unwatched = await daemon.ledger.classify(checkout, [path])
-            if path in unwatched:
-                # Outside the ledger (ledger.unwatched, the reading its prepare and custody make): git ignores it and
-                # neither the branch commit nor the index holds it, so no commit takes it, whoever made it. Not
-                # coordinated: no claim, receipt or window held, and decided before any claim, so none refuses it.
-                # 2.4.1-2.4.3 recorded its bytes UNKNOWN ("stale pre-image at operation admission") and its Post a
-                # second, and a claim another lead's edit had left there refused it (CLAIM_CONFLICT).
-                return outside()
-        if record and record["state"] == "refused":
-            # a replayed denial is decided again, never turned into an allowing warning
-            conflicts = daemon.custody.conflicts(checkout["id"], actor["unit"], [normalize(checkout, path)])
-            if conflicts:
-                refuse(conflicts)
-            record = None
-            daemon.store.put("lead_hook", ident, {"tool": tool, "state": "received", "input_digest": signature,
-                             "checkout": checkout["id"], "window": None, "deadline": time.time() + FILE_HOOK_S,
-                             "session_id": session, "tool_use_id": call})
-        if record:
-            if record["state"] not in ("prepared", "verified") or daemon.store.get(record["operation"])["state"] not in ("prepared", "verified"):
-                raise CoordinatorError("LEAD_HOOK_UNCERTAIN", "Prior intent is uncertain; do not replay this tool use")
-            return {"coordinated": True, "operation": record["operation"], "duplicate": True}
-        # Another unit's claim decides first: the hook allows an edit any later refusal is about
-        # (an uncalibrated adapter, an encoding), so that refusal must never hide the claim.
-        conflicts = daemon.custody.conflicts(checkout["id"], actor["unit"], [normalize(checkout, path)])
-        if conflicts:
-            refuse(conflicts)
-        from .participants import require_writable
-        try:
-            require_writable(daemon.store, actor["unit"], checkout["id"])
-        except CoordinatorError:
-            refused()
-            raise
-        if tool == "NotebookEdit":
-            intended(tool, data, b"")  # Concrete refusal before taking a claim.
-        pre = await asyncio.to_thread(read_path, daemon.store, checkout, path)
-        raw = daemon.store.read_blob(pre["blob"]) if pre["blob"] else b""
-        content = intended(tool, data, raw)
-        image = {"blob": daemon.store.blob(content), "mode": pre["mode"] or "100644"}
-        def prepare():
-            return daemon.ledger.prepare(actor, "lead-edit", {"expected": {path: image}, "host_tool": tool, "input_digest": signature}, [path],
-                                         native={"session_id": session, "tool_use_id": call}, outside=unwatched)
-        try:
-            await daemon.custody.acquire(actor, [qualified(checkout["id"], path)])
-            try:
-                operation = await prepare()
-            except CoordinatorError as exc:
-                if exc.code != "STALE_BASE":
-                    raise
-                # What changed these bytes outside a verified operation is recorded UNKNOWN now and heads the path:
-                # the lead's own edit starts from it and gets its own exact receipt, not a second UNKNOWN at its Post.
-                operation = await prepare()
-        except CoordinatorError as exc:
-            if not exc.operational and (exc.code == "PREFIX_PUBLISHED" or
-                                        exc.code == "CLAIM_CONFLICT" and exc.details.get("conflicts")):
-                refused()  # Every authoritative denial writes nothing, including a replay.
-            raise
-        if operation["pre"][path] != pre:
-            await daemon.ledger.quarantine(operation, "pre-image changed during host intent preparation")
-            raise CoordinatorError("LEAD_PREIMAGE_CHANGED", "Prepare the edit again against the current pre-image")
-        daemon.store.put("lead_hook", ident, {"unit": actor["unit"], "actor": actor["id"], "tool": tool,
-                         "checkout": checkout["id"], "deadline": daemon.store.get(ident)["deadline"],
-                         "state": "prepared", "input_digest": signature, "operation": operation["id"],
-                         "session_id": session, "tool_use_id": call}, actor["unit"])
-        return {"coordinated": True, "operation": operation["id"]}
-    if record and record["state"] == "outside":
-        return {"coordinated": False, "outside": True}
-    if not record or record["state"] in ("received", "refused", "unrecorded"):
-        # No prepared intent: its Pre was refused (an uncalibrated adapter, an encoding) or never
-        # finished, and the host went ahead. It counts as possibly writing until this reconcile
-        # has recorded its bytes; a failed reconcile leaves it counting until its deadline.
-        await daemon.ledger.reconcile(checkout, [path], reason="lead post hook without prepared intent")
-        if path in await daemon.ledger.classify(checkout, [path]):
-            # Outside the ledger, as its Pre would have found had it reached the daemon: the reconcile recorded nothing
-            # there, and the edit needs no intent.
-            if record:
-                record["state"] = "outside"
-                daemon.store.save(record)
-            return {"coordinated": False, "outside": True}
-        if record and record["state"] != "unrecorded":
-            record["state"] = "unrecorded"
-            daemon.store.save(record)
-        if batch:
-            return {"coordinated": True, "state": "unrecorded"}
-        raise CoordinatorError("LEAD_PRE_MISSING", "No matching prepared host intent; matching bytes cannot acquire authorship")
-    operation = daemon.store.get(record["operation"])
-    if record["state"] == "verified":
-        return {"operation": operation["id"], "duplicate": True, "state": "verified"}
-    if record["state"] != "prepared" or operation["state"] != "prepared":
-        raise CoordinatorError("LEAD_HOOK_UNCERTAIN", "Missing/failed completion cannot be repaired by matching bytes")
-    response = payload.get("tool_response")
-    failed = event == "PostToolUseFailure" or isinstance(response, dict) and response.get("isError")
-    if batch:
-        # No Post came: its bytes decide. The intended image is this edit's (its claim kept every writer out).
-        current = await asyncio.to_thread(read_path, daemon.store, daemon.store.get(operation["checkout"]), path)
-        failed = current != operation["intended"]["expected"][path]
-    if failed:
-        # Still at its pre-image, it changed nothing and is settled as no effect; any other bytes may be partly its
-        # doing, so they are quarantined (UNKNOWN). 2.4.3 quarantined a refused edit even when nothing changed.
-        await daemon.ledger.settle_unapplied(operation, ("host file tool did not run" if batch else "host file tool failed") +
-                                             "; partial effects receive no receipt", lambda current: True)
-        operation = daemon.store.get(operation["id"])
-        record = daemon.store.get(record["id"])
-        record["state"] = "no_effect" if operation.get("no_effect") else "failed"
-        daemon.store.save(record)
-        return {"operation": operation["id"], "state": "no_effect" if operation.get("no_effect") else "uncertain"}
-    try:
-        result = await daemon.ledger.verify(operation, operation["intended"]["expected"], "exact",
-                                            {"executor": "Claude file tool", "session_id": session, "tool_use_id": call,
-                                             "post_event": payload.get("hook_event_name")})
-        record["state"] = "verified"
-        daemon.store.save(record)
-        return {"operation": result["id"], "state": "verified"}
-    except BaseException as exc:
-        record["state"] = "uncertain"
-        daemon.store.save(record)
-        await daemon.ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__))
-        raise

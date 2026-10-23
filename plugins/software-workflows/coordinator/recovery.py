@@ -1,6 +1,7 @@
 """Generation-fenced recovery. Never replay an uncertain mutation or continue a turn."""
 import asyncio
 import base64
+import errno
 import json
 import math
 import os
@@ -11,6 +12,7 @@ import time
 from .client import CoordinatorError
 from . import native, processes, participants
 from .store import uid
+from .locks import finish
 
 # A quiet app-server's graceful exit after SIGTERM is bounded by Codex 0.163 itself: its threads' shutdown at
 # 10 s (shutdown_all_threads_bounded; a writer's MCP servers stop there) and each connection's RPC drain at 30 s
@@ -78,6 +80,10 @@ ANSWER_EVERY_S = seconds("SOFTWARE_WORKFLOWS_ANSWER_EVERY_S", 30)
 # sends an unkeyed call again within its own 90 s; a keyed call keeps the refusal as its key's answer (no effect was
 # made), so the CLI, which keys every call, prints it with retry_after (exit 3) for its caller to run it again.
 RECOVERY_WAIT_S = seconds("SOFTWARE_WORKFLOWS_RECOVERY_WAIT_S", 20)
+RECONCILE_RETRY_FIRST_S = seconds("SOFTWARE_WORKFLOWS_RECONCILE_RETRY_FIRST_S", RECONCILE_RETRY_FIRST_S)
+RECONCILE_RETRY_MAX_S = seconds("SOFTWARE_WORKFLOWS_RECONCILE_RETRY_MAX_S", RECONCILE_RETRY_MAX_S)
+if RECONCILE_RETRY_MAX_S < RECONCILE_RETRY_FIRST_S:
+    raise CoordinatorError("CONFIG", "Reconcile retry maximum must be at least its initial delay")
 
 
 async def may_execute(daemon, operation):
@@ -95,23 +101,43 @@ async def may_execute(daemon, operation):
 
 async def reconcile_listener(daemon, listener, advance=True):
     """Reconcile a run's writer app-server: reconnect, replace or re-admit it, and read back what native did
-    meanwhile. One caller at a time for each run (a recovery, a resume, a message's or a workflow's re-admission, a
-    cancel, a transport gap): each takes the run's lock, then reconciles the incarnation current by then, so two
-    callers never replace the same app-server. A failure marks that incarnation failed, so its unit's work waits,
-    and maintenance reconciles it again."""
+    meanwhile.
+    - One caller at a time for each run (a recovery, a resume, a message's or a workflow's re-admission, a cancel, a
+      transport gap, a startup incident's retry). Each takes the run's lock, then reconciles the incarnation
+      current by then, so two callers never replace the same app-server.
+    - A failure marks that incarnation failed, so its unit's work waits, and maintenance reconciles it again.
+    - Every call is a stop's to wait for. It is counted in daemon.listener_reconciles before its first await,
+      a caller still waiting for the run's lock included. Once a stop is closing, every call is refused
+      DAEMON_DRAINING, so nothing the stop has already stopped is started again behind it (review turn 48)."""
+    if daemon.closing:
+        raise CoordinatorError("DAEMON_DRAINING", "Coordinator is closing; reconcile on the serving daemon",
+                               {"retryable": True, "run": listener["run"], "listener": listener["id"]}, True)
+    token = uid("reconcile")
+    invocation = {"run": listener["run"], "listener": listener["id"], "started": time.time()}
+    daemon.listener_reconciles[token] = invocation
+    try:
+        # Cancellation cannot release the stop fence while this pass's native or filesystem work still runs.
+        return await finish(_registered_reconcile(daemon, listener, advance, invocation))
+    finally:
+        daemon.listener_reconciles.pop(token, None)
+
+
+async def _registered_reconcile(daemon, listener, advance, invocation):
     store = daemon.store
     async with daemon.reconcile_locks.hold(listener["run"]):
         listener = store.get(listener["id"])
         bound = store.get(listener["actor"]).get("listener")
         if listener.get("root_thread") and listener["state"] in ("dead", "stopped") and bound and bound != listener["id"]:
-            listener = store.get(bound)  # replaced meanwhile, by the caller this one waited for
+            listener = store.get(bound)
+        invocation["listener"] = listener["id"]
         try:
             notice = await reconcile_pass(daemon, listener)
-        except BaseException as exc:
+        except Exception as exc:
             reconcile_failed(daemon, listener, exc)
+            if startup_obligation(store, listener["run"]):
+                quarantine_failed(daemon, listener, exc)
             raise
-    # Progression belongs to the daemon. Persisted prepared intents can submit; uncertain inputs without a history
-    # match stay uncertain, never replayed. Outside the run's lock: a submission can reconcile its writer again.
+    # Outside the reconcile lock: advancement may need another reconcile. Unproven inputs are never resent.
     run = store.get(listener["run"])
     if advance and run.get("workflow"):
         await daemon.writer.advance(run["id"])
@@ -121,17 +147,192 @@ async def reconcile_listener(daemon, listener, advance=True):
 
 def reconcile_failed(daemon, listener, exc):
     """Mark the run's current incarnation failed: hook(), deliveries and submissions refuse it, and maintenance
-    reconciles it again once its retry is due. Startup recovery quarantines it instead."""
+    reconciles it again once its retry is due.
+    - The backoff starts at RECONCILE_RETRY_FIRST_S and doubles up to RECONCILE_RETRY_MAX_S. It is carried across
+      replacements, so a replacement does not restart it.
+    - The failure is recorded as a code with structured details, never native log text, and classified as
+      retryable or not (retryable_failure).
+    - A stop's own refusal (DAEMON_DRAINING) marks nothing."""
+    if not listener.get("root_thread") or getattr(exc, "code", None) == "DAEMON_DRAINING":
+        return
     store = daemon.store
-    if not listener.get("root_thread"):
-        return  # a threadless bootstrap is stopped again by the next recovery
     current = store.get(store.get(listener["actor"]).get("listener") or listener["id"])
     retries = current.get("recovery_retries", 0) + 1
-    code = getattr(exc, "code", type(exc).__name__)
-    current.update(recovery_state="failed", recovery_error=code, recovery_retries=retries,
-                   retry_at=time.time() + min(RECONCILE_RETRY_MAX_S, RECONCILE_RETRY_FIRST_S * 2 ** (retries - 1)))
+    info = failure_info(exc)
+    retryable, delay = retryable_failure(info), retry_delay(retries)
+    current.update(recovery_state="failed", recovery_error=info["code"], recovery_error_details=info,
+                   recovery_retryable=retryable, recovery_retries=retries, retry_at=time.time() + delay)
     store.save(current)
-    store.event("listener/reconcile_failed", current["id"], {"code": code, "retries": retries, "retry_at": current["retry_at"]})
+    store.event("listener/reconcile_failed", current["id"], dict(info, retryable=retryable, retries=retries,
+                retry_at=current["retry_at"], delay_seconds=delay, max_seconds=RECONCILE_RETRY_MAX_S))
+
+
+def failure_info(exc):
+    """Persist codes and structured diagnostics, never native log text or configuration."""
+    details = getattr(exc, "details", {}) or {}
+    info = {"code": getattr(exc, "code", type(exc).__name__)}
+    for key in ("method", "native_code", "exit_code", "errno"):
+        if key in details:
+            info[key] = details[key]
+    if isinstance(exc, OSError):
+        info["errno"] = exc.errno
+    if info["code"] == "ADMISSION_FAILED":
+        info["cases"] = []
+        for case in details.get("cases", []):
+            if case.get("passed"):
+                continue
+            error = case.get("error") or "PROBE_FAILED"
+            # Admission's original case has a code; an adopted incident may already have our structured form.
+            failure = (CoordinatorError(error.get("code") or "PROBE_FAILED", "", error) if isinstance(error, dict)
+                       else CoordinatorError(error, "", case.get("details")))
+            info["cases"].append({"probe": case.get("probe"), "error": failure_info(failure)})
+    return info
+
+
+def retryable_failure(info):
+    """Temporary loss of evidence or capacity can heal; correctness refusals need intervention."""
+    code = info["code"]
+    if code == "ADMISSION_FAILED":
+        cases = info.get("cases") or []
+        return bool(cases) and all(retryable_failure(case["error"]) for case in cases)
+    if code in {"NATIVE_UNCERTAIN", "NATIVE_DISCONNECTED", "LISTENER_SILENT", "TimeoutError",
+                "ConnectionError", "ConnectionResetError", "ConnectionRefusedError", "BrokenPipeError", "EOFError",
+                "EXCLUSIVE_WRITER", "CUSTODIAN_LOST", "LEASE_UNCERTAIN", "PROBE_TIMEOUT",
+                "RESTORE_CUSTODY", "RESTORE_EXECUTING", "UNSTABLE_SNAPSHOT", "RECOVERY_BUSY", "REPLACEMENT_UNBOUND"}:
+        return True
+    if code in ("LISTENER_START", "PROBE_LISTENER"):
+        # No exit yet is a socket-start timeout; a signal can reflect resource pressure.
+        # A completed nonzero exit may instead prove malformed config: do not retry it blindly.
+        return info.get("exit_code") is None or info["exit_code"] < 0
+    return info.get("errno") in {errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE, errno.ENOSPC,
+                                 errno.ECONNRESET, errno.ECONNREFUSED, errno.EPIPE, errno.ETIMEDOUT}
+
+
+def retry_delay(retries):
+    # Saturate the exponent too: an indefinitely failing writer never builds an enormous integer.
+    ceiling = math.ceil(math.log2(RECONCILE_RETRY_MAX_S) - math.log2(RECONCILE_RETRY_FIRST_S))
+    step = min(max(0, retries - 1), ceiling)
+    return RECONCILE_RETRY_MAX_S if step == ceiling else math.ldexp(RECONCILE_RETRY_FIRST_S, step)
+
+
+def startup_obligation(store, runid):
+    """The incident belongs to the run, not the app-server incarnation it may replace."""
+    run = store.get(runid)
+    incident = store.get(run.get("startup_recovery"), required=False)
+    return incident if incident and incident["state"] == "pending" else None
+
+
+def retry_due(daemon, listener):
+    incident = startup_obligation(daemon.store, listener["run"])
+    return (listener.get("recovery_state") == "failed" and listener.get("retry_at", 0) <= time.time()
+            and (incident["retryable"] if incident else listener["state"] != "quarantined"))
+
+
+def startup_counts(store):
+    incidents = list(store.selected("SELECT * FROM records WHERE kind='startup_recovery' "
+                                    "AND json_extract(data,'$.state')='pending'"))
+    retryable = sum(bool(i["retryable"]) for i in incidents)
+    return {"pending": len(incidents), "retryable": retryable, "permanent": len(incidents) - retryable}
+
+
+def listener_lineage(store, listener):
+    found = set()
+    while listener and listener["id"] not in found:
+        found.add(listener["id"])
+        listener = store.get(listener.get("replaces"), required=False)
+    return found
+
+
+def repair_startup_records(daemon):
+    """Adopt 2.4.4 quarantine obligations and repair only predecessors proved replaced by durable lineage."""
+    store = daemon.store
+    for successor in list(store.all("listener")):
+        previous = store.get(successor.get("replaces"), required=False)
+        if not previous or previous["state"] != "dead" or previous.get("recovery_state") != "reconciling":
+            continue
+        bound = store.get(store.get(previous["actor"]).get("listener"), required=False)
+        if (bound and successor["run"] == previous["run"] and successor["actor"] == previous["actor"]
+                and successor["id"] in listener_lineage(store, bound) and bound["id"] != previous["id"]):
+            with store.transaction():
+                previous.update(recovery_state="replaced", replaced_by=successor["id"])
+                store.save(previous)
+                store.event("listener/replaced", previous["id"], {"successor": successor["id"], "repaired": True})
+    for run in list(store.all("run")):
+        actor = store.get(run.get("root_actor"), required=False)
+        listener = store.get((actor or {}).get("listener"), required=False)
+        if (not listener or not listener.get("root_thread") or startup_obligation(store, run["id"])
+                or run.get("startup_recovery") or listener.get("recovery_state") != "failed"):
+            continue
+        lineage = listener_lineage(store, listener)
+        unknowns = [row["id"] for row in store.db.execute(
+            "SELECT id,context FROM unknowns WHERE reason='listener recovery incomplete' AND path='*'")
+            if json.loads(row["context"]).get("listener") in lineage]
+        if listener["state"] != "quarantined" and not unknowns:
+            continue
+        exc = CoordinatorError(listener.get("recovery_error") or "RECOVERY_INCOMPLETE", "",
+                               listener.get("recovery_error_details"))
+        quarantine_failed(daemon, listener, exc, unknowns=unknowns, reconstructed=True)
+
+
+async def resolve_startup(daemon, listener, history):
+    """Read history first, then checkout bytes; resolve only this incident's immutable UNKNOWN rows."""
+    from .ledger import full_snapshot
+    store = daemon.store
+    incident = startup_obligation(store, listener["run"])
+    if not incident:
+        return None
+    if daemon.hook_stale(listener):
+        raise CoordinatorError("RECOVERY_BUSY", "Startup recovery still owes replacement with this release's hooks", {}, True)
+    lineage = listener_lineage(store, listener)
+    wanted = set(incident["unknowns"])
+    for checkoutid in participants.checkout_ids(store, listener["unit"]):
+        checkout = store.get(checkoutid)
+        def quiet():
+            daemon.ledger.require_owned(checkout)
+            if daemon.custody.active(checkoutid):
+                raise CoordinatorError("RESTORE_CUSTODY", "Startup recovery waits for checkout custody to settle", {}, True)
+            refuse_executing(store, checkoutid)
+        async with daemon.ledger.lock(checkoutid):
+            quiet()
+            began = time.time()
+            selected = [u["id"] for u in store.unresolved(checkoutid)
+                        if u["id"] in wanted and u["path"] == "*" and u["reason"] == "listener recovery incomplete"
+                        and u["created"] < began and json.loads(u["context"]).get("listener") in lineage]
+            known = {r[0] for r in store.db.execute("SELECT path FROM heads WHERE checkout=?", (checkoutid,))}
+            unreadable, listed = {}, set()
+            actual = await asyncio.to_thread(full_snapshot, store, checkout, known, unreadable, listed)
+            quiet()
+            outside = await daemon.ledger.outside(checkout, actual, unreadable, listed)
+            quiet()
+            ident = uid("recovery_resolution")
+            with store.transaction():
+                result = daemon.ledger.apply_observation(checkout, set(actual), actual,
+                    "unexplained bytes after startup history reconciliation", transaction=False,
+                    outside=outside, unreadable=unreadable)
+                # A lead resolution made while the read yielded is retained verbatim.
+                unresolved = {u["id"] for u in store.unresolved(checkoutid)}
+                selected = [key for key in selected if key in unresolved]
+                evidence = {"run": listener["run"], "listener": listener["id"], "incident": incident["id"],
+                            "failed_listener": incident["failed_listener"], "history": history, "checkout": checkoutid,
+                            "scan_started": began, "created": time.time(), "unknowns": selected,
+                            "paths_scanned": result["paths_scanned"], "found": result["unknowns"], "unreadable": unreadable}
+                store.put("recovery_resolution", ident, evidence, incident["id"])
+                for unknown in selected:
+                    store.db.execute("INSERT INTO resolutions(unknown_id,restore,edit) VALUES(?,?,?) ON CONFLICT(unknown_id) "
+                                     "DO UPDATE SET restore=excluded.restore,edit=excluded.edit WHERE resolutions.edit IS NULL",
+                                     (unknown, ident, ident))
+                incident = store.get(incident["id"])
+                incident["resolutions"].append(ident)
+                store.save(incident)
+                store.event("unknown/recovery_resolved", ident, evidence)
+    remaining = [key for key in wanted if store.db.execute(
+        "SELECT 1 FROM unknowns u LEFT JOIN resolutions r ON r.unknown_id=u.id WHERE u.id=? AND r.edit IS NULL",
+        (key,)).fetchone()]
+    if remaining:
+        raise CoordinatorError("RECOVERY_EVIDENCE", "Startup UNKNOWNs do not match the reconciled listener's participants and lineage",
+                               {"unknowns": remaining})
+    incident.update(state="complete", completed=time.time(), listener=listener["id"], history=history)
+    return incident  # committed with the current listener's successful outcome, with no intervening await
 
 
 def ancestry_order(actors):
@@ -336,14 +537,22 @@ async def _reconcile_listener(daemon, listener):
         replacement["recovery_state"] = "reconciling"
         # The notice its first full pass sends: why the coordinator ended it, when it did (end_wedged, runs.end_writer).
         replacement["initializing"] = "ended" if listener.get("ended") else "readmitted" if readmitted else "died"
-        store.save(replacement)
-        for child in list(store.all("actor", actor["unit"])):
-            if child["kind"] == "lead":
-                continue
-            child["listener"] = replacement["id"]
-            child["active_turn"] = None
-            child["state"] = "recovering"
-            store.save(child)
+        # A replacement attempt does not restart the run's backoff.
+        for key in ("recovery_retries", "retry_at", "recovery_error", "recovery_error_details", "recovery_retryable"):
+            if key in listener:
+                replacement[key] = listener[key]
+        with store.transaction():
+            store.save(replacement)
+            listener.update(state="dead", recovery_state="replaced", replaced_by=replacement["id"])
+            store.save(listener)
+            for child in list(store.all("actor", actor["unit"])):
+                if child["kind"] == "lead":
+                    continue
+                child["listener"] = replacement["id"]
+                child["active_turn"] = None
+                child["state"] = "recovering"
+                store.save(child)
+            store.event("listener/replaced", listener["id"], {"successor": replacement["id"], "run": listener["run"]})
         listener = replacement
     connection = daemon.connections.get(listener["id"])
     attached = bool(connection and not connection.closed)
@@ -371,9 +580,13 @@ async def _reconcile_listener(daemon, listener):
                 silence(daemon, listener, "no answer on its socket (" + code + ")")
             raise
     readmit = fresh or listener.get("admission_fingerprint", {}).get("adapter_digest") != await asyncio.to_thread(native.adapter_digest)
-    if not attached or readmit:
+    resuming = not attached or readmit or bool(listener.get("recovery_error")) or bool(startup_obligation(store, listener["run"]))
+    if resuming:
+        # Full history is paged below, so returning it here is redundant. 2026-10-22, 26 writers/4 checkouts:
+        # slowest root resume 0.117 s before, 0.094 s with excludeTurns (0 timeouts; sampled load up to 18.7).
+        # This fixture leaves ample headroom in the existing 60 s RPC timeout; it does not justify a new cap.
         response = await connection.call("thread/resume", {"threadId": listener["root_thread"],
-                                          "approvalPolicy": "never", "sandbox": "danger-full-access",
+                                          "approvalPolicy": "never", "sandbox": "danger-full-access", "excludeTurns": True,
                                           **({"cwd": cwd, "runtimeWorkspaceRoots": roots} if unit.get("project_revision") else {})})
         native.policy_echo(response)
         verify_thread(response, unit, cwd, roots)
@@ -427,6 +640,7 @@ async def _reconcile_listener(daemon, listener):
     # Discover every loaded descendant before reconciling its items. Parent events
     # may have been missed; thread/read supplies the native ancestry.
     await daemon.discover_descendants(listener)
+    history_threads = []
     for child in ancestry_order(list(store.all("actor", actor["unit"]))):
         if child["kind"] == "lead":
             continue
@@ -435,12 +649,13 @@ async def _reconcile_listener(daemon, listener):
             # This admitted, still-attached thread has never received one.
             if not attached:
                 raise CoordinatorError("THREAD_UNMATERIALIZED", "The unused native thread was disconnected; create a new unit")
+            history_threads.append({"actor": child["id"], "thread": child["thread"], "unsubmitted": True})
             continue
-        if child["thread"] != listener["root_thread"] and (not attached or fresh):
+        if child["thread"] != listener["root_thread"] and (resuming or fresh):
             # A new app-server connection must subscribe to each live child too, and a replacement has loaded only
             # the root. Resuming history does not start a turn or repeat its input.
             child_response = await connection.call("thread/resume", {"threadId": child["thread"],
-                "approvalPolicy": "never", "sandbox": "danger-full-access",
+                "approvalPolicy": "never", "sandbox": "danger-full-access", "excludeTurns": True,
                 **({"cwd": child.get("cwd", cwd), "runtimeWorkspaceRoots": roots} if unit.get("project_revision") else {})})
             native.policy_echo(child_response)
             # Native 0.163.0 children inherit roots and ancestry, but their own
@@ -474,6 +689,7 @@ async def _reconcile_listener(daemon, listener):
                     elif not operation:
                         for checkoutid in participants.checkout_ids(store, child["unit"]):
                             store.unknown(checkoutid, "*", "history contains an unaccounted effect-capable item", {"item": item["id"], "listener": listener["id"]})
+        history_threads.append({"actor": child["id"], "thread": child["thread"], "turns": len(turns), "items_complete": True})
         metadata = await connection.call("thread/read", {"threadId": child["thread"], "includeTurns": False})
         if metadata["thread"].get("status", {}).get("type") == "idle":
             child["active_turn"] = None
@@ -507,23 +723,37 @@ async def _reconcile_listener(daemon, listener):
             else:
                 await daemon.ledger.quarantine(operation, "crash gap: intent is not proof of execution or no effect",
                                                executing=await may_execute(daemon, operation))
-    await asyncio.gather(*(daemon.ledger.reconcile(store.get(key), ignore_pending=False, reason="recovery snapshot")
-                           for key in participants.checkout_ids(store, actor["unit"])))
+    history = {"completed": time.time(), "threads": history_threads}
+    history["event"] = store.event("recovery/history", listener["id"], dict(history, run=listener["run"]))
+    # A failing checkout must not leave sibling scans running after this invocation leaves the stop fence.
+    results = await asyncio.gather(*(daemon.ledger.reconcile(store.get(key), ignore_pending=False, reason="recovery snapshot")
+                                    for key in participants.checkout_ids(store, actor["unit"])), return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
     if alive:
         await daemon.messages.withdraw_stale(listener)  # a unit held only by a message queued there reads quiet below
     listener = store.get(listener["id"])
-    if alive and listener["state"] == "connected" and daemon.hook_stale(listener) and daemon.unit_quiet(actor["unit"]):
+    if alive and not connection.closed and daemon.hook_stale(listener) and daemon.unit_quiet(actor["unit"]):
         # Admitted by another release, its hooks run that release's program, and hook() refuses every call it
         # makes (HOOK_PROGRAM_CHANGED). Its native turns are read now, and while it reconciles no hook, delivery or
         # submission starts work: with nothing of its unit in flight, it is stopped (no notification gap) and
         # replaced by an app-server admitted with this release's hooks, which resumes the same thread.
         await daemon.stop_listener(listener, drain_s=READMIT_DRAIN_S, kill=True)
         return await _reconcile_listener(daemon, store.get(listener["id"]))
+    incident = await resolve_startup(daemon, listener, history)
+    listener = store.get(listener["id"])
     listener.update(recovery_state="reconciled", state="connected")
-    for key in ("recovery_error", "recovery_retries", "retry_at"):
+    for key in ("recovery_error", "recovery_error_details", "recovery_retryable", "recovery_retries", "retry_at"):
         listener.pop(key, None)
     initialized = listener.pop("initializing", None)
-    store.save(listener)
+    with store.transaction():
+        store.save(listener)
+        if incident:
+            store.save(incident)
+            store.event("listener/startup_recovered", listener["id"],
+                        {"run": listener["run"], "incident": incident["id"], "resolutions": incident["resolutions"],
+                         "seconds": round(incident["completed"] - incident["created"], 3)})
     if initialized == "readmitted":
         return ("Re-admitted with this release's hooks: a replacement app-server resumed this thread without continuing "
                 "it. Nothing of the unit was in flight. " + RUNTIME_NOTE)
@@ -567,6 +797,8 @@ async def recover(daemon):
     from .intents import invalidate_windows
     invalidate_windows(daemon)
     await daemon.ledger.recover_ownership()
+    from .lead_calls import recover as recover_lead_calls
+    await recover_lead_calls(daemon)
     for request in list(store.all("custody_request")):
         if request["state"] == "waiting":
             request.update(state="interrupted", recovered_generation=store.generation)
@@ -576,12 +808,14 @@ async def recover(daemon):
         attempt["generation"] += 1
         attempt["daemon_generation"] = store.generation
         store.save(attempt)
+    repair_startup_records(daemon)
     defer_unbound(store)
     # All units regain coverage before any listener reconnects or input advances. A threadless bootstrap needs none: it
     # is stopped, never given work. A checkout whose lease is refused (a writer outside the coordinator took it while no
     # daemon ran) fails only its own writers' recovery: each reconcile takes its leases again before it reconnects, and
     # is quarantined with an UNKNOWN when refused. Every other checkout recovers.
-    recoverable = [l for l in store.all("listener") if recoverable_listener(l)]
+    permanent = {i["run"] for i in store.all("startup_recovery") if i["state"] == "pending" and not i["retryable"]}
+    recoverable = [l for l in store.all("listener") if recoverable_listener(l) and l["run"] not in permanent]
     for checkoutid in sorted({key for l in recoverable if l.get("root_thread") for key in participants.checkout_ids(store, l["unit"])}):
         try:
             await daemon.ensure_lease(checkoutid)
@@ -667,17 +901,45 @@ def recovery_plan(daemon, recoverable):
     return {"runs": runs, "checkouts": checkouts, "units": units, "events": events}
 
 
-def quarantine_failed(daemon, listener, exc):
-    """A writer whose startup reconcile failed: quarantined, with an UNKNOWN in each of its unit's checkouts, since
-    its history was not read back. A resume reconciles it again."""
+def quarantine_failed(daemon, listener, exc, unknowns=None, reconstructed=False):
+    """A writer whose startup reconcile failed is quarantined, with an UNKNOWN in each of its unit's checkouts,
+    since its history was not read back.
+    - One incident per run (startup_recovery) holds those UNKNOWNs and the failure's classification, and it
+      outlives replacements.
+    - A retryable incident is reconciled again by maintenance once its retry is due, and a resume reconciles it
+      at once. resolve_startup then resolves exactly its UNKNOWNs, after the history read and a read of each
+      checkout.
+    - One that cannot pass (a completed nonzero exit, a refused policy) stays quarantined for the lead."""
+    if not listener.get("root_thread") or getattr(exc, "code", None) == "DAEMON_DRAINING":
+        return
     store = daemon.store
-    actor = store.get(listener["actor"])
-    code = getattr(exc, "code", type(exc).__name__)
-    current = store.get(actor.get("listener") or listener["id"])
-    current.update(state="quarantined", recovery_state="failed", recovery_error=code)
-    store.save(current)
-    for checkoutid in participants.checkout_ids(store, actor["unit"]):
-        store.unknown(checkoutid, "*", "listener recovery incomplete", {"listener": listener["id"], "code": code})
+    current = store.get(store.get(listener["actor"]).get("listener") or listener["id"])
+    run = store.get(current["run"])
+    info = failure_info(exc)
+    retryable = retryable_failure(info)
+    incident = startup_obligation(store, run["id"])
+    with store.transaction():
+        if not incident:
+            ident = uid("startup_recovery")
+            selected = list(unknowns or [])
+            if not selected:
+                selected = [store.unknown(key, "*", "listener recovery incomplete",
+                    {"listener": current["id"], "run": run["id"], "incident": ident, "code": info["code"]})
+                    for key in participants.checkout_ids(store, current["unit"])]
+            store.put("startup_recovery", ident, {"run": run["id"], "failed_listener": current["id"],
+                "generation": store.generation, "created": time.time(), "state": "pending",
+                "unknowns": selected, "resolutions": [], "reconstructed": reconstructed}, run["id"])
+            run["startup_recovery"] = ident
+            store.save(run)
+            incident = store.get(ident)
+        incident.update(error=info, retryable=retryable, listener=current["id"], last_failed=time.time())
+        store.save(incident)
+        current.update(state="quarantined", recovery_state="failed", recovery_error=info["code"],
+                       recovery_error_details=info, recovery_retryable=retryable)
+        current.setdefault("retry_at", time.time() + RECONCILE_RETRY_FIRST_S)
+        store.save(current)
+        store.event("listener/startup_quarantined", current["id"],
+                    {"incident": incident["id"], "unknowns": incident["unknowns"], "error": info, "retryable": retryable})
 
 
 async def recover_writers(daemon, plan):
@@ -1061,8 +1323,10 @@ def resolve_restored_parents(store):
             store.save(operation)
 
 
-def refuse_executing(store, checkout):
-    """A restore would race a write native may still finish for a quarantined patch."""
+def refuse_executing(store, checkout, paths=None):
+    """A restore must not race a call whose host can still write."""
+    from .lead_calls import refuse
+    refuse(store, checkout, paths, code="RESTORE_EXECUTING")
     executing = [o["id"] for o in store.live_operations(checkout) if o.get("executing")]
     if executing:
         raise CoordinatorError("RESTORE_EXECUTING", "A quarantined patch may still be writing; its paths stay held "
@@ -1151,8 +1415,10 @@ async def restore_unknown(daemon, params):
         raise CoordinatorError("RESTORE_SCOPE", "Name the known revision to restore, \"baseline\" for what the branch commit and "
                                "the index hold, or pass revisions {path: null} to remove a path both lack", {"path": path})
     checkout = store.get(row["checkout"])
+    refuse_executing(store, checkout["id"], [path])
     if await daemon.ledger.unwatched(checkout, [path]):
         async with daemon.ledger.lock(checkout["id"]):
+            refuse_executing(store, checkout["id"], [path])
             with store.transaction():
                 released = daemon.ledger.release(checkout, [path], "restore of a path outside the ledger")
         await daemon.ledger.notify_released()
@@ -1168,7 +1434,7 @@ async def restore_unknown(daemon, params):
         raise CoordinatorError("RESTORE_ACTIVE", "Interrupt active writers before restoring UNKNOWN")
     if daemon.custody.active(row["checkout"]):
         raise CoordinatorError("RESTORE_CUSTODY", "Uncertain command survivors must be reconciled before restoration")
-    refuse_executing(store, row["checkout"])
+    refuse_executing(store, row["checkout"], [path])
     # The branch commit and the index, not the tree recorded at registration: a path a later publication added is
     # missing from that tree but committed on the branch.
     base = baseline_of(*await asyncio.to_thread(gitio.entries_at, checkout["root"], path))

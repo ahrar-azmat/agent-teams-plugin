@@ -15,9 +15,12 @@ import uuid
 
 
 class CoordinatorError(RuntimeError):
-    def __init__(self, code, message, details=None, operational=False):
+    def __init__(self, code, message, details=None, operational=False, *, answered=False):
         super().__init__(message)
         self.code, self.details, self.operational = code, details or {}, operational
+        # Local validation failures also use refusal codes. Only a validated
+        # daemon error envelope proves that the coordinator answered this call.
+        self.answered = answered
 
     def envelope(self):
         return {"code": self.code, "message": str(self), "details": self.details,
@@ -261,10 +264,11 @@ class Client:
             raise CoordinatorError("RPC_ID", "Mismatched RPC response", operational=True)
         if "error" in response:
             error = response["error"]
-            if not isinstance(error, dict) or not isinstance(error.get("code"), str) or not isinstance(error.get("message"), str):
+            if (not isinstance(error, dict) or not isinstance(error.get("code"), str)
+                    or not isinstance(error.get("message"), str) or error.get("kind") not in ("refusal", "failure")):
                 raise CoordinatorError("RPC_RESPONSE", "Malformed coordinator error response", operational=True)
             raise CoordinatorError(error["code"], error["message"], error.get("details"),
-                                   error.get("kind") == "failure")
+                                   error.get("kind") == "failure", answered=True)
         if "result" not in response:
             raise CoordinatorError("RPC_RESPONSE", "Coordinator response has no result", operational=True)
         return response["result"]

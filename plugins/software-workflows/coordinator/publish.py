@@ -53,6 +53,10 @@ class Publisher:
                     raise CoordinatorError("BACKGROUND_TERMINAL", "Background terminal inventory is not empty")
         if self.daemon.custody.unit_active(unit["id"]):
             raise CoordinatorError("CUSTODY_HELD", "Command custody has not been reconciled")
+        from .lead_calls import refuse
+        from .participants import checkout_ids
+        for checkout in checkout_ids(self.store, unit["id"]):
+            refuse(self.store, checkout, code="UNVERIFIED_OPERATION")
         for operation in self.store.all("operation", unit["id"]):
             if allow_quarantined and operation["state"] == "quarantined" and not operation.get("executing"):
                 continue  # Reopening permits restoration, never sealing or publication.

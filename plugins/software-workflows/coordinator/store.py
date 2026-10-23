@@ -29,12 +29,18 @@ def fingerprint(pairs):
 
 # Partial indexes contain only live occupancy. Finished history advances the
 # durable clock instead of being reread for every lead Bash fingerprint.
+LEAD_COMPLETION_PENDING = "kind='lead_hook' AND json_extract(data,'$.execution.unadmitted_completion.state')='pending'"
+LEAD_BATCH_PENDING = "kind='lead_batch' AND json_extract(data,'$.state')='pending'"
+LEAD_BATCH_ITEM_PENDING = "kind='lead_batch_item' AND json_extract(data,'$.state')='pending'"
+LEAD_BATCH_LEGACY = "kind='lead_batch' AND coalesce(json_extract(data,'$.schema'),1)=1"
+
 WINDOW_ACTIVE = {
     "actor": "kind='actor' AND (json_extract(data,'$.active_turn') IS NOT NULL OR json_extract(data,'$.state')='running')",
     "operation": "kind='operation' AND json_extract(data,'$.state') IN ('prepared','allowed','running')",
     "custody": "kind='custody' AND json_extract(data,'$.state')!='released'",
     # A quarantined patch native may still be writing (ledger.quarantine executing=True).
     "executing": "kind='operation' AND json_extract(data,'$.executing') IS NOT NULL",
+    "lead_edit": "kind='lead_hook' AND json_extract(data,'$.execution.phase') IN ('admitting','open','settling')",
     "lead_hook": "kind='lead_hook' AND ((json_extract(data,'$.tool')='Bash' AND json_extract(data,'$.state')='observed') OR "
                  "(json_extract(data,'$.tool') IN ('Write','Edit','MultiEdit','NotebookEdit') AND json_extract(data,'$.state')='received'))",
 }
@@ -177,6 +183,10 @@ class Store:
                 ("lead_actor", "id", "kind='actor' AND json_extract(data,'$.kind')='lead'"),
                 ("lead_session_actor", "json_extract(data,'$.actor'),id", "kind='lead_session'"),
                 ("lead_hook_call", "json_extract(data,'$.tool_use_id'),id", "kind='lead_hook'"),
+                ("lead_completion_pending", "id", LEAD_COMPLETION_PENDING),
+                ("lead_batch_pending", "id", LEAD_BATCH_PENDING),
+                ("lead_batch_item_pending", "coalesce(json_extract(data,'$.retry_after'),0),id", LEAD_BATCH_ITEM_PENDING),
+                ("lead_batch_legacy", "id", LEAD_BATCH_LEGACY),
                 ("claim_checkout", "json_extract(data,'$.checkout'),id", "kind='claim' AND json_extract(data,'$.state')='held'"),
                 # Every native notification and hook finds its operation by call id; every admission
                 # checks the checkout's unreconciled operations.
@@ -276,7 +286,7 @@ class Store:
         SQL triggers advance counters in the same transaction as every record
         transition. Subtracting this hook's revision excludes only its own saves.
         """
-        for kind in ("lead_hook", "actor", "operation", "custody", "executing"):
+        for kind in ("lead_hook", "lead_edit", "actor", "operation", "custody", "executing"):
             query = "SELECT id FROM records INDEXED BY window_" + kind + " WHERE " + WINDOW_ACTIVE[kind]
             args = []
             if kind == "lead_hook":

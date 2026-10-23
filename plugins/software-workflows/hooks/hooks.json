@@ -21,7 +21,7 @@
             "type": "command",
             "command": "python3",
             "args": [
-              "${CLAUDE_PLUGIN_ROOT}/hooks/live_view_nudge.py"
+              "${CLAUDE_PLUGIN_ROOT}/hooks/office_autostart.py"
             ]
           }
         ]

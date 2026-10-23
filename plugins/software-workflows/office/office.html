@@ -61,6 +61,10 @@ a { color: var(--link); }
 #splitter { cursor: col-resize; background: var(--line); }
 #splitter:hover, #splitter.drag { background: #4b3f75; }
 #panel { background: var(--panel); display: flex; flex-direction: column; min-width: 0; overflow: hidden; }
+/* Expanded (⤢ or E, back with E or Esc): an open worker takes the whole window, its text kept to a readable width */
+#main.wide.reading { grid-template-columns: 1fr; }
+#main.wide.reading > #office, #main.wide.reading > #splitter { display: none; }
+#main.wide.reading #stream > *, #main.wide.reading .view.pad > *, #main.wide.reading #composer > * { max-width: 1180px; margin-left: auto; margin-right: auto; }
 
 /* ---------- office overlays ---------- */
 .plate { position: absolute; transform: translateX(-50%); pointer-events: auto; cursor: pointer; text-align: center; white-space: nowrap; line-height: 1.15; user-select: none; }
@@ -304,14 +308,14 @@ table.runs td.mono { font: 11.5px var(--mono); word-break: break-all; }
       <p>Click a worker to read their whole conversation as it happens: messages, reasoning, every command and its output, web searches, file changes. Then pause them, or send them more instructions, images and <span class="kbd">@</span> file references.</p>
       <p style="font-size:12.5px">A worker's role follows the Codex tool it runs, unless Claude names one with a <span class="kbd">Role: Product Manager</span> line in the task, or you pick one from the role menu in its header.</p>
       <div class="legend" id="legend"></div>
-      <p style="font-size:12.5px">Keys: <span class="kbd">[</span> <span class="kbd">]</span> previous / next worker · <span class="kbd">/</span> search · <span class="kbd">Esc</span> close · <span class="kbd">⌘</span>+<span class="kbd">Enter</span> send</p>
+      <p style="font-size:12.5px">Keys: <span class="kbd">[</span> <span class="kbd">]</span> previous / next worker · <span class="kbd">/</span> search · <span class="kbd">E</span> expand to full width · <span class="kbd">Esc</span> close · <span class="kbd">⌘</span>+<span class="kbd">Enter</span> send</p>
       <p style="font-size:12px;color:var(--dim)" id="logdir"></p>
     </div>
     <div id="detail" hidden>
       <div class="dh">
         <canvas id="avatar" width="14" height="20"></canvas>
         <div class="who"><div class="nm"><b id="d-name"></b><select id="d-role" class="chip rolesel" title="This worker's role in the office"></select><span id="d-phase" class="chip"></span><span id="d-status" class="pill"></span></div><div class="tt" id="d-title"></div></div>
-        <div class="dh-actions"><button class="btn warn" id="b-pause" hidden>⏸ Pause</button><button class="btn" id="b-close" title="Close (Esc)">✕</button></div>
+        <div class="dh-actions"><button class="btn warn" id="b-pause" hidden>⏸ Pause</button><button class="btn" id="b-wide" type="button" title="Read this worker at full width (E)">⤢ Expand</button><button class="btn" id="b-close" title="Close (Esc)">✕</button></div>
       </div>
       <div class="meta" id="d-meta"></div>
       <div class="tabs">
@@ -407,6 +411,8 @@ const clock = ts => ts ? new Date(ts * 1000).toLocaleTimeString(undefined, { hou
 function tok(n) { n = +n || 0; return n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(n); }
 const base = p => String(p || '').replace(/\/+$/, '').split('/').pop() || p;
 const home = p => String(p || '').replace(/^\/Users\/[^/]+/, '~');
+// Expanded and reading: the office floor (and the roster on it) is hidden behind the open worker
+function wideReading() { const m = document.getElementById('main'); return m.classList.contains('wide') && m.classList.contains('reading'); }
 function store(k, v) { try { if (v === undefined) return JSON.parse(localStorage.getItem('office.' + k)); localStorage.setItem('office.' + k, JSON.stringify(v)); } catch (e) { return undefined; } }
 function copy(text, what) { navigator.clipboard.writeText(text).then(() => toast(`Copied ${what || ''}`.trim())).catch(() => toast('Copy failed', 'bad')); }
 function toast(msg, kind) {
@@ -1016,7 +1022,7 @@ const Office = (() => {
   cv.addEventListener('mouseleave', () => { hover = null; tip(null); });
   new ResizeObserver(() => { relayout(); }).observe(box);
   requestAnimationFrame(frame);
-  return { update, reveal: id => { if (!desk.has(id)) Roster.open(true); } };
+  return { update, reveal: id => { if (!desk.has(id) && !wideReading()) Roster.open(true); } };
 })();
 
 /* the current step, from the live log's last line */
@@ -1061,7 +1067,8 @@ const Roster = (() => {
         h('div', { class: 'c' }, w.live ? dur(now() - (w.run_ts || w.first_ts)) : ago(w.last_ts), h('br'), base(w.cwd)));
     }));
   }
-  $('#b-roster').onclick = () => open(!el.classList.contains('open'));
+  // The roster sits on the office floor: asking for it while expanded brings the office back first
+  $('#b-roster').onclick = () => { if (wideReading()) $('#b-wide').click(); open(!el.classList.contains('open')); };
   $('#r-close').onclick = () => open(false);
   return { open, render };
 })();
@@ -1105,6 +1112,7 @@ const Panel = (() => {
     gen++; feeds = new Map(); actions = []; actionEls = new Map(); stick = true; unseen = 0;
     stream.replaceChildren(); $('#jump').hidden = true;
     $('#welcome').hidden = true; $('#detail').hidden = false;
+    $('#main').classList.add('reading');  // Expand applies only while a worker is open
     Composer.reset(worker);
     header(); showTab('stream');
     Office.reveal(id); Roster.render();
@@ -1113,6 +1121,7 @@ const Panel = (() => {
   function close() {
     gen++; S.selected = null; worker = null; shown = null; store('selected', null);
     $('#welcome').hidden = false; $('#detail').hidden = true;
+    $('#main').classList.remove('reading');
     Roster.render();
   }
   function sync() {
@@ -1393,8 +1402,10 @@ const Panel = (() => {
       sending: ['▶', a.kind === 'cancel' ? 'pausing…' : 'delivered — the continuation runs below'],
       done: a.kind === 'cancel' ? (a.run_status === 'cancelled' ? ['⏸', 'paused'] : ['⏸', `it had already stopped (${stInfo(a.run_status).label.toLowerCase()})`])
         : a.kind === 'steer' ? ['✓', 'entered the running turn'] : ['✓', 'continuation answered'],
-      delivering: ['▶', a.delivery === 'submitted' ? 'Codex has it — it enters the turn at its next model request…' : 'sending to the running turn…'],
-      held: ['⏳', 'not taken by the turn: ' + (a.error || '')], unconfirmed: ['?', 'unconfirmed: ' + (a.error || '')],
+      delivering: ['▶', a.delivery === 'submitted' ? 'Codex has it — it enters the turn at its next model request…'
+        : a.delivery === 'delivery_uncertain' ? 'its send went unanswered — the coordinator is checking whether Codex has it…' : 'sending to the running turn…'],
+      held: ['⏳', 'not taken by the turn: ' + (a.error || '')], unconfirmed: ['?', 'unconfirmed: ' + (a.error || '')], unproven: ['⚠', 'unproven: ' + (a.error || '')],
+      dropped: ['✖', 'not delivered: ' + (a.error || '')],
       continuing: ['▶', 'delivered — the continuation is still running below'],
       ended: a.run_status === 'cancelled' ? ['⏸', 'continuation paused before it answered'] : ['✖', `continuation ended: ${stInfo(a.run_status).label.toLowerCase()} — see the run below`],
       failed: ['✖', 'failed: ' + (a.error || '')], withdrawn: ['↩', 'withdrawn'],
@@ -1407,7 +1418,7 @@ const Panel = (() => {
       (f ? f.tail : stream).append(el);
       bump();
     }
-    const sig = a.status + (a.result || '').length + (a.error || '').length;
+    const sig = a.status + (a.delivery || '') + (a.result || '').length + (a.error || '').length;
     if (el._sig === sig) return;
     el._sig = sig;
     const thumbs = (a.images || []).map(p => h('img', { src: `/api/upload?name=${enc(p.split('/').pop())}&t=${enc(TOKEN)}`, alt: '' }));
@@ -1647,6 +1658,16 @@ function confirmBox(title, html, label, kind) {
   win.onchange = () => { S.win = win.value; store('win', S.win); };
   const ws = $('#ws'); ws.onchange = () => { S.ws = ws.value; store('ws', S.ws); if (S.lastState) applyState(S.lastState); };
   const q = $('#search'); q.oninput = () => { S.q = q.value; if (S.lastState) applyState(S.lastState); };
+  // Expand: the open worker at full width (the choice is remembered, and applies whenever a worker is open)
+  const main = $('#main'), wb = $('#b-wide');
+  function setWide(on) {
+    if (on) Roster.open(false);  // it would stay open, hidden with the floor, and take the next Esc
+    main.classList.toggle('wide', on); store('wide', on);
+    wb.textContent = on ? '⤡ Office' : '⤢ Expand';
+    wb.title = on ? 'Back to the office view (E or Esc)' : 'Read this worker at full width (E)';
+  }
+  wb.onclick = () => setWide(!main.classList.contains('wide'));
+  setWide(!!store('wide'));
   const nb = $('#b-notify'); nb.classList.toggle('on', S.notify);
   nb.onclick = async () => {
     if (!S.notify && 'Notification' in window && Notification.permission !== 'granted') { try { await Notification.requestPermission(); } catch (e) { /* ignore */ } }
@@ -1657,11 +1678,15 @@ function confirmBox(title, html, label, kind) {
     if ($('#modal').classList.contains('open')) return;  // a dialog's keys are its own; nothing moves under it
     const typing = /INPUT|TEXTAREA|SELECT/.test((document.activeElement || {}).tagName || '');
     if (e.key === 'Escape') {
-      if ($('#roster').classList.contains('open')) Roster.open(false); else if (!typing) Panel.close(); else document.activeElement.blur();
+      if (wideReading() && !typing) setWide(false);
+      else if ($('#roster').classList.contains('open')) Roster.open(false);
+      else if (typing) document.activeElement.blur();
+      else Panel.close();
       return;
     }
     if (typing) return;
     if (e.key === '/') { e.preventDefault(); q.focus(); }
+    if ((e.key === 'e' || e.key === 'E') && !e.metaKey && !e.ctrlKey && !e.altKey && main.classList.contains('reading')) setWide(!main.classList.contains('wide'));
     if (e.key === '[' || e.key === ']') {
       const list = S.visible; if (!list.length) return;
       let i = list.findIndex(w => w.id === S.selected);
@@ -1669,7 +1694,7 @@ function confirmBox(title, html, label, kind) {
       Panel.select(list[i].id);
     }
   });
-  const sp = $('#splitter'), main = $('#main');
+  const sp = $('#splitter');
   const pw = store('panelw'); if (pw) main.style.setProperty('--panel-w', pw + 'px');
   sp.addEventListener('pointerdown', e => {
     sp.setPointerCapture(e.pointerId); sp.classList.add('drag');

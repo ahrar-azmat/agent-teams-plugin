@@ -329,7 +329,7 @@ class Custody:
     def unit_active(self, unitid):
         return list(self.store.held_custody(unit=unitid))
 
-    async def acquire(self, actor, paths, cwd=None, mark=None):
+    async def acquire(self, actor, paths, cwd=None, mark=None, lead_call=None):
         """Claim these paths for the actor's unit. A path outside the ledger (ledger.unwatched) is neither claimed nor
         held against another unit's claim: nothing there is recorded, so nothing there refuses an edit (2.4.0-2.4.3
         claimed it, and another unit's edit of the same ignored file was refused CLAIM_CONFLICT). Those are returned
@@ -345,6 +345,9 @@ class Custody:
         normalized = {key: values for key, values in normalized.items() if values}
         outside = [qualified(key, path) for key, values in sorted(outside.items()) for path in sorted(values)]
         async with self.condition:
+            from .lead_calls import refuse
+            for key, values in groups.items():
+                refuse(self.store, key, values, lead_call, "RESTORE_EXECUTING" if mark else "CLAIM_CONFLICT")
             if self.store.get(actor["unit"])["state"] != "open":
                 raise CoordinatorError("UNIT_FROZEN", "Cannot claim paths for a sealed unit")
             from .participants import require_writable
@@ -391,9 +394,6 @@ class Custody:
     async def release(self, unit, paths=None, cwd=None):
         if self.unit_active(unit["id"]):
             raise CoordinatorError("CUSTODY_HELD", "Reconcile command custody before releasing claims")
-        for operation in self.store.all("operation", unit["id"]):
-            if operation["state"] not in ("verified", "reconciled", "denied", "resolved"):
-                raise CoordinatorError("UNVERIFIED_OPERATION", "Cannot release an unreconciled operation's claim")
         if paths is not None:
             if not isinstance(paths, list):
                 raise CoordinatorError("CLAIM_PATHS", "Handback paths must be a list or omitted for all claims")
@@ -402,6 +402,16 @@ class Custody:
             paths = grouped(self.store, actor, paths, cwd)
         released = []
         async with self.condition:
+            from .lead_calls import refuse
+            from .participants import checkout_ids
+            for key in checkout_ids(self.store, unit["id"]):
+                if paths is None or key in paths:
+                    refuse(self.store, key, None if paths is None else paths[key], code="UNVERIFIED_OPERATION")
+            # Admission could have begun while this release waited for the condition.
+            for operation in self.store.all("operation", unit["id"]):
+                if operation["state"] not in ("verified", "reconciled", "denied", "resolved"):
+                    raise CoordinatorError("UNVERIFIED_OPERATION", "Cannot release an unreconciled operation's claim",
+                                           {"operation": operation["id"]})
             with self.store.transaction():
                 for claim in self.store.all("claim", unit["id"]):
                     if claim["state"] != "released" and (paths is None or claim["path"] in paths.get(claim["checkout"], [])):
@@ -464,7 +474,11 @@ class Custody:
                     pending = [o for item in proposed for o in self.store.live_operations(item["checkout"])
                                if o["kind"] in ("patch", "lead-edit", "restore") and (o["state"] in ("prepared", "allowed", "running") or o.get("executing"))
                                and effect_conflict(item, path_effect(self.store.get(item["checkout"]), o["paths"], o["id"]))]
-                    if not conflicts and not pending:
+                    from .lead_calls import active, describe
+                    lead_pending = [r for item in proposed for r in active(self.store, item["checkout"])
+                                    if not r.get("paths") or effect_conflict(item, path_effect(
+                                        self.store.get(item["checkout"]), r["paths"], r["id"]))]
+                    if not conflicts and not pending and not lead_pending:
                         if process_baseline is None:
                             process_baseline = await asyncio.to_thread(baseline)
                             continue  # Recheck every checkout after the asynchronous collection.
@@ -475,7 +489,9 @@ class Custody:
                         request.update(state="denied", holders=[r["unit"] for r in conflicts])
                         self.store.save(request)
                         raise CoordinatorError("CUSTODY_WAIT", "Custody wait reached the safe hook deadline; retry or message the holder",
-                                               {"holders": [r["unit"] for r in conflicts]})
+                                               {"holders": [r["unit"] for r in conflicts],
+                                                "operations": [o["id"] for o in pending],
+                                                "lead_edits": [describe(r) for r in lead_pending]})
                     try:
                         await asyncio.wait_for(self.condition.wait(), min(left, 1))
                     except asyncio.TimeoutError:

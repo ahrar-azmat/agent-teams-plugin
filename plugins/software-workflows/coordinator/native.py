@@ -134,7 +134,7 @@ FIELDS = {
     "thread/start": ({"cwd", "model", "modelProvider", "approvalPolicy", "sandbox", "config",
                       "dynamicTools", "developerInstructions", "ephemeral", "historyMode", "projectId", "runtimeWorkspaceRoots"}, set()),
     "thread/resume": ({"threadId", "cwd", "model", "modelProvider", "approvalPolicy", "sandbox",
-                       "config", "developerInstructions", "runtimeWorkspaceRoots"}, {"threadId"}),
+                       "config", "developerInstructions", "runtimeWorkspaceRoots", "excludeTurns"}, {"threadId"}),
     "thread/read": ({"threadId", "includeTurns"}, {"threadId"}),
     "thread/list": ({"cursor", "limit", "ancestorThreadId", "archived", "sortDirection"}, set()),
     "turn/start": ({"threadId", "input", "clientUserMessageId", "approvalPolicy", "sandboxPolicy"}, {"threadId", "input"}),

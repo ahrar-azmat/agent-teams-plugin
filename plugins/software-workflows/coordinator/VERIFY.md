@@ -12317,3 +12317,295 @@ the marketplace.
 
 ### Known limits
 Those of CHANGELOG.md, 2.4.4.
+
+## 2.4.5
+
+Every change below was run for real on the checkout: one codebase, no copies, disposable state for every daemon,
+and native writers on the installed Codex 0.163.0 app-server with the fixture model. Reds are 2.4.4's bytes: the
+released tree for the office, and 2.4.4's logs or the kept export for the coordinator. Logs are under the lead's
+scratchpad:
+- `r245-unit-a/logs` (unit A's writer runs);
+- `r245-unit-b-2244/logs`, `r245-unit-b-round2-2355/logs`, then `r245-unit-b-round3/logs` to
+  `r245-unit-b-round9/logs` (unit B's writer runs, rounds 1 to 9);
+- `r245-lead` (the lead's re-runs);
+- `office245` (the office hook).
+
+No test files were added.
+
+### Stop fence (unit A, property 1)
+| Case | 2.4.4 | 2.4.5 |
+|---|---|---|
+| turn-48 race: forced switch, 13 writers / 4 checkouts, `W244_RECONCILE_IN_DRAIN=1` (a reconcile asked for while the stop drains) | stop accepted, then `ended leftover app-server 2443` (`t48-red.log`); exit 0 hid it | the late reconcile refused `DAEMON_DRAINING`; stop accepted; no leftover app-server (`t48-green.log`). The lead's re-run: stop accepted, patch verified, `exit 0`, no app-server left (`r245-lead/t48.log`) |
+| `W244_GAP_IN_DRAIN=1`, 13 / 4 | stop accepted; no leftover | the same |
+| `W244_STOP_PROBE=1 W244_CANCEL_IN_DRAIN=1`, maintlost | `daemon gone: True; app-servers left: []` | the same; the next explicit resume verified `VALUE = 100`, 0 UNKNOWN |
+| a reconcile held behind its run lock, its caller cancelled (26 writers) | — | stop `NOT_QUIESCENT` naming the run and listener, `listener_reconciles: 1`; after the release the cancelled caller finished, the count returned to 0, and the stop succeeded |
+| a quarantine retry made due while the daemon closes | — | `{"code":"DAEMON_DRAINING","retry_due":true}` |
+
+### Startup recovery (unit A, properties 2 and 3)
+Forced switch, 13 writers / 4 checkouts. `W245_FAILURES=1` loses selected `thread/resume` answers at import: real
+native resumes, with their responses discarded (simulated lost answers, not observed 60 s timeouts). The writers are:
+two transient, one persistent and one policy mismatch. The early lead resume was suppressed, so no lead call was
+made during recovery.
+
+| Case | 2.4.4 | 2.4.5 |
+|---|---|---|
+| the four failed writers | 4 quarantines remain; their 4 startup `*` UNKNOWNs unresolved; no resolution (`startup-red.log`) | both transient writers healed on the current hooks by 62.7 s from `recovery/start` (initial pass 60.8 s). Each was resolved only after its native history completed and a 3,700-path scan of its checkout: `recovery_resolution`, found 0. The persistent writer stayed quarantined after 5 attempts, 6, 11, 20 and 40 s apart. The policy mismatch stayed quarantined after 1 attempt (non-retryable). Exactly the 4 original UNKNOWNs remain in history: 2 resolved, 2 open (`startup-green.log`). The lead's re-run gave the same, with no lead resume sent (`r245-lead/startup.log`, `startup.observe.json`) |
+| 2.4.4 records, adopted at startup (`W245_LEGACY=1`, 6 writers / 2 checkouts) | — | older incidents adopted; recoverable writers healed; two existing lead narrowing links preserved; an unrelated checkout-wide UNKNOWN kept; changed bytes left as a path UNKNOWN (`legacy-green2.log`; the first attempt's fixture lacked a lead actor and is not counted) |
+| replaced predecessors (26 writers) | 26 proven replaced listeners left `reconciling` | 0; predecessors `dead`/`replaced` with `replaced_by`; the legacy run repaired 3 historical ones from their successor lineage |
+
+26 writers / 4 checkouts of 3,700 files, before and after (`measure26-before.log`, `measure26-after.log`, both exit 0):
+| Measurement | 2.4.4 | 2.4.5 |
+|---|---|---|
+| ready from daemon launch | 1.6 s | 1.6 s |
+| initial recovery complete from launch | 66.4 s | 68.5 s |
+| slowest root resume | 0.117 s | 0.094 s |
+| native resume timeouts, quarantines | 0, 0 | 0, 0 |
+| peak overlapping writer recoveries / simultaneous root resumes | 26 / 4 | 26 / 5 |
+| sampled load | 6.9-10.7 | 6.3-18.7 |
+
+These measurements show no overall speedup. They also show no need for a concurrency bound or a longer native
+timeout, so neither was added. The fixture's histories are shorter than those of the live incident.
+
+### Lead file calls (unit B, a Codex writer)
+Round 1's reds ran on the installed 2.4.4 cache, checked byte for byte against 5f82588; its greens and every later
+run ran on the checkout. Each later round's reds ran on the previous round's tree. The runs used either:
+- real `claude -p` sessions (2.1.306, `--debug-file` in the work dir so only the run's own process is signalled); or
+- the real hook entry point run by /usr/bin/python3 (3.9), with payloads shaped as 2.1.306 sends them.
+
+Each harness adaptation was made in memory and is recorded in its round's `acceptance-report.log`.
+
+A Write held after admission: a second PreToolUse hook on Write sleeps 150 s (`r244/w-lead/scripts/r4_exec_host.py`,
+`r3_prompt_host.py`, `r6_interrupt.py`).
+| Case | 2.4.4 | 2.4.5 |
+|---|---|---|
+| r3-other: at 125 s a handback, then another lead's Write of the path; then the Post | quarantined; the handback refused; the other lead's Write denied; after the Post `uncertain`, 1 UNKNOWN | still `prepared`; the handback refused `UNVERIFIED_OPERATION` ("may still write"); the other lead's Write denied ("A lead file call still holds this path"); after the Post `verified`, exact. After the call ended, the handback passed, the denied call's replay stayed denied, and the other unit's new Write verified |
+| r4-lease: a legacy writer's tree lock at 3 s, 125 s and after the call | taken each time: the lease not held | refused at 3 s and 125 s (the lease held); taken after the Post |
+| r4-stop: `daemon/stop` at 125 s | accepted | `NOT_QUIESCENT`, `lead_edits` naming the call and its host; accepted after the Post |
+| r4-restore: at 125 s a restore of the path, which holds an earlier UNKNOWN | ran (`resolved`); the late Write then failed the host's staleness check | refused `RESTORE_EXECUTING`; after the Post the edit verified, then the restore resolved |
+| r4-window: another lead's Bash at 125 s | given a quiet window and `lead-command` credit; the edit later found as an UNKNOWN "before lead Bash" | no window (`UNKNOWN-context-only`); the edit verified after its Post; the other lead's next Bash got its window and credit |
+| r6-prehook: an interrupt (`control_request`) 5 s after admission | `prepared` until 125 s, then quarantined with an UNKNOWN | ended from the transcript within 10 s: `no_effect`, nothing unresolved, the lease released |
+| r4-kill: the host SIGKILLed at 125 s | quarantined at 120 s; its UNKNOWN stays | 15 s after the kill: `no_effect` ("host exited"), nothing unresolved |
+| partial-r4-killearly: partial bytes written, then the host SIGKILLed 3 s after admission | still `prepared` 5 s after the kill; stop `NOT_QUIESCENT` until the 120 s pass | 5 s after the kill: `failed`, quarantined ("host exited; changed or partial"), an UNKNOWN at t.txt; stop accepted |
+| recovery-r4-lease: the daemon's worker killed while the Write is held | — | the restarted daemon lists the call in `lead_edits`, refuses a stop and keeps the lease (a legacy writer's tree lock refused at 125 s). It quarantines the edit ("lead call interrupted by daemon replacement; awaiting host end"); after the Post t.txt stays UNKNOWN, and the lease is released |
+
+The twelve lead-hook cases (`r244/w-lead/scripts/leadhooks_check.py`, from 2.4.4): denied, deniedwrite and tail are
+identical to 2.4.4. ignored, stale, editfail, editdenied, claimed, headonly and headgone give 2.4.4's outcomes, each
+call now ending `settled`. In prompt and handback a permission prompt stays open for 125 s: 2.4.4 quarantined the edit
+and left 3 and 2 UNKNOWNs; 2.4.5 verifies it exactly, with 0 UNKNOWNs. Round 2 gave round 1's results in all twelve
+(`case-comparison.log`).
+
+Round 2, from round 1's tree to the final one:
+| Case | Round 1 | Final |
+|---|---|---|
+| stopped: the daemon stopped, two lead Writes | both denied ("Coordinator admission was not confirmed"), no warning | both run, one warning ("Writer coordinator is unavailable…"); the next reconcile records t.txt UNKNOWN |
+| operational: injected recovering, lease, malformed and lost answers | malformed and lost denied | all four run; the next reconcile records UNKNOWNs where nothing proves the change |
+| malformed-error: a daemon error without `kind` | denied ("malformed error without kind") | runs, with the warning |
+| startup: a lead call that ended before a restart, its file unreadable (EACCES) | startup failed `DAEMON_STARTUP` (PermissionError); stop refused `{recovery: 1}` | ready; another checkout served; the call held with `observation_problem`, settled at its Post; stop accepted |
+| terminal: four 2.4.4 lead-call records left `prepared` after their operations ended (verified, denied, resolved, reconciled) | taken as open calls; stop refused `NOT_QUIESCENT` | one `verified`, three `no_effect`; 202 receipts before and after; stop accepted |
+| legacy: the installed 2.4.4 hook's Pre against the final daemon, no Post | held past 123 s; lease held; stop refused | released at 120 s (`legacy availability limit`), an UNKNOWN at t.txt; the lease free; stop accepted |
+
+The forced switch (2.4.3 to the checkout, 13 writers / 4 checkouts, a reconcile injected into the drain) ran in both
+rounds: patch verified, `VALUE = 100`, stop accepted, no app-server left.
+
+Round 3 (`r245-unit-b-round3/logs`), from round 2's tree to the final one. "2.4.4 hook" and "2.4.4 daemon" are the
+installed 2.4.4 cache, byte-identical to 5f82588:
+| Case | Round 2 | Final |
+|---|---|---|
+| p1: the 2.4.4 hook's second Write of a path an open call of the same session holds; one while the first call is still admitting (no unit yet) | a warning (`OPERATION_BUSY`), and the Write runs | denied: `CLAIM_CONFLICT` naming the holder |
+| p1: the current hook, same session; the 2.4.4 hook, another session | denied | denied |
+| extra-p1-replay: a replay of the refused call; changed input for an open call | — | denied |
+| p2: a Write whose admission failed operationally (the lease), then its Post, no later scan | nothing recorded (heads `[]`) | an UNKNOWN at the Post; a repeated Post records nothing more, even after the file changes again |
+| p2: the same call ended by its batch; a failed tool with unchanged bytes | nothing; nothing | an UNKNOWN at the batch; nothing |
+| extra-p2-refusal-retry: a refusal the 2.4.4 hook lets run; a refusal with only a batch; an unreadable target | — | an UNKNOWN at its Post; nothing; held `pending` (PermissionError) with nothing held, reconciled by the observer after `chmod 644` |
+| extra-p2-refusal-retry-settled-startup: the duplicate Post after a restart | — | inert: the same one UNKNOWN |
+| p3: an endpoint manifest naming another state root; the state directory at 0755; two calls each | denied, no warning | runs, one warning per session; the manifest unchanged, no daemon event; no socket connect (extra-p3-no-rpc) |
+| p4: the current hook against the 2.4.4 daemon: a Write's Pre and Post; a prepared call's batch | a false warning; the marker kept | no warning; the marker removed; the receipt exact |
+| extra-p4-unrecorded / extra-p4-malformed-modern: 2.4.4's `{coordinated, state: "unrecorded"}` batch; five malformed modern replies | — | the marker removed / each warns and keeps the call open, and the genuine Post settles it |
+
+The 25 regressions (the twelve lead-hook cases, the six round-2 cases, r4-lease, r4-stop, r4-restore, r4-kill,
+r6-prehook, r3-other, the forced switch) gave round 2's results. The one difference is intended: green-operational's
+lease.txt is UNKNOWN at its Post, not at the next scan (`regression-comparison.log`).
+
+Round 4 (`r245-unit-b-round4/logs`), from round 3's tree to the final one. Each call's Pre never reached the daemon:
+| Case | Round 3 | Final |
+|---|---|---|
+| p5-legacy: the Pre fails locally (an endpoint manifest naming another state root) and the Write runs while a legacy writer holds the tree's lock; then its Post, its batch and a repeated Post | the Post closed the call "admission refused" (`EXCLUSIVE_WRITER`), nothing recorded and nothing left to retry; the batch recorded nothing | an UNKNOWN at t.txt at the first Post, with no actor, unit, claim, operation or hold; the legacy writer kept its lock; the batch and the repeated Post changed nothing |
+| p5-stopped: the daemon stopped at the Pre and running at the Post; an unrelated file changed too | the Post created an actor and a unit, and their attach scanned both files | only t.txt UNKNOWN at the Post; the unrelated file not read; nothing created or held |
+| p5-others: a failed tool with unchanged bytes; a target at chmod 000 | an actor and a unit created; the unreadable call held as an open execution | nothing recorded or created; the unreadable call `pending` (PermissionError) and holding nothing, then reconciled by the observer after `chmod 644`, one UNKNOWN |
+| p5-batch: a batch alone with no marker, the bytes changed; and a batch sent straight to the daemon | the hook's batch sent nothing; the direct one went through admission and its attach scanned both files | the hook's batch records t.txt UNKNOWN at once; the direct one only its own file; nothing created or held |
+| extra-p5-outside: an ignored target at chmod 000; an unregistered path's Pre, Post, batch and direct dispatch | — | acknowledged `outside`, no UNKNOWN; no record |
+| extra-p5-pending-restart: a pending unreadable observation across a daemon stop and restart | — | still pending, holding nothing; once readable, acknowledged (the restart's recovery scan had recorded its one UNKNOWN) |
+| extra-p5-scope-failures: an unreadable parent directory; `.git` missing for a while | — | each pending, then reconciled at its recorded path once restored |
+| extra-p5-legacy-terminal: a 2.4.4 `unrecorded` record without execution metadata, then changed bytes, a Post and a batch | — | inert: nothing read |
+
+The 35 regressions (round 3's 25 and its ten p1–p4 and extra cases) gave round 3's results, with one intended change:
+in green-operational the two calls whose admission failed (recovering.txt, malformed.txt) no longer create a unit,
+and their UNKNOWNs read "lead post hook without prepared intent" (`regression-comparison.log`).
+
+Round 5 (`r245-unit-b-round5/logs`), from round 4's tree to the final one. A batch now goes as one `lead-hook/batch`
+request, which the daemon records whole before it reads any file:
+| Case | Round 4 | Final |
+|---|---|---|
+| p6-stopped: a batch of four calls already settled at their Posts and one Write whose Pre and Post never reached the daemon; the daemon's worker stopped while the hook runs, continued after it exits | the hook took 12.06 s and never sent the fifth call: nothing recorded | the hook returned in 3.06 s; once the worker continued, the fifth file was UNKNOWN with no further hook event, and nothing was created or held |
+| p6-cost: batches of 1, 3 and 5 settled calls through the real hook entry point, median of 10 | with the worker stopped: 3.05, 9.06 and 12.07 s | 0.060, 0.060 and 0.059 s; with the worker stopped about 3.06 s each (the installed 2.4.4 hook, which asks about none: 0.037, 0.038 and 0.043 s) |
+| p6-mixed, p6-newhook-old, p6-oldhook-new, p6-drain: an admitted Write whose Post was lost, two marked Bash calls and a completion-only Write in one batch; the current hook against the installed 2.4.4 daemon and the reverse; a batch while draining | the same outcomes | the same outcomes: the 2.4.4 daemon answers `METHOD` and the hook asks per call |
+| p7: a 2.4.4 `failed` Write (its operation quarantined, its UNKNOWN recorded) imported at startup; its delayed batch, and separately a delayed Post, while a restore of the path runs | rewritten `unrecorded`, its operation link dropped, a second UNKNOWN; the restore failed `REVISION_CHANGED` | kept `failed` with its operation; nothing recorded; the restore resolved to the baseline |
+| p7-states: 2.4.4 `no_effect`; `uncertain` after a failed Post verification; `uncertain` from the 120 s pass | the failed-Post `uncertain` imported as an open call | the first two kept as they were, holding nothing; only the 120 s one stays open, until its Failure ends it |
+
+Round 6 (`r245-unit-b-round6/logs`), from round 5's tree to the final one. The hook now writes each batch to a
+private outbox in the state directory before its first daemon call:
+| Case | Round 5 | Final |
+|---|---|---|
+| p8-fallback: the p6-stopped batch against the installed 2.4.4 daemon, which answers `METHOD`, its worker then stopped; a final-tree daemon replaces it | the hook's per-call fallback ran out of time (12.07 s); the fifth call never recorded | the fifth call recorded from the outbox by the replacement: UNKNOWN, nothing held, no further hook event |
+| p8-absent / p8-replacement: no daemon at the batch, then one started; the worker stopped before it reads the request, then replaced | the fifth call never recorded | recorded from the outbox, once |
+| p9-gitstate: the lead's probe, a denied Write to `.git/info/exclude`, then its batch | its delivery pending with `GIT_STATE` at +21 s, retried every pass (worker CPU 0.06 s per 20 s, against 0.02 s idle), again after a restart | ended with its refusal at once; 0.02 s CPU per 20 s; nothing pending after a restart |
+| p9-refusal: a Bash call's batch with rewritten input | pending with `LEAD_HOOK_REWRITTEN` at +21 s | ended with its refusal at once |
+| p9-ack: a failed save of a batch acknowledgment (injected) | `background/failure`; the lead-call observer gone, so a later call stayed open despite its transcript result | the observer kept running; the later call settled from its transcript, `no_effect`, nothing held |
+| p10: a batch of 25 settled 32 KiB Writes and one unreadable target | 350 MB of JSON decoded on the event loop in a 4 s retry window, 28 reconciliations; 834 KB stored, every input kept | nothing decoded and one reconciliation in the same window; 17 KB stored, no input kept |
+| extra-slow-independent: one batch's file reads held behind an injected gate | — | another open call settled from its transcript in 0.25 s meanwhile |
+| extra-round5-header-migration: a completed round-5 batch record | — | converted at startup to compact items, its lead-call records unchanged |
+
+The 55 regressions (round 5's 43 and its twelve p6 and p7 cases), and unit A's forced switch, gave round 5's results.
+The only differences are the batch records' new shape (`regression-comparison.log`).
+
+Round 7 (`r245-unit-b-round7/logs`), from round 6's tree to the final one:
+| Case | Round 6 | Final |
+|---|---|---|
+| p11-restart / p11-poll: the real hook SIGKILLed after its outbox is staged and before it is published; then a daemon restart, or no restart | the stage left for good; the fifth call never recorded | the fifth call recorded (UNKNOWN), the stage removed, the four settled calls unchanged, nothing held |
+| p11-incomplete: a dead producer's stage with two complete items and a truncated third | nothing recorded; the stage left | the two recorded, the third discarded, the stage removed |
+| p11, a live producer | — | its stage untouched through the observer's scans |
+| extra-p11-publication-error: the publishing rename fails, the daemon stopped | — | the stage kept; at startup the fifth call recorded and the stage removed |
+| p12: an admitted Write whose first batch settlement fails and whose next read stalls; another checkout's call ending through its transcript | 28 reads in 6.7 s; the other call still open after 2.0 s | 3 reads in that time, 3 s apart; the other call settled in 0.27 s while the read stalled |
+| p13: all 18 default executor workers held in slow file reads | `daemon/status` timed out (0.6 s); a conflicting Write's Pre took 3.09 s and ran with a warning instead of being refused | `daemon/status` in 1.4 ms; the conflicting Pre refused in 0.07 s |
+
+The 67 comparison runs (round 6's 55 regressions and its twelve focused runs) gave round 6's results, and unit A's
+forced switch passed (`regression-comparison.log`).
+
+Round 8 (`r245-unit-b-round8/logs`), from round 7's tree to the final one:
+| Case | Round 7 | Final |
+|---|---|---|
+| p14-post: an admitted Write whose observer job is held inside its transcript read (an injected gate), the file written, then its real PostToolUse | the Post took 3.06 s and ran with the availability warning; the call stayed open, its hold and lease kept and the stop refused; on release the old probe's cursor was applied | the Post answered in 0.05 s, verified, nothing held, the stop accepted, while the read stayed held; on release, nothing changed |
+| p14-failure / p14-batch / p14-stop: the same, ended by a PostToolUseFailure, by a batch, or with a `daemon/stop` | — | `no_effect` in 0.06 s; verified in 0.07 s; the stop accepted, each while the read stayed held |
+| p14-stale / p14-error: a probe result, or a probe error, made stale by a newer record | the stale result applied: the call ended failed with an UNKNOWN | discarded; the call ended by its own Post |
+
+The 74 comparison runs (round 7's seven focused runs and its 67) gave round 7's results (`regression-comparison.log`).
+
+Round 9 (`r245-unit-b-round9/logs`), from round 8's tree to the final one:
+| Case | Round 8 | Final |
+|---|---|---|
+| p15-stop: p14-stop with the transcript read kept held after the stop is accepted; then a replacement daemon on the same state | the old worker stayed alive, holding `worker.lock`; the replacement failed `DAEMON_UNRESPONSIVE` | the old worker exited in 0.26 s; the replacement served in 0.94 s; the read's late result changed nothing |
+| p15-retry / p15-batch: the held read, and the call's first settlement failing (an unreadable file); then the file made readable | no retry while the read stayed held: the call kept its hold, lease and stop blocker | the Post's (or the batch's) settlement retried after 3.2 s and verified, with nothing held, while the read stayed held |
+
+The first p15-retry and p15-batch runs exited 1, with the same results. They checked the checkout's lease as the
+call settled, but the lease is freed by the next 1 s maintenance pass, as on 2.4.4 (`daemon.py`, `maintenance`).
+`final-green-p15-retry` and `final-green-p15-batch` wait for it within the same 4.5 s. No code changed between the
+two, and both logs are kept.
+
+The 80 comparison runs (round 8's six p14 runs and its 74) gave round 8's results (`regression-comparison.log`).
+
+The lead re-ran the decisive runs from each round's recorded commands (`r245-lead/rerun.py`, the push gate stripped,
+each case's leftover fixture processes ended):
+- round 3's on round 3's tree: 29 of 35 before round 4 replaced it, all exit 0;
+- round 4's on round 4's tree: 38 of 43, all exit 0, before round 5 replaced it;
+- round 6's twelve focused runs on round 6's tree (`r245-lead/rerun6`): all twelve gave the writer's results.
+  - In p8-fallback, p8-absent and p8-replacement, the fifth call was reconciled from the batch, with an UNKNOWN,
+    nothing held, and the four settled calls unchanged.
+  - The two refusals ended at once (0.02 s CPU per 20 s).
+  - p10 decoded nothing in its retry window and kept 114 + 16,895 bytes.
+- round 7's on round 7's tree (`r245-lead/rerun7`): 52 of 74, all exit 0, before round 8 replaced it;
+- round 8's on round 8's tree (`r245-lead/rerun8`): 31 of 80, among them the six p14 runs, all exit 0, before round 9
+  replaced it;
+- round 9's 83 on the final tree (`r245-lead/rerun9`), and its two `final-green` p15 runs (`r245-lead/rerun9b`).
+  Every outcome was the writer's, compared line by line with generated ids, times, pids and work dirs normalized
+  (`r245-lead/compare_logs.py`, `rerun9/compare.txt`). 69 of the 85 logs matched exactly. The others differed in
+  random lease ids, socket dirs and thread names, and in timing:
+  - an observation problem recorded one observer pass earlier (p1-replay, p13);
+  - two UNKNOWNs recorded in the other order (p6-mixed);
+  - p10's first decode count (52 against 78), with nothing decoded in its retry window or on the event loop in both;
+  - the processes in a killed session's group (r4-kill).
+
+  In p15-stop the old worker exited in 0.26 s with the read still held, and the replacement served in 1.00 s. In
+  p15-retry and p15-batch the failed settlement was retried after 3.21 and 3.19 s and verified: nothing held, the
+  lease freed, the read still held, and its late result changed nothing. The first p15-retry and p15-batch runs
+  exited 1, as the writer's did.
+
+The lead's probes on round 5's tree (`r245-lead/batch_gitstate.py`, `batch_refusal.py`) found the refusal retried
+forever; round 6 fixed it.
+
+The coordinator review (Codex code_review, session 01a14eac) of unit B, and what was done:
+| Finding | Done |
+|---|---|
+| HIGH (turn 49): a Pre hook Claude Code times out at 15 s lets the call run without admission | kept as a known limit (CHANGELOG.md): the plugin's hooks set no `onFailure: "block"` (supported by Claude Code 2.1.306), as a hook that cannot finish counts as an unavailable coordinator, and a broken `python3` would block every lead edit |
+| MEDIUM (turn 49): one call's unreadable file failed startup recovery for every checkout | settlement isolated per call, retried by the observer (the startup row) |
+| MEDIUM (turn 49): a 2.4.4 lead-call record left `prepared` after its operation ended held its paths for good | it takes its operation's outcome (the terminal row) |
+| HIGH (turn 50): same-session and admitting overlaps were refused `OPERATION_BUSY`, which 2.4.4's hook does not enforce | `CLAIM_CONFLICT` naming every holder (p1) |
+| MEDIUM (turn 50): a call allowed after a failed admission was not reconciled at its Post | reconciled at its Post, once, committed with its acknowledgment (p2) |
+| MEDIUM (turn 50): errors raised by the hook's own checks denied the call | only a refusal the daemon answered denies (p3) |
+| LOW (turn 50): a 2.4.4 daemon's replies read as unavailable | accepted (p4) |
+| MEDIUM (turn 51): a completion whose Pre never reached the daemon went through admission first, and a refused admission there (a legacy writer's lock) discarded its bytes, with nothing left to retry | such a completion is recorded directly, with no admission (round 4, the p5 rows) |
+| MEDIUM (turn 52): a batch's time could run out on calls already settled, so a later call whose Pre and Post never reached the daemon was never sent | one request carries the whole batch, recorded before any file is read (round 5, p6) |
+| MEDIUM (turn 52): a late Post or batch of a call 2.4.4 had already settled rewrote its record, dropped its operation and read the file again, which could fail a restore | 2.4.4's completed states are recognized and kept (round 5, p7) |
+| MEDIUM (turn 53): with a 2.4.4 daemon answering, the per-call fallback still dropped the calls its time did not reach | the outbox, kept until a daemon acknowledges each call (round 6, p8) |
+| MEDIUM (turn 53): a failed save in the batch bookkeeping could end the lead-call observer for good | each batch attempt runs on its own; the observer survives (round 6, p9-ack) |
+| MEDIUM (turn 53): each item re-read and rewrote the whole batch, keeping every input | one record per item, compacted when it ends (round 6, p10) |
+| The lead's own (round 5): a refusal that can never change, such as `GIT_STATE`, was retried forever | a refusal ends the item (round 6, p9-gitstate, p9-refusal) |
+| MEDIUM (turn 54): a hook killed between staging and publishing its outbox stranded those completions | stages are named by their producer's process identity and recovered once it is gone (round 7, p11) |
+| MEDIUM (turn 54): an admitted call's settlement retry ran inline on the shared observer, every pass | every settlement is its own job, with a 3 s cooldown (round 7, p12) |
+| MEDIUM (turn 54): round 6 decoded every RPC on the thread pool that file reads use | requests are decoded inline again, as on 2.4.4 (round 7, p13) |
+| MEDIUM (turn 55): round 7's job read the transcript inside the call's lock, so a stalled read held up that call's own Post | the read happens before the lock, and a stale result is discarded (round 8, p14) |
+| MEDIUM (turn 56): a stalled read kept the stopped worker alive, so no replacement could start | reads run on daemon threads that nothing waits for (round 9, p15-stop) |
+| MEDIUM (turn 56): a stalled read held the call's only job, so a failed settlement was never retried | reads and settlements have separate jobs (round 9, p15-retry, p15-batch) |
+
+Turn 57, of round 9: "Ship it", no findings, the hypothesis that unit B is ready to ship CONFIRMED. Codex also
+matched the 80 comparison runs against round 8's, and found no earlier finding still standing.
+
+The lead's diff reading also changed round 1, which the review did not flag. Round 1 denied a lead's file call
+whenever the coordinator was unavailable, which went beyond its charter. It could also hold a legacy hook's call
+forever. Round 2 restored the availability rule and added the 120 s legacy limit (the stopped and legacy rows).
+
+### The Codex Office (unit C, the lead)
+Run against a scratch office on port 8799 with its own data directory, through the real hook entry point (PreToolUse
+JSON on stdin, python3). A browser stub (`BROWSER`) records each open. Every row ran on the final code, after the
+review's fixes.
+
+| Case | Result |
+|---|---|
+| first Codex call of a session; a second call; a new session | started and opened once; nothing; opened once more |
+| office killed; office whose recorded Python was removed (found by the session's 10-minute full check); `off`; an invalid value | restarted without a new tab; replaced without a new tab; nothing started and no marker; one message per session naming the setting |
+| the office's environment (`ps -E`), started from a hook carrying `CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, `CODEX_GATE_SESSION`, `CLAUDE_PLUGIN_ROOT`, a gate shim (`git` beside `../push_gate.py`) and a gate farm on PATH | none of those variables; PATH without the shim and the farm. A plain directory holding a `git` script is not a shim and stays on PATH |
+| a `subprocess.py` planted in the session's working directory | not imported (`-I`, run from the office's folder); office up, opened once |
+| a start that fails in the office (`office/office.log` a directory), three calls, then repaired | each failure left the marker empty (not done) and wrote `autostart.failed`, and `autostart.log` held the failure. The person was told on the second call only. The call after the repair started the office, opened it once, wrote `done` and cleared `autostart.failed`; a later call did nothing |
+| a start the hook cannot spawn (`office/autostart.log` a directory), two calls, then repaired | the same call told the person, naming `IsADirectoryError` and the path; the marker stayed empty and `autostart.failed` was present; the second call was silent. After the repair the next call started the office and opened it once; a later call did nothing |
+| an empty, unlocked marker (a hook that died before spawning); a start SIGKILLed while it waited 25 s for `office.lock` held by another process | each taken over by the next call, which opened the office once. A second call during the wait found the claim locked and opened nothing |
+| four calls of a new session at once | one open; marker `done` |
+| an office running; `office.lock` held 45 s by another process; a new session's call, a second call during the hold, then the release | the start gave up after 30 s ("held ... for 30 s" in `autostart.log`) and opened nothing; the marker stayed empty. After the release the waiting start ran, opened the office once and wrote `done`; a later call did nothing |
+| an empty marker 40 days old, taken over with the daily sweep due (`.swept` absent); another session's empty marker 40 days old | the taken-over marker kept (touched, and locked), the office opened once, `done`; a second call did nothing. The other session's marker swept |
+| turn 8's interleavings, forced in-process: main() after a start that gave up while `running()` already answers / after a start that found and opened the office; sweep() of a marker that `lstat` showed old at listing, taken over and completed (`done`, fresh) before the sweep locked it / one still old under the lock | the claim left empty / `done`; kept / removed |
+| turn 9's interleaving, forced in-process: claim() of an empty marker that is removed and claimed anew by another holder between claim's open and its lock / no interference | not claimed (the new file's holder keeps it) / claimed. The hook suite then ran again with the same outcomes as before |
+| sessions directory a symlink; state directory a symlink; sessions directory 0755 | each refused with a message naming the path; nothing started; the target's `keepme` and a 40-day-old file named like a marker were kept |
+| `message_outcome` with stubbed coordinator answers (events, the note's `records/list` record, the run's state), the run stopped throughout: none / record pending | `persisted`, "ended" after 2 stopped polls; one record read |
+| none, record `submitting`, until the events show submitted and entered at read 9 | `entered_context`; records read at polls 2, 4, 8 |
+| uncertain, record back to `pending`; submitted, record entered; submitted, record `unproven`; none, record `cancelled` | `persisted` (held); `entered_context`; `delivery_unproven`; `cancelled` ("not delivered") |
+| event reads failing; record reads failing | "unreachable" after 2 failed reads (unconfirmed), never held |
+| submitted, record `submitted`, 600 polls | `submitted` at the deadline (unconfirmed); records read at polls 2, 4, 8, 16, 32, 64, 124, 184, ... (a minute apart) |
+| a running run, never sent; entered or unproven, then cancelled | no record read; the earlier outcome stands |
+| Expand in Chrome (1512 px, 42 workers) | `E`: office hidden, button `⤡ Office`. A reveal opened no roster. The roster button left Expand and opened the roster, and Esc closed it. `E` then Esc: the office back, the worker still open. A second Esc closed the worker |
+
+The office review (Codex code_review, session 01a14f98) said "Do not ship" at turn 5, "Needs changes" at turns 6 to 8, and "Ship it" at turn 9, with one LOW finding. Every finding was fixed and re-run above:
+| Finding | Fix |
+|---|---|
+| HIGH (turn 5): `python -c` in the office's detach step imported the project folder's modules | `-I`, run from the office's own folder |
+| MEDIUM (turn 5): the marker sweep followed a symlinked sessions directory | `own_dir` refuses symlinks and shared directories; the sweep deletes only regular files named like markers, and never blocks a start |
+| MEDIUM (turn 5): a reused pid counted as the office | the pid's start time compared; a full check every 10 minutes |
+| MEDIUM (turn 5): a failed start used up the session's open and its diagnostics were lost | `autostart.failed`, told once per session; `autostart.log` |
+| MEDIUM (turn 6, the same finding): a failure before the start existed (the log unopenable, the spawn failing), or a hook or start that died, kept the claim, unreported | the claim is a locked marker that the start inherits and marks done once the office runs. Anything else leaves it unlocked and not done, so the next call takes it over. A spawn failure is recorded and told in that call |
+| MEDIUM (turn 5): `delivery_uncertain` ended the office's wait | not final |
+| MEDIUM (turn 6, the same finding): a note in flight ended at the run's stop, before the coordinator settled it, and a submitted one advised sending again | only a never-sent note ends with the run. Submitted and uncertain notes wait for entered, unproven or cancelled, within the call's budget. Cancelled reads "not delivered" |
+| LOW (turn 5): in Expand, the roster stayed open behind the panel and took Esc | closed on Expand; Esc and the roster button handled |
+| MEDIUM (turn 7, the delivery finding): a note whose send is still awaited (`submitting`, which has no event), or one sent back to wait, read as never sent; failed event reads were taken as answers | once the run reads stopped, the note's own record decides (`records/list`, read at 2, 4, 8 ... stopped polls, then a minute apart); failed reads count as the coordinator not answering |
+| MEDIUM (turn 7, the start finding): when the start lock stayed held for 30 s, `locked()` skipped the start, yet the claim was marked done because an office ran | `done` only when start() itself ran and the office runs |
+| LOW (turn 7): the sweep could remove a marker being taken over | a taken-over marker is touched; the sweep removes a marker only while it can lock it |
+| LOW (turn 7): the page's render signature left out a note's delivery | included |
+| MEDIUM (turn 8, the start finding): a start that returned at its 10 s give-up, with the office answering just after, still completed the claim | start() reports `shown` only after finding the office up and opening it if asked; only that completes the claim |
+| LOW (turn 8): the sweep read a marker's age before taking its lock | age and identity checked again under the lock |
+| LOW (turn 9): a claim could lock a marker the sweep had removed and another hook had made again | after locking, the claim checks that its file is still the one the path names, and otherwise opens the path again |

@@ -3,6 +3,303 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.5] — 2026-10-23
+
+The office opens by itself, and Claude no longer runs a log tail. Three of 2.4.4's known limits are fixed: a lead edit
+lost its hold after 120 s, a stop could leave an app-server running, and a writer quarantined at startup stayed
+quarantined. Each fix has a real run (coordinator/VERIFY.md, 2.4.5).
+
+### Changed: the Codex Office opens by itself, and Claude no longer runs a log tail
+- Until now, every Codex call made a hook tell Claude to start a background `tail -F` of the runs' stream log. That
+  cost context on every call. The office, where the user actually watches runs, started only when they typed
+  `/software-workflows:office`. On 10-22 the office still running was the 2.4.0 copy. A Homebrew upgrade had
+  removed the Python it ran on, so its requests failed with `ModuleNotFoundError`.
+- Now `hooks/office_autostart.py` starts the office in the background on a session's first Codex call. It opens the
+  office in the browser once per session, and later in the session starts it again only if it has stopped. It
+  prints nothing, so it adds nothing to Claude's context. The tail instruction is gone; `hooks/live_view_nudge.py`
+  only names the log for the lead's coordination exemption.
+- `office.py start` replaces an office started by another plugin version, as before, and now also one whose
+  recorded Python no longer exists. `server.json` records the interpreter.
+- The office runs detached and outlives the session that started it. It now starts without that session's
+  variables (Claude Code's session and hook variables, `CODEX_GATE_*`, the push gate's git shims on PATH), the same
+  scrub the daemon has had since 2.4.4.
+- A start never imports anything from the session's project folder: the hook runs the office with `python -I` from
+  the office's own folder, and so does the office's own detach step.
+- A session's claim on its first start is a locked marker. The start inherits the lock, and marks the claim done once
+  it has run and the office runs, so two calls at once open the office once. Anything else leaves the claim not done
+  and unlocked:
+  - a start that fails or dies;
+  - a start that gave up waiting for the start lock;
+  - a hook that dies before spawning one.
+
+  Until the office runs, each Codex call tries again (and opens the office once it is up).
+- A failed start is told to the person once per session: at once with its reason when the hook could not spawn it,
+  otherwise at the next call, naming `office/autostart.log`. A start that works clears the failure. The log restarts
+  after 1 MiB.
+- An office counts as running only while its recorded pid still has its recorded start time, so a pid the system
+  has reused does not count. Every 10 minutes a session's call also has it checked in full: that it answers and
+  that it is this plugin's.
+- The hook keeps its per-session markers in a private directory of the user's own. A symlinked or shared directory
+  is refused with a message. The daily sweep deletes only regular files named like markers, and never a marker a
+  start or a claim holds.
+- Verified for real, against a scratch office on another port and data directory, with a browser stub that records
+  each open:
+  - the first call started the office and opened it once;
+  - a second call in the same session started and opened nothing;
+  - a new session opened it again;
+  - a killed office was restarted, without opening another tab;
+  - an office whose recorded Python was removed was replaced;
+  - `off` started nothing;
+  - an invalid value showed one message per session;
+  - the office's own environment held none of the session's variables or shims.
+- Codex's review (session 01a14f98) found one HIGH and four MEDIUM findings at turn 5.
+  - Turns 6 to 8 found more paths of two of them: a start that failed, gave up or never ran yet kept or completed
+    the session's claim, and the delivery wait below.
+  - Turn 7 also found two LOW findings: the sweep could remove a claim being taken over, and the page did not redraw
+    a note's delivery change.
+  - Turn 8 found two more interleavings: a start that gave up just before its office answered, and a sweep acting on
+    an age it read before taking the marker's lock.
+  - Turn 9 said "Ship it", with one LOW finding: a claim could lock a marker the sweep had just replaced.
+
+  Each is fixed, and every case above ran again on the final code, plus these:
+  - a `subprocess.py` planted in the session's folder was not imported;
+  - a start that failed in the office (its `office.log` made a directory):
+    - left the claim not done each time, and the person was told on the next call only, not on the one after;
+    - after the repair, the next call started the office, opened it once and cleared the failure;
+  - a start the hook could not spawn (`autostart.log` made a directory) was told in that same call, naming
+    `IsADirectoryError`; after the repair, the next call started the office and opened it once;
+  - a claim left empty by a hook that died, and a start killed with SIGKILL while it waited for the start lock, were
+    each taken over by the next call, which opened the office once;
+  - four calls of a new session at once opened it once;
+  - with an office running and the start lock held 45 s, a new session's start gave up after 30 s and opened
+    nothing. The claim stayed not done, and the office opened once after the lock was released;
+  - a 40-day-old empty claim taken over while the daily sweep ran was kept, and opened the office once. Another
+    session's 40-day-old marker was swept;
+  - turn 8's two interleavings, forced:
+    - a start that gave up while the office answered by the time the claim was judged left the claim not done; a
+      start that found the office and opened it completed it;
+    - a marker judged old at listing time, then taken over and completed before the sweep locked it, was kept; one
+      still old under the lock was removed;
+  - turn 9's interleaving, forced: a claim whose marker was swept and claimed anew between its open and its lock did
+    not proceed; without that interference it claimed;
+  - a symlinked sessions directory, a symlinked state directory and a sessions directory open to others were each
+    refused with a message, and nothing was started;
+  - the symlink's target kept its files, including a 40-day-old file named like a marker.
+
+### Added: the office's settings explain themselves
+- The plugin has its first user setting, `office`: `open` (default), `background` or `off`. Claude Code shows it,
+  with an explanation of each choice, in `/plugin` (Configure options) and `/config`.
+- The `SOFTWARE_WORKFLOWS_OFFICE` environment variable overrides it for the sessions that have it.
+- `CODEX_OFFICE_PORT` still picks the port.
+- The README's "Office settings" section gives each setting's values, default and effect.
+- `claude plugin validate` passes on 2.1.306.
+
+### Added: Expand, to read a worker at full width
+- The worker panel always shared the window with the office floor: at most the window width minus 340 px,
+  560 px by default.
+- **⤢ Expand**, or the `E` key, now gives an open worker the whole window, keeping its text to a readable width.
+  `E` or `Esc` brings the office back. The choice is remembered.
+- Measured in Chrome on a 1512 px window: the panel went from 560 px to 1512 px, and the Answer tab rendered in
+  full. Esc returned to 560 px with the worker still open, and closing the worker showed the office floor.
+- While expanded, the roster stays closed. Otherwise it would sit open, hidden behind the panel, and take the next
+  Esc.
+  - The roster button leaves Expand first.
+  - A worker revealed while expanded no longer opens the roster.
+  - Checked on the final page in Chrome with 42 workers, step by step:
+    - `E` expanded, and a reveal opened no roster;
+    - the roster button left Expand and opened the roster, and the next Esc closed it;
+    - `E` and Esc returned to the office with the worker still open, and a second Esc closed the worker.
+
+### Fixed: the office had no label for an unproven delivery (a 2.4.4 known limit)
+- The office now reads the coordinator's `message/delivery_unproven` as a final outcome and labels the note
+  **⚠ unproven**. The label says the note may already have run, and that a new Send could run it twice.
+- Before, it read "could not tell whether it reached the turn" or "send it again". Checked against recorded event
+  sequences: an `entered_context` event still wins over `delivery_unproven`.
+- A run's stop no longer settles a note by itself, because a run's status follows its turns, not its deliveries.
+  Some notes are in flight with no event that says so:
+  - a send whose answer the coordinator still awaits (it records "submitting" without an event);
+  - a note Codex had (`submitted`, or `delivery_uncertain` after a lost send result), which the coordinator settles
+    from the thread's history after the turn: entered, unproven or cancelled, or back to wait for the next turn.
+
+  Once the run reads stopped, the office reads the note's own record (`records/list`): after 2 stopped polls, then 4,
+  8, … and then a minute apart. The live ledger's 2,087 notes take 12 ms to read and decode. Only a note the record
+  shows waiting ends as held for the next turn. Event or record reads that fail twice end as unconfirmed, never as
+  held.
+  - 2.4.4 stopped waiting at `delivery_uncertain` and labelled the note "could not tell".
+  - It stopped waiting at a submitted note once the run read stopped twice, and advised sending it again.
+- A note whose run was cancelled before the turn took it reads **✖ not delivered**. Before, it read as waiting for the
+  next turn.
+- The page redraws a note when only its delivery changes, so "Codex has it" and "the coordinator is checking" show as
+  they happen.
+- Checked against stubbed coordinator answers, the run stopped throughout:
+
+  | Events and the note's record | The office's wait ended |
+  |---|---|
+  | none; record waiting | held for the next turn, after 2 stopped polls (one record read) |
+  | none; record submitting until the events show it entered at the 9th read | entered (done); records read at polls 2, 4, 8 |
+  | uncertain; record back to waiting | held for the next turn |
+  | submitted; record entered (its event not read yet) | entered (done) |
+  | submitted; record unproven, or none and record cancelled | unproven; not delivered |
+  | event reads failing; record reads failing | unconfirmed (the coordinator stopped answering), after 2 failed reads |
+  | submitted; record submitted for 600 polls | unconfirmed at the call's budget; records read at polls 2, 4, 8, 16, 32, 64, 124, 184, … |
+  | a run still running, never sent | no record read |
+  | entered, or unproven, then cancelled | entered, or unproven: the earlier outcome stands |
+
+### Fixed: a stop leaves no app-server running (2.4.4 review turn 48)
+- On 2.4.4, a listener reconcile could start an app-server after a stop had taken its snapshot of listeners.
+  Maintenance settling a plain run's cancel did this, and nothing stopped the new app-server.
+- Measured on 2.4.4: a forced switch with 13 writers in 4 checkouts and a reconcile injected into the drain ended
+  with a leftover app-server.
+- Now every listener reconcile is counted from the one entry point they share, including while it waits for its
+  run's lock.
+  - A stop's drain waits for the reconciles under way, and `NOT_QUIESCENT` names them in
+    `details.listener_reconciles`.
+  - Once the stop closes, every new reconcile is refused `DAEMON_DRAINING`: maintenance, cancel, resume,
+    re-admission, transport-gap recovery and startup retries alike.
+- `daemon/status` shows the reconciles under way.
+- The same injected run on 2.4.5: the stop was accepted, a writer's patch verified, and no app-server the run
+  started was left.
+
+### Fixed: a writer quarantined at startup heals itself
+- On 10-22 a live switch re-admitted 26 writers at a load average of about 17. Nine writers' `thread/resume` did not
+  answer in time, and each was quarantined with a checkout-wide `*` UNKNOWN. Nothing retried them, so a lead
+  narrowed the UNKNOWNs by hand.
+- Now a startup failure that can pass on a later attempt is a durable incident, and the daemon retries it itself.
+  - Retryable failures: native or transport failures (`NATIVE_UNCERTAIN`, `NATIVE_DISCONNECTED`, `LISTENER_SILENT`)
+    and resource or lease contention.
+  - Delays start at 5 s and double up to 300 s, with no attempt limit. `SOFTWARE_WORKFLOWS_RECONCILE_RETRY_FIRST_S`
+    and `SOFTWARE_WORKFLOWS_RECONCILE_RETRY_MAX_S` set them.
+  - A retry makes the same history, admission and replacement checks as a successful startup. It then reads each
+    checkout's bytes and records a `recovery_resolution` for exactly the `*` UNKNOWNs that startup left. Paths that
+    differ keep their own UNKNOWNs.
+  - Policy, project, schema, configuration and missing-history refusals stay quarantined, as before.
+  - Startup adopts 2.4.4's quarantines and their UNKNOWNs, including ones a lead has already narrowed.
+  - Events record each incident's progress: `listener/startup_retry`, `listener/startup_quarantined` and
+    `listener/startup_recovered`. `daemon/status` counts the incidents still outstanding.
+- Recovery resumes ask Codex for `excludeTurns:true`, honoured by Codex 0.163.0, and still read every turn through
+  pagination afterward.
+- Measured with injected lost resume responses in a forced switch of 13 writers:
+  - two transient failures healed by themselves, 62.7 s after recovery began, with no lead call;
+  - their `*` UNKNOWNs carry a recorded resolution (nothing found);
+  - a timeout that never passes failed 5 attempts, 6, 11, 20 and 40 s apart, and stays quarantined;
+  - a policy mismatch stayed quarantined without a retry.
+- Measured to size it: 26 writers in 4 checkouts of 3,700 files each.
+  - Recovery took 66.4 s before and 68.5 s after, with no quarantines or resume timeouts in either run.
+  - The slowest resume took 0.117 s before and 0.094 s after, at a load of up to 18.7 with 26 reconciles under way
+    together.
+  - That leaves the 60 s native timeout ample headroom, so no concurrency bound and no longer timeout were added.
+- A dead listener that another listener replaced now reads `recovery_state: "replaced"`, with `replaced_by`. Before,
+  it read `reconciling` forever: the live ledger had 43 such records, 17 of them from 10-22. Startup repairs the old
+  records whose replacement it can prove.
+
+### Fixed: a lead edit lost its hold after 120 s (a 2.4.4 known limit)
+- On 2.4.4, a lead's Write or Edit that no Post or batch settled within 120 s was quarantined. A permission prompt
+  left open, an interrupt or a killed session did this. The call could still write, but from then on it held neither
+  the checkout's compatibility lease, a stop, other leads' quiet windows nor a restore. After its Post, the edit stayed
+  uncertain, with UNKNOWNs that needed a restore or a narrow.
+- Now a lead's file call holds its paths from its PreToolUse until the call has really ended. No timer ends it. Any of
+  these does:
+  - its PostToolUse or PostToolUseFailure;
+  - its PostToolBatch;
+  - its `tool_result` in the session's transcript;
+  - the exit of the Claude Code process that made it, known by its pid and start time.
+- Until then the call keeps its claims and the checkout's compatibility lease. It holds a stop (`NOT_QUIESCENT`, which
+  names it in `details.lead_edits`) and other leads' quiet windows. A restore of its path is refused
+  (`RESTORE_EXECUTING`), and so is a handback. `daemon/status` lists open calls under `lead_edits`.
+- The daemon looks at each open call's transcript and process every 0.25 s. A call that ended without a Post is
+  settled by its file's bytes:
+  - unchanged: no effect;
+  - the intended image: verified;
+  - anything else: quarantined with an UNKNOWN, at once.
+- A call whose transcript or process cannot be read stays open until its Post, and `daemon/status` reports why
+  (`observation_problem`). It never holds up startup or another checkout. A read that hangs holds up nothing either:
+  - the call's own Post or batch still settles it;
+  - a settlement that fails is still retried every 3 s;
+  - a stopped daemon still exits, so the next one can start.
+- At the switch, lead calls that 2.4.4 had settled keep their outcomes, and calls still open continue under the new
+  rule. A late Post or batch of a settled call changes nothing, so it cannot disturb a restore of its file.
+- A PostToolBatch's calls now go to the daemon in one request, and the hook first writes them to a private outbox in
+  the state directory. The daemon records every call before it reads any file. A call no daemon has acknowledged stays
+  in the outbox for the next daemon. So no call is lost to the hook's 14 s, to a hung or stopped daemon, to a 2.4.4
+  daemon still running during the switch, or to the hook being killed while writing the outbox. A refusal ends a
+  call's delivery. Any other failure is retried every 3 s; once the call's own record holds its completion, that
+  record alone retries it, apart from the daemon's other work.
+- An overlap with an open lead call is refused as a claim conflict naming the holder, even when the holder is the
+  caller's own session or a call still being admitted. 2.4.4's hooks deny such a conflict too, so a session not yet
+  restarted after the upgrade is held to the same rule.
+- As on 2.4.4, only a refusal the daemon answers denies a lead's file call. The call runs when:
+  - the daemon is unreachable, stopping or failing;
+  - its error answer has no valid `kind`;
+  - the hook's own checks of the state directory or the daemon's endpoint fail. Then it does not contact the
+    endpoint at all.
+
+  The person is told once per session. A call that runs without admission has its file reconciled at its Post or
+  its failure, as on 2.4.4, so changed bytes are UNKNOWN at once. Without either, its batch reconciles it, even when
+  its Pre left no marker. Only that call's file is read, and nothing is admitted for it, so a legacy writer's tree
+  lock does not stop it. A file that cannot be read yet is retried by the daemon until it can. The call gets no
+  receipt and holds nothing.
+- During the switch, a 2.4.5 session's hooks accept the replies of a 2.4.4 daemon that is still running.
+- Measured with real `claude -p` sessions (2.1.306). In each, another PreToolUse hook held the Write about 150 s after
+  the coordinator admitted it:
+
+  | | 2.4.4 | 2.4.5 |
+  |---|---|---|
+  | the edit 125 s after its Pre | quarantined | still open |
+  | a legacy writer's tree lock, meanwhile | taken | refused: the lease is held |
+  | `daemon/stop`, meanwhile | accepted | refused `NOT_QUIESCENT`, naming the call |
+  | a restore of the path, meanwhile | ran | refused `RESTORE_EXECUTING` |
+  | another lead's Bash, meanwhile | given a quiet window | no quiet window: what it changed is UNKNOWN |
+  | after the Post | uncertain, with an UNKNOWN | verified with an exact receipt; a stop is accepted |
+
+  - An interrupt while the Write waited: 2.4.4 quarantined the edit at 125 s with an UNKNOWN. 2.4.5 ended it from the
+    transcript 10 s after the interrupt, with no effect and nothing unresolved.
+  - A killed session: 2.4.4 quarantined the edit at 125 s with an UNKNOWN. 2.4.5 ended it within 15 s of the kill,
+    with no effect, as its file was unchanged. With partial bytes written before the kill, the edit was quarantined
+    with an UNKNOWN within 5 s.
+  - Twelve lead-hook cases from 2.4.4 (refused, ignored and stale paths, failed and denied edits, claims, handbacks,
+    prompts), run through the real hook: ten gave 2.4.4's outcomes. The two whose permission prompt stayed open past
+    120 s now end verified, where 2.4.4 left 3 and 2 UNKNOWNs.
+  - With the daemon stopped, two Writes ran with one warning, and the next reconcile recorded the file UNKNOWN.
+    Injected failures (recovering, lease, malformed and lost answers) each let the call run. One that ran after a
+    failed admission had its file UNKNOWN at its Post.
+  - A Write whose Pre never reached the daemon, run while a legacy writer held the tree's lock: its file was UNKNOWN
+    at its Post, with no unit, claim or hold, and the legacy writer kept its lock. With only a batch and no marker,
+    the batch recorded it at once. A file unreadable at the Post was recorded once it could be read.
+  - A batch of four settled Writes and one whose Pre and Post never reached the daemon, with the daemon's worker
+    stopped while the hook ran: the hook returned in 3.06 s. Once the worker continued, the fifth file was UNKNOWN.
+    With a 2.4.4 daemon answering, or no daemon at all, the next 2.4.5 daemon recorded it from the outbox. Batches of
+    1, 3 and 5 settled calls took a median 0.07 to 0.08 s through the hook (2.4.4: about 0.045 s).
+  - A 2.4.4 Write left `failed`, then its late batch while its file was being restored: the record was kept, nothing
+    was recorded, and the restore resolved.
+  - With a call's transcript read held stalled, a stop's worker still exited in 0.26 s, and the next daemon served in
+    0.94 s. A settlement that failed meanwhile was retried after 3.2 s and verified, with the read still stalled.
+  - With the installed 2.4.4 hook against 2.4.5, a second Write of a path an open call holds was denied, whether it
+    came from the same session, another session, or arrived while the first call was still being admitted.
+  - A state directory open to others, or an endpoint manifest naming another state root: the Write ran with one
+    warning, and the hook made no connection.
+  - Four 2.4.4 lead-call records were left `prepared` after their operations had ended, as when a hook dies before
+    saving. At the switch they took their operations' outcomes: one verified, three with no effect. The ledger still
+    held 202 receipts, and a stop was accepted.
+- A session still running 2.4.4's hooks after the upgrade sends neither its process's identity nor its transcript.
+  Its file calls end at their Post or batch, or 120 s after their Pre, as on 2.4.4. At 120 s the call is quarantined
+  with an UNKNOWN, counted as `lead_hook/legacy_limit` and in `daemon/status` as `lead_edit_legacy_limit`. Measured
+  with the installed 2.4.4 hook against 2.4.5: released at 120 s with an UNKNOWN, the lease freed, and a stop
+  accepted.
+
+### Known limits
+- A lead's PreToolUse hook that Claude Code ends at its 15 s timeout lets the call run without admission (review turn
+  49, HIGH). The plugin's hooks do not set `onFailure: "block"`, which Claude Code 2.1.306 supports. A hook that
+  cannot finish counts as an unavailable coordinator, which never blocks a lead's call; with that setting, a broken
+  `python3` would block every lead edit. Nothing holds such a call's paths, and the next reconcile records its changes
+  as UNKNOWN. The hook's own daemon calls are budgeted to end by 14 s.
+- A permission prompt left open holds a stop, the checkout's lease and other leads' quiet windows until it is
+  answered, interrupted or its session ends. `daemon/stop` answers `NOT_QUIESCENT` and names the call.
+- A session on 2.4.4's hooks or older keeps 2.4.4's 120 s limit until it restarts. An interrupted file call of such
+  a session holds its file for those 120 s, so retrying that edit is refused until then. Restart sessions after
+  upgrading.
+- A lead file call open while the daemon is replaced (a version switch, a worker restart) keeps its hold until it
+  ends, but its edit is quarantined: its file is left UNKNOWN, for a restore or a narrow.
+
 ## [software-workflows 2.4.4] — 2026-10-22
 
 Everything 2.4.3 left open: its known limit (a lost start judged by a 2 s rule), the candidates reported by the
