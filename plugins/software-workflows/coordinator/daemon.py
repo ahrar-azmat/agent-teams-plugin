@@ -1836,7 +1836,7 @@ class Daemon:
         from .watchdog import Watchdog, THRESHOLD, INTERVAL, SEGMENT_BYTES, CLOSE_SECONDS, RETRY_MAX_SECONDS
         watchdog = getattr(self, "diagnostic_watchdog", None)
         retry_at, delay, started = 0.0, CLOSE_SECONDS, 0.0
-        reported_dumps = reported_failures = 0
+        reported_signals = reported_failures = 0
         restarts = self.loop_lag.get("watchdog_restarts", -1) + 1
         self.loop_lag.update(traceback_file=str(self.store.root / "loop-stalls.log"), threshold_seconds=THRESHOLD,
                              diagnostic_bytes_limit=2 * SEGMENT_BYTES)
@@ -1866,7 +1866,7 @@ class Daemon:
                     else:
                         watchdog, started = candidate, time.monotonic()
                         self.diagnostic_watchdog = watchdog
-                        reported_dumps = reported_failures = 0
+                        reported_signals = reported_failures = 0
                         self.loop_lag.update(watchdog_pid=watchdog.process.pid, watchdog_restarts=restarts,
                                              watchdog_retry_at=None, diagnostic_error=None, watchdog_unreaped=None)
                         if restarts:
@@ -1885,9 +1885,9 @@ class Daemon:
                 if status["lookup_failures"] != reported_failures:
                     self.store.event("watchdog/lookup_failed", None, status)
                     reported_failures = status["lookup_failures"]
-                if watchdog.dumps != reported_dumps:
-                    self.store.event("watchdog/dump_possibly_truncated", None, watchdog.status())
-                    reported_dumps = watchdog.dumps
+                if watchdog.signals != reported_signals:
+                    self.store.event("watchdog/diagnostic_signal", None, watchdog.status())
+                    reported_signals = watchdog.signals
                 if hasattr(watchdog.process, "end") and processes.exit_evidence(watchdog.process.family["root"]):
                     # The supervisor is this helper's parent. Its handle has no
                     # child watcher to refresh returncode in this worker. Ask

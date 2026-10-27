@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.8 / P1
+# Writer coordinator — software-workflows 2.4.9 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -2326,15 +2326,17 @@ settlement. Status caches derived writer summaries until relevant records change
 The most recent 100 timestamped heartbeats stay in memory; ordinary beats do not
 write a log or re-arm a watchdog. One supervised watchdog process at a time
 reads shared memory independently of the daemon's GIL. After a 0.75-second missed heartbeat it
-records the estimated wall-clock stall start and signals the registered C-level
-faulthandler to dump all Python thread stacks through a nonblocking pipe. The
-helper drains that pipe independently of its single file-output thread. A stopped
-helper or stalled filesystem can lose diagnostics but cannot block the signal
-handler. Since faulthandler does not report short writes, every dump is labelled
-`possibly_truncated` in status and the durable event journal; it is never reported
-as complete. The helper's output queue is bounded to one 16 MiB segment; overflow
+records the estimated wall-clock stall start in `loop-stalls.log` and asks the
+owner to send the worker its diagnostic signal, which the worker only counts
+(`diagnostic_signals` in status, a `watchdog/diagnostic_signal` event). Since
+2.4.9 no thread stacks are dumped: 2.4.8's faulthandler signal-handler dump walked
+every thread's frames while the loop was inside SQLite, and on 10-27 that walk
+crashed the live worker (SIGSEGV). Status keeps `dumps: 0` and
+`dump_integrity: no_dump`. A stopped helper or stalled filesystem can lose
+diagnostics but never blocks the worker. The helper's output queue is bounded to one 16 MiB segment; overflow
 drops new output, counts lost bytes in status and logs the loss when output resumes.
-It verifies its parent and command-line ownership before signalling.
+It never signals the worker itself: it asks the owner (`owner/diagnostic`), which
+signals only the worker identity it recorded.
 Status names the watchdog PID, `loop-stalls.log` path, threshold and diagnostic
 byte limit. It also reports the supervisor's running, restarting or stopped
 state and reason. Supervision ends only when the daemon's final stop event is
@@ -2532,20 +2534,25 @@ heartbeat-coroutine exits and supervisor-task exits are journaled and restarted
 with the same one-to-thirty-second exponential backoff used for helper failures.
 A failed helper retirement remains visible with its PID and error; subsequent
 attempts keep reaping that same child. No replacement starts while retirement
-is incomplete: an unreaped helper may still signal, so SIGUSR2 stays ignored
-and its descriptors remain owned. A successful retry then disposes them and
-restores the previous handler before a replacement registers its own pipe.
+is incomplete: an unreaped helper may still signal, so a no-op handler (`absorb`)
+takes SIGUSR2 and its descriptors remain owned. A successful retry then disposes
+them, and `absorb` keeps taking SIGUSR2 until a replacement registers its handler.
+Since 2.4.9 the worker never returns SIGUSR2 to SIG_DFL, whose action ends the
+process: the owner can still deliver a request that a retired helper queued. Nor
+does it set SIG_IGN: every process the worker starts would keep an ignored signal
+across exec, while a caught one is back at SIG_DFL there.
 Final shutdown also retains that obligation. Each reap attempt is bounded, but
 a kernel that indefinitely refuses to reap a killed child can delay final exit;
-abandoning a potentially signalling child is not safe. Shutdown posts an end marker, waits one second, kills an unresponsive
-unreaped direct child, then allows one second to reap it. The direct-child
-relationship proves ownership without another process lookup. One shared close
+abandoning a potentially signalling child is not safe. Shutdown posts an end marker and waits one second. A helper
+that is still running is then ended by the owner through its recorded family (`owned.Process.end()`). A helper the
+worker started itself is killed as its unreaped direct child and given one second to be reaped; that relationship
+proves ownership without another process lookup. One shared close
 task completes cleanup even when its callers cancel. If that close task itself
 is cancelled or fails, the next close call starts a fresh retirement attempt
-while retaining the same child, descriptors and ignored SIGUSR2 disposition. Signal
-registration is removed before any descriptor is closed; signals are ignored
+while retaining the same child, descriptors and absorbed SIGUSR2. Signal
+registration is removed before any descriptor is closed; signals are absorbed
 until the helper is gone. Helper exit checks use nonblocking `Popen.poll()`.
-Failure to start restores the previous signal disposition. Transient parent
+Failure to start restores the previous signal disposition, except that SIG_DFL and SIG_IGN become `absorb`. Transient parent
 lookup failures are logged, exposed in status and journaled when the loop resumes;
 monitoring retries with exponential backoff from one to thirty seconds. The
 helper continues draining its diagnostic pipe during that backoff. An unexpected

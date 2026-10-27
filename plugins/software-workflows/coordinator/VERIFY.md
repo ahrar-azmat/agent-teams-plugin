@@ -13912,7 +13912,7 @@ The writer's own run on the final source (`r248-w/round3/static-final-results.js
 Python 3.11 and checked the untracked files' whitespace, all exit 0.
 
 ### Known limits
-- **Turn 86's findings**, pushed at the user's direction and fixed in 2.4.9:
+- **Turn 86's findings**, pushed at the user's direction and to be fixed in 2.4.10 (2.4.9 is the watchdog hotfix):
   - `recovery.py:148` (MEDIUM): re-verifying a legacy dormant listener calls `dormancy.recover()` outside the
     normal error classification. A `RESOURCE_PAUSED` from its offline reader's launch records checkout-wide
     UNKNOWNs and quarantines the listener. On retry the writer is replaced instead of verified read-only again.
@@ -13941,7 +13941,7 @@ Python 3.11 and checked the untracked files' whitespace, all exit 0.
   - The live 2.4.7 daemon's `loop-stalls.log` at 21:11 showed its loop inside `restore_unknown` → `store.all` →
     `selected`, during the lead's settlement of the 43 release paths.
   - A `daemon/status` call meanwhile took 94.05 s.
-  - Fixed first in 2.4.9, with a sweep of every whole-kind read on the loop.
+  - To be fixed first in 2.4.10, with a sweep of every whole-kind read on the loop.
 - **Catalog 073** fails on the final source (above).
 - **The first start:** the full first start of this release on a 12.1 GB ledger, with recovery and retention over
   real content, has not been run. The shape replica's ledger was 559 MB, and the index build was measured on a copy
@@ -13957,3 +13957,116 @@ Python 3.11 and checked the untracked files' whitespace, all exit 0.
   - Representative p95 timings, and the memory of a shared pool against a container per test, were not measured.
 - **Ownership:** the exhaustive SIGKILL at every owner-journal transition was not run.
 - **The ledger** does not shrink by itself. VACUUM it while the coordinator is stopped.
+
+## 2.4.9
+
+Two changes to the stall watchdog's SIGUSR2 (`watchdog.py`, `daemon.py`, the README's watchdog paragraphs): the worker
+no longer dumps thread stacks from a signal handler, and it never returns SIGUSR2 to its default action. Measured on
+10-27 between 22:10 and 23:05 on the user's Mac (Codex 0.163.0, Python 3.15.1), while the live 2.4.7 daemon served the
+user's writers.
+
+### The crash it fixes
+- The live 2.4.7 worker (pid 87737) died of SIGSEGV at 21:44:38. The crash report is
+  `~/Library/Logs/DiagnosticReports/Python-2026-10-27-214444.ips`.
+  - The faulting stack: `faulthandler_user` → `dump_traceback` → `_PyFrame_SafeGetCode` → `_PyObject_IsFreed`,
+    entered from `_sigtramp`.
+  - The main thread was inside `sqlite3_step`, from `pysqlite_cursor_iternext` in a generator.
+- The trigger was the watchdog's SIGUSR2. `watchdog.py` registered it with
+  `faulthandler.register(SIGUSR2, all_threads=True, chain=True)`, and it had fired 1,219 times since 17:22.
+- The supervisor restarted the worker 60 s later. Recovery took 39.3 s (generation 12) and re-attached the five live
+  app-servers without interrupting them.
+
+### The stall probe (`r249/stall_probe.py`)
+- **The setup.**
+  - A disposable coordinator (supervisor, worker and watchdog helper) on its own state and runtime directory.
+  - The worker is stopped with SIGSTOP for 2.2 s, twice.
+  - Then status, `loop-stalls.log` and the ledger's watchdog events are read, the daemon is stopped through its own
+    stop, and both directories are removed whole.
+- **Red, the installed 2.4.8.**
+  - 6 thread stacks in `loop-stalls.log` ("most recent call first"), 3 threads in each of 2 dumps.
+  - Status `dumps: 2` with `possibly_truncated`, and 2 `watchdog/dump_possibly_truncated` events.
+  - The worker survived this probe: it shows the dump mechanism, not the crash.
+- **Green, the final 2.4.9 tree.**
+  - 2 `loop_stall` lines, 2 `watchdog_diagnostic_signal` lines, 0 stack dumps.
+  - Status `diagnostic_signals: 2`, `dumps: 0`, `no_dump`, and 2 `watchdog/diagnostic_signal` events.
+  - The same worker served throughout (largest loop lag 2.18 s). The stop was clean, no process was left, 9.1 s. The
+    run was repeated after the second fix, with the same counts.
+- **Not reproduced:** the crash itself, which happened once in 1,219 dumps. The crash report shows an invalid access
+  during faulthandler's walk while the interrupted thread was reading SQLite. The interpreter defect behind it is
+  unproven.
+
+### The late diagnostic signal (`r249/backoff_probe.py`, review turn 89's HIGH)
+- **The setup.**
+  - A disposable coordinator; its helper is killed with SIGKILL.
+  - Status is read every 20 ms until the worker has retired the helper (`watchdog_pid` null, `diagnostic_error`
+    "watchdog exited: -9").
+  - Then SIGUSR2 goes to the worker, as the owner's `owner/diagnostic` would send a request the helper had queued.
+- **Red, the installed 2.4.8.** The helper was retired 0.105 s after the kill, and SIGUSR2 was sent at 0.105 s. The
+  worker (49684) ended, and the supervisor started another (49705).
+- **Green, the final 2.4.9 tree.** The helper was retired 0.091 s after the kill, and SIGUSR2 was sent at 0.091 s. The
+  same worker (64352) kept serving and started a replacement helper (`watchdog_restarts: 1`). Turn 89's version, which
+  rested at SIG_IGN, gave the same result (0.111 s, worker 49740).
+- Each run stopped cleanly with no process left, 2.4 s each.
+
+### What a process the worker starts inherits (`r249/inherit_probe.py`, review turn 90's MEDIUM)
+- **The setup.** A fresh Python process takes a SIGUSR2 disposition and starts a non-interactive bash running
+  `trap "echo trapped" USR2; kill -USR2 $$; echo after`. Then it signals itself with SIGUSR2.
+- **SIG_DFL, as 2.4.8 restored it:** the trap ran, and the process ended on its own signal (exit -31).
+- **SIG_IGN, turn 89's resting disposition:** the trap never ran, and bash printed only `after`: the child kept the
+  ignored signal across exec. The process survived.
+- **`resting(SIG_DFL)` of the final tree (`absorb`):** the trap ran, and the process survived.
+- **Not run:** the full path the review names, a supervisor replaced during the backoff and then a lead command with a
+  USR2 trap. This probe measures the exec inheritance that path depends on.
+
+### The watchdog's catalog selections (`r249/cat249.sh` to `cat249e.sh`)
+24 selections exercise SIGUSR2 or `loop_stall`. They ran with the writer's runner (`regress.py`) on the 2.4.9 tree, one
+at a time, with gate and session variables stripped:
+- **020, 021, 022 and 027 pass as written** on the final tree.
+- **010, 013, 014, 015, 016, 038, 075, 077 and 079** passed as written before the second fix.
+  - They assert that SIGUSR2 is back to its earlier SIG_DFL once the watchdog closes (`handler_restored` or
+    `restored`). 2.4.9 removes exactly that.
+  - With only that comparison changed to `callable(...)`, all nine pass on the final tree. `callable` is true for a
+    caught handler, and false for SIG_DFL and SIG_IGN.
+- **025, 026 and 031** assert `"truncat"` in status, 2.4.8's dump label, which 2.4.9 removes. With only that clause
+  changed to the new key `diagnostic_signals`, all three pass on the final tree:
+  - the helper and its lookup are gone;
+  - status answers while the helper is stopped and SIGUSR2 is delivered;
+  - the daemon exits 0 and the stop takes under 5 s.
+- **028** fails, as in round 3 on 2.4.8.
+- **009, 076, 078, 081 and 115** fail at a fixture condition that never arrives.
+  - The Mac was at kernel memory pressure level 2; round 3 ran at level 1.
+  - Each case's idle writer was parked (`CHILD_RECOVERY_SUMMARY` state `parking`), by design (`memory.py:89`).
+- **087 and 116** are refused `CUSTODIAN_REQUIRED` ("Native writers require Client.ensure supervision"), because their
+  harness starts `daemon serve` without a supervisor. The lead's 17:37 and 17:40 runs of the frozen 2.4.8 source
+  failed them the same way.
+
+### Review (Codex code_review, session 01a14eac, turns 89 and 90)
+- **Turn 89: Do not ship, on one HIGH:** the late diagnostic signal above, present in 2.4.8. The second change fixes
+  it, and the run above measures it.
+- **Turn 89's three LOW, corrected in the docs:**
+  - this section's account of the crash claimed more than the crash report shows;
+  - "each signal adds a record" overstated it: the records follow changes of a polled counter, best effort;
+  - the README's watchdog paragraphs still described the helper's own parent and command-line checks and a
+    direct-child kill, from before the owner ran the helper.
+- No consumer of the renamed fields was found in the office console or the hooks.
+- **Turn 90: Needs changes.** It confirmed the HIGH and the three LOW closed.
+  - MEDIUM: turn 89's SIG_IGN would be inherited across exec by every process the worker started while resting. That
+    includes a supervisor it starts during the backoff, and every command that supervisor launches, where a script's
+    USR2 trap would silently fail. Fixed: the worker rests at the no-op handler `absorb`, measured above.
+  - LOW: "present since 2.4.7" was wrong, since 2.4.7's helper signalled the worker itself. Corrected to 2.4.8.
+
+### Static checks (`r249/static_checks249.py`, on the final tree)
+- every plugin `.py` compiles under Python 3.15 (83 files), and the 14 hook-run files under the system Python 3.9.6;
+- `coordinator/hooks.py --check`: exit 0, compatible, protocol `jsonl-v1`;
+- ruff (F821, F822, F823, F811, F841, F401): 35 findings against installed 2.4.8's 35, none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.9.
+
+### Known limits
+- **A worker crash still ends every running writer turn,** as in 2.4.8 (`owners.py:360`). 2.4.7 kept them and
+  re-attached.
+  - Keeping them across a restart is part of the lifecycle redesign.
+  - The blind architect review of 10-27 (session 01a17206, turn 9) rejected that design as first proposed:
+    re-attaching alone loses the hook receipts Codex does not save (`rollout/src/policy.rs:214`).
+- **No thread stacks are written for a stall.** An out-of-process sampler is not built.
+- **2.4.8's known limits stand.** Those marked for 2.4.9 move to 2.4.10.

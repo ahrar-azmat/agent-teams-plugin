@@ -3,6 +3,60 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.9] — 2026-10-27
+
+The coordinator no longer dumps its threads' stacks from a signal handler, and a late diagnostic signal can no longer
+end its worker. On 10-27 at 21:44 that dump crashed the user's live 2.4.7 worker, and 2.4.8 has the same dump. Both
+changes are to the stall watchdog's SIGUSR2, each with a real run on Codex 0.163.0 (coordinator/VERIFY.md, 2.4.9).
+
+### Fixed: a stall diagnostic crashed the worker
+- When the event loop missed its heartbeat for 0.75 s, the watchdog asked the supervisor to send the worker SIGUSR2.
+  faulthandler's C signal handler then walked every thread's frames into `loop-stalls.log`.
+  - On the live 2.4.7 daemon it fired 1,219 times between 17:22 and 21:44, every 2 to 5 s while the user's writers
+    were busy.
+  - At 21:44:38 the walk crashed the worker with SIGSEGV (`faulthandler_user` → `dump_traceback` →
+    `_PyFrame_SafeGetCode` → `_PyObject_IsFreed`), while its main thread was inside `sqlite3_step`.
+  - The supervisor restarted the worker 60 s later, and recovery re-attached the five live app-servers in 39.3 s.
+    2.4.8 would have ended them instead (Known limits).
+- Now the worker only counts the signal.
+  - The stall is still recorded in `loop-stalls.log`: its estimated start, the heartbeat's age and the threshold.
+  - A change in the signal count is recorded, best effort: a `watchdog_diagnostic_signal` line there and a
+    `watchdog/diagnostic_signal` event in the ledger. Several signals between two polls make one record.
+  - Status reports `diagnostic_signals`, with `dumps: 0` and `dump_integrity: no_dump`.
+  - 2.4.8's `possibly_truncated` labels and `watchdog/dump_possibly_truncated` events are gone.
+- No thread stacks are written for a stall any more. A diagnostic that cannot crash the worker, sampled from another
+  process, comes with the lifecycle work below.
+
+### Fixed: a late diagnostic signal could end the worker
+- When the worker retired its watchdog helper (the helper exited, or the worker stopped), it restored SIGUSR2's
+  previous disposition, normally the default, whose action ends the process.
+  - The owner signals the worker by its recorded identity alone. So a diagnostic request the retired helper had
+    queued could still arrive in the backoff before a replacement started, and end the worker.
+  - Under 2.4.8's supervisor that also ends every running writer turn.
+  - Present in 2.4.8, where the owner relays the helper's request (2.4.7's helper signalled the worker itself); found
+    by review.
+- Now the worker never returns SIGUSR2 to its default: between helpers and after the last one, a no-op handler takes
+  it.
+  - It never sets SIG_IGN either. Every process the worker starts would keep an ignored signal across exec, so a
+    script's USR2 trap would silently fail there. A caught signal is back at SIG_DFL in the new process.
+- Measured on a disposable coordinator: the helper was killed and SIGUSR2 sent 0.1 s later, in the backoff.
+  - 2.4.8's worker ended, and its supervisor started another.
+  - 2.4.9's worker kept its PID and started a replacement helper.
+- Measured on the mechanism: a process at each disposition started bash with a USR2 trap, then signalled itself.
+  - At SIG_DFL the trap ran and the process ended.
+  - At SIG_IGN the trap never ran.
+  - With 2.4.9's handler the trap ran and the process survived.
+
+### Known limits
+- A worker crash still ends every running writer turn, as in 2.4.8.
+  - When its worker exits, the supervisor ends every process family it owns, app-servers included
+    (`owners.py:360`). 2.4.7 kept them and re-attached.
+  - With the dump removed, no cause of a worker crash is known.
+  - Keeping app-servers across a worker restart is part of the lifecycle redesign: replacing, restarting and stopping
+    the coordinator without waiting on writers. It is being designed and reviewed first, because re-attaching alone
+    loses the hook receipts that Codex does not save.
+- 2.4.8's known limits stand. Those marked for 2.4.9 move to 2.4.10.
+
 ## [software-workflows 2.4.8] — 2026-10-27
 
 A tool call no longer makes the coordinator re-read every file of the checkout: only files whose stat identity
@@ -172,7 +226,7 @@ blocks every stop, and 2.4.7's known limits from review are fixed. On 10-26 the 
 
 ### Known limits
 - Codex code_review turn 86 found no CRITICAL or HIGH defect in the fix round, and said Do not ship for six it rates
-  lower. They are pushed at the user's direction and fixed in 2.4.9:
+  lower. They are pushed at the user's direction and are to be fixed in 2.4.10 (2.4.9 is the watchdog hotfix):
   - A memory refusal while a dormant writer is re-verified (`RESOURCE_PAUSED`: the compressor at its warning line,
     a malformed memory setting or an unreadable kernel reading) records UNKNOWNs for its checkout, and the writer is then replaced instead of verified again read-only (MEDIUM).
   - A crash in the middle of dropping a writer's service namespace leaves its lease active, with credentials for
@@ -199,8 +253,8 @@ blocks every stop, and 2.4.7's known limits from review are fixed. On 10-26 the 
   the daemon keeps starting. Make no edits until the coordinator is ready.
 - `unknown/restore` still reads every actor and operation record of the ledger on the event loop, as in 2.4.7: on
   the user's ledger (15,261 operations, 1.5 GB) each restore holds the coordinator for seconds. The lead's release
-  settlement of 43 paths held the live 2.4.7 coordinator this way, and a status call waited 94 s. Fixed first in
-  2.4.9, with the other whole-kind reads on the loop.
+  settlement of 43 paths held the live 2.4.7 coordinator this way, and a status call waited 94 s. To be fixed
+  first in 2.4.10, with the other whole-kind reads on the loop.
 - The ledger does not shrink by itself: VACUUM it while the coordinator is stopped.
 
 ## [software-workflows 2.4.7] — 2026-10-27

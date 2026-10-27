@@ -1,13 +1,15 @@
-"""Bounded, best-effort C-level diagnostics independent of the daemon's GIL.
+"""Bounded, best-effort loop-stall diagnostics independent of the daemon's GIL.
 
-The signal handler writes to a nonblocking pipe. Python's faulthandler does not
-report short writes, so every dump is explicitly marked possibly truncated.
-A stopped helper or slow filesystem can lose diagnostics, never block a writer.
+The helper records each stall it sees. Since 2.4.9 the worker writes no
+traceback for the owner's diagnostic signal: faulthandler's signal-handler dump
+walked every thread's frames while the loop was inside SQLite, and on 10-27 that
+walk crashed the live worker (SIGSEGV in _PyObject_IsFreed). The signal is only
+counted. A stopped helper or slow filesystem can lose diagnostics, never block a
+writer.
 """
 import asyncio
 from collections import deque
 from datetime import datetime, timezone
-import faulthandler
 import json
 import mmap
 import os
@@ -23,10 +25,10 @@ import time
 
 THRESHOLD = .75
 INTERVAL = .1
-# Threat: disk fill during weeks of recurring stalls. faulthandler bounds a
-# dump to 100 threads x 100 frames; each frame has two <=500-character strings
-# plus formatting (~11 MB worst case). Two 16 MiB segments bound disk use.
-# One segment also bounds the helper's RAM queue if its filesystem stops.
+# Threat: disk fill during weeks of recurring stalls. The segment was sized for
+# 2.4.8's worst-case faulthandler dump (~11 MB); since 2.4.9 a stall writes only
+# its event lines (under 1 KB). Two 16 MiB segments bound disk use. One segment
+# also bounds the helper's RAM queue if its filesystem stops.
 SEGMENT_BYTES = 16 * 1024 * 1024
 # Ten polling intervals allow ordinary pipe draining and logger shutdown.
 # A stopped helper then gets SIGKILL using its unreaped direct-child ownership,
@@ -38,6 +40,18 @@ CLOSE_SECONDS = 10 * INTERVAL
 RETRY_MAX_SECONDS = 30
 MEMORY_BYTES = 64
 LOOKUP_ERRORS = {1: "TimeoutExpired", 2: "CalledProcessError", 3: "OSError"}
+
+
+def absorb(signum, frame):
+    """SIGUSR2 while no helper is registered. The owner can still deliver a diagnostic request that a retired helper
+    queued, and SIG_DFL would end the worker. A caught signal, unlike SIG_IGN, is back at SIG_DFL in every process the
+    worker starts: exec resets caught signals and keeps ignored ones."""
+
+
+def resting(previous):
+    """SIGUSR2's disposition while no helper is registered: the previous handler, or absorb in place of SIG_DFL and
+    SIG_IGN."""
+    return absorb if previous in (None, signal.SIG_DFL, signal.SIG_IGN) else previous
 
 
 async def wait_exit(process, seconds):
@@ -66,23 +80,23 @@ class Watchdog:
         self.read_fd, self.write_fd = os.pipe()
         os.set_blocking(self.write_fd, False)
         self.process = None
-        self.dumps = 0
+        self.signals = 0
         self.closing = False
         self.previous_handler = None
         self.close_task = None
         self.closed_outcome = None
         self.forced = False
 
-    def dumped(self, signum, frame):
-        # Chained after the C dump; never perform I/O in this Python handler.
+    def signalled(self, signum, frame):
+        # Counts the owner's diagnostic signal; never perform I/O in this Python handler.
         if not self.closing:
-            self.dumps += 1
-            struct.pack_into("Q", self.memory, 16, self.dumps)
+            self.signals += 1
+            struct.pack_into("Q", self.memory, 16, self.signals)
 
     def status(self):
         dropped = struct.unpack_from("Q", self.memory, 24)[0]
-        return {"dumps": self.dumps, "dump_integrity": "possibly_truncated" if self.dumps else "no_dump",
-                "dump_policy": "nonblocking; short writes cannot be proved absent",
+        return {"diagnostic_signals": self.signals, "dumps": 0, "dump_integrity": "no_dump",
+                "dump_policy": "none: the diagnostic signal is counted, never dumped in-process",
                 "logger_dropped_bytes": dropped, "logger_error": bool(struct.unpack_from("Q", self.memory, 32)[0]),
                 "lookup_failures": struct.unpack_from("Q", self.memory, 40)[0],
                 "lookup_error": LOOKUP_ERRORS.get(struct.unpack_from("Q", self.memory, 48)[0]),
@@ -99,9 +113,8 @@ class Watchdog:
 
     async def start(self):
         self.beat()
-        self.previous_handler = signal.signal(signal.SIGUSR2, self.dumped)
+        self.previous_handler = signal.signal(signal.SIGUSR2, self.signalled)
         try:
-            faulthandler.register(signal.SIGUSR2, file=self.write_fd, all_threads=True, chain=True)
             # Python 3.15 on this macOS host can wake asyncio's child watcher
             # on SIGSTOP, then block its loop in waitpid(pid, 0). This helper
             # must never use that watcher: poll() always uses WNOHANG.
@@ -116,16 +129,16 @@ class Watchdog:
         except BaseException:
             self.unregister()
             self.dispose()
-            signal.signal(signal.SIGUSR2, self.previous_handler)
+            signal.signal(signal.SIGUSR2, resting(self.previous_handler))
             raise
-        # Retain a read descriptor: an exited helper must not turn the C
-        # handler's best-effort write into SIGPIPE.
+        # Nothing writes to the pipe since 2.4.9; the helper's select on it
+        # paces its polling, and this read descriptor is retained with it.
 
     def unregister(self):
-        # Ignore any signal already sent by the helper before disposing either
-        # descriptor. The original disposition is restored only after it exits.
-        faulthandler.unregister(signal.SIGUSR2)
-        signal.signal(signal.SIGUSR2, signal.SIG_IGN)
+        # Absorb any signal already sent by the helper before disposing either
+        # descriptor. The original disposition is restored only after it exits,
+        # and never as SIG_DFL or SIG_IGN (resting).
+        signal.signal(signal.SIGUSR2, absorb)
 
     def dispose(self):
         for fd in (self.read_fd, self.write_fd):
@@ -173,7 +186,7 @@ class Watchdog:
             self.unregister()
             if self.closed_outcome is not None:
                 self.dispose()
-                signal.signal(signal.SIGUSR2, self.previous_handler)
+                signal.signal(signal.SIGUSR2, resting(self.previous_handler))
 
     async def close_direct(self):
         if self.process:
@@ -262,7 +275,7 @@ def monitor(root, parent, generation, memory_fd, pipe_fd, parent_identity=None):
 
     writer = threading.Thread(target=logger, name="watchdog-file-output", daemon=True)
     writer.start()
-    reported, dumps = None, 0
+    reported, signals = None, 0
     retry_at, retry_delay, failures = 0.0, CLOSE_SECONDS, 0
     try:
         # The owner is now our kernel parent; the observed worker is a sibling.
@@ -275,10 +288,9 @@ def monitor(root, parent, generation, memory_fd, pipe_fd, parent_identity=None):
             if before != struct.unpack_from("d", memory)[0]:
                 continue
             count = struct.unpack_from("Q", memory, 16)[0]
-            if count != dumps:
-                event("watchdog_dump_possibly_truncated", dumps=count,
-                      reason="nonblocking signal output; complete delivery cannot be proved")
-                dumps = count
+            if count != signals:
+                event("watchdog_diagnostic_signal", signals=count)
+                signals = count
             age = time.monotonic() - before
             if age >= THRESHOLD and before != reported and time.monotonic() >= retry_at:
                 try:
@@ -306,7 +318,7 @@ def monitor(root, parent, generation, memory_fd, pipe_fd, parent_identity=None):
                           stall_start_wall=wall + INTERVAL,
                           stall_start_utc=datetime.fromtimestamp(wall + INTERVAL, timezone.utc).isoformat(),
                           heartbeat_monotonic=before, observed_wall=time.time(), age_seconds=age,
-                          threshold_seconds=THRESHOLD, parent=parent, dump_integrity="possibly_truncated")
+                          threshold_seconds=THRESHOLD, parent=parent, dump_integrity="no_dump")
                     if struct.unpack_from("d", memory)[0] < 0:
                         break
                     try:
