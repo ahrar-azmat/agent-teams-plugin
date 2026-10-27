@@ -4,6 +4,12 @@
       "type": "stdio",
       "command": "${CODEX_ORACLE_PYTHON:-python3}",
       "args": ["${CLAUDE_PLUGIN_ROOT}/run_server.py"],
+      "env": {
+        "CLAUDE_PLUGIN_OPTION_WRITER_MCP_SERVERS": "${user_config.writer_mcp_servers}",
+        "CLAUDE_PLUGIN_OPTION_WRITER_PARK_IDLE_SECONDS": "${user_config.writer_park_idle_seconds}",
+        "CLAUDE_PLUGIN_OPTION_MEMORY_WARN_RATIO": "${user_config.memory_warn_ratio}",
+        "CLAUDE_PLUGIN_OPTION_MEMORY_CRITICAL_RATIO": "${user_config.memory_critical_ratio}"
+      },
       "timeout": 14400000
     }
   }

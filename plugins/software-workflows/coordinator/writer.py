@@ -90,7 +90,7 @@ class Writer:
         for key in participants.checkout_ids(self.store, run["unit"]):
             await self.daemon.ensure_lease(key)
         listener = self.store.get(actor["listener"])
-        if listener["state"] == "dormant":
+        if listener["state"] in ("dormant", "parking") or listener.get("park_resume_required"):
             await self.daemon.dormancy.start(runid, "workflow advance")
             listener = self.store.get(self.store.get(actor["id"])["listener"])
         if self.daemon.hook_stale(listener) and not self.unbound(listener):
@@ -101,7 +101,7 @@ class Writer:
             from .recovery import reconcile_listener
             await reconcile_listener(self.daemon, listener, advance=False)
         from .writer_profile import deliver_context
-        await deliver_context(self.daemon, self.store.get(run["root_actor"]))
+        await deliver_context(self.daemon, self.store.get(run["root_actor"]), preparing_input=True)
         await self.daemon.messages.deliver_held(runid)
         # Everything is read again after the awaits above (a lease, a replacement): a cancel, a drain, another input
         # or another incarnation since then starts nothing, and the input stays prepared until native bindings are
@@ -120,7 +120,10 @@ class Writer:
         image_paths([item["path"] for item in phase["input"] if item["type"] == "localImage"])
         phase.update(state="submitting", submitted=time.time(), start_listener=listener["id"])
         run.update(production_started=True, state="running")
-        self.store.save(run)  # Durable before the native RPC, including its uncertain window.
+        with self.store.transaction():
+            phase["input"] = self.daemon.messages.prefix_held(actor, input_id, phase["input"])
+            phase["input_digest"] = digest(phase["input"])
+            self.store.save(run)  # Durable before the RPC, including held mail.
         self.starting.add(input_id)
         try:
             response = await connection.call("turn/start", {
@@ -210,6 +213,7 @@ class Writer:
             return
         phase["turn"] = turn
         if item.get("type") == "userMessage" and item.get("clientId") == phase["input_id"]:
+            self.daemon.messages.entered(actor["id"], phase["input_id"], {"turn": turn, "item": item.get("id")})
             phase["input_observed"] = True
             if phase["state"] in ("uncertain", "submitting"):
                 phase["state"] = "submitted"

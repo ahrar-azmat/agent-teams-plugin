@@ -7,19 +7,15 @@ import json
 import os
 from pathlib import Path
 import shlex
-import signal
-import selectors
-import socket
 import sqlite3
 import stat
-import subprocess
 import sys
 import time
 
 from .locks import KeyedLocks, finish_all
-from .client import CoordinatorError, validate_state, venv_fds, launch_environment
+from .client import CoordinatorError, validate_state
 from . import telemetry
-from .store import Store, uid, digest, encoded, WINDOW_ACTIVE
+from .store import Store, uid, digest, encoded, WINDOW_ACTIVE, BLOCKERS
 from .ledger import Ledger, normalize, patch_scope, read_path
 from .custody import Custody
 from . import native, tools, processes, runtime, participants, routing
@@ -30,7 +26,7 @@ VERSION = runtime.plugin_version()  # in daemon/status, so that a newer client c
 # 3.5 s replacement start, and 1 s draining leave 1.5 s for polling/transport.
 # This bounds waiting for RPC settlement; occupied mutations refuse immediately.
 STOP_DRAIN_S = 1.0
-READ_RPC = {"daemon/status", "checkout/query", "checkout/revisions", "project/status",
+READ_RPC = {"daemon/status", "checkout/query", "checkout/revisions", "project/status", "services/status",
             "run/status", "run/list", "run/result", "run/events", "run/terminals",
             "claim/list", "unknown/list", "message/inbox", "unit/status", "unit/diff", "records/list"}
 COMPLETION_RPC = {"operation/complete", "custody/reconcile", "run/interrupt", "run/terminate-terminal", "review/complete", "lead-hook/batch"}
@@ -135,6 +131,15 @@ class Daemon:
         self.writer_status = {}
         from .dormancy import Dormancy
         self.dormancy = Dormancy(self)
+        from .parking import Parking
+        from .retention import Retention
+        self.parking = Parking(self)
+        from . import memory
+        self.memory = memory.Memory(self)
+        memory.CURRENT = self.memory
+        self.retention = Retention(self)
+        from .services import Services
+        self.broker = Services(self)
         from .writer_profile import setting, suggestion
         self.writer_profile = setting()
         self.writer_profile["suggestion"] = suggestion(self.store)
@@ -293,10 +298,15 @@ class Daemon:
         def ended(completed):
             if self.stop.is_set() or self.listener_retiring(listener):
                 return
+            error = None if completed.cancelled() else completed.exception()
+            if error is not None and native.local_resource_failure(error):
+                connection = self.connections.get(listener)
+                if connection is not None:
+                    connection.intake_failed(error, role)
+                    return
             current = self.store.get(listener, required=False)
             if not current or current["state"] in ("stopped", "dead") or role == "log" and not current.get("log"):
                 return
-            error = None if completed.cancelled() else completed.exception()
             # Replaying a lost queue item must precede later applications. Stop
             # visibly and let startup replay the durable suffix, rather than
             # restarting a consumer past an interrupted journal application.
@@ -344,6 +354,7 @@ class Daemon:
                 "endpoint": getattr(self, "endpoint", None),
                 "event_loop_lag": dict(self.loop_lag),
                 "services": {name: dict(state) for name, state in self.services.items()},
+                "project_services": self.broker.status(),
                 "checkout_scans": self.ledger.scans.status(),
                 "checkout_locks": [lock.status() for lock in self.ledger.locks.values() if lock.locked() or lock.waiting],
                 "locks": {"rpc": len(self.request_locks), "actor": len(self.actor_locks),
@@ -352,7 +363,7 @@ class Daemon:
                 # What children.start measured as this daemon started, and the runs, units and checkouts startup
                 # recovery is still reconciling. The writer app-servers it ended (recovery.end_wedged), by reason, and
                 # those now silent (reported, never ended): the first sign of either is here, not a blocked lead.
-                "child_watcher": self.child_watcher, "recovering": recovering_counts(self),
+                "memory": self.memory.status(), "child_watcher": self.child_watcher, "recovering": recovering_counts(self),
                 "listener_reconciles": list(self.listener_reconciles.values()), "startup_recovery": startup_counts(self.store),
                 "recovery_capacity": {"limit": self.recovery_limit, "active": self.recovery_active, "queued": self.recovery_queued},
                 "history_capacity": {"limit": self.history.incremental_limit, "active": self.history.incremental_active,
@@ -362,6 +373,7 @@ class Daemon:
                 "lead_edits": self.pending_lead_edits(),
                 "lead_edit_legacy_limit": legacy_status(self.store),
                 "ended": dict(self.ended), "silent": len(self.silent), "dormancy": self.dormancy.status(), "writer_mcp_profile": self.writer_profile,
+                "retention": self.retention.status(),
                 "sqlite": sqlite3.sqlite_version, "version": VERSION, **({} if brief else {"writers": writers})}
 
     def intake_status(self):
@@ -386,6 +398,10 @@ class Daemon:
     async def create_run(self, params, revision=None):
         if set(params) - {"checkout", "project", "cwd", "dispatch_cwd", "mode", "task", "paths", "model", "fixture", "workflow"} or params.get("mode", "native") not in ("lead", "native"):
             raise CoordinatorError("RUN_FIELDS", "run/start accepts checkout or project, cwd, dispatch_cwd, mode (lead or native), task, paths, model, fixture and workflow")
+        if params.get("mode", "native") == "native":
+            # Refuse before allocating a run or its claims. The launch boundary
+            # checks again in case pressure changes during preparation.
+            self.memory.check()
         if params.get("workflow") is not None:
             from .writer import descriptor
             params = dict(params, workflow=descriptor(params["workflow"]))
@@ -557,10 +573,11 @@ class Daemon:
         return not (any(a.get("active_turn") for a in self.store.all("actor", unitid)) or self.custody.unit_active(unitid)
                     or self.admitting_units.get(unitid)
                     or any(r.get("unit") == unitid for r in active(self.store))
-                    or any(o["state"] in ("prepared", "allowed", "running") or o.get("executing") for o in self.store.all("operation", unitid))
+                    or any(self.store.db.execute("SELECT 1 FROM records INDEXED BY quiet_" + kind + " WHERE " + WINDOW_ACTIVE[kind] +
+                                                 " AND parent=? LIMIT 1", (unitid,)).fetchone() for kind in ("operation", "executing"))
                     or any(p.get("state") in ("submitting", "uncertain") for p in (run.get("phases") or {}).values())
-                    or any(m.get("unit") == unitid and m["state"] not in ("entered_context", "acknowledged")
-                           and m["delivery"] in ("submitting", "submitted", "uncertain") for m in self.store.all("message")))
+                    or self.store.db.execute("SELECT 1 FROM records INDEXED BY blocker_delivery WHERE " + BLOCKERS["delivery"] +
+                                             " AND json_extract(data,'$.unit')=? LIMIT 1", (unitid,)).fetchone())
 
     def lead_mail(self, message):
         """Mail a lead reads through its inbox (`lead`, a session mailbox, or an actor of kind lead): no native turn
@@ -630,7 +647,7 @@ class Daemon:
         """A listener's stored config with this release's coordinator hooks in place of those it was admitted with.
         Its trust entries for them stay keyed by position: admit_listener replaces their hashes."""
         _, hooks = self.hook_config()
-        return dict(config, features=dict(config.get("features") or {}, hooks=True),
+        return dict(config, thread_unload_delay_secs=0, features=dict(config.get("features") or {}, hooks=True),
                     hooks=dict(config.get("hooks") or {}, PreToolUse=hooks["hooks.PreToolUse"], PostToolUse=hooks["hooks.PostToolUse"]))
 
     async def admit_listener(self, actor, config, home, roots, cwd):
@@ -638,6 +655,7 @@ class Daemon:
         hashes, and the one kept starts with that trust."""
         command, _ = self.hook_config()
         profile_base_config = config
+        service_environment = await self.broker.acquire(actor["run"])
         spawned = []
         try:
             listener = await self.spawn_listener(actor, config, home)
@@ -665,10 +683,12 @@ class Daemon:
             prior_trust = effective.get("config", {}).get("hooks", {}).get("state", {})
             config.setdefault("hooks", {})["state"] = dict(prior_trust, **trust)
             await self.stop_listener(listener)
-            listener = await self.spawn_listener(actor, config, home)
+            listener = await self.spawn_listener(actor, config, home, service_environment=service_environment)
             spawned.append(listener["id"])
             connection = self.connections[listener["id"]]
-            verify((await connection.call("config/read", {"cwd": cwd, "includeLayers": False}))["config"], profile)
+            effective_writer = (await connection.call("config/read", {"cwd": cwd, "includeLayers": False}))["config"]
+            verify(effective_writer, profile)
+            self.broker.verify_environment(effective_writer, service_environment)
             listed = await connection.call("hooks/list", {"cwds": roots})
             own = native.coordinator_hooks(listed, roots, command=command)
             if len(own) != 2 or any(h["trustStatus"] != "trusted" or not h["enabled"] for h in own):
@@ -711,7 +731,7 @@ class Daemon:
             await finish(self.stop_listener(reader, kill=True))
             raise
 
-    async def spawn_listener(self, actor, config, home=None, incarnation=None):
+    async def spawn_listener(self, actor, config, home=None, incarnation=None, service_environment=None):
         from .writer_profile import require_valid
         require_valid(self.writer_profile)
         ident = incarnation or uid("listener")
@@ -731,8 +751,11 @@ class Daemon:
         descriptor = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_CLOEXEC, 0o600)
         try:
             offset = os.fstat(descriptor).st_size
-            process = await asyncio.create_subprocess_exec(binary, "app-server", "--listen", "unix://" + str(socket),
-                                                           *native.override_args(config), cwd=actor.get("cwd", self.store.get(actor["checkout"])["root"]),
+            from .owned import spawn
+            process = await spawn(binary, "app-server", "--listen", "unix://" + str(socket),
+                                                           kind="listener", listener=ident,
+                                                           *native.override_args(dict(config, **({"shell_environment_policy.set": service_environment} if service_environment else {}))),
+                                                           cwd=actor.get("cwd", self.store.get(actor["checkout"])["root"]),
                                                            env=environment, stdin=asyncio.subprocess.DEVNULL,
                                                            stdout=asyncio.subprocess.DEVNULL, stderr=descriptor,
                                                            start_new_session=True, close_fds=True)
@@ -747,7 +770,8 @@ class Daemon:
                            "socket": str(socket), "binary": binary, "binary_digest": await telemetry.to_thread(native.file_digest, binary),
                            "endpoint_allocation": allocation,
                            "pid": process.pid, "birth": birth["birth"], "incarnation": ident, "state": "starting",
-                           "kernel_id": birth.get("kernel_id"),
+                           "kernel_id": birth.get("kernel_id"), "boot_session": birth.get("boot_session"),
+                           "owner_sequence": process.family["owner_sequence"],
                            "home": str(home) if home else None, "config": config,
                            "hook_digest": native.file_digest(Path(__file__).with_name("hooks.py")),
                            "log": str(log), "generation": self.store.generation}, actor["run"])
@@ -755,7 +779,7 @@ class Daemon:
             self.store.put("native_log", ident + ":log", {"offset": offset}, ident)
             deadline = asyncio.get_running_loop().time() + 30
             while not socket.exists():
-                if process.returncode is not None or asyncio.get_running_loop().time() >= deadline:
+                if await process.poll() is not None or asyncio.get_running_loop().time() >= deadline:
                     self.read_native_log(ident)
                     raise CoordinatorError("LISTENER_START", "Native listener failed to start",
                                            {"exit_code": process.returncode, "path": str(socket),
@@ -766,12 +790,7 @@ class Daemon:
             async def cleanup():
                 # It never served, so nothing was admitted to it: end it and what it started (its own process group, while
                 # this daemon has not reaped it), so no failed start outlives its error.
-                if process.returncode is None:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    await process.wait()
+                await process.end()
                 try:
                     runtime.cleanup(allocation)
                     cleaned = True
@@ -992,6 +1011,16 @@ class Daemon:
         """Its app-server has exited: nothing it admitted can still write. Quarantines stop holding the paths they
         kept for a write that might still finish. With `unfinished`, a patch it never reported ending is
         quarantined for that reason, as a crash gap is."""
+        # An app-server's exit alone says nothing about the descendants it left.
+        if listener.get("owner_sequence"):
+            result = await self.leases.call("end", payload={"listener": listener["id"], "mode": "drain"})
+            if result["family"]["state"] != "GONE":
+                raise CoordinatorError("FAMILY_REAPING", "Recorded descendants still hold execution custody", operational=True)
+            listener["owner_sequence"] = result["family"]["owner_sequence"]
+            listener["family_gone"] = result["family"]["exit_evidence"]
+            self.store.save(listener)
+        else:
+            self.legacy_exited(listener)
         query = "SELECT * FROM records INDEXED BY window_{} WHERE {} AND json_extract(data,'$.native.listener')=? ORDER BY id"
         # A stopped process is not evidence that its queued completion was absent.
         # Detach normally replays it; an interrupted retirement leaves this
@@ -1002,6 +1031,16 @@ class Daemon:
                     await self.ledger.quarantine(operation, unfinished)
         for operation in list(self.store.selected(query.format("executing", WINDOW_ACTIVE["executing"]), (listener["id"],))):
             self.ledger.end_execution(operation)
+
+    def legacy_exited(self, listener):
+        # Migration of already-exited writers is observation, never permission
+        # to signal. Retained custody identities must independently have ended.
+        members = [listener]
+        for reservation in self.custody.unit_active(listener["unit"]):
+            members.extend(reservation.get("processes", []))
+        if any(not processes.exit_evidence(member) for member in members):
+            raise CoordinatorError("OWNER_UNREGISTERED", "Unregistered surviving processes retain custody; operator reconciliation required",
+                                   {"listener": listener["id"], "retryable": True}, True)
 
     async def native_turn(self):
         """FIFO cooperative service: n live tickets ahead means at most n+1 grants.
@@ -1045,6 +1084,13 @@ class Daemon:
         if self.native_stop_error is not None:
             raise self.native_stop_error
 
+    def check_native_resource(self, listener, error, stage):
+        if native.local_resource_failure(error):
+            connection = self.connections.get(listener)
+            if connection is not None:
+                connection.intake_failed(error, stage)
+        self.check_native_stop()
+
     async def tail_native_log(self, listenerid):
         """Follow a live listener's log. A failure to read it is recorded, never fatal: a result read late only
         delays a release."""
@@ -1073,6 +1119,7 @@ class Daemon:
                     self.background(self.settle_returned(self.store.get(ident)))
                 failure = None
             except Exception as exc:
+                self.check_native_resource(listenerid, exc, "native log")
                 code = getattr(exc, "code", type(exc).__name__)
                 if code != failure:
                     self.store.event("native/log_failure", listenerid, {"code": code})
@@ -1084,6 +1131,18 @@ class Daemon:
         if self.native_intake_closed:
             raise CoordinatorError("DAEMON_STOPPING", "Native intake has ended", operational=True)
         ident = listener["id"]
+        if listener.get("owner_sequence"):
+            grant = await self.leases.call("adopt", payload={"listener": ident})
+        else:
+            # Upgrade bridge: only a persisted, thread-bound predecessor may be
+            # imported. The supervisor verifies its birth and journals ownership
+            # before granting it; threadless living bootstraps still refuse.
+            saved = self.store.get(ident)
+            proof = {key: saved[key] for key in ("id", "pid", "birth", "kernel_id", "boot_session",
+                                                "root_thread", "process_lineage") if key in saved}
+            grant = await self.leases.call("adopt-legacy", payload={"record": proof})
+        listener["owner_sequence"] = grant["family"]["owner_sequence"]
+        self.store.save(listener)
         await self.detach_listener(ident)
         self.retiring_listeners.discard(ident)
         self.flush_native_progress()
@@ -1141,6 +1200,7 @@ class Daemon:
             # This publication is strictly after COMMIT; failed batches leave
             # neither an application wakeup nor a claimed receipt high-water.
             queue.publish(sequence, len(entries))
+            self.parking.touch(ident)
 
         def intake_failure(details):
             self.native_stop_error = connection.intake_error
@@ -1254,6 +1314,7 @@ class Daemon:
                        "features.multi_agent_v2_dynamic_tools": True, "features.unified_exec_tty": False,
                        "approval_policy": "never", "sandbox_mode": "danger-full-access"})
         config.update({"model_reasoning_effort": "max", "model_reasoning_summary": "detailed"})
+        config["thread_unload_delay_secs"] = 0
         workflow = params.get("workflow")
         if workflow and workflow["compact_limit"]:
             config["model_auto_compact_token_limit"] = workflow["compact_limit"]
@@ -1264,6 +1325,7 @@ class Daemon:
         from .writer_profile import context
         profile_line = context(listener["writer_profile"]) if listener["writer_profile"]["mode"] == "list" else ""
         response = await connection.call("thread/start", {"cwd": cwd,
+                                          "config": await self.broker.thread_config(actor),
                                           **({"projectId": unit["project"], "runtimeWorkspaceRoots": roots} if unit.get("project_revision") else {}),
                                           "model": workflow["model"] if workflow else params.get("model", "gpt-6-astra"), "approvalPolicy": "never",
                                           "sandbox": "danger-full-access", "dynamicTools": tools.specifications(),
@@ -1273,7 +1335,8 @@ class Daemon:
                                           "Messages require ack from the named recipient. Child fallback ack format: C1_ACK <message-id>. "
                                           + "Workspace roots in order: " + json.dumps(roots) + ". Paths are absolute or relative to the actual tool cwd. "
                                           "Qualified coordinator paths use {root_id: checkout-id, path: repository-relative-path}." +
-                                          ("\n" + profile_line if profile_line else "")})
+                                          ("\n" + profile_line if profile_line else "") +
+                                          ("\n" + self.broker.instructions(actor) if self.broker.instructions(actor) else "")})
         from .projects import verify_thread
         verify_thread(response, unit, cwd, roots)
         actor.update(thread=response["thread"]["id"], session=response["thread"]["id"], policy=native.policy_echo(response))
@@ -1285,6 +1348,10 @@ class Daemon:
         listener["services"] = await telemetry.to_thread(processes.inventory, listener, None)
         self.store.save(listener)
         admitted = await admission.writer_gate(self, listener["id"], response, fixture=bool(fixture))
+        listener = self.store.get(listener["id"])
+        listener["recovery_state"] = "reconciled"
+        self.store.save(listener)
+        self.parking.touch(listener["id"])
         run = self.store.get(actor["run"])
         run.update(admission=admitted, rollout=response["thread"].get("path"))
         self.store.save(run)
@@ -1312,19 +1379,6 @@ class Daemon:
                 return False
             await asyncio.sleep(0.05)
 
-    def signal_listener(self, listener, number):
-        """Send `number` to the listener's app-server while that process still holds its pid: its birth identity is
-        read right before the signal, with nothing awaited between (an app-server another daemon started is reaped
-        by launchd, and its pid can be another process's then). False when it has exited."""
-        current = processes.identity(listener["pid"])
-        if not current or current["birth"] != listener["birth"] or current["zombie"]:
-            return False
-        try:
-            os.kill(listener["pid"], number)
-        except ProcessLookupError:
-            return False
-        return True
-
     async def stop_listener(self, listener, drain_s=5, kill=False):
         from .locks import retire
         await retire(self._stop_listener, listener, drain_s, kill)
@@ -1343,16 +1397,14 @@ class Daemon:
         await self.detach_listener(listener["id"])
         detached = time.monotonic()
         kill = kill or bool(listener.get("wedged"))
-        if self.signal_listener(listener, signal.SIGTERM):
-            began = time.monotonic()
-            self.signal_listener(listener, signal.SIGCONT)
-            exited, killed = await self.listener_exited(listener, drain_s), False
-            if not exited and kill:
-                killed = self.signal_listener(listener, signal.SIGKILL)
-                exited = await self.listener_exited(listener, 5)
-            self.store.event("listener/exit", listener["id"], {"seconds": round(time.monotonic() - began, 2), "exited": exited, "killed": killed})
-            if not exited:
-                raise CoordinatorError("LISTENER_DRAIN", "Native listener did not finish draining; retained ownership")
+        if listener.get("owner_sequence"):
+            result = await self.leases.call("end", payload={"listener": listener["id"], "mode": "drain"})
+            if result["family"]["state"] != "GONE":
+                raise CoordinatorError("LISTENER_DRAIN", "Recorded family remains alive; custody retained")
+            listener["owner_sequence"] = result["family"]["owner_sequence"]
+            self.store.save(listener)
+        else:
+            self.legacy_exited(listener)
         exited_at = time.monotonic()
         if listener.get("endpoint_allocation"):
             if Path(listener["endpoint_allocation"]["directory"]).exists():
@@ -1376,8 +1428,18 @@ class Daemon:
         async with self.actor_locks.hold((listener["id"], thread)):
             return await self.resolve_actor_locked(listener, thread, session, connection)
 
+    def listener_connection(self, listener):
+        self.check_native_stop()
+        connection = self.connections.get(listener["id"])
+        if connection is not None:
+            connection.check_intake()
+        if connection is None or connection.closed:
+            raise CoordinatorError("LISTENER_UNAVAILABLE", "This listener has no live connection",
+                                   {"listener": listener["id"], "state": listener["state"], "retryable": True}, True)
+        return connection
+
     async def discover_descendants(self, listener):
-        connection = self.connections[listener["id"]]
+        connection = self.listener_connection(listener)
         async for page in native.page(connection, "thread/loaded/list", {}):
             for entry in page["data"]:
                 await self.resolve_actor(listener, entry if isinstance(entry, str) else entry["id"])
@@ -1393,7 +1455,7 @@ class Daemon:
         deadline = asyncio.get_running_loop().time() + 5
         while True:
             try:
-                response = await (connection or self.connections[listener["id"]]).call("thread/read", {"threadId": thread, "includeTurns": False})
+                response = await (connection or self.listener_connection(listener)).call("thread/read", {"threadId": thread, "includeTurns": False})
                 break
             except CoordinatorError as exc:
                 if exc.code != "NATIVE_RPC" or asyncio.get_running_loop().time() >= deadline:
@@ -1826,6 +1888,12 @@ class Daemon:
                 if watchdog.dumps != reported_dumps:
                     self.store.event("watchdog/dump_possibly_truncated", None, watchdog.status())
                     reported_dumps = watchdog.dumps
+                if hasattr(watchdog.process, "end") and processes.exit_evidence(watchdog.process.family["root"]):
+                    # The supervisor is this helper's parent. Its handle has no
+                    # child watcher to refresh returncode in this worker. Ask
+                    # for the real outcome after kernel exit evidence, leaving
+                    # a healthy idle helper free of periodic owner RPCs.
+                    await watchdog.process.poll()
                 if watchdog.process.returncode is not None:
                     error = "watchdog exited: " + str(watchdog.process.returncode)
                     self.store.event("watchdog/exited", None, {"pid": watchdog.process.pid,
@@ -1881,7 +1949,7 @@ class Daemon:
                     queue.applied += 1
                     queue.applied_bytes += queue.active_bytes
             except Exception as exc:
-                self.check_native_stop()
+                self.check_native_resource(listener["id"], exc, "native application")
                 code = getattr(exc, "code", type(exc).__name__)
                 key = "native_applied:" + listener["id"]
                 applied = self.store.get(key, required=False) or {}
@@ -1918,8 +1986,8 @@ class Daemon:
             # Receipt is durable, application is not. The next generation
             # handles the pending request exactly as after a crash.
             raise
-        except BaseException:
-            self.check_native_stop()
+        except BaseException as exc:
+            self.check_native_resource(listener["id"], exc, "native request")
             obligation.update(state="failed")
             self.store.save(obligation)
             raise
@@ -1991,6 +2059,11 @@ class Daemon:
             self.store.save(obligation)
 
     async def notification(self, listener, method, params):
+        if method == "mcpServer/startupStatus":
+            snapshot = await self.leases.call("snapshot", payload={"listener": listener["id"]})
+            listener["owner_sequence"] = snapshot["family"]["owner_sequence"]
+            self.store.save(listener)
+            return
         if method == "thread/reverted":
             actor = await self.resolve_actor(listener, params["threadId"])
             self.history.invalidate(actor, "thread_reverted")
@@ -2217,7 +2290,7 @@ class Daemon:
         try:
             operation = self.store.get(reservation["operation"])
             if terminals is None:
-                response = await self.connections[listener["id"]].call("thread/backgroundTerminals/list", {"threadId": actor["thread"]})
+                response = await self.listener_connection(listener).call("thread/backgroundTerminals/list", {"threadId": actor["thread"]})
                 if response.get("nextCursor"):
                     raise CoordinatorError("TERMINAL_PAGINATION", "Native terminal inventory is incomplete")
                 terminals = response["data"]
@@ -2523,11 +2596,13 @@ class Daemon:
                                            "NOT IN ('verified','reconciled','resolved','denied')", (run["unit"],)))
         return bool(waiting) and all(self.awaiting_outcome(o) for o in waiting)
 
-    def stop_pending(self):
+    def stop_pending(self, caller_commands=()):
         from .writer import TERMINAL
         now = time.time()
         hooks = []
         for record in self.store.all("lead_hook"):
+            if record.get("stop_control") and record.get("shell_command_digest") in caller_commands:
+                continue  # only the connected caller's pure stop command, never its other shell work
             if record.get("execution"):
                 if record["execution"]["phase"] in ("admitting", "open", "settling"):
                     hooks.append(record)
@@ -2582,7 +2657,8 @@ class Daemon:
             raise CoordinatorError("DAEMON_REPLACED", "Stop belongs to a different daemon process", current)
         if self.draining:
             raise CoordinatorError("DAEMON_DRAINING", "Another stop is draining this daemon", {"retryable": True}, True)
-        pending = self.stop_pending()
+        caller_commands = params.get("_caller_commands", ())
+        pending = self.stop_pending(caller_commands)
         if pending:
             raise CoordinatorError("NOT_QUIESCENT", "Settle pending work before stopping",
                                    {"pending": pending, "listener_reconciles": list(self.listener_reconciles.values()),
@@ -2592,7 +2668,7 @@ class Daemon:
         try:
             deadline = time.monotonic() + STOP_DRAIN_S
             while True:
-                pending = self.stop_pending()
+                pending = self.stop_pending(caller_commands)
                 tasks = (self.rpc_tasks | set(self.inflight)) - {asyncio.current_task()}
                 # An advance that began before the drain sees it at its next step and ends without a turn. A
                 # re-admission or a transport gap's reconcile under way ends first: what it starts is a listener, which
@@ -2617,8 +2693,9 @@ class Daemon:
                     await self.stop_listener(listener)
             for checkout in list(self.store.all("checkout")):
                 await self.release_lease(checkout["id"], stopping=True)
+            await self.leases.call("owner/stop", payload={"inhibit": bool(params.get("park"))})
             self.stop.set()
-            return {"stopping": True}
+            return {"stopping": True, "inhibited": bool(params.get("park"))}
         finally:
             if not self.stop.is_set():
                 self.draining = self.closing = False
@@ -2630,6 +2707,10 @@ class Daemon:
         if owned:
             self.inflight[task] = method
         try:
+            from .intents import FILES
+            timed_admission = method == "lead-hook/dispatch" and params.get("payload", {}).get("tool_name") in FILES
+            if method not in READ_RPC | COMPLETION_RPC | {"daemon/stop"} and not timed_admission:
+                await self.leases.call("ping")  # detached leases cannot authorize new production before bridge refresh
             return await self.dispatch_admitted(method, params)
         finally:
             if owned:
@@ -2638,7 +2719,9 @@ class Daemon:
     async def dispatch_admitted(self, method, params):
         self.check_native_stop()
         if method == "daemon/status":
-            return self.status(params.get("checkout"), bool(params.get("brief")))
+            result = self.status(params.get("checkout"), bool(params.get("brief")))
+            result["supervision"] = await self.leases.call("owner/status")
+            return result
         if method == "checkout/query":
             from .observations import query
             return query(self, params["cwd"], params.get("session_id", ""), params.get("git_common"))
@@ -2666,6 +2749,10 @@ class Daemon:
             return await self.projects.register(params)
         if method == "project/status":
             return self.projects.status(params)
+        if method == "services/declare":
+            return self.broker.declare(self.store.get(params["unit"]), params["spec"])
+        if method == "services/status":
+            return self.broker.status()
         if method == "checkout/register":
             return await self.ledger.register(params["path"])
         if method == "checkout/reconcile":
@@ -2743,7 +2830,15 @@ class Daemon:
             return await self.runs.resume(run, text=params.get("text", ""), deadline=params.get("deadline"), images=params.get("images"))
         if method in ("run/terminals", "run/terminate-terminal"):
             actor = self.store.get(self.store.get(params["run"])["root_actor"])
-            connection = self.connections[actor["listener"]]
+            listener = self.store.get(actor["listener"])
+            self.check_native_stop()
+            if listener["state"] == "dormant":
+                if method == "run/terminate-terminal":
+                    raise CoordinatorError("NO_SUCH_TERMINAL", "A dormant writer has no running terminal")
+                return {"data": [], "nextCursor": None}
+            connection = self.connections.get(actor["listener"])
+            if not connection or connection.closed:
+                raise CoordinatorError("LISTENER_UNAVAILABLE", "Terminal inventory needs a connected writer", {"retryable": True}, True)
             args = {"threadId": actor["thread"]}
             if method == "run/terminate-terminal":
                 args["processId"] = params["process_id"]
@@ -2985,6 +3080,22 @@ class Daemon:
             if set(request) - {"id", "method", "params", "key"}:
                 raise CoordinatorError("RPC_FIELDS", "Unknown RPC envelope field")
             method, params, key = request["method"], request.get("params", {}), request.get("key")
+            if method == "daemon/stop":
+                commands = []
+                try:
+                    peer = writer.get_extra_info("socket")
+                    current = processes.identity(peer.getsockopt(0, 2))
+                    seen = set()
+                    while current and current["pid"] not in seen and current["pid"] > 1:
+                        seen.add(current["pid"])
+                        argv = processes.arguments(current["pid"])
+                        for index, arg in enumerate(argv[:-1]):
+                            if arg in (b"-c", b"-lc"):
+                                commands.append(digest(argv[index + 1].decode()))
+                        current = processes.identity(current["ppid"])
+                except (CoordinatorError, OSError, UnicodeError):
+                    commands = []
+                params = dict(params, _caller_commands=commands)
             payload = params.get("payload", {}) if method == "lead-hook/dispatch" else {}
             if payload.get("hook_event_name") == "PreToolUse":
                 from .admissions import STARTED, peer_started
@@ -3012,7 +3123,7 @@ class Daemon:
                     except CoordinatorError as exc:
                         answer = {"error": exc.envelope()}
                     if key:
-                        if (answer.get("error") or {}).get("code") in ("WRITER_START_FAILED", "WRITER_START_PENDING"):
+                        if (answer.get("error") or {}).get("code") in ("WRITER_START_FAILED", "WRITER_START_PENDING", "RESOURCE_PAUSED", "RESOURCE_EXHAUSTED"):
                             # No input was submitted by this refusal. Its separate durable
                             # start operation remains joinable, including with the same key.
                             self.store.db.execute("DELETE FROM idempotency WHERE key=?", (key,))
@@ -3082,6 +3193,7 @@ class Daemon:
                 # What startup recovery is still reconciling stays its own until it is done (recovery.recover_writers):
                 # its writers' custody and retries, its runs' cancels and inputs, its checkouts' leases.
                 recovering = self.recovering
+                self.broker.maintain()
                 held = list(self.store.held_custody())
                 for actor in list(self.store.all("actor")):
                     if (actor.get("listener") and ("run", actor.get("run")) not in recovering
@@ -3155,28 +3267,28 @@ class Daemon:
     async def serve(self):
         from .locks import finish
         from .recovery import recover, recover_writers
-        from . import children
         allocation = server = None
-        previous_sigint = signal.getsignal(signal.SIGINT)
+        from .stop_control import StopControl
+        control = getattr(self, "stop_control", None)
+        local_control = control is None
+        if local_control:
+            control = StopControl().__enter__()
         loop = asyncio.get_running_loop()
         def request_stop():
             self.stop.set()
             self.closing = True
             self.ready = False
-        def interrupt(signum, frame):
-            # Schedule the entire transition and wake the selector. Calling
-            # Event.set in a raw handler can interrupt waiter registration.
-            # Repeated SIGINTs request the same stop, never Runner's abrupt exit.
-            loop.call_soon_threadsafe(request_stop)
-        signal.signal(signal.SIGINT, interrupt)
+        control.bind(loop, request_stop)
         try:
-            # Before any child process: one stopped by a signal must never freeze this loop (children.py). Measured on
-            # this loop as it starts, not assumed of the interpreter, with the probe shown red on the known-bad watcher.
-            try:
-                self.child_watcher = await children.start(asyncio.get_running_loop())
-            except Exception as exc:
-                self.child_watcher = {"ok": False, "code": getattr(exc, "code", type(exc).__name__)}
+            if control.requested:
+                return
+            # Probe the actual owner, not an unrelated worker asyncio watcher.
+            from .owned import verify_watcher
+            self.child_watcher = await verify_watcher()
             self.store.event("daemon/child_watcher", None, self.child_watcher)
+            if not self.child_watcher["ok"]:
+                raise CoordinatorError("CHILD_WATCHER_UNSAFE", "Native child exit watching failed its startup probe",
+                                       self.child_watcher, True)
             if self.upgrade_fd is not None:
                 asyncio.get_running_loop().call_later(UPGRADE_HOLD_S, self.release_upgrade)
             allocation = runtime.allocate("rpc")
@@ -3201,6 +3313,7 @@ class Daemon:
             self.ready = True
             self.release_upgrade()
             self.background(recover_writers(self, plan))
+            self.background(self.broker.recover())
             self.start_loop_supervisor()
             self.start_service("maintenance", self.maintenance)
             from .executors import observe as observe_executors
@@ -3208,6 +3321,11 @@ class Daemon:
             from .lead_calls import observe
             self.start_service("lead_calls", lambda: observe(self))
             self.background(self.compact_history())
+            for listener in list(self.store.all("listener")):
+                if listener["state"] == "dormant":
+                    self.retention.request(listener["id"])
+                elif listener["state"] == "connected":
+                    self.parking.schedule(listener["id"])
             await self.stop.wait()
         finally:
             # Unlike a tentative drain, leaving serve is irreversible. Fence
@@ -3219,11 +3337,20 @@ class Daemon:
             try:
                 await finish(self.close_serving(allocation, server))
             finally:
-                signal.signal(signal.SIGINT, previous_sigint)
+                if control.requested:
+                    try:
+                        await finish(self.leases.call("owner/stop", payload={"inhibit": bool(os.environ.get("SOFTWARE_WORKFLOWS_LAUNCH_AGENT"))}))
+                    except (CoordinatorError, OSError):
+                        pass  # the explicit process exit code also fences supervisor restart
+                control.loop = control.callback = None
+                if local_control:
+                    control.__exit__(None, None, None)
 
     async def close_serving(self, allocation, server):
         """Join resource users before releasing anything, despite cancellation."""
         from .locks import cancel_and_join, joined
+        self.parking.close()
+        self.broker.close()
         if server is not None:
             # Python 3.12+ wait_closed also waits for idle connections.
             server.close()
@@ -3335,6 +3462,12 @@ def upgrade_claim(root):
 
 
 def worker(root):
+    from .stop_control import StopControl
+    with StopControl() as control:
+        return _worker(root, control)
+
+
+def _worker(root, control):
     if sys.version_info < (3, 11):
         raise CoordinatorError("PYTHON_VERSION", "Daemon requires Python 3.11+")
     root = validate_state(root, create=True)
@@ -3347,6 +3480,7 @@ def worker(root):
             return 0
         try:
             daemon = Daemon(root)
+            daemon.stop_control = control
             if upgrade:
                 daemon.upgrade_fd = int(upgrade)
                 os.set_inheritable(daemon.upgrade_fd, False)  # never into an app-server or a command
@@ -3355,159 +3489,10 @@ def worker(root):
             error = exc if isinstance(exc, CoordinatorError) else CoordinatorError(
                 "DAEMON_STARTUP", type(exc).__name__ + ": " + str(exc)[:1024], operational=True)
             runtime.atomic_json(root / "startup-error.json", {"time": time.time(), "error": error.envelope()})
-            return 3
-    return 0
+            return 4 if control.requested else 3
+    return 4 if control.requested else 0
 
 
 def supervise(root):
-    root = validate_state(root, create=True)
-    os.umask(0o077)
-    inherited = venv_fds()
-    with open(root / "supervisor.lock", "a+b") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return 0
-        from .leases import Custodian, RecoveryEndpoint, receive, send
-        records = json.loads(os.environ.pop("SOFTWARE_WORKFLOWS_RECOVERY_LEASES", "[]"))
-        recovery_fd = os.environ.pop("SOFTWARE_WORKFLOWS_RECOVERY_FD", "")
-        recovered = json.loads(os.environ.pop("SOFTWARE_WORKFLOWS_RECOVERY_WORKER", "null"))
-        custodian = Custodian(records)
-        rescue = RecoveryEndpoint(root)
-        def note(name, record):
-            # A diagnostic for whoever investigates (a full disk refuses it): never a reason to end this process,
-            # and the leases with it.
-            try:
-                runtime.atomic_json(root / name, record)
-            except OSError:
-                pass
-        restarting, waiting = False, None
-        while True:
-            child = None
-            if recovery_fd:
-                parent_socket = socket.socket(fileno=int(recovery_fd))
-                recovery_fd = ""
-                for record in custodian.held.values():
-                    custodian.compat.share_lease(record, recovered["pid"], os.getpid())
-            else:
-                upgrade = None
-                if restarting:
-                    # A restart is a daemon start like any other: under upgrade.lock (Client.upgrading). The first
-                    # start is its launcher's, which holds the lock itself. A process holding it now is starting,
-                    # replacing or stopping the daemon. Holding no lease, this supervisor steps aside for it. Holding
-                    # leases, it waits for the lock and keeps them: the app-servers of the worker that died run on,
-                    # with their commands, and may still write under them, and none holds a lease itself (each is
-                    # spawned close_fds), so letting go would open their checkouts to another writer until a new
-                    # daemon's recovery took the leases again. The holder lets go within its own deadline: a client
-                    # waiting for a daemon to answer is refused DAEMON_UNRESPONSIVE once its timeout passes
-                    # (Client.current), one replacing it DAEMON_OUTDATED (Client.retire), and this supervisor then
-                    # restarts its worker under the lock. Only a signal ends it while it holds leases.
-                    try:
-                        upgrade = upgrade_claim(root)
-                    except OSError:
-                        if not custodian.held:
-                            raise
-                        time.sleep(1)  # no descriptor left (EMFILE), say: tried again each second, the leases held
-                        continue
-                    if upgrade is None and not custodian.held:
-                        note("supervisor-exit.json", {"time": time.time(), "code": "UPGRADE_HELD", "leases_released": 0,
-                                                      "message": "The worker exited while another process held upgrade.lock: "
-                                                                 "it is not restarted here"})
-                        rescue.close()
-                        return 0
-                    if upgrade is None:
-                        if waiting is None:
-                            waiting = time.time()
-                            note("supervisor-wait.json", {"since": waiting, "code": "UPGRADE_HELD", "leases_held": len(custodian.held),
-                                                          "message": "The worker exited while another process held upgrade.lock: "
-                                                                     "it is restarted once the lock is free, its leases held until then"})
-                        continue
-                    if waiting is not None:
-                        note("supervisor-wait.json", {"since": waiting, "until": time.time(), "code": "UPGRADE_HELD",
-                                                      "leases_held": len(custodian.held),
-                                                      "message": "The worker was restarted once upgrade.lock was free"})
-                        waiting = None
-                parent_socket = child_socket = None
-                try:
-                    parent_socket, child_socket = socket.socketpair()
-                    environment = launch_environment()
-                    environment["SOFTWARE_WORKFLOWS_CUSTODIAN_FD"] = str(child_socket.fileno())
-                    passed = inherited + (child_socket.fileno(),)
-                    if upgrade is not None:
-                        environment["SOFTWARE_WORKFLOWS_UPGRADE_FD"] = str(upgrade)  # the worker holds it until it serves
-                        passed += (upgrade,)
-                    child = subprocess.Popen([sys.executable, "-B", "-m", "coordinator", "daemon", "worker", "--state", str(root)],
-                                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                             close_fds=True, pass_fds=passed, env=environment,
-                                             cwd=str(Path(__file__).resolve().parents[1]))
-                except OSError as exc:
-                    for end in (parent_socket, child_socket):
-                        if end is not None:
-                            end.close()
-                    note("startup-error.json", {"time": time.time(), "error": {
-                        "code": "WORKER_SPAWN", "message": type(exc).__name__, "leases_retained": bool(custodian.held)}})
-                    if not custodian.held:
-                        rescue.close()
-                        return 3
-                    # A refused fork or exec (EAGAIN, ENOMEM) clears as other processes end: tried again each second,
-                    # 30 times within the 30 s a client waits for a daemon to start (Client.ensure's timeout).
-                    time.sleep(1)
-                    continue
-                finally:
-                    if upgrade is not None:
-                        os.close(upgrade)
-                child_socket.close()
-            parent_socket.settimeout(15)
-            def alive():
-                if child is not None:
-                    return child.poll() is None
-                current = processes.identity(recovered["pid"])
-                return bool(current and current["birth"] == recovered["birth"] and not current["zombie"])
-            with selectors.DefaultSelector() as selector:
-                selector.register(parent_socket, selectors.EVENT_READ)
-                selector.register(rescue.socket, selectors.EVENT_READ)
-                while alive():
-                    for key, _ in selector.select(0.25):
-                        if key.fileobj is rescue.socket:
-                            candidate, _ = rescue.socket.accept()
-                            candidate.settimeout(20)
-                            try:
-                                expected = processes.identity(child.pid) if child is not None else recovered
-                                custodian.reconnect(candidate, expected)
-                            except Exception:
-                                candidate.close()  # Every acquired reference remains held.
-                                continue
-                            try:
-                                selector.unregister(parent_socket)
-                            except KeyError:
-                                pass
-                            parent_socket.close()
-                            parent_socket = candidate
-                            selector.register(parent_socket, selectors.EVENT_READ)
-                            continue
-                        try:
-                            request, _ = receive(parent_socket)
-                            custodian.request(parent_socket, request)
-                        except (OSError, EOFError, ValueError):
-                            # A lost acknowledgment never releases an acquisition.
-                            selector.unregister(key.fileobj)
-                            break
-                        except Exception as exc:
-                            try:
-                                send(parent_socket, {"ok": False, "holder": "Custodian retained exclusion: " + type(exc).__name__})
-                            except OSError:
-                                selector.unregister(key.fileobj)
-            parent_socket.close()
-            result = child.wait() if child is not None else 0
-            recovered = None
-            if result in (0, 3) and not custodian.held:
-                rescue.close()
-                return result
-            # A replacement worker receives existing descriptors while the
-            # custodian keeps its references throughout ledger reconciliation.
-            # The pause only paces a worker that dies as it starts: nothing a new one waits for outlives the old one
-            # (worker.lock goes with its process). Each start is a recovery, serving after 0.64 s (measured 10-21, 13
-            # writers): 0.25 s keeps such a loop to a start every 0.9 s or more, and 1 s after a startup refusal (3),
-            # which a restart alone does not change, to one every 1.6 s or more.
-            time.sleep(1 if result == 3 else 0.25)
-            restarting = True
+    from .owners import supervise as own
+    return own(root)

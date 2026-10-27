@@ -32,13 +32,19 @@ class Publisher:
 
     async def quiescent(self, unit, allow_quarantined=False):
         listeners = {actor["listener"] for actor in self.store.all("actor", unit["id"]) if actor.get("listener")}
+        dormant = set()
         for listenerid in listeners:
+            listener = self.store.get(listenerid)
+            if listener["state"] == "dormant":
+                self.daemon.dormancy.require_quiet(listener)
+                dormant.add(listenerid)
+                continue
             connection = self.daemon.connections.get(listenerid)
             if not connection or connection.closed:
                 raise CoordinatorError("LISTENER_UNAVAILABLE", "Cannot enumerate every descendant before sealing")
             await self.daemon.discover_descendants(self.store.get(listenerid))
         for actor in list(self.store.all("actor", unit["id"])):
-            if actor.get("listener"):
+            if actor.get("listener") and actor["listener"] not in dormant:
                 connection = self.daemon.connections.get(actor["listener"])
                 if not connection or connection.closed:
                     raise CoordinatorError("LISTENER_UNAVAILABLE", "Cannot prove writer quiescence")

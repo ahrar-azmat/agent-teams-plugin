@@ -137,6 +137,10 @@ async def terminate(process, timeout=5, *, group=False):
     returncode=None retains direct-child ownership, so its PID cannot be reused.
     The timeout bounds graceful exit, not a kernel that cannot reap SIGKILL.
     """
+    if hasattr(process, "end"):
+        await retire(process.end)
+        return
+
     async def close():
         if process.returncode is None:
             try:

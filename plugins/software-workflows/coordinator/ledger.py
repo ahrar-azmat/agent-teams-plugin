@@ -179,6 +179,17 @@ def overlaps(left, right):
     return left == right or left.startswith(right + "/") or right.startswith(left + "/")
 
 
+# Three seconds also covers coarse two-second filesystem timestamps. Recent
+# files remain racy and are read until a hash starts strictly beyond that tick;
+# aging a cache entry alone cannot make it safe. APFS/ext4 nanosecond stamps get
+# the same conservative treatment. ctime is included even if mtime is restored.
+RACY_NS = 3_000_000_000
+
+
+def path_stamp(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_nlink)
+
+
 def read_path(store, checkout, name):
     normalized = normalize(checkout, name)
     root = checkout["root"]
@@ -188,6 +199,8 @@ def read_path(store, checkout, name):
         try:
             descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             descriptors.append(descriptor)
+            root_info = os.fstat(descriptor)
+            cache_key = (checkout.get("id"), root, root_info.st_dev, root_info.st_ino, normalized["path"])
             for component in parts[:-1]:
                 descriptor = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
                 descriptors.append(descriptor)
@@ -199,12 +212,32 @@ def read_path(store, checkout, name):
                 before = os.fstat(stream.fileno())
                 if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
                     raise CoordinatorError("PATH_TYPE", "Only ordinary single-link files have receipts", {"path": name, "checkout": checkout.get("id")})
-                blob = store.blob(stream)
+                began = time.time_ns()
+                stamp = path_stamp(before)
+                with store._blob_publish:
+                    cached = store._path_blobs.get(cache_key)
+                    reusable = bool(cached and cached[0] == stamp and cached[2] < began)
+                    if reusable:
+                        target = store.root / "blobs" / cached[1]["blob"]
+                        try:
+                            reusable = store._validated_blobs.get(cached[1]["blob"]) == store._blob_stamp(target.stat())
+                        except FileNotFoundError:
+                            reusable = False
+                blob = cached[1]["blob"] if reusable else store.blob(stream)
                 after = os.fstat(stream.fileno())
                 current = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
-                fields = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_mode, s.st_nlink)
-                if fields(before) == fields(after) == fields(current):
-                    return {"blob": blob, "mode": "100755" if before.st_mode & 0o111 else "100644"}
+                if stamp == path_stamp(after) == path_stamp(current):
+                    image = {"blob": blob, "mode": "100755" if before.st_mode & 0o111 else "100644"}
+                    if reusable:
+                        counters = telemetry.IO.get()
+                        if counters is not None:
+                            counters["skipped_bytes"] = counters.get("skipped_bytes", 0) + before.st_size
+                    else:
+                        with store._blob_publish:
+                            store._path_blobs.pop(cache_key, None)
+                            if max(before.st_mtime_ns, before.st_ctime_ns) + RACY_NS < began:
+                                store._path_blobs[cache_key] = (stamp, dict(image), began)
+                    return image
         except (FileNotFoundError, NotADirectoryError):
             # A tracked path whose parent is now a file is absent like a deleted one.
             return {"blob": None, "mode": None}

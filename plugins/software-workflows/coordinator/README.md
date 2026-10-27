@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.7 / P1
+# Writer coordinator — software-workflows 2.4.8 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -86,15 +86,97 @@ disabled TTY. It validates the effective modes and the start/resume policy echoe
 Incompatible managed settings cause refusal. This is cooperative coordination
 with full access, not operating-system confinement against arbitrary code.
 
-No child process can block the worker's event loop. On macOS, CPython's threaded
-child watcher returns when a child stops (`waitid` reports `CLD_STOPPED`) and the
-loop then reaps it with a blocking `waitpid`, so one app-server, probe or lead
-command stopped by a signal froze the daemon until it was continued or died. As the
-worker starts, before any child, a probe shown red on the interpreter's watcher
-installs one that waits for the exit through kqueue (`NOTE_EXIT`, which no stop or
-continue fires) and reaps without blocking. Where a pidfd watches children (Linux)
-the interpreter's watcher is kept. `daemon/status.child_watcher` reports what was
-measured.
+Native app-servers and asynchronous helpers are children of the supervisor,
+which checks their exit with `waitpid(WNOHANG)`. A stopped child remains owned.
+Before serving, the worker asks that supervisor to stop an owned probe, measures
+continued event-loop service, then requires its exit evidence and `FAMILY_GONE`.
+A failed probe refuses readiness with `CHILD_WATCHER_UNSAFE`;
+`daemon/status.child_watcher` reports the actual observation. The existing
+kqueue exit watcher remains available to standalone capability fixtures.
+
+### Process ownership and requested stops
+
+The supervisor starts native app-servers, discovery/readers, calibration and
+asynchronous helpers behind a closed gate. It fsyncs `OWNED` in `owner.journal`
+before releasing that gate, then snapshots and grants the family to the worker.
+The journal contains identities and state, never command arguments or environment
+values. Each worker has its own session. macOS identity contains the kernel unique
+ID and exec version read together; an identity-conditioned signal returning ESRCH
+requires another identity read and does not establish exit. Cleanup snapshots
+lineage before signalling, gives the root five seconds, snapshots again, gives
+survivors TERM and two seconds, then retries KILL against surviving identities.
+Custody and execution claims stay owned until durable `FAMILY_GONE`.
+
+The preallocated journal defaults to 8 MiB, configurable through
+`SOFTWARE_WORKFLOWS_OWNER_JOURNAL_BYTES`. Its working model is 30 writers, two
+incarnations each and 16 family members with repeated snapshots. Normal records
+use at most its first 75%; the last quarter is cleanup reserve. Compaction starts
+above 50%, retaining current ownership. Status alarms at 60%. An exhausted or
+damaged journal refuses new ownership with retryable `RESOURCE_EXHAUSTED`; it
+never opens an unregistered payload's gate. The lifecycle measurements and any
+remaining validation limitations are recorded in the build report.
+
+After a supervisor failure, the surviving worker transfers its held lease
+descriptors with SCM_RIGHTS. Acknowledgement of those descriptors precedes
+compatibility-bridge refresh; no release/reacquire window authorizes another
+writer. Recorded orphan families are ended on the next supervisor start.
+Unrecorded processes are not adopted or signalled by executable name.
+The owner blocks in `select(None)` when no end deadline is pending.
+
+SIGINT and SIGTERM latch an idempotent requested stop before the worker Runner
+starts and through executor, generator and loop cleanup. Requested stop exits
+with its explicit outcome; it does not request a replacement worker.
+The journal's inhibit also survives a supervisor restart. LaunchAgent support is
+opt-in through `daemon install-agent` and `daemon uninstall-agent`, with explicit
+consent; normal setup does not install it. The agent uses socket activation and
+the inhibit. Without one, crash cleanup runs at the next client start. The MCP
+pre-exec root-registration gate (O8a) remains out of scope; MCP fan-out is managed
+by the explicit writer profile and verified parking.
+
+### Shared project services and launch pressure
+
+A project can declare `services` in `.software-workflows/services.json` at its
+checkout roots, or through `services/declare`. A declaration maps names to
+`kind` (`minio`, `postgres`, `redis`), a locally present `image`, optional `config`
+and environment-variable mappings. Conflicting checkout declarations refuse.
+Supported configuration is `migration_version`, SQL `migrations` for PostgreSQL,
+and `startup_seconds`. Images are inspected locally and never pulled.
+
+Pool identity includes the project/checkout set, the image IDs and configuration,
+Docker engine identity and context, plus generation. A per-key lock serializes
+acquisition. Containers are created stopped with installation, pool, service and
+nonce labels, loopback ephemeral ports and restart=no. Their full IDs are durable
+before start. Readiness requires authenticated S3/admin, PostgreSQL SELECT or
+Redis ACL PING operations. Per-writer MinIO users have their own bucket policies;
+PostgreSQL writers receive a non-superuser role and a database cloned from the
+migration template; Redis users receive a key prefix and no flush/config/ACL power.
+
+Credentials stay in owner-only state files, never events. Endpoints and credentials
+enter `shell_environment_policy.set` at start and resume and effective launch
+configuration is checked. Developer instructions name the variables and direct
+writers to use those services. `services_private` supplies a separately owned,
+run-labelled pool for server-control tests. Namespace release waits until the
+run ends and its clients' family has exited. Shared idle pools stop after the
+parking interval, restart on demand and refresh ephemeral endpoint assignments.
+Superseded/private pools are removed after their last lease. Removal verifies full
+IDs and every ownership label before `docker rm -v`; no prune or foreign-container
+adoption occurs. Failed cleanup remains durable and visible for retry/recovery.
+Status includes pools, ports, namespaces, leases, idle time, cleanup obligations
+and report-only historical `lead.run` containers.
+
+Before every native app-server launch, kernel pressure and the greater of the
+compressor page/segment ratios are read without a helper process. The measured
+Jetsam range was 0.68–0.70. Warning defaults to 0.50 (18 points below the lower
+observation), critical to 0.62 (six points below it). Pressure level 2 also warns;
+level 4 is critical. Warning defers with retryable `RESOURCE_PAUSED` and asks the
+oldest eligible idle families to park; critical refuses with retryable
+`RESOURCE_EXHAUSTED`. Neither interrupts an active turn. Recovery thresholds use
+five percentage points of hysteresis. `memory_warn_ratio` and
+`memory_critical_ratio` plugin settings and their `SOFTWARE_WORKFLOWS_` overrides
+configure the levels; `SOFTWARE_WORKFLOWS_MEMORY_HYSTERESIS` configures hysteresis.
+Invalid settings or unavailable readings defer launches. Status/Office expose the
+last sample and level; transitions produce one event. Temporary resource refusals
+are not completed idempotent results.
 
 ## Native projects, revisions and selection
 
@@ -1066,8 +1148,8 @@ They discover saved descendants and read persisted turns and items, then stop.
 Failed reads clean up their reader and leave an explicit retryable
 `WRITER_HISTORY_READ_FAILED` outcome. A successful pass records the listener as
 `dormant`, with a timestamp and reason, preserving its run, root thread and actors.
-Subsequent startup passes skip it. There is no idle timer or live-writer parking;
-a live writer keeps the existing reconnect/replacement rules.
+Subsequent startup passes skip it. A connected writer can also become dormant
+through the verified idle-parking procedure below.
 
 Read-only recovery compares journaled `item/completed` receipts since the last
 verified receipt checkpoint against saved history, by thread, turn, item ID and
@@ -1098,8 +1180,8 @@ A failed held delivery stays pending with its failure recorded while the resume
 continues. Waking mail requests the same shared start. Cancellation of a dormant
 run, status, list and log reads start no writer. The start notice says "started
 from dormancy", includes the runtime note and any history gap, and does not
-create UNKNOWN merely because the writer was dormant. Once started, a writer
-stays running until the existing stop/recovery lifecycle ends it.
+create UNKNOWN merely because the writer was dormant. Once started, a writer is
+eligible for parking again after its next idle interval.
 
 `daemon/status.dormancy` reports current dormant/running families, history gaps,
 persisted demand attempts, durable failure counters and this generation's cold-start
@@ -1107,10 +1189,80 @@ p50/max seconds. Run listings and logs include the listener state, dormant time,
 reason, gap IDs and applied profile. Every transition is an event. Status reads
 the small writer-start records; it does not count failures by scanning events.
 
+### Verified live parking and native retention
+
+`writer_park_idle_seconds` defaults to 1800; its
+`SOFTWARE_WORKFLOWS_WRITER_PARK_IDLE_SECONDS` override takes precedence. The
+measured 388 live turn gaps had a median of 792 s, with 27% exceeding 1800 s.
+Zero disables parking. A malformed value disables it and reports
+`WRITER_PARK_SETTING` in status; it does not stop the daemon.
+
+A park requires a connected, reconciled family with no active turn, prepared or
+queued input, owed workflow work, delivery or notice, native tool request,
+background terminal, unsettled operation, custody or lead hold. Last native
+activity resets the idle interval. One demand-driven timer schedules that
+family's pending park; no parking timer remains for a dormant family.
+
+Under the run's start/park and reconciliation locks, parking fences deliveries,
+compares saved items with received evidence, unsubscribes every loaded thread,
+confirms unload through loaded-thread inventory, compares saved items again,
+and only then asks the owner to end the family. Pre-verification missing a suffix
+reports `PERSISTENCE_PENDING` and retries later. A post-unload mismatch records a
+`HISTORY_GAP`; it never authorizes a successful park. Demand waits for the park
+outcome. A partial unload retains a durable resume requirement for recovery.
+`FAMILY_GONE` precedes the dormant transition and advancement of
+`received_verified`. Status includes attempts, completions, abandonment reasons,
+persistence-pending count, parking p50/max and cold-start p50/max.
+
+Receipt equality retains all fields, with only the native 0.163.0 persistence
+transformations below accepted as alternatives. This is the same table as
+`item_projection.ITEM_PROJECTIONS`; an unknown type requires full equality.
+
+| Native item type | Receipt-to-saved comparison |
+|---|---|
+| dynamicToolCall | All fields unchanged. |
+| reasoning | All fields unchanged. |
+| commandExecution | aggregatedOutput: native 65,536-byte middle truncation; all other fields unchanged. |
+| fileChange | All fields unchanged. |
+| agentMessage | All fields unchanged. |
+| userMessage | All fields unchanged. |
+| contextCompaction | All fields unchanged. |
+| sleep | All fields unchanged. |
+| mcpToolCall | result: native 65,536-byte serialized preview; all other fields unchanged. |
+
+A dormant listener may satisfy publication/reopen quiescence using its verified
+exit and saved-family proof. A pending demand, history gap, uncovered actor,
+delivery, custody, operation or tool obligation still refuses quiescence.
+An ended peer's abandoned dynamic invocation retains its possible-effect evidence
+and is retired explicitly; recovery never reruns it on a replacement listener.
+Terminal inventory of a dormant writer is empty without waking it, and terminating
+an absent terminal returns `NO_SUCH_TERMINAL`.
+
+Retention runs one listener at a time after dormancy and at startup. The listener
+and its replacement ancestry must be dormant; unresolved UNKNOWNs, quarantines,
+open operations and pending obligations prevent deletion. Only rows at or below
+both received verification and the native applied cursor qualify. Rows first go
+to `archive/native/<listener>/<first>-<last>.jsonl.gz`; the file and directories
+are fsynced and a SHA-256 archive record is committed before deletion. Deletion
+uses 64-row transactions with a cooperative yield, reusing the native journal's
+measured batch size rather than limiting retained evidence. A crash resumes the
+same durable range and verifies its digest before deleting any remaining rows.
+
+`run/events` includes archive paths and ranges. The office sees `native/archived`
+events. Replay continues beyond its durable applied cursor, and run/log and
+history use native saved history. Archive records preserve the removed raw
+receipt range for diagnosis. Status reports ledger bytes, freelist pages,
+archived rows/bytes and the last archive action. SQLite reuses freed pages; it
+does not shrink the file automatically. To reclaim physical file space, stop the
+coordinator completely, retain its backups and archives, and run SQLite `VACUUM`
+on its ledger while no coordinator process has it open. Never vacuum on a timer.
+
 ### Explicit writer MCP profile
 
 `writer_mcp_servers` accepts `all` (the default) or a JSON list of exact server
 names, such as `["calendar","repository"]`; `[]` disables every server.
+An explicit list enables exactly those servers, including a listed server that
+the native configuration disables.
 `SOFTWARE_WORKFLOWS_WRITER_MCP_SERVERS` overrides the plugin setting. The daemon
 captures the selection at startup; status records its source and that changes
 apply at the next daemon start. The captured selection controls subsequent
@@ -1766,15 +1918,18 @@ only in disposable fixture homes, and never calls an external model. It is
 product capability code, not a test suite. Production writers do not receive
 those fixture settings.
 
-All nine required probes observe a bad configuration before accepting its good
-counterpart: hooks, native evidence, dynamic tools, delivery, TTY, reconnect,
-terminals, policy and outbound validation. `exec_policy` is an additional probe.
-Only completed successful calibration is reusable under its fingerprint. A
+The eleven required probes observe a bad configuration before accepting its good
+counterpart: hooks, native evidence, dynamic tools, delivery, TTY, receipts,
+reconnect, terminals, ownership, policy and outbound validation. `exec_policy` is an additional probe.
+Calibration reports retain the fingerprint of the configuration actually measured. A
 separate C1-owned red/green Git probe proves that missing objects cannot invoke
 lazy-fetch helpers during helper-free reads.
 
-Admission also probes one optional capability for each writer binding, `inject`,
-once, after the required probes; it is cached with the binding and never a refusal.
+Admission can probe one optional capability, `inject`, after the required probes.
+Writer admission runs the controls and retains their report; it does not cache
+them under a separate fingerprint-only listener. Disposable-provider controls
+retain their own fingerprint; they do not establish a production injection capability.
+An unmatched production configuration records `CAPABILITY_CONFIGURATION_UNMEASURED`.
 Its red is a `turn/steer` of a note while a code-mode cell runs: the request after it
 must show the cell still running, the preemption the detector looks for. A
 `thread/inject_items` into the same running cell must leave the cell to complete, be
@@ -1783,9 +1938,10 @@ must start no turn within 1.5 s and be carried by the next turn's first request.
 verdict is `active` when the red came back red and both other parts held, `idle`
 when the red came back red and only the idle part held, and none otherwise (notices
 are then held). A probe that raised or timed out proves neither way and takes
-`idle`, recorded with its error in `capability_fallback`, and is not probed again for
-that binding; each of its steps has its own bound, so it always ends. The probe adds
-about 7 s to a binding's first admission and nothing to a cache hit;
+`None`, recorded with its error in `capability_fallback`. Held mail can instead be
+durably prefixed to the next already-authorized input, before that input's text;
+the native client-message echo settles both. This fallback creates no extra turn.
+Each probe step has its own bound;
 `admission/capability` records the verdict and its seconds.
 
 | State entry | Purpose |
@@ -1860,9 +2016,9 @@ A call the daemon refuses `WRITER_RECOVERING` is sent again while the call's own
 time lasts (90 s by default), only while a whole wait (the refusal's
 `waited_seconds`) and 5 s of the call's own work still fit in it; a keyed call is
 not, since the daemon keeps that answer as its key's.
-Capability cache keys exclude random endpoint observations and use a per-key
-calibration lock; every listener still proves effective policy, hook trust and
-writer tool catalogs. The measured native execution-policy representation has
+Admission serializes calibration per requested configuration; every listener
+still proves effective policy, hook trust and writer tool catalogs. Control
+reports are evidence, not reusable production capability entries. The measured native execution-policy representation has
 two unordered maps; only their entry order is normalized, with raw trace digests
 retained as observations. Ordered rules and policy values still change the key;
 unrecognized representations conservatively retain their raw digest.
@@ -2114,6 +2270,14 @@ without deleting their UNKNOWNs or failure records. The daemon stops for recover
 if the diagnostic cannot be stored, it is
 written to stderr and the stop still proceeds. Uncommitted rows are never
 published for application.
+
+Local capacity failures during native application, request handling or log
+processing use that same stop fence before recording an evidence failure.
+This includes ENOSPC, EDQUOT, EFBIG, descriptor/memory exhaustion and SQLite
+FULL/NOMEM. SQLite IOERR also means the local ledger is unavailable: APFS can
+lose the underlying ENOSPC classification. It stops consumption without claiming
+corrupt native evidence. Constraint errors and verified content mismatches keep
+their existing reconciliation rules.
 
 Admission's two guarded
 preparation phases read heads only for the requested paths; they still compare

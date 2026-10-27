@@ -56,6 +56,19 @@ WINDOW_ACTIVE = {
                  "(json_extract(data,'$.tool') IN ('Write','Edit','MultiEdit','NotebookEdit') AND json_extract(data,'$.state')='received'))",
 }
 
+# Eligibility is queried between cooperative retention batches. Index only the
+# blockers, with their scope in the index: historic tool output may be gigabytes
+# and must never be decoded to answer an existence question. SQLite maintains
+# these predicates in the same transaction as each record mutation.
+BLOCKERS = {
+    "operation": "kind='operation' AND (json_extract(data,'$.state') NOT IN ('verified','reconciled','resolved','denied') OR json_extract(data,'$.executing') IS NOT NULL)",
+    "quarantine": "kind='operation' AND json_extract(data,'$.state')='quarantined'",
+    "dynamic": "kind='dynamic' AND json_extract(data,'$.state')='pending'",
+    "obligation": "kind='native_obligation' AND json_extract(data,'$.state') IN ('pending','failed')",
+    "mail": "kind='message' AND json_extract(data,'$.state') NOT IN ('entered_context','acknowledged') AND coalesce(json_extract(data,'$.delivery'),'') NOT IN ('cancelled','turn_ended')",
+    "delivery": "kind='message' AND json_extract(data,'$.state') NOT IN ('entered_context','acknowledged') AND json_extract(data,'$.delivery') IN ('submitting','submitted','uncertain')",
+}
+
 
 def uid(prefix):
     return prefix + "_" + uuid.uuid4().hex
@@ -82,6 +95,7 @@ class Store:
         self.status_epoch = 0
         self.root = validate_state(root, create=True)
         self._validated_blobs = {}
+        self._path_blobs = {}  # advisory source stamps; never persisted across a restart
         self._blob_publish = threading.RLock()
         for name in ("blobs", "listeners", "indexes", "schemas", "calibrations"):
             directory = self.root / name
@@ -181,6 +195,11 @@ class Store:
                 self.db.execute("CREATE INDEX IF NOT EXISTS window_" + kind +
                     " ON records(" + ("json_extract(data,'$.deadline')," if kind == "lead_hook" else "") +
                     "id) WHERE " + condition)
+                self.db.execute("CREATE INDEX IF NOT EXISTS quiet_" + kind + " ON records(parent,id) WHERE " + condition)
+            for kind, condition in BLOCKERS.items():
+                scope = "json_extract(data,'$.recipient')" if kind == "mail" else "json_extract(data,'$.unit')" if kind == "delivery" else "parent"
+                self.db.execute("CREATE INDEX IF NOT EXISTS blocker_" + kind + " ON records(" + scope +
+                    (",json_extract(data,'$.native.listener')" if kind == "operation" else "") + ",id) WHERE " + condition)
             # Consumer lookups must not deserialize every historical unit or
             # session before applying their checkout/session filter.
             for name, expression, condition in (
@@ -275,6 +294,20 @@ class Store:
                     if existing:
                         self.db.execute("DROP TRIGGER " + name)
                     self.db.execute(definition)
+        # Native evidence may leave SQLite only after a durable archive record.
+        # Every other event, and every event update, remains immutable. Retention
+        # validates the file digest before each resumed deletion sequence.
+        archive_delete = """CREATE TRIGGER immutable_events_delete BEFORE DELETE ON events
+        WHEN OLD.kind!='native' OR NOT EXISTS (
+          SELECT 1 FROM records WHERE kind='archive' AND parent=OLD.subject
+          AND json_extract(data,'$.state') IN ('durable','complete')
+          AND OLD.seq BETWEEN json_extract(data,'$.first') AND json_extract(data,'$.last'))
+        BEGIN SELECT RAISE(ABORT,'immutable event without durable archive'); END"""
+        existing = self.db.execute("SELECT sql FROM sqlite_master WHERE name='immutable_events_delete'").fetchone()
+        if not existing or existing[0] != archive_delete:
+            with self.transaction():
+                self.db.execute("DROP TRIGGER IF EXISTS immutable_events_delete")
+                self.db.execute(archive_delete)
         generation = self.get("daemon", required=False)
         self.generation = (generation or {}).get("generation", 0) + 1
         self.put("meta", "daemon", {"generation": self.generation, "pid": os.getpid(),

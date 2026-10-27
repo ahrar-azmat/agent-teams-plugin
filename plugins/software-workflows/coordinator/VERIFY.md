@@ -13615,3 +13615,345 @@ Not measured:
 - weeks of uptime with the watchdog (10 idle minutes, forced stalls, a stopped watchdog and rotation were measured);
 - an editor lifetime on Linux;
 - the incident's own checkout.
+
+### The live switch, 2.4.6 to 2.4.7 (10-27)
+- **The first arming** (`projects/switch247.py`, from 08:5x) gave up at 16:40 after 1,603 refused stops. Its 4-hour
+  patience ran on the monotonic clock, which stops while the Mac sleeps, and the Mac hibernated from 10:36 to 14:39
+  on a 1 % battery. Log: `r247-lead/switch247-run1.log`.
+- **What held it until 14:5x** was one message, `msg_240e97cc`.
+  - It was a wake=start message to the root actor of `run_6f231178`, sent 437 s after that run's `run/cancelled`.
+    It had stayed owed a delivery for 2.4 days, so every stop answered `NOT_QUIESCENT` (deliveries=1).
+  - The lead settled it with the documented `run/interrupt` on the already-cancelled run
+    (`r247-lead/settle_stuck_message.py`).
+  - Cancel generation 2 marked the message cancelled, and the run stayed cancelled, with no failures.
+  - This is L2, fixed in 2.4.8.
+- **After that,** only the user's Sales_Profiler turns held the stop: one or two writers, each with an active turn
+  whose native events were under two minutes old (`r247-lead/live_turns.py`).
+- **The second arming**, from 16:43 with 10 h of wall-clock patience, was accepted at 17:21 on attempt 256, when
+  both turns had ended.
+  - 2.4.7 recovered 44 writers, 44 units and 5 checkouts in 347 s. 43 writers became dormant and 1 stayed
+    connected.
+  - One startup quarantine healed in 127 s.
+  - The event loop's longest lag during recovery was 5.19 s.
+  - No session or gate variables reached the daemons.
+- **Memory**, before and after (the watcher's 20 s samples):
+  - app-servers: 44 before, 2 to 3 after;
+  - swap in use: 17.4 GB before, 4.6 GB after;
+  - compressor ratio: 0.33 before, 0.16 after;
+  - pressure level: 2 before, 1 after.
+
+## 2.4.8
+
+Every change below was run for real on the checkout:
+- one codebase, no copies;
+- disposable state for every daemon;
+- native writers on the installed Codex 0.163.0 app-server, with the fixture model;
+- lead hooks run by the system Python 3.9 (`/usr/bin/python3`).
+
+The records:
+- **Baselines.** 2.4.7's tree (953d61c), and 2.4.6's installed copy for N2. Each red is the tree before that
+  round's fix: the build's freeze (`r248-w/round2/freeze.json`, 2,825 file hashes) for the fix round.
+- **The writer's commands** are the `COMMAND_JSON` records in `r248-w/round2/` (the build) and `r248-w/round3/` (the
+  fix round). Its reports are `implementation-report.md` and `report.md` beside them. Every run below is named by
+  its record there.
+- **The lead's runs** used the writer's own runner (`regress.py`) in lane roots of the lead's own
+  (`r248-lead/cat1a`, `cat1b`), so no writer evidence was overwritten.
+- **The host.** The runs shared the host with the user's live coordinator (2.4.6 until 17:22, then 2.4.7) and its
+  writers. Every case start passed a memory and disk guard: kernel level 1 or 2 with the compressor below 0.45,
+  free memory at least 25 %, no Jetsam in ten minutes, at least 15 GiB of disk.
+
+No test files were added.
+
+### Plugin options reach the Codex Oracle server (L1)
+- Measured on Claude Code 2.1.311 with a throwaway plugin (`r248/uc-probe-results.md`):
+  - an MCP server whose `.mcp.json` maps `"CLAUDE_PLUGIN_OPTION_PROBE_A": "${user_config.probe_a}"` received the
+    option's default;
+  - the same server without the mapping received no option at all, which is the 2.4.7 bug (calibration red);
+  - a mapping that names an undeclared option kept that server from starting.
+- 2.4.8 maps only declared options.
+
+### Scans hash what changed (L5)
+- **Measured on the live 2.4.7 daemon** (pid 87737), read-only, from `daemon/status.checkout_scans` 27 minutes after
+  its start. `reread_bytes` was 0 everywhere, so these bytes were first reads:
+  - this repository (116 paths): 105 scans read 498 MB, 4.7 MB a scan and 0.07 s each;
+  - Sales_Profiler (about 3,300 paths, 90 MB): 46 scans read 4,211 MB, 91.5 MB a scan and 0.51 s each.
+  - The worker's CPU in `top` while one lead command ran: 10 % and 37 %; its `ps` average: 21 %.
+- **The code on the freeze**, unchanged from 2.4.7: `ledger._snapshot_once` read and hashed every path on every
+  scan. The stats it took only detected an unstable read.
+- **Red** (`l5-frozen-red-repeat`, exit 1, 12.78 s): three real Bash hook pairs on a 3,300-file, 90 MB synthetic
+  checkout made 8 scans, hashed 720,030,827 bytes and took 2.239 s of worker CPU. Its first scan was still running
+  at the before reading.
+- **Green** (`l5-cache-green`, exit 0, 15.39 s): the same three commands, warmed, made 7 scans. They hashed 50,000
+  bytes, skipped 629,983,218 and took 1.437 s of worker CPU.
+- **Correctness** (`l5-correctness-green`, final source, exit 0, 20.64 s): each was attributed exactly as on the
+  freeze:
+  - a same-size rewrite that kept the old mtime;
+  - a rename over a file;
+  - a rewrite inside the racy window.
+  - The three warmed commands' delta was 50,000 bytes hashed and 1.519 s of worker CPU. The CPU figures of the two
+    runs have different warm-up boundaries, and neither is an energy measurement.
+- After a cold restart the first scan hashed the whole checkout again (90,062,144 bytes), and the next skipped
+  89,953,056.
+- **What remains:** the worker's CPU was about 0.28 s a scan before and 0.21 s after. These are observations with
+  different warm-up boundaries. The rest of a scan is its stat walk, git's listing and its bookkeeping (Known
+  limits).
+
+### Journal retention and parking without loop stalls (L4)
+- **Measured read-only on the user's 2.4.7 ledger:**
+  - 12.1 GB, 1,376,643 events;
+  - 1,248,419 native rows (91 %) in the 43 dormant writers' chains.
+  - The heaviest unit held 1,435 operations, 765 MB of JSON. Decoding them took 2.74 to 4.17 s.
+  - The build re-decoded them before every 64-row delete batch, 1,788 batches for that unit. Its park check also
+    decoded all messages and the unit's tool-call records (261 MB, 2.58 s).
+- **Red** (`l4-frozen-red-repeat`, exit 1, 20.93 s): a replica with 1,400 operations (749,999,600 payload bytes)
+  and 110,000 native rows. An eligibility check took up to 1.038 s and a lead hook up to 2.596 s. The run stops
+  after six full decodes.
+  - Its first attempt (`l4-frozen-red`) was refused `RESOURCE_PAUSED` at kernel level 2 and ratio 0.200 before it
+    reached retention, the L3 red below.
+- **Green** (`l4-indexed-green`, exit 0, 18.59 s): eligibility comes from blocker indexes updated in the same
+  transactions as the records, still checked before every batch.
+  - 1,721 checks, at most 1.577 ms each.
+  - All 110,000 rows were archived and deleted, with the archive's count and SHA-256 verified.
+- **A lead hook during archival** (`l4-corrected-hook-green-repeat`, exit 0, 10.30 s): the archive finished in
+  1.66 s. The lead's Pre took 0.188 s (2 calls), and the event loop lagged at most 2.07 ms over 78 samples.
+- **Startup on a replica shaped like the live ledger** (`r3-final-startup-shape-verified`, final source, exit 0,
+  40.67 s): 43 dormant roots without a `dormant_proof` and 184 dead predecessors, synthetic content.
+  - All 227 listeners were verified, and 1,250,000 rows were archived into 227 archives.
+  - Its four earlier attempts exited 1 on the fixture, with no product change between them:
+    - a missing seeded native-log record (`r3-final-startup-shape`, `-diagnostic`);
+    - a completion count that included offline readers' events (`-complete`, `-exact`).
+- `r3-final-retention-boundary` (exit 0): the archive's range boundary.
+
+### Memory admission (L3)
+- The 10-26 to 10-27 samples (2,714 of them, every 20 s):
+  - level 2 for 19 % of the time, in runs of up to 23+ minutes;
+  - ratio 0.32 to 0.40, max 0.403;
+  - no Jetsam.
+- The build paused every launch at level 2. That also failed 18 of the lead's catalog cases on the build
+  (`RESOURCE_PAUSED`). The fix round's own first L4 setup met it at ratio 0.200.
+- Now level 2 alone parks idle writers and lets the launch through. The ratio lines (0.50, 0.62) keep their
+  hysteresis, and level 4 stays critical. Status shows the reading each decision used (`deciding_input`).
+- `r3-final-extended` (exit 0) checks the threshold and hysteresis decisions. The real G4 starts and the
+  user-profile starts succeeded at level 2 with a low ratio.
+
+### Mail to a cancelled writer (L2)
+- **Red** (`l2-frozen-red`, exit 1, 0.24 s): a waking message to a cancelled run's writer was stored and stayed owed
+  a delivery.
+- **Green** (`l2-refusal-green`, exit 0, 0.21 s): the send is refused `RUN_CANCELLED`. No message is stored and
+  nothing is owed.
+- **Upgrade** (`l2-native-upgrade-green-repeat`, exit 0, 5.24 s): a ledger holding such a message from an older
+  release is settled once, with a durable `message/cancelled` event. The first stop then succeeded, and no
+  replacement writer started. The first attempt (`l2-native-upgrade-green`) exited 1.
+- `r3-final-l2` (final source, exit 0): `RUN_CANCELLED`, with no new message.
+
+### The build's review findings, fixed (turn 85)
+Each has a red on the build's freeze and a green on the fix round's source. Logs are in `r248-w/round3/`.
+- **H1**, the hook deadline through the owner's check:
+  - red (`h1-frozen-red`, exit 1): during a slow family retirement, the real Write hook let the call run after
+    3.106 s;
+  - green (`h1-deadline-green`, exit 0): refused `LEAD_ADMISSION_BUSY` at phase ownership in 2.010 s.
+- **H2**, GONE dropped at compaction:
+  - red (`h2-frozen-red`): compaction and reopen lost the family's GONE;
+  - green (`h2-receipt-green`, then `h2-native-compaction-green` on a native writer, exit 0, 8.26 s): it stays.
+- **H3**, the journal descriptor after a failed replace:
+  - red (`h3-frozen-red`): an injected EIO on the directory open after the replace left the descriptor on the old
+    inode, and an append was accepted and lost;
+  - green (`h3-handover-green`): the handover is immediate, and appends stop after a failed sync.
+- **H4**, namespace retirement racing a resume:
+  - red (`h4-frozen-red`): a cleanup queued behind the pool lock dropped a namespace after a resume took its lease
+    back;
+  - green (`h4-fence-green`): the lease revision, the run's ended and drained state and any pending demand are
+    re-checked under the start and pool locks, and the namespace stays.
+- **M1**, a cancelled spawn:
+  - red (`m1-frozen-red`): a cancel after the grant left the real child alive, state GRANTED;
+  - green (`m1-cancel-green`): the child ends by its preassigned launch identity, and the family is GONE.
+- **M2**, legacy bootstraps:
+  - red (`m2-frozen-red-repeat`): an exited threadless predecessor was refused `OWNER_UNREGISTERED`;
+  - green (`m2-legacy-green`): it retires without a signal, and a living one is still refused.
+- **M3**, the predecessor chain:
+  - red (`m3-frozen-red-repeat`): a predecessor's dynamic request and its obligation stayed pending;
+  - green (`m3-chain-green`): both are retired, and the effect evidence is kept.
+- **M4** is L2, above.
+- **M5**, Redis ACLs, on a real local `redis-server`, with no image pulled:
+  - red (`m5-frozen-red`): the retained user failed to authenticate after a restart;
+  - green (`m5-redis-green`): the same credential authenticated.
+- **M6**, the LaunchAgent's settings:
+  - red (`m6-frozen-red`): all three supplied options were dropped;
+  - green (`m6-settings-green`): all three were kept. No agent was installed.
+- **M7**, credential files:
+  - red (`m7-frozen-red`): an empty credential file was accepted;
+  - green (`m7-atomic-green`): files are published whole, and an empty one is refused `SERVICE_SECRET_INCOMPLETE`.
+- **M8**, an unleased pool:
+  - red (`m8-frozen-red`): the pool stayed running with no lease and no `idle_since`;
+  - green (`m8-idle-green`): after its identity check it is idle, under the idle policy.
+- The M2/M3 first reds and L5's first red failed to arrange; their repeats reproduce the defects.
+
+### Parking, retention, services, ownership (the build, `r248-w/round2/implementation-report.md`)
+- **Parking:** G1 made 42 terminal writers dormant, with the owed writer and a second restart checked. The focused
+  runs exit 0: park and resume, an abandoned park (`PERSISTENCE_PENDING`), held mail, and a cancelled demand start.
+- **Parking with the user's MCP profile** (final source, exit 0, 13.97 s): a real 0.163.0 writer.
+  - `MCP_DOCKER` and `openaiDeveloperDocs` were connected at the first launch, and again after a park and a resume
+    on the same thread. The thread's inventory listed eight gateway tools and five Docs tools.
+  - The cycle took 6.36 s, its idle interval included, and every owned family reached GONE.
+  - The Docker gateway ran with an empty owned registry, so the user's container-backed tools were not covered.
+- **G4, with all servers and with two** (`r3-final-g4-all-delivery`, `r3-final-g4-two-delivery`, exit 0):
+  - ten cold starts and a named start-failure retry;
+  - recovery from a worker killed by identity mid-start, with the same native thread surviving and the crashed
+    caller's input not sent again.
+- **The watchdog** (final source, exit 0): its helper was killed by identity and replaced 1.137 s later.
+- **A full disk** (final source, exit 0, 10.60 s): real ENOSPC on an owned 512 MiB image, then `SQLITE_FULL`, a local
+  stop, relief and an automatic restart, with no UNKNOWN.
+- **The regression set** (final source): U1 five times, D2, J1, S1, R1 and the owned-RPC stop repeats, all exit 0.
+- **Retention at scale:** 27 synthetic histories (1,997,863,091 rollout bytes; 321,357 journal rows,
+  2,660,157,537 JSON bytes).
+  - The first recovery took 112.9 s, and the archive run's recovery 208.2 s, with four readers.
+  - 28 archives, 321,497 rows, 4,532,917 gzip bytes. Archive writes took 22.96 s and deletes 6.08 s in all.
+  - `daemon/status` over 2,253 calls: p50 2.1 ms, p99 67.7 ms, max 254 ms, no errors.
+  - A dormant restart took 1.49 s.
+  - The ledger kept 682,075 free pages, and 1,000 new rows reused them, with the page count unchanged.
+- **Shared services**, on local PostgreSQL and MinIO images:
+  - Two concurrent acquisitions made one pool, and each writer was refused the other's namespace.
+  - Cold readiness 0.977 and 0.652 s, warm 0.136 and 0.603 s.
+  - These ran: the create, journal and start crash windows, exact-ID cleanup, a spec change, a private service, and
+    delivery of the environment to a native writer with held mail.
+- **Ownership:**
+  - A real `exec` kept its identity and changed its version, and a stale-version signal returned ESRCH without
+    inventing an exit.
+  - Recorded families reached GONE while an unrecorded process of the same name stayed untouched.
+  - The journal used 17,413 bytes for 15 records. A 32,768-byte journal ran out of normal capacity and then of 14
+    reserve records, each refused loudly with `RESOURCE_EXHAUSTED`.
+  - Three supervisor kills: the same worker was adopted in 5.324, 5.295 and 5.295 s. The throwaway agent was booted
+    out and its plist removed.
+- **A full disk** (final build source, exit 0, 10.43 s): an owned APFS image reached ENOSPC after 506,875,904
+  ballast bytes, and native application raised `SQLITE_FULL`. After relief, recovery was ready with no UNKNOWN,
+  failed prefix, reconcile failure or startup incident, and all 11 families reached GONE.
+- **Item projection:** a command's output of 200,001 characters was saved as 65,536, and an MCP output of 200,100 as
+  65,566. The projected values matched, and a real change still showed.
+- **The watchdog:** catalog 028 found an owner-backed watchdog handle that kept `returncode=None` after its helper
+  died. Fixed in the build, the helper was replaced in 1.158 s.
+
+### Catalog runs
+- **The lead's, on the build** (`r248-lead/cat1.summary`): the 75 selections the writer had not attempted (060-134),
+  plus 043, 046, 047, 048 and 059. 44 exited 0 and 36 failed:
+  - 18 `RESOURCE_PAUSED` (L3);
+  - 4 leftover directories from the writer's earlier runs;
+  - 3 `OWNER_UNREGISTERED`, on fixtures that started listeners by hand without an owner record;
+  - 8 SIGINT entry-point recipes exiting 3: the recipe overwrote the child's `PYTHONPATH` (`CUSTODIAN_REQUIRED`);
+  - 3 other assertions.
+- **The writer's, on the final source** (`r3-final-cat-000` to `-134`): all 135 selections ran, and 134 ended with
+  their expected exit.
+  - 073 (`repeat-command`) exits 1. Its command exits, but its ordering check is false. It passed on 2.4.7, and
+    the cause is not established.
+  - The negative controls 113 and 127 exit 1 with their required `IDLE_WAIT_TIMEOUT_DIAGNOSTICS` discriminator.
+  - Adapted fixtures, each keeping its assertions: 087-090 and 116-119 keep the case's owner adapter in the child's
+    environment; 047, 060 and 082 spawn under the recorded listener with its owner record; 102 and 110 inject the
+    command's exit at the production owner; 081 and 115 drop an obsolete cleanup that named an r247 path.
+- **The F matrix** (`r3-final-f-00` to `-13`, final source): all 14 cases and five companions exit 0, and the
+  independent validator exits 0 (`final-F-summary.json`).
+  - The 56 initial calls had no denial, and Pre was at most 1.042 s.
+  - The grant margin was at least 0.968 s and the reply margin at least 0.963 s.
+  - No fail-open warning, no lead UNKNOWN, and every drain was accepted.
+  - Start loads were 2.6 to 6.9.
+- **N2 against installed 2.4.6** (`r248-w/round3/n2-summary.json`): two matched pairs, in both orders.
+  - `r3-final-n2-1-tree` with `-2-base`: the tree recorded 21,063 events a minute against 2.4.6's 21,206 (ratio
+    0.993). Pre was at most 0.43 s against 0.81 s.
+  - `-5-tree` with `-4-base`: 21,103 against 21,055 (ratio 1.002). Pre was at most 0.38 s against 0.53 s.
+  - Neither pair counts as complete acceptance, only because the 2.4.6 baseline left one incidental
+    `coordinator/transportGap` unapplied after its drain.
+  - `-3-tree` (exit 1) is not a comparison. Kernel level 2 during its startup parked its 27 idle fixture
+    listeners, and the fixture then sent turns over the retained connections without a demand start.
+  - Three complete pairs were asked for, and two ran.
+
+### Review findings (Codex code_review, session 01a14eac, turns 85 to 87)
+- **Turn 85** (the build): Do not ship.
+  - A1, A3 and A4 were fixed. A2 was still open for the predecessor chain.
+  - 4 HIGH (H1 to H4) and 8 MEDIUM (M1 to M8), above.
+  - On the lead's hypotheses: "a production launch path skips the owner journal" was unproven; the stuck mail was
+    confirmed.
+- **Turn 86** (the fix round, tree `1357e96a4901`): Do not ship.
+  - Fixed on their reported paths: H1 to H3, H4's concurrent-resume race, M1 to M5, M7, M8, L2, L3 and L5.
+  - M2's exited-bootstrap case and L4's repeated decoding are fixed. M6 still stands.
+  - No CRITICAL or HIGH. 5 MEDIUM and 1 LOW, under Known limits.
+  - The lead's hypothesis, that the first start on the live ledger is safe, was refuted as an unconditional claim,
+    by the capacity-refusal and snapshot-failure paths. The first start's latency on that ledger was unproven.
+- **The two first-start findings, checked on the user's Mac at 20:22:**
+  - No process was stopped (state T), so no 2.4.7 app-server can take the SIGSTOP path.
+  - The kernel was at level 2 and the compressor at 0.21, a point-in-time reading. The compressor line is 0.50,
+    and a malformed setting or an unreadable reading also holds launches.
+- **The index build on the user's ledger** (`r248-lead/firststart_probe.py`, 20:3x):
+  - A consistent copy of the live ledger was taken with SQLite's online backup from a read-only connection:
+    12,445,552,640 bytes and 1,421,382 events, in 37.6 s.
+  - Opened with the release's `Store`, it built 12 new partial indexes in 73.2 s, 13.4 s of it CPU. They are
+    `blocker_*` for delivery, dynamic, mail, obligation, operation and quarantine, and `quiet_*` for actor,
+    custody, executing, lead_edit, lead_hook and operation.
+  - A second open took 0.01 s.
+  - No daemon ran on the copy, and it was removed whole.
+  - The daemon serves only after the build. A lead hook waits at most about 11 s for a replacement
+    (`hooks/coordinator_lead.py`, `replacement_call`), then takes its unavailable path and lets the edit run
+    without attribution. `Client.start()` answers a retryable `DAEMON_START` after 30 s and leaves the daemon
+    starting. So no edit is to be made until the first start is ready.
+- **Turn 87** (the release docs): Needs changes, all documentation.
+  - The first start's no-edit window above.
+  - The exception to "never signals an unrecorded process".
+  - The LaunchAgent's settings, and parking with `0`.
+  - The memory option's wording.
+  - The ledger's growth, and the scan and CPU figures.
+  - Applied before the final review.
+
+### Static checks on the release tree
+`r247-lead/static_checks248.py`, with the version at 2.4.8 (`r247-lead/static-248`):
+- every plugin `.py` compiles in memory under Python 3.15, and the hook-run files under the system Python 3.9.6;
+- `coordinator/hooks.py --check`: exit 0, compatible, protocol `jsonl-v1`;
+- ruff (F821, F822, F823, F811, F841, F401): 35 findings against installed 2.4.7's 35,
+  none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.8.
+The writer's own run on the final source (`r248-w/round3/static-final-results.json`) also parsed every file as
+Python 3.11 and checked the untracked files' whitespace, all exit 0.
+
+### Known limits
+- **Turn 86's findings**, pushed at the user's direction and fixed in 2.4.9:
+  - `recovery.py:148` (MEDIUM): re-verifying a legacy dormant listener calls `dormancy.recover()` outside the
+    normal error classification. A `RESOURCE_PAUSED` from its offline reader's launch records checkout-wide
+    UNKNOWNs and quarantines the listener. On retry the writer is replaced instead of verified read-only again.
+    `RESOURCE_PAUSED` comes from the compressor at its warning line (with hysteresis), a malformed memory setting,
+    or an unreadable kernel reading. The user's Mac read 0.21 at 20:22, a point-in-time observation.
+  - `services.py:483` (MEDIUM): a namespace drop has no durable retirement fence. A crash between its destructive
+    calls leaves the lease active or idle, and its next acquisition hands out credentials for deleted resources.
+  - `launch_agent.py:26` (MEDIUM, M6 remaining): only the installer's own environment is persisted. `install-agent`
+    from a clean shell writes an empty settings map, and the agent then runs with the defaults.
+  - `recovery.py:703` (MEDIUM): a SIGSTOPped legacy app-server goes to `end_wedged()` and `stop_listener()` before
+    `attach()` adopts it. Its retirement is then refused, non-retryable (`OWNER_UNREGISTERED`). The user's Mac had
+    no stopped process.
+  - `owners.py:47` (MEDIUM): when a cleanup snapshot's append fails, the emergency cleanup still signals the
+    members it has just found, though they were never journaled.
+  - `memory.py:89` (LOW): kernel level 2 calls `Parking.request()` directly, so `writer_park_idle_seconds=0` or a
+    malformed value does not stop the parking that memory pressure asks for.
+- **Scans:** a scan still stats every file and runs git's listing. On the 3,300-file replica the worker's CPU was
+  about 0.28 s a scan before and 0.21 s after, with different warm-up boundaries.
+- **Upgrading:** the first start of 2.4.8 builds 12 new ledger indexes before it serves: 73 s on a copy of the user's
+  12.1 GB ledger. Meanwhile a lead hook waits at most about 11 s for the new daemon and then lets the edit run
+  without attribution, and a call that starts the daemon may answer `DAEMON_START` (retryable) after 30 s while
+  the daemon keeps starting. Make no edits until the coordinator is ready.
+- **Whole-kind reads on the loop:** `recovery.restore_unknown` is unchanged from 2.4.7. It calls
+  `store.all("actor")` and `store.all("operation")` on the event loop (`recovery.py:1737`, `:1771`, `:1825`,
+  `:1869`), decoding every record of those kinds for each restore.
+  - The live 2.4.7 daemon's `loop-stalls.log` at 21:11 showed its loop inside `restore_unknown` → `store.all` →
+    `selected`, during the lead's settlement of the 43 release paths.
+  - A `daemon/status` call meanwhile took 94.05 s.
+  - Fixed first in 2.4.9, with a sweep of every whole-kind read on the loop.
+- **Catalog 073** fails on the final source (above).
+- **The first start:** the full first start of this release on a 12.1 GB ledger, with recovery and retention over
+  real content, has not been run. The shape replica's ledger was 559 MB, and the index build was measured on a copy
+  of the user's.
+- **N2:** two of three matched pairs completed, and their acceptance is incomplete on the baseline's side (above).
+  The matched comparison of the F matrix with the build's freeze is not available.
+- **The installed 2.4.6 full-disk red:** its routed and restart attempts both hit three real `SQLITE_FULL` failures
+  at COMMIT, and the daemon stayed ready with no UNKNOWN. So the inherited strict-red discriminator did not fire,
+  and the tree's full-disk recovery stands on its own green.
+- **Services:**
+  - Redis ran as a local `redis-server`, because no Redis image was present.
+  - The MCP profile cycle used an empty Docker gateway registry.
+  - Representative p95 timings, and the memory of a shared pool against a container per test, were not measured.
+- **Ownership:** the exhaustive SIGKILL at every owner-journal transition was not run.
+- **The ledger** does not shrink by itself. VACUUM it while the coordinator is stopped.

@@ -3,6 +3,206 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.8] — 2026-10-27
+
+A tool call no longer makes the coordinator re-read every file of the checkout: only files whose stat identity
+changed are hashed again. On the user's 3,300-file checkout a scan read 91.5 MB. An idle writer now hands back
+its processes while the coordinator runs. After 30 minutes without activity its saved history is checked, its threads
+are unloaded natively, and its app-server stops with every MCP server. It starts again when it is next used. A
+dormant writer's native journal moves out of the ledger into a compressed archive, in slices that do not hold the
+coordinator. Writers of one project share one set of local service containers (MinIO, PostgreSQL, Redis), each
+writer with its own namespace and credentials, instead of starting a container per test run. The coordinator records
+every process family it starts, and at its next start ends the ones a crash left behind. It holds new launches while
+the Mac is short of memory. Plugin options now reach the Codex Oracle server, mail to a cancelled writer no longer
+blocks every stop, and 2.4.7's known limits from review are fixed. On 10-26 the user's 42 idle writers held about
+23 GB, the ledger grew about 1.5 GB a day, and the Mac ran out of memory. Each change has a real run on Codex 0.163.0
+(coordinator/VERIFY.md, 2.4.8).
+
+### Changed: a tool call hashes what it changed, not the whole checkout
+- Before and after each lead command, the coordinator used to re-read and re-hash every file of the checkout.
+  - On the user's 3,300-file Sales_Profiler checkout a scan read 91.5 MB and took about 0.5 s, measured on the live
+    2.4.7 daemon.
+  - On battery the daemon was a main drain, and Claude sessions began keeping their tool calls to a minimum.
+- Now a file is hashed again only when its stat identity changed since it was hashed: device, inode, size, mtime,
+  ctime, mode and links.
+  - A hash counts only if it began at least 3 s after the file's mtime and ctime (git's racy-clean rule), so a file
+    written within a timestamp tick of its hash is hashed again.
+  - The cache is in memory and advisory: after a restart the first scan reads everything.
+- Attribution is unchanged. A rewrite that restores the old mtime still moves the ctime and is seen, and a rename
+  over a file is a new inode.
+- Measured on a 3,300-file, 90 MB replica, three lead commands that each changed one file:
+  - before: 720 MB hashed, 2.24 s of worker CPU;
+  - after: 50 KB hashed, 1.44 to 1.52 s of worker CPU (two runs).
+- Each scan still stats every file and lists the checkout with git, so a tool call still costs CPU. The two CPU
+  figures have different warm-up boundaries: they are observations, not an energy measurement (Known limits).
+- Status reports, per checkout, the bytes hashed and the bytes skipped.
+
+### Changed: an idle writer hands back its processes, and starts again when used
+- A writer idle for `writer_park_idle_seconds` (default 1800) is parked, in this order:
+  1. its saved history is checked against what was received;
+  2. its threads are unloaded natively (`thread/unsubscribe`), children included;
+  3. its saved history is checked again;
+  4. only then is its app-server stopped, with its MCP servers, and the family's exit confirmed.
+- A writer with anything in flight is not parked: a turn, queued input, a delivery, a background terminal, a tool
+  request, an operation, custody or a lead hold. Output not yet saved abandons the park (`PERSISTENCE_PENDING`),
+  and it is retried later.
+- The default comes from 388 measured gaps between one thread's turns (10-19 to 10-26): p50 792 s, and 27 % longer
+  than 30 minutes. `0` turns off parking on the idle timer, and a malformed value is shown in status and does the
+  same. Parking that memory pressure asks for still happens (Known limits).
+- `run/resume`, a waking message or a workflow advance starts a parked writer through 2.4.7's shared demand start.
+- Measured on a real Codex 0.163.0 writer with the user's MCP profile (`MCP_DOCKER`, `openaiDeveloperDocs`). Both
+  servers were connected at the first launch, and again after a park and a resume on the same thread. The cycle took
+  6.36 s, its short idle interval included.
+- Status (`daemon/status.dormancy`) counts parks attempted, completed and abandoned, with their reasons.
+
+### Changed: a dormant writer's journal leaves the ledger
+- Once a writer and the app-servers it replaced are dormant and verified, their applied native events are written
+  to `<state>/archive/native/<listener>/`, compressed, fsynced and digested, then deleted from the ledger in batches
+  of 64 rows.
+- A writer whose unit has an unresolved UNKNOWN, a quarantine or an open operation naming it keeps its events.
+- Each batch re-checks eligibility from indexes kept in the same transactions as the records, instead of decoding
+  the unit's operations again. On a replica of the user's heaviest unit (1,400 operations, 750 MB of JSON, 110,000
+  rows), a check took at most 1.6 ms where the build took 1.04 s. All 110,000 rows were archived and verified, the
+  event loop lagged at most 2 ms, and a lead hook's Pre took 0.19 s meanwhile.
+- Readers of native events:
+  - `run/events` lists each archive with its range, SHA-256 and path;
+  - `run/log` and the Office read Codex's saved history, which retention never touches;
+  - history checks read only receipts after the verified checkpoint.
+- SQLite reuses the freed pages, so the archived journal no longer adds to the ledger. The file does not shrink, and
+  the records that stay keep growing. To shrink it, VACUUM it while the coordinator is stopped
+  (coordinator/README.md).
+- What can move: on the user's 12.1 GB ledger, events hold 6.4 GB, and 91 % of all event rows are native rows of
+  dormant writers. Tool-call records (3.9 GB) and operations (1.5 GB) stay in the ledger.
+- Measured:
+  - a startup on a replica shaped like the user's ledger (43 dormant writers without the 2.4.8 proof, 184 replaced
+    app-servers) verified all 227 listeners and archived 1,250,000 rows into 227 archives. It was ready in 0.78 s,
+    had every dormant proof in 23.2 s and finished archiving in 33.5 s. The event loop lagged at most 0.04 s, with no
+    history gap and no UNKNOWN. That replica's ledger was 559 MB.
+  - the first open of a copy of the user's 12.1 GB ledger built the 12 new partial indexes in 73 s (13 s of CPU),
+    before the daemon serves; the next open took 0.01 s.
+  - 27 synthetic histories: 321,497 rows into 28 archives, 23.0 s of archive writes and 6.1 s of deletes in all,
+    with `daemon/status` at p99 0.068 s meanwhile.
+
+### Added: writers of one project share its service containers
+- A project declares MinIO, PostgreSQL or Redis services in `.software-workflows/services.json`, using images
+  already present locally. The coordinator never pulls.
+- The first writer that needs them gets one pool per project and spec. Containers are created stopped, labelled,
+  with Docker-assigned loopback ports, and their full IDs are recorded before they start. A pool is ready only after
+  an authenticated call (an S3 call, `SELECT 1`, an ACL `PING`).
+- Each writer gets its own namespace and credentials: a MinIO bucket with a scoped user, a PostgreSQL database
+  cloned from a template with its own role, a Redis ACL user limited to a key prefix. The writer's commands receive
+  them as environment variables through Codex's `shell_environment_policy.set`. Status and events show names, never
+  values.
+- Credential files are published whole (a synced temporary file, then a hard link), and an empty or partial one is
+  refused (`SERVICE_SECRET_INCOMPLETE`), never rotated silently.
+- An idle pool is stopped (`docker stop`) and started again on demand, with its Redis ACL users restored before any
+  credential is handed out. A writer's namespace is dropped when its run ends, after re-checking under the start
+  and pool locks that the run is still ended, so a resume keeps it. A changed spec makes a new pool, and the old one
+  is removed after its last lease.
+- Removal checks the exact recorded container ID and labels, then `docker rm -v`. Containers the plugin did not
+  create are reported, never touched.
+- Measured: two writers shared one PostgreSQL and MinIO pool, and each was refused the other's namespace. Cold
+  readiness 0.98 and 0.65 s, warm 0.14 and 0.60 s.
+
+### Added: the coordinator owns its processes, and a crash leaves none behind
+- Every process family the coordinator starts is recorded in an owner journal, by kernel identity, not by PID or
+  name.
+- A family is ended by snapshot, TERM, wait, snapshot, then TERM and KILL for the survivors. It counts as gone only
+  on exit evidence, and its GONE record is kept through compaction.
+- At the next start, families of a crashed coordinator are ended. A process the journal does not record is reported,
+  not signalled, with one exception: when a cleanup snapshot cannot be journaled, the emergency cleanup also signals
+  the members it has just found (Known limits). A bootstrap left by a daemon from before the owner journal is retired without a signal once its
+  exit is verified.
+- A worker survives the death of its supervisor and is adopted by the next one.
+- `daemon install-agent` / `uninstall-agent` installs an opt-in LaunchAgent that restarts the coordinator after a
+  crash. It keeps, for its state directory, the settings (MCP profile, parking, memory) of the environment it is
+  installed from: run it where those are set, since from a clean shell it keeps the defaults (Known limits).
+  Nothing installs it by itself. Measured with a throwaway agent: adoption in 5.32, 5.30 and 5.30 s after each of three supervisor kills.
+
+### Added: launches wait while memory is short
+- Before an app-server launch (a writer, a demand start, an offline reader or a calibration), the coordinator reads
+  the kernel's pressure level and the compressor's fill ratio.
+- At a compressor ratio of 0.50 it holds the launch with retryable `RESOURCE_PAUSED` and parks idle writers first.
+- At 0.62, or at the kernel's critical level (4), it refuses with retryable `RESOURCE_EXHAUSTED`.
+- At the kernel's warning level (2) alone, it parks idle writers and lets the launch through. Nothing running is
+  interrupted.
+- Why the ratio and not the warning level:
+  - On 10-26 Jetsam killed processes at ratios 0.68 to 0.70, with the level not warning.
+  - On 10-27 the level sat at 2 for 19 % of the day, in runs of over 23 minutes, at ratios 0.32 to 0.40, with no
+    Jetsam.
+- Both ratios and the hysteresis are settings (`memory_warn_ratio`, `memory_critical_ratio`,
+  `SOFTWARE_WORKFLOWS_MEMORY_HYSTERESIS`). Status shows the reading each decision used.
+
+### Fixed: plugin options never reached the Codex Oracle server
+- Claude Code exports `CLAUDE_PLUGIN_OPTION_*` to hooks only. `.mcp.json` now maps each option into the server's
+  environment, so `writer_mcp_servers` and the new settings apply.
+
+### Fixed: mail to a cancelled writer kept every stop from completing
+- `message/send` accepted a waking message to the writer of a run that was already cancelled.
+  - Its delivery returned early for the cancelled run.
+  - Only a cancel's own pass settles a unit's pending mail, and that pass had already run.
+  - So the message stayed owed a delivery for good, and every `daemon/stop` answered `NOT_QUIESCENT`.
+- On the user's 2.4.6 this held the switch to 2.4.7 for 2.4 days. It was settled by hand with `run/interrupt`.
+- Now mail to a cancelled or cancelling writer is refused (`RUN_CANCELLED`). Mail a cancel overtakes is settled with
+  a durable `message/cancelled` event; a delivery that may have reached Codex keeps its evidence.
+
+### Fixed: the build's review findings (Codex code_review, turn 85)
+- A lead edit's admission now includes the owner's check within its 2.0 s budget. During a slow family retirement a
+  Write was refused `LEAD_ADMISSION_BUSY` in 2.01 s, where the build let it run after the hook's 3 s timeout.
+- After a failed journal replace, the owner hands over to the new file at once, and refuses further records if its
+  sync fails, instead of appending to the removed file.
+- A spawn cancelled after its child was granted retires that child by its launch identity.
+- Retiring a dead connection's pending tool requests walks the whole chain of verified-exited predecessors, keeping
+  the evidence of any effect, so an upgraded unit is not held `PENDING_TOOL`.
+- A pool that started but never got its first lease is reconciled to idle once its container's identity is verified.
+- The service, ownership and LaunchAgent fixes are in their sections above.
+
+### Fixed: 2.4.7's known limits
+- A sealed unit whose writers were dormant could not be reopened or published. Quiescence now uses the dormant
+  writer's recorded evidence.
+- A tool call cut off when its app-server died stayed pending for good. It now gets an outcome that keeps the
+  evidence it may have had an effect, and it never runs again.
+- A cancel during a dormant writer's start left the new app-server running. That start's replacement is now retired.
+- `run/terminals` failed for a dormant writer. It now returns an empty list without starting the writer.
+- Output that Codex shortens when it saves no longer reads as a `HISTORY_GAP`. The table is in
+  coordinator/README.md.
+- A hook's classification is cached only against the files it was parsed from, re-checked around parsing. A child
+  watcher that cannot start makes readiness qualified. A stop asked for while a worker starts is kept through its
+  cleanup.
+
+### Known limits
+- Codex code_review turn 86 found no CRITICAL or HIGH defect in the fix round, and said Do not ship for six it rates
+  lower. They are pushed at the user's direction and fixed in 2.4.9:
+  - A memory refusal while a dormant writer is re-verified (`RESOURCE_PAUSED`: the compressor at its warning line,
+    a malformed memory setting or an unreadable kernel reading) records UNKNOWNs for its checkout, and the writer is then replaced instead of verified again read-only (MEDIUM).
+  - A crash in the middle of dropping a writer's service namespace leaves its lease active, with credentials for
+    resources that were deleted (MEDIUM).
+  - `daemon install-agent` run from a clean shell records no settings, and the agent then starts with the defaults
+    (MEDIUM).
+  - A stopped (SIGSTOP) app-server from 2.4.7 is retired before it is adopted, and stays quarantined
+    `OWNER_UNREGISTERED` (MEDIUM).
+  - When the owner journal cannot record a cleanup snapshot, the emergency cleanup still signals the members it has
+    just found (MEDIUM).
+  - `writer_park_idle_seconds` set to `0` does not stop the parking that memory pressure asks for (LOW).
+- A scan still stats every file and lists the checkout with git, so a tool call still costs CPU. The before and
+  after CPU figures have different warm-up boundaries.
+- Catalog case 073 (`repeat-command`) fails on the final source. Its command exits, but its ordering check is false.
+  It passed on 2.4.7, and the cause is not established.
+- The full first start on a 12.1 GB ledger, with recovery and retention over real content, has not been run. The
+  shape replica's ledger was 559 MB, and the user's index build was measured on a copy.
+- The MCP profile run used an empty Docker gateway registry, so the user's container-backed tool catalog was not
+  covered. Redis was run with a local `redis-server`, as no Redis image was present.
+- Two of the three matched N2 pairs against 2.4.6 completed, at rate ratios of 0.993 and 1.002.
+- Upgrading: the first start of 2.4.8 builds 12 new ledger indexes before it serves: 73 s on a copy of the user's
+  12.1 GB ledger. Meanwhile a lead hook waits at most about 11 s for the new daemon and then lets the edit run
+  without attribution, and a call that starts the daemon may answer `DAEMON_START` (retryable) after 30 s while
+  the daemon keeps starting. Make no edits until the coordinator is ready.
+- `unknown/restore` still reads every actor and operation record of the ledger on the event loop, as in 2.4.7: on
+  the user's ledger (15,261 operations, 1.5 GB) each restore holds the coordinator for seconds. The lead's release
+  settlement of 43 paths held the live 2.4.7 coordinator this way, and a status call waited 94 s. Fixed first in
+  2.4.9, with the other whole-kind reads on the loop.
+- The ledger does not shrink by itself: VACUUM it while the coordinator is stopped.
+
 ## [software-workflows 2.4.7] — 2026-10-27
 
 A finished writer whose app-server has exited no longer comes back as an app-server when the coordinator starts. Its

@@ -3,6 +3,7 @@
 Native projects are never mutated here. Prepared checkout ledgers are reusable
 after interruption; only an activated revision can become a unit's membership.
 """
+from . import owned
 import asyncio
 from contextlib import asynccontextmanager
 import json
@@ -73,13 +74,14 @@ class Catalog:
             from .fixture import runtime_configuration
             home, config = runtime_configuration(self.fixture, "discovery")
             env["CODEX_HOME"] = str(home)
-        self.process = await asyncio.create_subprocess_exec(native.native_codex(), "app-server", "--listen", "stdio://",
+        self.process = await owned.spawn(native.native_codex(), "app-server", "--listen", "stdio://",
             *native.override_args(config), env=env, cwd=self.store.root,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             limit=16 << 20, start_new_session=True)
         birth = processes.identity(self.process.pid)
         self.record = self.store.put("project_discovery", uid("discovery"), {
-            "pid": self.process.pid, "birth": birth and birth["birth"], "state": "running"})
+            "pid": self.process.pid, "birth": birth and birth["birth"], "state": "running",
+            "owner_listener": getattr(self.process, "listener", None)})
         try:
             await self.call("initialize", {"clientInfo": {"name": "software-workflows-projects", "version": "2.4.0"},
                                            "capabilities": {"experimentalApi": True}})
@@ -110,6 +112,8 @@ class Catalog:
                 except asyncio.TimeoutError:
                     self.process.kill()
                     await self.process.wait()
+        if hasattr(self.process, "end"):
+            await self.process.end()
         record = self.store.get(self.record["id"])
         record.update(state="stopped", exit_code=self.process.returncode)
         self.store.save(record)

@@ -233,6 +233,33 @@ creates, changes or deletes one.
 - **Finished writers.** When the coordinator starts, a writer whose run has finished and whose
   app-server has exited stays dormant: its saved history is checked, and it starts again only when
   you resume it or message it.
+- **Idle writers.** A writer with nothing in flight for 30 minutes is parked: its saved history is
+  checked, its threads are unloaded, and its app-server stops with every MCP server it started. It
+  starts again when you resume it or message it, or when its workflow moves on. The plugin option
+  `writer_park_idle_seconds` sets the delay, and `0` turns off parking on the timer (memory
+  pressure can still park a writer).
+- **Memory.** Before the coordinator starts an app-server, it reads the kernel's memory compressor.
+  While the compressor is filling up, it holds the launch (`RESOURCE_PAUSED`, retried) and parks idle
+  writers. When the compressor is nearly full, or the kernel reports critical pressure, it refuses
+  the launch (`RESOURCE_EXHAUSTED`). Nothing that is running is interrupted. The plugin options
+  `memory_warn_ratio` (0.50) and `memory_critical_ratio` (0.62) set the two lines.
+- **Shared services.** A project can declare MinIO, PostgreSQL or Redis in
+  `.software-workflows/services.json`. Its writers share one set of local containers, and each writer
+  gets its own bucket, database or key prefix, with its own credentials, which its commands receive
+  as environment variables. The images must already be on the machine: the coordinator never pulls.
+  It removes only containers it created, checked by their exact ID.
+- **Its own processes.** The coordinator records every process it starts. After a crash, its next
+  start ends the ones left behind. It does not signal a process it did not record, with one
+  exception after a failed journal write (see the CHANGELOG's known limits).
+  `daemon install-agent` installs an optional LaunchAgent that restarts it after a crash, and
+  `daemon uninstall-agent` removes it. Nothing installs the agent for you (see
+  `/software-workflows:setup`).
+- **The ledger's size.** A dormant writer's native journal moves out of the ledger, compressed, into
+  `archive/native/` in the coordinator's state. The ledger then grows more slowly, as SQLite reuses
+  the freed pages, but it does not shrink by itself: to shrink it, run `VACUUM` on it while the
+  coordinator is stopped.
+- **Scans.** Before and after each lead tool call, the coordinator hashes again only the files whose
+  stat identity changed since it last hashed them, not the whole checkout.
 - **Your own edits.** In a checkout the coordinator has registered, Claude's Edit and Write go through
   a hook. They are recorded as yours, and refused on a path another writer claims. One the
   coordinator cannot admit within about two seconds of the hook starting (its checkout busy settling
@@ -264,7 +291,11 @@ creates, changes or deletes one.
   Lead edits made during the replacement wait for the new daemon; one that arrives while it is
   still recovering is refused as busy and retried. A coordinator from before 2.4.0 is
   never stopped by a call. Stop it once, when no session is editing, with the command the refusal
-  names. Sessions that still run an older release keep working until you restart them.
+  names. Sessions that still run an older release keep working until you restart them. Mail that an
+  older release accepted for an already cancelled writer is settled when the new daemon first
+  starts, so it no longer keeps every stop from completing. The first start of 2.4.8 builds new
+  indexes in the ledger before it serves, about a minute on a 12 GB ledger: make no edits until it
+  is ready, since a lead hook waits only about 11 s and then lets the edit run unrecorded.
 
 Known limits, measured on macOS:
 
@@ -546,6 +577,9 @@ Set these in the environment Claude Code starts with. Every one is optional.
 | `SOFTWARE_WORKFLOWS_PYTHON` | The Python (3.11+) the coordinator daemon runs on (default: the server's). |
 | `SOFTWARE_WORKFLOWS_RECOVERY_CONCURRENCY` | How many writers the coordinator recovers at once (default 4). A full read of a writer's history takes one of these slots. A positive integer; a running coordinator keeps the value it started with. |
 | `SOFTWARE_WORKFLOWS_WRITER_MCP_SERVERS` | Overrides the plugin option `writer_mcp_servers`: `all` or a JSON list of exact MCP server names that writers start. Read when the coordinator starts. |
+| `SOFTWARE_WORKFLOWS_WRITER_PARK_IDLE_SECONDS` | Overrides the plugin option `writer_park_idle_seconds`: the seconds a writer stays idle before it is parked (default 1800; `0` turns off parking on the timer, though memory pressure can still park a writer). Read when the coordinator starts. |
+| `SOFTWARE_WORKFLOWS_MEMORY_WARN_RATIO`, `SOFTWARE_WORKFLOWS_MEMORY_CRITICAL_RATIO` | Override the plugin options `memory_warn_ratio` (0.50) and `memory_critical_ratio` (0.62): the compressor fill at which launches are held, and at which they are refused. |
+| `SOFTWARE_WORKFLOWS_MEMORY_HYSTERESIS` | How far the ratio must fall below a line before launches resume (default 0.05). |
 | `SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY` | How many short history reads run at once beside recovery (default 2): a live writer's catch-up, a message's delivery check, settling a resume's or a cancel's inputs. A positive integer; a running coordinator keeps the value it started with. |
 
 The server's venv lives in the plugin's data directory

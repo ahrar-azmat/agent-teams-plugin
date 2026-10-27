@@ -252,6 +252,9 @@ async def dispatch(daemon, payload):
                   "checkout": checkout["id"], "reach": [c["id"] for c in reach], "window": None, "deadline": deadline, "arm_deadline": time.time() + 3,
                   "session_actors": session_actors(daemon.store, checkout["id"], session)}
         if tool == "Bash":
+            fields["shell_command_digest"] = digest(data.get("command", ""))
+            from .client import stop_control_command
+            fields["stop_control"] = stop_control_command(data.get("command"))
             # Quiet as the call arrives? The window taken at the end of Pre must equal this, so a call
             # that started and ended in between (another lead's, a writer's turn) leaves none.
             fields["arrival"] = quiet(daemon, checkout, set(fields["session_actors"]), ident)

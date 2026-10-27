@@ -20,6 +20,23 @@ from .client import CoordinatorError, launch_environment, venv_fds
 
 
 MAX_FRAME = 1024 * 1024
+CURRENT = None
+
+
+def control(root, action, payload=None, timeout=20):
+    from .owner_journal import inspect
+    record = inspect(root)["custodian"]
+    if not record:
+        raise FileNotFoundError("No owner endpoint")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(timeout)
+        connection.connect(record["address"])
+        send(connection, {"action": action, **(payload or {})})
+        response, _ = receive(connection)
+        if not response.get("ok"):
+            error = response["error"]
+            raise CoordinatorError(error["code"], error["message"], error.get("details"), True)
+        return response
 
 
 def send(connection, message, fds=()):
@@ -61,7 +78,7 @@ def receive(connection, count=0):
             body += chunk
         message = json.loads(body)
         expected = count if message.get("ok", True) else 0
-        if len(descriptors) != expected:
+        if expected is not None and len(descriptors) != expected:
             raise ValueError("Unexpected lease descriptors")
         for fd in descriptors:
             os.set_inheritable(fd, False)
@@ -74,16 +91,19 @@ def receive(connection, count=0):
 
 class RecoveryEndpoint:
     """A private, birth-bound reconnection route to a surviving custodian."""
-    def __init__(self, root):
+    def __init__(self, root, journal=None):
         from . import runtime, processes
         self.allocation = runtime.allocate("custodian")
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.bind(self.allocation["path"])
         os.chmod(self.allocation["path"], 0o600)
         self.socket.listen(4)
-        runtime.atomic_json(Path(root) / "custodian.json", {
-            "state": str(root), "allocation": self.allocation,
-            "process": processes.identity(os.getpid())})
+        record = {"state": str(root), "allocation": self.allocation,
+                  "process": processes.identity(os.getpid()), "address": self.allocation["path"], "agent": False}
+        if journal is None:
+            runtime.atomic_json(Path(root) / "custodian.json", record)
+        else:
+            journal.append("CUSTODIAN", cleanup=True, **record)
 
     def close(self):
         from . import runtime
@@ -93,12 +113,15 @@ class RecoveryEndpoint:
 
 class Leases:
     def __init__(self, root):
+        global CURRENT
+        CURRENT = self
         self.root = root
         self.lock = asyncio.Lock()
         self.held = {}
         self.connection = None
         self.replacement = None
         self.controller = None
+        self.production_ready = True
         if os.environ.get("SOFTWARE_WORKFLOWS_CUSTODIAN_FD"):
             self.connection = socket.socket(fileno=int(os.environ.pop("SOFTWARE_WORKFLOWS_CUSTODIAN_FD")))
             self.connection.settimeout(15)
@@ -107,18 +130,26 @@ class Leases:
         from . import compat, processes, runtime
         if self.connection:
             self.connection.close()
+        manifest = None
         try:
-            manifest = runtime.private_json(Path(self.root) / "custodian.json")
+            from .owner_journal import inspect
+            manifest = inspect(self.root)["custodian"]
+            if manifest is None:
+                manifest = runtime.private_json(Path(self.root) / "custodian.json")
             current = processes.identity(manifest["process"]["pid"])
             living = current and not current["zombie"] and current["birth"] == manifest["process"]["birth"]
         except FileNotFoundError:
             living = False
-        if living:
+        agent = bool(os.environ.get("SOFTWARE_WORKFLOWS_LAUNCH_AGENT") or manifest and manifest.get("agent"))
+        if living or agent:
             if manifest["state"] != str(self.root):
                 raise ValueError("Custodian recovery manifest belongs to another state root")
-            allocation = manifest["allocation"]
-            runtime.validate_allocation(allocation, observational=True)
-            address = runtime.endpoint_info(allocation["path"], measured_limit=allocation["measured_limit"])["resolved"]
+            if agent:
+                address = manifest["address"]
+            else:
+                allocation = manifest["allocation"]
+                runtime.validate_allocation(allocation, observational=True)
+                address = runtime.endpoint_info(allocation["path"], measured_limit=allocation["measured_limit"])["resolved"]
             connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             connection.settimeout(20)
             try:
@@ -146,6 +177,7 @@ class Leases:
                 if not receipt.get("ok"):
                     raise ValueError("Custodian did not confirm restored redundancy")
                 self.controller = response["custodian"]
+                self.production_ready = receipt.get("production_ready", False)
                 self.connection = connection
                 return
             except BaseException:
@@ -176,19 +208,22 @@ class Leases:
         finally:
             child.close()
         self.connection = parent
-        send(parent, {"action": "ping"})
+        send(parent, {"action": "ping", "worker": os.getpid()})
         response, _ = receive(parent)
         if not response.get("ok"):
             raise CoordinatorError("CUSTODIAN_LOST", "Redundant custody could not be restored; production refused")
         self.controller = response["custodian"]
 
-    def exchange(self, action, cwd):
+    def exchange(self, action, cwd, payload=None, descriptors=()):
         from . import compat
         if self.connection is None:
             raise CoordinatorError("CUSTODIAN_REQUIRED", "Native writers require Client.ensure supervision")
-        send(self.connection, {"action": action, "cwd": cwd, "worker": os.getpid()})
+        send(self.connection, dict(payload or {}, action=action, cwd=cwd, worker=os.getpid()), descriptors)
         response, fds = receive(self.connection, 1 if action == "acquire" else 0)
         if not response["ok"]:
+            if "error" in response:
+                error = response["error"]
+                raise CoordinatorError(error["code"], error["message"], error.get("details"), error.get("kind") == "failure")
             raise CoordinatorError("EXCLUSIVE_WRITER", response["holder"])
         if response.get("custodian"):
             self.controller = response["custodian"]
@@ -212,12 +247,20 @@ class Leases:
                 if record["cwd"] == cwd:
                     compat.release_lease(record, bridges=False)
                     del self.held[path]
+        elif action == "spawn":
+            send(self.connection, {"action": "grant", "listener": response["family"]["listener"]})
+            response, _ = receive(self.connection)
+            if not response.get("ok"):
+                error = response["error"]
+                raise CoordinatorError(error["code"], error["message"], error.get("details"), True)
+        if action in ("ping", "acquire", "spawn", "adopt", "adopt-legacy"):
+            self.production_ready = True
         return response
 
-    async def call(self, action, cwd=""):
+    async def call(self, action, cwd="", payload=None, descriptors=()):
         async with self.lock:
             try:
-                return await finish_thread(self.exchange, action, cwd)
+                return await finish_thread(self.exchange, action, cwd, payload, descriptors)
             except (OSError, EOFError, ValueError) as exc:
                 # Acquiring may already have succeeded. Retain every reference
                 # and rebuild redundancy before another admission can proceed.
@@ -227,7 +270,7 @@ class Leases:
                     raise CoordinatorError("CUSTODIAN_LOST", "Lease references retained; redundancy unavailable, production refused",
                                            {"cause": getattr(repair_error, "code", type(repair_error).__name__)}, operational=True) from repair_error
                 if action == "ping":
-                    return {"ok": True}
+                    return await finish_thread(self.exchange, "ping", "")
                 raise CoordinatorError("LEASE_UNCERTAIN", "Custodian replaced; retained leases require reconciliation before retry", operational=True) from exc
 
 
@@ -236,15 +279,17 @@ class Custodian:
         from . import compat
         self.compat = compat
         self.held = {}
+        self.production_ready = False
         compat._register_server()
         for record in records:
             fd = record.pop("fd")
             compat.adopt_lease(record, fd)
             self.held[compat._tree_identity(record["cwd"])] = record
 
-    def reconnect(self, connection, worker):
+    def reconnect(self, connection, worker, request=None, adopted=None):
         from . import processes
-        request, _ = receive(connection)
+        if request is None:
+            request, _ = receive(connection)
         identity = request.get("worker", {})
         if request.get("action") != "reconnect" or not worker or any(identity.get(k) != worker.get(k) for k in ("pid", "birth")):
             raise ValueError("Custodian recovery requires the existing worker birth identity")
@@ -265,20 +310,33 @@ class Custodian:
                 os.close(fd)
                 raise
             self.held[key] = record
-        for record in self.held.values():
-            self.compat.share_lease(record, worker["pid"], os.getpid())
         send(connection, {"ok": True, "count": len(self.held), "custodian": processes.identity(os.getpid())})
         for record in self.held.values():
             send(connection, {"lease": record}, (self.compat._HELD[record["path"]],))
         ack, _ = receive(connection)
         if ack != {"action": "ack", "tokens": sorted(r["token"] for r in self.held.values())}:
             raise ValueError("Incomplete recovered lease acknowledgment")
-        send(connection, {"ok": True})
+        if adopted:
+            adopted()
+        self.production_ready = False
+        send(connection, {"ok": True, "production_ready": False})
+
+    def refresh(self, worker):
+        if self.production_ready:
+            return
+        try:
+            for record in self.held.values():
+                self.compat.share_lease(record, worker["pid"], os.getpid())
+        except OSError as exc:
+            raise CoordinatorError("RESOURCE_EXHAUSTED", "Lease descriptors retained; compatibility bridge refresh is pending",
+                                   {"resource": "lease_bridge", "errno": exc.errno, "retryable": True}, True) from exc
+        self.production_ready = True
 
     def request(self, connection, request):
         from . import processes
         action = request["action"]
         if action == "ping":
+            self.refresh(processes.identity(request["worker"]))
             send(connection, {"ok": True, "custodian": processes.identity(os.getpid())})
             return
         cwd = request["cwd"]
@@ -293,7 +351,8 @@ class Custodian:
             record = self.held[identity]
             # Existing bridges already name the previous controllers. Before
             # production, repoint them to this worker and this custodian.
-            self.compat.share_lease(record, request["worker"], os.getpid())
+            self.production_ready = False
+            self.refresh(processes.identity(request["worker"]))
             send(connection, {"ok": True, "identity": identity, "custodian_pid": os.getpid(),
                               "custodian": processes.identity(os.getpid()), "lease": record},
                  (self.compat._HELD[record["path"]],))

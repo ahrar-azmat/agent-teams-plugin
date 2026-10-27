@@ -6,7 +6,8 @@ import time
 from .client import CoordinatorError
 from .locks import finish
 from .store import digest
-from . import native, participants
+from .item_projection import receipt_digests
+from . import native, participants, processes
 
 
 def view(listener):
@@ -25,13 +26,33 @@ class Dormancy:
     def pending(self, runid):
         return (self.demand(runid) or {}).get("state") in ("pending", "starting", "failed")
 
+    def require_quiet(self, listener):
+        """A dormant state is not itself proof that its family is quiescent."""
+        proof = listener.get("dormant_proof") or {}
+        if (listener["state"] != "dormant" or not proof.get("exit") or not proof.get("read_only")
+                or not proof.get("descendants_enumerated")):
+            raise CoordinatorError("DORMANT_UNVERIFIED", "Dormant writer needs exit and saved-family evidence")
+        if listener.get("history_gaps"):
+            raise CoordinatorError("HISTORY_GAP", "Saved writer history differs from received evidence",
+                                   {"gaps": listener["history_gaps"]})
+        if self.pending(listener["run"]):
+            raise CoordinatorError("WRITER_START_PENDING", "Dormant writer has a pending demand start", {"retryable": True}, True)
+        actors = [a for a in self.store.all("actor", listener["unit"]) if a.get("listener") == listener["id"]]
+        if any(a.get("active_turn") or a["id"] not in proof.get("actors", []) for a in actors):
+            raise CoordinatorError("DORMANT_UNVERIFIED", "Dormant proof does not cover every bound actor")
+        recipients = {a["id"] for a in actors}
+        if any(m.get("recipient") in recipients and m["state"] not in ("entered_context", "acknowledged")
+               and m.get("delivery") not in ("cancelled", "turn_ended") for m in self.store.all("message")):
+            raise CoordinatorError("PENDING_DELIVERY", "Dormant writer still has mail or a notice to settle")
+
     def eligible(self, listener):
         from .recovery import startup_obligation
         from .writer import TERMINAL
         run = self.store.get(listener["run"])
-        return (run["state"] in TERMINAL and listener.get("root_thread") and not self.pending(run["id"])
+        parking = (listener.get("park") or {}).get("step") in ("unloading", "postverify", "stopping", "family_exit")
+        return ((run["state"] in TERMINAL or parking) and listener.get("root_thread") and not self.pending(run["id"])
                 and bool(run.get("workflow") or run.get("task") or run.get("production_started") or run.get("phases"))
-                and not startup_obligation(self.store, run["id"]) and not self.daemon.writer_owed(listener["unit"]))
+                and not startup_obligation(self.store, run["id"]) and (parking or not self.daemon.writer_owed(listener["unit"])))
 
     async def received(self, listener, actors):
         """One streamed journal pass per incarnation, indexed by completed item.
@@ -61,7 +82,7 @@ class Dormancy:
                     if thread not in after or row["seq"] <= after[thread]:
                         continue
                     turn, ident = params["turnId"], params["item"]["id"]
-                    value = (row["seq"], digest(params["item"]))
+                    value = (row["seq"], receipt_digests(params["item"]))
                     wanted = receipts[thread].setdefault(turn, {})
                     # The newest receipt wins if a reconnect repeated an item.
                     if ident not in wanted or wanted[ident][0] < row["seq"]:
@@ -75,7 +96,7 @@ class Dormancy:
                           "identity_digest_bytes": index_bytes, "seconds": round(time.monotonic() - began, 6)})
         return receipts, costs
 
-    async def compare(self, actor, connection, expected, cost):
+    async def compare(self, actor, connection, expected, cost, *, pending=False):
         """Compare the grouped receipt suffix with saved items, never a loaded thread."""
         began = time.monotonic()
         for turn, wanted in expected.items():
@@ -100,8 +121,11 @@ class Dormancy:
                     raise
             for ident, (sequence, received) in wanted.items():
                 cost["items"] += 1
-                if seen.get(ident) == received:
+                if seen.get(ident) in (received if isinstance(received, list) else [received]):
                     continue
+                if pending:
+                    raise CoordinatorError("PERSISTENCE_PENDING", "Received item is not yet saved in its native representation",
+                                           {"thread": actor["thread"], "turn": turn, "item": ident, "retryable": True}, True)
                 gap = {"code": "HISTORY_GAP", "thread": actor["thread"], "turn": turn, "item": ident,
                        "sequence": sequence, "received": received, "saved": seen.get(ident), "run": actor["run"]}
                 key = "history_gap:" + actor["id"] + ":" + digest([turn, ident, received])
@@ -115,9 +139,17 @@ class Dormancy:
         return cost
 
     async def recover(self, listener):
-        from .recovery import replay_native, reconcile_effects
+        from .recovery import replay_native, reconcile_effects, retire_peer_requests
         daemon, store = self.daemon, self.store
+        current = processes.identity(listener["pid"]) if listener.get("pid") else None
+        if current and current["birth"] == listener.get("birth") and not current["zombie"]:
+            raise CoordinatorError("WRITER_STILL_ALIVE", "Read-only dormancy requires a verified process exit")
+        if listener.get("owner_sequence"):
+            receipt = await daemon.leases.call("end", payload={"listener": listener["id"]})
+            if receipt["family"]["state"] != "GONE":
+                raise CoordinatorError("FAMILY_REAPING", "Dormancy requires FAMILY_GONE", operational=True)
         await replay_native(daemon, listener)
+        retire_peer_requests(daemon, listener)
         await daemon.settle_native_log(listener["id"])
         root = store.get(listener["actor"])
         threads = []
@@ -154,12 +186,25 @@ class Dormancy:
             store.event("recovery/history", listener["id"], dict(history, run=listener["run"]))
             listener = store.get(listener["id"])
             listener.update(state="dormant", recovery_state="reconciled", dormant_at=time.time(),
-                            dormant_reason="exited terminal writer recovered read-only", history_gaps=gaps)
+                            dormant_reason="exited terminal writer recovered read-only", history_gaps=gaps,
+                            dormant_proof={"exit": {"pid": listener.get("pid"), "birth": listener.get("birth"),
+                                                   "observed": time.time()}, "read_only": True,
+                                           "descendants_enumerated": True, "actors": [a["id"] for a in actors]})
             for key in ("recovery_error", "recovery_error_details", "recovery_retryable", "recovery_retries", "retry_at"):
                 listener.pop(key, None)
             store.save(listener)
             store.event("listener/dormant", listener["id"], {"run": listener["run"], "when": listener["dormant_at"],
                         "why": listener["dormant_reason"], "history_gaps": gaps})
+
+        # The streamed comparison also covered every predecessor's receipts.
+        previous = store.get(listener.get("replaces"), required=False)
+        while previous:
+            if processes.exit_evidence(previous):
+                previous.update(state="dormant", dormant_proof=listener["dormant_proof"],
+                                dormant_at=time.time(), dormant_reason="verified predecessor of dormant writer")
+                store.save(previous)
+            previous = store.get(previous.get("replaces"), required=False)
+        daemon.retention.request(listener["id"])
 
     async def start(self, runid, reason):
         """Persist intent before launch. All callers join the same task and RPC bound."""
@@ -168,7 +213,11 @@ class Dormancy:
         daemon.check_native_stop()
         run = store.get(runid)
         listener = store.get(store.get(run["root_actor"])["listener"])
-        if listener["state"] != "dormant" and not self.pending(runid):
+        parking = daemon.parking.tasks.get(listener["id"])
+        if parking is not None and listener["state"] == "parking":
+            await asyncio.shield(parking)
+            listener = store.get(store.get(run["root_actor"])["listener"])
+        if listener["state"] != "dormant" and not listener.get("park_resume_required") and not self.pending(runid):
             return
         record = self.demand(runid)
         restoring = reason == "recovery" and self.pending(runid)
@@ -204,6 +253,10 @@ class Dormancy:
                                    {"retryable": True, "run": runid}, True) from exc
 
     async def _start(self, runid, original, generation, resume_cancelled):
+        async with self.daemon.parking.locks.hold(runid):
+            return await self._start_locked(runid, original, generation, resume_cancelled)
+
+    async def _start_locked(self, runid, original, generation, resume_cancelled):
         from .recovery import reconcile_listener, ensure_running
         daemon, store = self.daemon, self.store
         record = self.demand(runid)
@@ -230,21 +283,32 @@ class Dormancy:
                           failures=record.get("failures", 0) + 1)
             store.save(record)
             store.event("writer/start_failed", runid, {"code": record["error"], "demand": record["id"], "retryable": record["state"] == "failed"})
-            if record["state"] == "cancelled":
-                raise
             # Only this attempt's unsubmitted replacement can be retired here.
             current = store.get(store.get(run["root_actor"])["listener"])
-            if current["id"] != original["id"]:
+            owned = (current["id"] != original["id"] and current.get("replaces") == original["id"]
+                     and current.get("run") == runid and self.tasks.get(runid) is asyncio.current_task())
+            if owned:
                 await finish(daemon.stop_listener(current, kill=True))
             with store.transaction():
                 for actor in bindings:
                     current_actor = store.get(actor["id"])
+                    if current_actor.get("listener") != original["id"] and not (owned and current_actor.get("listener") == current["id"]):
+                        continue  # A newer binding belongs to its own attempt.
                     current_actor.update(listener=original["id"], active_turn=None, state=actor["state"])
                     store.save(current_actor)
                 old = store.get(original["id"])
-                old.update(state="dormant", recovery_state="reconciled")
-                old.pop("replaced_by", None)
-                store.save(old)
+                if not old.get("replaced_by") or owned and old["replaced_by"] == current["id"]:
+                    # A failed park can leave the original server alive with
+                    # unloaded threads. It still needs a demand resume; failure
+                    # is not exit evidence and cannot make that server dormant.
+                    old.update(state="dormant" if original["state"] == "dormant" else "connected",
+                               recovery_state="reconciled")
+                    old.pop("replaced_by", None)
+                    store.save(old)
+            if record["state"] == "cancelled":
+                raise
+            if record["error"] in ("RESOURCE_PAUSED", "RESOURCE_EXHAUSTED"):
+                raise
             raise CoordinatorError("WRITER_START_FAILED", "Writer start failed; the dormant demand is retained for retry",
                                    {"retryable": True, "run": runid, "cause": record["error"]}, True) from exc
         record = self.demand(runid)
@@ -255,13 +319,14 @@ class Dormancy:
             store.save(record)
             store.event("writer/started", runid, {"demand": record["id"], "seconds": seconds, "listener": record["listener"]})
         self.cold.append(seconds)
+        daemon.parking.touch(record["listener"])
 
     def status(self):
         listeners = [l for l in self.store.all("listener") if l.get("root_thread")
                      and self.store.get(l["actor"]).get("listener") == l["id"]]
         starts = list(self.store.all("writer_start"))
         values = sorted(self.cold)
-        return {"dormant": sum(l["state"] == "dormant" for l in listeners),
+        return {**self.daemon.parking.status(), "dormant": sum(l["state"] == "dormant" for l in listeners),
                 "running": sum(l["state"] == "connected" for l in listeners),
                 "history_gaps": self.store.db.execute("SELECT count(*) FROM records WHERE kind='history_gap'").fetchone()[0],
                 "demand_starts": sum(r["attempts"] for r in starts),

@@ -12,7 +12,8 @@ import math
 import time
 import sys
 import json
-from functools import lru_cache
+from collections import OrderedDict
+import os
 from pathlib import Path
 
 from .client import CoordinatorError
@@ -28,21 +29,55 @@ STARTED = ContextVar("lead_hook_started", default=None)
 DECISION_SECONDS = 2.0
 
 
-@lru_cache(maxsize=None)
+LAYOUT_CACHE = OrderedDict()
+# Classification is an optimisation, never an admission limit. The measured
+# matrix has two installed hook roots; 128 entries retain 64 such release pairs
+# while bounding attacker-supplied script paths. Eviction merely reparses.
+LAYOUT_CACHE_SIZE = 128
+
+
+def layout_identity(paths):
+    return tuple((str(path), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                 for path in paths for info in [path.stat()])
+
+
 def hook_layout(script):
     """Confirm the script is the entry point declared by its plugin."""
-    path = Path(script)
+    path = Path(script).resolve()
     if path.name != "coordinator_lead.py" or path.parent.name != "hooks":
         return False
     plugin = path.parent.parent
-    manifest = json.loads((plugin / ".claude-plugin" / "plugin.json").read_text())
-    hooks = json.loads((plugin / "hooks" / "hooks.json").read_text())
-    return (manifest.get("name") == "software-workflows" and path.is_file() and
+    files = tuple(p.resolve() for p in (plugin / ".claude-plugin" / "plugin.json", plugin / "hooks" / "hooks.json",
+                                       path, plugin / "coordinator" / "client.py"))
+    try:
+        before = layout_identity(files)
+    except OSError:
+        LAYOUT_CACHE.pop(str(path), None)
+        return False
+    cached = LAYOUT_CACHE.get(str(path))
+    if cached and cached[0] == before:
+        LAYOUT_CACHE.move_to_end(str(path))
+        return cached[1]
+    manifest = json.loads(files[0].read_text())
+    hooks = json.loads(files[1].read_text())
+    result = (manifest.get("name") == "software-workflows" and path.is_file() and
             (plugin / "coordinator" / "client.py").is_file() and any(
                 hook.get("command") == "python3" and
                 hook.get("args") == ["${CLAUDE_PLUGIN_ROOT}/hooks/coordinator_lead.py"]
                 for group in hooks.get("hooks", {}).get("PreToolUse", [])
                 for hook in group.get("hooks", [])))
+    try:
+        unchanged = before == layout_identity(files) and all(os.path.isfile(p) for p in files)
+    except OSError:
+        unchanged = False
+    if unchanged:
+        LAYOUT_CACHE[str(path)] = (before, result)
+        LAYOUT_CACHE.move_to_end(str(path))
+        while len(LAYOUT_CACHE) > LAYOUT_CACHE_SIZE:
+            LAYOUT_CACHE.popitem(last=False)
+    else:
+        LAYOUT_CACHE.pop(str(path), None)
+    return result if unchanged else False
 
 
 def peer_started(writer):
@@ -352,6 +387,12 @@ async def dispatch(daemon, payload):
             task = asyncio.current_task()
             daemon.inflight[task] = "lead-hook/dispatch"
             try:
+                # Queueing behind family retirement is part of admission too.
+                # The outer decision wait still refuses on time; this task may
+                # never produce a grant after ownership takes its deadline.
+                check("ownership")
+                await daemon.leases.call("ping")
+                check("ownership")
                 async with daemon.actor_locks.hold(key):
                     result = await apply(daemon, payload)
                     check()

@@ -86,7 +86,12 @@ class Messages:
         ident = ident or uid("msg")
         existing = self.store.get(ident, required=False)
         if existing:
-            return existing
+            self.cancel_pending(existing)
+            return self.store.get(ident)
+        if actor and actor.get("kind") != "lead":
+            run = self.store.get(actor["run"])
+            if run.get("cancel_requested") or run["state"] == "cancelled":
+                raise CoordinatorError("RUN_CANCELLED", "Cancelled writers cannot receive new mail", {"run": run["id"]})
         fields = {"sender": sender, "recipient": actorid, "text": text, "wake": wake, "state": "persisted", "created": time.time(),
                   "attempts": [], "native_id": ident, "delivery": "pending"}
         if notice:
@@ -121,11 +126,33 @@ class Messages:
             return session.get("mailbox") or mailbox(self.store, session["session_id"], session["unit"])
         return self.store.get(actor["unit"]).get("lead_mailbox")
 
+    def cancel_pending(self, message):
+        """Settle unsent legacy mail and cancel races without fabricating a receipt.
+
+        Submitted/uncertain attempts still go through native evidence recovery.
+        A pending delivery has no current native effect to wait for.
+        """
+        if message["state"] in ("entered_context", "acknowledged") or message.get("delivery") != "pending":
+            return False
+        actor = self.store.get(message["recipient"], required=False)
+        if not actor or actor.get("_kind") != "actor" or actor.get("kind") == "lead":
+            return False
+        run = self.store.get(actor["run"])
+        if not (run.get("cancel_requested") or run["state"] == "cancelled"):
+            return False
+        with self.store.transaction():
+            message.update(delivery="cancelled", cancelled=time.time())
+            self.store.save(message)
+            self.store.event("message/cancelled", message["id"], {"reason": "recipient run cancelled", "run": run["id"]})
+        return True
+
     async def deliver(self, ident):
         if self.daemon.recovery_barrier:
             return
         async with self.locks.hold(ident):
             message = self.store.get(ident)
+            if self.cancel_pending(message):
+                return
             if message["state"] in ("entered_context", "acknowledged") or (message["recipient"] == "lead" or message["recipient"].startswith("lead_mailbox_")):
                 return
             if self.notice(message) and message["delivery"] in NOTICE_DELIVERIES:
@@ -142,8 +169,11 @@ class Messages:
                 await self.daemon.runs.settle_delivery(message, actor)
                 return
             listener = self.store.get(actor["listener"])
-            if listener["state"] == "dormant" and self.daemon.delivery_owed(message):
+            if (listener["state"] in ("dormant", "parking") or listener.get("park_resume_required")) and self.daemon.delivery_owed(message):
                 await self.daemon.dormancy.start(actor["run"], "waking message")
+                message = self.store.get(ident)
+                if self.cancel_pending(message):
+                    return
                 actor = self.store.get(actor["id"])
                 listener = self.store.get(actor["listener"])
             if not listener.get("admission") or listener["state"] != "connected" or listener.get("recovery_state") in ("reconciling", "failed"):
@@ -176,7 +206,8 @@ class Messages:
                     self.daemon.connections.get(listener["id"]) is not connection or connection.closed):
                 return  # A reconnect during lease restoration must verify its pinned bindings first.
             if self.store.get(target["run"]).get("cancel_requested"):
-                return  # cancelled while its leases were taken: the cancel marks it cancelled
+                self.cancel_pending(self.store.get(ident))
+                return
             if self.daemon.hook_stale(listener) and (not active or self.hooks_fail(listener)):
                 # Admitted by another release: it is replaced first, once its unit is quiet, and this message stays
                 # pending until then. A turn it is running still takes it (turn/steer) while that turn's calls pass;
@@ -185,8 +216,11 @@ class Messages:
                 return
             method = "turn/steer" if active else ("thread/queue/add" if message["wake"] == "queue" else "turn/start")
             from .writer_profile import deliver_context
-            await deliver_context(self.daemon, target)
+            await deliver_context(self.daemon, target, preparing_input=True)
             self.daemon.check_native_stop()
+            message = self.store.get(ident)
+            if self.cancel_pending(message) or message["delivery"] == "cancelled":
+                return
             if (self.store.get(target["run"]).get("cancel_requested") or
                     self.store.get(target["id"])["listener"] != listener["id"] or connection.closed or
                     self.store.get(listener["id"]).get("recovery_state") in ("reconciling", "failed")):
@@ -198,6 +232,7 @@ class Messages:
             message["attempts"].append(attempt)
             message["delivery"] = "submitting"
             with self.store.transaction():
+                params["input"] = self.prefix_held(target, native_id, params["input"])
                 self.store.save(message)
                 self.store.put("delivery", attempt, {"message": ident, "method": method, "actor": target["id"], "listener": listener["id"],
                                "client_id": native_id, "state": "submitting", "created": time.time()}, ident)
@@ -248,13 +283,41 @@ class Messages:
                     self.store.event("message/held_delivery_failed", message["id"],
                                      {"code": getattr(exc, "code", type(exc).__name__), "run": runid})
 
+    def prefix_held(self, actor, client_id, inputs):
+        """An unknown inject capability cannot authorize an injection.
+
+        Instead carry held mail ahead of an already authorized input. Its
+        durable client identity settles the mail on the same native echo,
+        including after a lost reply. This creates no turn by itself.
+        """
+        prefix = []
+        for message in self.store.selected("SELECT * FROM records WHERE kind='message' AND json_extract(data,'$.recipient')=? ORDER BY id", (actor["id"],)):
+            if message["wake"] != "none" or message["state"] != "persisted" or message["delivery"] not in NOTICE_DELIVERIES:
+                continue
+            if message["delivery"] in ("injecting", "injected"):
+                continue  # reconcile an existing injection before another delivery
+            text = "C1_MESSAGE " + message["id"] + " from " + message["sender"] + "\n" + message["text"]
+            if self.notice(message) and not message.get("inject_before_turn"):
+                text += "\n(No reply or acknowledgement needed.)"
+            else:
+                text += "\nAcknowledge with ack(message=" + message["id"] + ")."
+            attempt = uid("delivery")
+            self.store.put("delivery", attempt, {"message": message["id"], "method": "input/prefix", "actor": actor["id"],
+                           "listener": actor["listener"], "client_id": client_id, "state": "submitting", "created": time.time()}, message["id"])
+            message["attempts"].append(attempt)
+            message["delivery"] = "submitted"
+            self.store.save(message)
+            prefix.append({"type": "text", "text": text})
+        return prefix + inputs
+
     async def deliver_notice(self, message):
         """Deliver a coordinator notice (notice), under its lock, with thread/inject_items: native records it in the
         thread's history without a turn, at once on an idle thread and in a running turn at its next sampling request,
         without preempting a running code-mode cell as a steer's user input does (native.FIELDS). Only as its
         app-server's admission allows (its inject capability, admission.CAPABILITIES): "active" proved both, "idle" the
-        idle thread only (or its probe failed: admission.FALLBACK), where the notice waits for the turn to end; with
-        neither it is held for an app-server that has one. Never steered, queued or started as a turn, and no reply
+        idle thread only, where the notice waits for the turn to end; an unknown or failed probe proves
+        neither, so the notice stays held until an explicitly authorized input can carry it. Never steered, queued
+        or started as an independent turn, and no reply
         is asked.
         One a running turn holds is in context once that turn completes: native records at its finish what it had not
         taken (tasks/mod.rs on_task_finished). An interrupt drops what it had not taken (abort_all_tasks), as does the
@@ -440,6 +503,13 @@ class Messages:
         return 1
 
     def entered(self, actorid, native_id, evidence):
+        for attempt in self.store.selected("SELECT * FROM records WHERE kind='delivery' AND json_extract(data,'$.method')='input/prefix' AND json_extract(data,'$.client_id')=? AND json_extract(data,'$.actor')=?", (native_id, actorid)):
+            message = self.store.get(attempt["message"])
+            if message["state"] not in ("entered_context", "acknowledged"):
+                self.transition(message, "entered_context", {**evidence, "input_prefix": native_id})
+            if attempt["state"] != "entered_context":
+                attempt["state"] = "entered_context"
+                self.store.save(attempt)
         relay = native_id.endswith(":relay")
         ident = native_id[:-6] if relay else native_id
         message = self.store.get(ident, required=False)
@@ -619,6 +689,10 @@ class Messages:
             message = self.store.get(ident)
             _, actor = self.recipient(message["recipient"])
             if actor:
+                run = self.store.get(actor["run"])
+                if run.get("cancel_requested") or run["state"] == "cancelled":
+                    self.cancel_pending(message)
+                    raise CoordinatorError("RUN_CANCELLED", "Cancelled writers cannot retry mail", {"run": run["id"]})
                 await self.reconcile(message, actor)
             message = self.store.get(ident)
             if message["state"] in ("entered_context", "acknowledged") or message["delivery"] == "submitted":

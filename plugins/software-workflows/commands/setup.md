@@ -24,3 +24,11 @@ Take the person through it:
    ("Check again: …"), exactly as printed, and show what is ready now. If agent teams were turned on, tell the person they start in
    their next Claude Code session. If the server environment was just built, or Python or Codex
    was just installed, `/mcp` → codex-oracle → Reconnect starts the server without a restart.
+6. Explain the optional macOS owner LaunchAgent only if crash cleanup at login or
+   after a supervisor crash is wanted. Do not install it as part of normal setup.
+   From the plugin directory, the person can run the configured daemon Python
+   with `-B -m coordinator daemon install-agent --state <coordinator-state>`;
+   it asks for explicit consent. `daemon uninstall-agent --state <coordinator-state>`
+   removes it. The agent uses a private activated socket and respects a durable
+   requested-stop inhibit. Without it, orphan cleanup happens on the next client
+   start. State must be the person's chosen coordinator state, not an invented path.

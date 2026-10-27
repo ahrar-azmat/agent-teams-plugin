@@ -1,7 +1,7 @@
 {
   "name": "software-workflows",
   "description": "Agent-teams orchestration with Codex as the cross-model advisor and writer: the Codex Oracle MCP server (architect_review, code_review, research, codex_query, abraham and its run tools) and the hooks that gate plan mode and git push on a Codex review.",
-  "version": "2.4.7",
+  "version": "2.4.8",
   "author": {
     "name": "Ahrar Ahmad"
   },
@@ -21,6 +21,24 @@
       "title": "Writer MCP servers",
       "description": "Writer MCP servers: all (default), or a JSON list of exact server names. Changes apply at the next coordinator start.",
       "default": "all"
+    },
+    "writer_park_idle_seconds": {
+      "type": "string",
+      "title": "Writer idle parking delay",
+      "description": "Seconds of native inactivity before verified unload and parking. Default 1800; 0 disables idle-timer parking (memory pressure can still park a writer). SOFTWARE_WORKFLOWS_WRITER_PARK_IDLE_SECONDS overrides this setting.",
+      "default": "1800"
+    },
+    "memory_warn_ratio": {
+      "type": "string",
+      "title": "Memory compression warning ratio",
+      "description": "Pause new native launches at this compressor ratio; kernel warning pressure alone parks idle writers without pausing launches. Default 0.50; must be below the critical ratio.",
+      "default": "0.50"
+    },
+    "memory_critical_ratio": {
+      "type": "string",
+      "title": "Memory compression critical ratio",
+      "description": "Refuse new native launches at this compressor ratio, or kernel critical pressure. Default 0.62.",
+      "default": "0.62"
     }
   },
   "keywords": [

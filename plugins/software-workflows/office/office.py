@@ -867,6 +867,9 @@ def native_runs(fresh=False):
                 return [], _native["records"]
             _native["present"] = True
             listing = client.call("run/list", {"cwd": "/", "limit": 100})["data"]
+            status = client.call("daemon/status", {"brief": True})
+            _native["resources"] = {"memory": status.get("memory"), "services": status.get("project_services"),
+                                    "dormancy": status.get("dormancy"), "retention": status.get("retention")}
             for s in listing:
                 if native_lead(s):
                     continue  # a Claude session's own unit: no Codex thread to read
@@ -1832,7 +1835,12 @@ class Handler(BaseHTTPRequestHandler):
                                f"The writer coordinator does not answer ({_native['error']}); its runs show as last seen."
                                if _native["error"] else "")
                 coordinator = " · ".join([x for x in [coordinator] if x] + partly_published(_native["listing"]))
+                resources = _native.get("resources") or {}
+                memory = resources.get("memory") or {}
+                if memory.get("level") in ("warning", "critical"):
+                    coordinator += (" · " if coordinator else "") + "Memory pressure: " + memory["level"] + "; new native launches deferred"
                 return self._json({"now": time.time(), "workers": ws, "workspaces": spaces, "coordinator": coordinator,
+                                   "resources": resources,
                                    "log_dir": str(LOG_DIR), "version": plugin_version(), "roles": ROLES})
             if u.path == "/api/run":
                 runs = JOURNAL.refresh()

@@ -3,12 +3,14 @@ import asyncio
 from contextlib import contextmanager
 import base64
 from collections import deque
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
 import shutil
+import sqlite3
 import struct
 import subprocess
 import time
@@ -46,6 +48,29 @@ JOURNAL_QUEUE_BYTES = 512 * 1024
 JOURNAL_BATCH_COUNT = 64
 JOURNAL_BATCH_BYTES = 64 * 1024
 JOURNAL_BATCH_AGE_S = 0.002
+
+
+def local_resource_failure(error):
+    """Unavailable local storage/capacity is not contrary native evidence.
+
+    SQLite IOERR does not reliably retain the underlying ENOSPC on APFS. It
+    therefore stops this local consumer as an unavailable ledger; corruption
+    and constraint failures keep their existing evidence/reconciliation path.
+    Follow wrappers without losing an original OS resource error.
+    """
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, MemoryError):
+            return True
+        if isinstance(error, OSError) and error.errno in (
+                errno.ENOSPC, errno.EDQUOT, errno.EFBIG, errno.EMFILE, errno.ENFILE, errno.ENOMEM):
+            return True
+        if isinstance(error, sqlite3.Error) and getattr(error, "sqlite_errorcode", 0) & 255 in (
+                sqlite3.SQLITE_FULL, sqlite3.SQLITE_NOMEM, sqlite3.SQLITE_IOERR):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
 
 
 def environment(**overrides):
@@ -145,7 +170,7 @@ METHODS = {
     "project/list": "ProjectListParams", "project/read": "ProjectReadParams",
     "initialize": "InitializeParams", "thread/start": "ThreadStartParams",
     "thread/resume": "ThreadResumeParams", "thread/read": "ThreadReadParams",
-    "thread/list": "ThreadListParams",
+    "thread/list": "ThreadListParams", "thread/unsubscribe": "ThreadUnsubscribeParams",
     "thread/loaded/list": "ThreadLoadedListParams", "turn/start": "TurnStartParams",
     "turn/steer": "TurnSteerParams", "turn/interrupt": "TurnInterruptParams",
     "thread/turns/list": "ThreadTurnsListParams", "thread/items/list": "ThreadItemsListParams",
@@ -172,6 +197,7 @@ FIELDS = {
                        "config", "developerInstructions", "runtimeWorkspaceRoots", "excludeTurns"}, {"threadId"}),
     "thread/read": ({"threadId", "includeTurns"}, {"threadId"}),
     "thread/list": ({"cursor", "limit", "ancestorThreadId", "archived", "sortDirection"}, set()),
+    "thread/unsubscribe": ({"threadId"}, {"threadId"}),
     "turn/start": ({"threadId", "input", "clientUserMessageId", "approvalPolicy", "sandboxPolicy"}, {"threadId", "input"}),
     "turn/steer": ({"threadId", "expectedTurnId", "input", "clientUserMessageId"}, {"threadId", "expectedTurnId", "input"}),
     "turn/interrupt": ({"threadId", "turnId"}, {"threadId", "turnId"}),
@@ -833,6 +859,9 @@ class Connection:
                 else:
                     await asyncio.sleep(0)
         except (OSError, ValueError, asyncio.IncompleteReadError, MemoryError) as exc:
+            if local_resource_failure(exc):
+                self.intake_failed(exc, "receiver capacity")
+                return
             if not self.closed and not self.retiring and self.stopped_error() is None:
                 message = {"method": "coordinator/transportGap", "params": {"error": type(exc).__name__}}
                 if self.intake is not None:

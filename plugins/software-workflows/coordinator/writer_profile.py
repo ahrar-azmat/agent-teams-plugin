@@ -138,7 +138,7 @@ def context(profile):
             "Plugins installed later stay disabled until that restart.")
 
 
-async def deliver_context(daemon, actor):
+async def deliver_context(daemon, actor, preparing_input=False):
     """Old threads keep their initial context on native resume. Publish once.
 
     A fresh writer includes the line in thread/start's developer instructions.
@@ -160,6 +160,8 @@ async def deliver_context(daemon, actor):
         store.save(message)
     await daemon.messages.deliver(ident)
     if store.get(ident)["state"] not in ("entered_context", "acknowledged"):
+        if preparing_input:
+            return  # writer/messages durably prefix it to this authorized input
         raise CoordinatorError("WRITER_MCP_CONTEXT", "The writer profile notice is still pending; retry before submitting input",
                                {"message": ident, "retryable": True}, True)
     actor = store.get(actor["id"])

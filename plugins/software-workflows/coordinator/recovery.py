@@ -7,7 +7,6 @@ import json
 import math
 import os
 from pathlib import Path
-import signal
 import sys
 import time
 
@@ -147,6 +146,9 @@ async def _registered_reconcile(daemon, listener, advance, invocation, demand):
         if listener.get("root_thread") and listener["state"] in ("dead", "stopped", "dormant") and bound and bound != listener["id"]:
             listener = store.get(bound)
         if listener["state"] == "dormant" and not demand:
+            if not listener.get("dormant_proof"):
+                async with capacity(daemon):
+                    await daemon.dormancy.recover(listener)
             return
         invocation["listener"] = listener["id"]
         invocation["phase"] = "queued"
@@ -295,6 +297,52 @@ def request_uncertain(daemon, listener, message, obligation):
         store.save(obligation)
 
 
+def retire_peer_requests(daemon, listener):
+    """Retire the verified-exited chain, not just its newest incarnation."""
+    seen = set()
+    while listener and listener["id"] not in seen:
+        seen.add(listener["id"])
+        _retire_peer_requests(daemon, listener)
+        listener = daemon.store.get(listener.get("replaces"), required=False)
+
+
+def _retire_peer_requests(daemon, listener):
+    """End connection-local reply ownership after a proven peer exit.
+
+    This is not successful tool completion and never authorizes another effect.
+    Keep the invocation, its original stage and all effect/operation records.
+    A lead can resolve those independently; a new listener cannot reissue this
+    old listener's request identifier.
+    """
+    ensure_running(daemon)
+    if not processes.exit_evidence(listener):
+        raise CoordinatorError("PEER_NOT_ENDED", "Cannot retire requests of a live peer")
+    store = daemon.store
+    prefix = "dynamic:" + listener["id"] + ":"
+    with store.transaction():
+        # The primary-key range selects this peer's prefix before any JSON
+        # decoding. Large completed tool responses in other peers stay on disk.
+        for invocation in list(store.selected("SELECT * FROM records WHERE kind='dynamic' AND id>=? AND id<? "
+                                              "AND json_extract(data,'$.state')='pending'", (prefix, prefix + chr(0x10ffff)))):
+            if not invocation["id"].startswith(prefix) or invocation["state"] != "pending":
+                continue
+            invocation.update(state="retired", retired=time.time(),
+                              outcome={"code": "DYNAMIC_PEER_ENDED", "effect": "possible" if
+                                       invocation.get("stage", "effect") == "effect" else "not_started",
+                                       "resolution": "inspect retained operation and message evidence; never replay this invocation"})
+            store.save(invocation)
+            store.event("dynamic/peer_ended", invocation["id"], invocation["outcome"])
+        for obligation in list(store.all("native_obligation", listener["id"])):
+            if obligation["state"] not in ("pending", "failed"):
+                continue
+            invocation = store.get(obligation.get("dynamic"), required=False)
+            completed = invocation and invocation.get("response") is not None
+            obligation.update(state="completed" if completed else "retired", replay="response" if completed else "peer_ended",
+                              peer_exit={"pid": listener.get("pid"), "birth": listener.get("birth"), "observed": time.time()})
+            store.save(obligation)
+            store.event("native/request_retired", listener["id"], {"obligation": obligation["id"], "state": obligation["state"]})
+
+
 def ensure_running(daemon):
     daemon.check_native_stop()
     if daemon.stop.is_set():
@@ -352,7 +400,7 @@ def retryable_failure(info):
     if code == "ADMISSION_FAILED":
         cases = info.get("cases") or []
         return bool(cases) and all(retryable_failure(case["error"]) for case in cases)
-    if code in {"NATIVE_INTAKE_STOPPED", "NATIVE_JOURNAL_FAILED", "WRITER_HISTORY_READ_FAILED", "WRITER_START_FAILED", "WRITER_START_PENDING", "NATIVE_UNCERTAIN", "NATIVE_DISCONNECTED", "LISTENER_SILENT", "TimeoutError", "HISTORY_CHANGED", "HISTORY_APPLY_PENDING",
+    if code in {"RESOURCE_PAUSED", "RESOURCE_EXHAUSTED", "NATIVE_INTAKE_STOPPED", "NATIVE_JOURNAL_FAILED", "WRITER_HISTORY_READ_FAILED", "WRITER_START_FAILED", "WRITER_START_PENDING", "NATIVE_UNCERTAIN", "NATIVE_DISCONNECTED", "LISTENER_SILENT", "TimeoutError", "HISTORY_CHANGED", "HISTORY_APPLY_PENDING",
                 "ConnectionError", "ConnectionResetError", "ConnectionRefusedError", "BrokenPipeError", "EOFError",
                 "EXCLUSIVE_WRITER", "CUSTODIAN_LOST", "LEASE_UNCERTAIN", "PROBE_TIMEOUT",
                 "RESTORE_CUSTODY", "RESTORE_EXECUTING", "UNSTABLE_SNAPSHOT", "RECOVERY_BUSY", "REPLACEMENT_UNBOUND"}:
@@ -688,19 +736,14 @@ async def _reconcile_listener(daemon, listener):
         await daemon.detach_listener(listener["id"])
         ended = ("listener ended by the coordinator (" + listener["ended"] + "), with potentially escaped effects"
                  if listener.get("ended") else "listener died with potentially escaped effects")
+        await daemon.executor_exited(listener)
         for reservation in daemon.custody.unit_active(actor["unit"]):
-            if reservation["unit"] != actor["unit"]:
-                continue
-            for process in reservation.get("processes", []):
-                try:
-                    await finish_thread(processes.terminate, process, actor["session"])
-                except CoordinatorError as exc:
-                    reservation.update(state="quarantined", reason=exc.code)
-                    store.save(reservation)
             store.unknown(reservation["checkout"], "*", ended, {"listener": listener["id"]})
         # The receipts it wrote before it died apply to the calls it admitted; never its replacement's.
         await daemon.settle_native_log(listener["id"])
         await daemon.executor_exited(listener)
+        await replay_native(daemon, listener)
+        retire_peer_requests(daemon, listener)
         listener = store.get(listener["id"])
         if daemon.dormancy.eligible(listener):
             try:
@@ -770,12 +813,14 @@ async def _reconcile_listener(daemon, listener):
                 silence(daemon, listener, "no answer on its socket (" + code + ")")
             raise
     readmit = fresh or listener.get("admission_fingerprint", {}).get("adapter_digest") != await finish_thread(native.adapter_digest)
-    resuming = not attached or readmit or bool(listener.get("recovery_error")) or bool(startup_obligation(store, listener["run"]))
+    resuming = (not attached or readmit or bool(listener.get("recovery_error"))
+                or bool(listener.get("park_resume_required")) or bool(startup_obligation(store, listener["run"])))
     if resuming:
         # Full history is paged below, so returning it here is redundant. 2026-10-22, 26 writers/4 checkouts:
         # slowest root resume 0.117 s before, 0.094 s with excludeTurns (0 timeouts; sampled load up to 18.7).
         # This fixture leaves ample headroom in the existing 60 s RPC timeout; it does not justify a new cap.
         response = await connection.call("thread/resume", {"threadId": listener["root_thread"],
+                                          "config": await daemon.broker.thread_config(actor),
                                           "approvalPolicy": "never", "sandbox": "danger-full-access", "excludeTurns": True,
                                           **({"cwd": cwd, "runtimeWorkspaceRoots": roots} if unit.get("project_revision") else {})})
         native.policy_echo(response)
@@ -836,6 +881,7 @@ async def _reconcile_listener(daemon, listener):
             # A new app-server connection must subscribe to each live child too, and a replacement has loaded only
             # the root. Resuming history does not start a turn or repeat its input.
             child_response = await connection.call("thread/resume", {"threadId": child["thread"],
+                "config": await daemon.broker.thread_config(child),
                 "approvalPolicy": "never", "sandbox": "danger-full-access", "excludeTurns": True,
                 **({"cwd": child.get("cwd", cwd), "runtimeWorkspaceRoots": roots} if unit.get("project_revision") else {})})
             native.policy_echo(child_response)
@@ -876,6 +922,7 @@ async def _reconcile_listener(daemon, listener):
     incident = await resolve_startup(daemon, listener, history)
     listener = store.get(listener["id"])
     listener.update(recovery_state="reconciled", state="connected")
+    listener.pop("park_resume_required", None)
     for key in ("recovery_error", "recovery_error_details", "recovery_retryable", "recovery_retries", "retry_at"):
         listener.pop(key, None)
     initialized = listener.pop("initializing", None)
@@ -933,7 +980,8 @@ async def reconcile_effects(daemon, listener, actor):
 
 def recoverable_listener(listener):
     """Whether startup recovery reconciles it: not a threadless bootstrap that was stopped, and not dead."""
-    return listener["state"] not in ("dead", "dormant") and not (listener["state"] == "stopped" and not listener.get("root_thread"))
+    return (listener["state"] not in ("dead", "dormant") or listener["state"] == "dormant" and not listener.get("dormant_proof")) and not (
+        listener["state"] == "stopped" and not listener.get("root_thread"))
 
 
 def defer_unbound(store):
@@ -1007,7 +1055,10 @@ async def recover(daemon):
         if discovery["state"] == "running":
             current = await finish_thread(processes.identity, discovery["pid"])
             if current and current["birth"] == discovery["birth"]:
-                os.kill(current["pid"], signal.SIGTERM)
+                if discovery.get("owner_listener"):
+                    await daemon.leases.call("end", payload={"listener": discovery["owner_listener"]})
+                else:
+                    store.event("owner/unregistered", discovery["id"], {"pid": current["pid"], "action": "retained_without_signal"})
             discovery["state"] = "interrupted"
             store.save(discovery)
     # Lead operations have no native history to fill the crash gap: fenced before any lead call is admitted.
@@ -1446,7 +1497,8 @@ async def lead_command(daemon, params):
         cwd = params.get("cwd") or actor.get("cwd") or daemon.store.get(actor["checkout"])["root"]
         from .routing import route
         route(daemon.store, actor, ".", cwd, directory=True)
-        process = await asyncio.create_subprocess_exec(*argv, cwd=cwd,
+        from .owned import spawn
+        process = await spawn(*argv, cwd=cwd,
                                                        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
                                                        stderr=asyncio.subprocess.PIPE, start_new_session=True,
                                                        env=dict(os.environ, SOFTWARE_WORKFLOWS_OPERATION=operation["id"]), close_fds=True)

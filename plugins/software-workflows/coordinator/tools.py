@@ -11,6 +11,7 @@ PATH = {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"root_id
 
 
 CONTRACTS = {
+    "services_private": ({"specification": {"type": "object"}}, [], "Allocate isolated private project services for server-level tests, optionally with a different local image or configuration; read the returned owner-only environment file. These containers are removed when your run ends."),
     "claim": ({"paths": {"type": "array", "items": PATH}}, ["paths"], "Atomically claim paths for your unit."),
     "release": ({"paths": {"type": "array", "items": PATH}}, ["paths"], "Request lead-authorized handback; claims remain held."),
     "declare": ({"command": {"type": "string"}, "reason": {"type": "string"}, "level": {"enum": ["shared"]}},
@@ -46,6 +47,9 @@ async def dispatch(daemon, actor, name, args, effect=None):
         return await daemon.custody.acquire(actor, args["paths"], effect=effect)
     if effect is not None:
         effect()
+    if name == "services_private":
+        await daemon.broker.acquire(actor["run"], private=True, specification=args.get("specification"))
+        return daemon.broker.private_files(actor["run"])
     if name == "release":
         return daemon.custody.release_request(actor, args["paths"])
     if name == "declare":

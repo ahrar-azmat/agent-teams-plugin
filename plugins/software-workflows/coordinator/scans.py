@@ -92,6 +92,7 @@ class Producer:
         self.active = None
         self.last_seconds = 0.0
         self.scans, self.bytes = 0, 0
+        self.skipped_bytes = 0
         self.rereads, self.reread_bytes = 0, 0
 
     async def request(self, obligation, paths):
@@ -137,6 +138,7 @@ class Producer:
                     self.last_seconds = time.monotonic() - began
                     self.scans += 1
                     self.bytes += counters["bytes"]
+                    self.skipped_bytes += counters.get("skipped_bytes", 0)
                     revalidation = any(r.get("revalidation") for r in records)
                     if revalidation:
                         self.rereads += 1
@@ -144,7 +146,8 @@ class Producer:
                     store.event("checkout/scan", ident, {"checkout": self.checkout["id"],
                         "obligations": self.active["obligations"], "started": began,
                         "seconds": self.last_seconds, "executor_delay": self.active["executor_started"] - began,
-                        "bytes": counters["bytes"], "revalidation": revalidation, "paths": len(images) + len(unreadable),
+                        "bytes": counters["bytes"], "skipped_bytes": counters.get("skipped_bytes", 0),
+                        "revalidation": revalidation, "paths": len(images) + len(unreadable),
                         "oldest_obligation_seconds": time.time() - min(r["created"] for r in records)})
                     for _, _, future, _ in cohort:
                         if not future.done():
@@ -173,6 +176,7 @@ class Producer:
         return {"checkout": self.checkout["id"], "active": self.active,
                 "active_seconds": now - self.active["since"] if self.active else 0,
                 "queued": len(self.queue), "scans": self.scans, "bytes": self.bytes,
+                "hashed_bytes": self.bytes, "skipped_bytes": self.skipped_bytes,
                 "rereads": self.rereads, "reread_bytes": self.reread_bytes,
                 "last_seconds": self.last_seconds,
                 "oldest_seconds": max((time.time() - r[0]["created"] for r in self.queue), default=0)}
@@ -387,6 +391,7 @@ class Manager:
                         o["unreadable"].update(unreadable)
                         producer.rereads += 1
                         producer.reread_bytes += counters["bytes"]
+                        producer.skipped_bytes += counters.get("skipped_bytes", 0)
                         store.event("observation/revalidate", ident, {"checkout": c["checkout"]["id"],
                             "paths": sorted(paths), "whole_custody": False, "bytes": counters["bytes"]})
                     o["heads"], o["versions"] = heads, versions

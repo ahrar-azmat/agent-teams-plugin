@@ -3,6 +3,7 @@
 A probe succeeds only after its negative control was observed. Production policy
 visibility is a separate mandatory capability, never a warning-through switch.
 """
+from . import owned
 import asyncio
 from contextlib import asynccontextmanager
 import hashlib
@@ -23,16 +24,16 @@ from .client import CoordinatorError
 from . import native, gitio, processes, runtime, children
 from .fixture import Provider, action, function, patch, message, scratch_directory
 from .ledger import case_sensitive
-from .store import digest, uid, encoded, fsync_dir
+from .store import digest, uid, encoded
 
 
 PROBES = ("hooks", "evidence", "dynamic", "delivery", "tty", "receipts", "reconnect", "terminals", "ownership", "policy", "validation")
-# Optional capabilities: each probed once for a writer binding (calibrate_writer), cached with it and recorded on its
-# listeners; none is ever a refusal. inject: messages.deliver_notice injects a no-wake notice where it is "active" (at
+# Optional capabilities are diagnostic probe results until measured in the
+# actual writer configuration; none is ever a refusal. inject: messages.deliver_notice injects a no-wake notice where it is "active" (at
 # any time) or "idle" (while no turn runs), and holds it where the probe found it absent (None). A probe that raised or
 # timed out (each of its steps is bounded) proves neither: its binding takes FALLBACK, recorded with the error.
 CAPABILITIES = ("inject",)
-FALLBACK = {"inject": "idle"}
+FALLBACK = {"inject": None}
 
 
 class ProbeListener:
@@ -82,7 +83,7 @@ class ProbeListener:
             environment["RUST_LOG"] = self.log
         self.allocation = runtime.allocate("probe")
         self.socket = Path(self.allocation["path"])
-        self.process = await asyncio.create_subprocess_exec(native.native_codex(), "app-server", "--listen", "unix://" + str(self.socket),
+        self.process = await owned.spawn(native.native_codex(), "app-server", "--listen", "unix://" + str(self.socket),
                            *native.override_args(self.config), cwd=self.repo, env=environment, stdin=asyncio.subprocess.DEVNULL,
                            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, start_new_session=True, close_fds=True)
         self.birth = processes.identity(self.process.pid)["birth"]
@@ -217,7 +218,7 @@ class Admission:
                 directory.mkdir(mode=0o700, exist_ok=True)
                 home = directory / "generation-home"
                 home.mkdir(mode=0o700, exist_ok=True)
-                process = await asyncio.create_subprocess_exec(binary, "app-server", "generate-json-schema", "--experimental", "--out", str(directory),
+                process = await owned.spawn(binary, "app-server", "generate-json-schema", "--experimental", "--out", str(directory),
                             env=dict(os.environ, CODEX_HOME=str(home)), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
                 try:
                     code = await process.wait()
@@ -250,7 +251,7 @@ class Admission:
         if missing:
             raise CoordinatorError("METHOD_INVENTORY", "Required native methods unavailable", {"missing": sorted(missing)})
         binary = native.native_codex()
-        proc = await asyncio.create_subprocess_exec(binary, "--version", stdout=asyncio.subprocess.PIPE)
+        proc = await owned.spawn(binary, "--version", stdout=asyncio.subprocess.PIPE)
         try:
             version = (await proc.communicate())[0].decode().strip()
         finally:
@@ -343,40 +344,23 @@ class Admission:
         return {"admitted": True, "fingerprint": binding, "cache_hit": cached, "effective_modes": modes}
 
     async def calibrate_writer(self, binding, fingerprint, fixture):
-        """Calibrate a writer binding once: its required probes, then each of its optional capabilities (CAPABILITIES)
-        once, a probe that raised included (its fallback is cached). Returns (whether the cache held the required
-        probes, the capabilities' observations)."""
-        cache = self.store.root / "calibrations" / ("writer-" + binding + ".json")
-        try:
-            cached = json.loads(cache.read_text())
-        except (OSError, ValueError):
-            cached = {}
-        hit = cached.get("completed") is True and cached.get("fingerprint_digest") == binding and cached.get("fingerprint") == fingerprint
-        owed = [name for name in CAPABILITIES if not hit or name not in (cached.get("capabilities") or {})]
-        if not owed:
-            return True, cached["capabilities"]
-        # Isolated state under the OS temporary tree keeps every calibration
-        # artifact under that same caller-owned root. Normal state continues
-        # to use the OS temporary directory accepted by the fixture adapter.
+        """Run reference controls without borrowing their configuration identity.
+
+        Each behavioral control deliberately changes its disposable provider,
+        hooks or policy. A later fingerprint-only listener is not the listener
+        that measured those controls. Keep the evidence, but do not cache it as
+        a writer capability. The actual writer policy is checked by writer_gate.
+        """
         temporary_roots = {Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve()}
         parent = self.store.root / "calibrations" if any(p in self.store.root.parents for p in temporary_roots) else None
         directory = tempfile.mkdtemp(prefix="software-workflows-admission-", dir=parent)
-        if not hit:
-            self.store.event("admission/calibrating", binding, {"state": "running"})
-            calibration = await self.check({"scratch": directory, "probes": list(PROBES) + (["projects"] if fingerprint.get("project") else [])})
-            if not calibration["completed"]:
-                raise CoordinatorError("ADMISSION_INCOMPLETE", "Required runtime probes did not all complete")
-            cached = {"fingerprint": fingerprint, "fingerprint_digest": binding,
-                      "evidence": calibration["evidence"], "completed": True, "fixture": fixture}
-        cached["capabilities"] = dict(cached.get("capabilities") or {}, **await self.capabilities(directory, owed))
-        descriptor, pending = tempfile.mkstemp(prefix="writer-pending-", dir=cache.parent)
-        with os.fdopen(descriptor, "w") as output:
-            output.write(encoded(cached))
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(pending, cache)
-        fsync_dir(cache.parent)
-        return hit, cached["capabilities"]
+        self.store.event("admission/calibrating", binding, {"state": "running", "fixture": fixture})
+        calibration = await self.check({"scratch": directory, "probes": list(PROBES) + (["projects"] if fingerprint.get("project") else [])})
+        if not calibration["completed"]:
+            raise CoordinatorError("ADMISSION_INCOMPLETE", "Required runtime probes did not all complete")
+        return False, {name: {"capability": None, "fallback": True,
+            "error": "CAPABILITY_CONFIGURATION_UNMEASURED",
+            "evidence": calibration["evidence"]} for name in CAPABILITIES}
 
     async def capabilities(self, scratch, names):
         """Probe the optional capabilities `names` (CAPABILITIES). Each is its probe's "capability" (None where that
@@ -428,8 +412,8 @@ class Admission:
                  "evidence": str(directory), "completed": all(r["passed"] for r in results),
                  "production_admitted": False, "production_refusal": None if fingerprint["exec_policy"]["complete"] else "ADMISSION_EXEC_POLICY_UNOBSERVABLE"}
         (directory / "report.json").write_text(encoded(value))
-        if value["completed"] and set(PROBES) <= set(requested):
-            (self.store.root / "calibrations" / (value["fingerprint_digest"] + ".json")).write_text(encoded(value))
+        # report.json is evidence only. The fingerprint-only listener did not
+        # measure the preceding controls, so it cannot name a capability cache.
         if not value["completed"]:
             raise CoordinatorError("ADMISSION_FAILED", "One or more required red/green native observations failed", value)
         return value
@@ -594,7 +578,7 @@ class Admission:
                 await listener.start_thread()
                 owner = processes.identity(listener.process.pid)
                 services = await finish_thread(processes.inventory, owner, None)
-                unrelated = await asyncio.create_subprocess_exec("/bin/sleep", "10")
+                unrelated = await owned.spawn("/bin/sleep", "10")
                 unrelated_identity = processes.identity(unrelated.pid)
                 seen, reparented, negative, marker_failures = {}, [], False, set()
                 try:

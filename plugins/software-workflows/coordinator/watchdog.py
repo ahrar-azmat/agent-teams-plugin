@@ -41,6 +41,12 @@ LOOKUP_ERRORS = {1: "TimeoutExpired", 2: "CalledProcessError", 3: "OSError"}
 
 
 async def wait_exit(process, seconds):
+    if hasattr(process, "end"):
+        try:
+            await asyncio.wait_for(process.wait(), seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
     deadline = time.monotonic() + seconds
     while process.poll() is None:
         if time.monotonic() >= deadline:
@@ -83,7 +89,7 @@ class Watchdog:
                 "lookup_retry_at": struct.unpack_from("d", self.memory, 56)[0]}
 
     def beat(self):
-        if self.process:
+        if self.process and not hasattr(self.process, "end"):
             self.process.poll()  # waitpid(WNOHANG), including a stopped helper
         sample = {"wall": time.time(), "monotonic": time.monotonic(), "generation": self.generation}
         struct.pack_into("d", self.memory, 8, sample["wall"])
@@ -99,9 +105,12 @@ class Watchdog:
             # Python 3.15 on this macOS host can wake asyncio's child watcher
             # on SIGSTOP, then block its loop in waitpid(pid, 0). This helper
             # must never use that watcher: poll() always uses WNOHANG.
-            self.process = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()),
+            from .owned import spawn
+            from .processes import identity
+            self.process = await spawn(sys.executable, "-B", str(Path(__file__).resolve()),
                 str(self.root), str(os.getpid()), str(self.generation), str(self.memory_file.fileno()), str(self.read_fd),
-                ],
+                json.dumps(identity(os.getpid())),
+                kind="watchdog", fd_arguments={6: self.memory_file.fileno(), 7: self.read_fd},
                 pass_fds=(self.memory_file.fileno(), self.read_fd),
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except BaseException:
@@ -151,6 +160,23 @@ class Watchdog:
         self.unregister()
         try:
             if self.process:
+                if hasattr(self.process, "end"):
+                    if not await wait_exit(self.process, CLOSE_SECONDS):
+                        self.forced = True
+                    await self.process.end()
+                else:
+                    await self.close_direct()
+            self.closed_outcome = dict(self.status(), helper_forced=self.forced,
+                                       shutdown_integrity="possibly_lost" if self.forced else "helper_exited")
+            return self.closed_outcome
+        finally:
+            self.unregister()
+            if self.closed_outcome is not None:
+                self.dispose()
+                signal.signal(signal.SIGUSR2, self.previous_handler)
+
+    async def close_direct(self):
+        if self.process:
                 if not await wait_exit(self.process, CLOSE_SECONDS):
                     # poll() still None proves this is our unreaped direct
                     # child. Its PID cannot be reused; a fallible ps lookup
@@ -160,19 +186,14 @@ class Watchdog:
                         self.forced = True
                     if not await wait_exit(self.process, CLOSE_SECONDS):
                         raise RuntimeError("watchdog did not exit after owned SIGKILL")
-            self.closed_outcome = dict(self.status(), helper_forced=self.forced,
-                                       shutdown_integrity="possibly_lost" if self.forced else "helper_exited")
-            return self.closed_outcome
-        finally:
-            self.unregister()
-            # Keep SIGUSR2 ignored and both descriptors owned while an
-            # unreaped helper might still signal. A retry can still read status.
-            if self.closed_outcome is not None:
-                self.dispose()
-                signal.signal(signal.SIGUSR2, self.previous_handler)
 
 
-def monitor(root, parent, generation, memory_fd, pipe_fd):
+def monitor(root, parent, generation, memory_fd, pipe_fd, parent_identity=None):
+    from coordinator import processes
+    from coordinator.client import CoordinatorError
+    parent_identity = parent_identity or processes.identity(parent)
+    if not parent_identity:
+        return
     memory = mmap.mmap(memory_fd, MEMORY_BYTES)
     os.close(memory_fd)
     os.set_blocking(pipe_fd, False)
@@ -244,7 +265,10 @@ def monitor(root, parent, generation, memory_fd, pipe_fd):
     reported, dumps = None, 0
     retry_at, retry_delay, failures = 0.0, CLOSE_SECONDS, 0
     try:
-        while os.getppid() == parent:
+        # The owner is now our kernel parent; the observed worker is a sibling.
+        # Its pinned identity, not a parent PID or executable name, authorizes
+        # this diagnostic signal. The negative heartbeat ends normal cleanup.
+        while True:
             before, wall = struct.unpack_from("dd", memory)
             if before < 0:
                 break
@@ -258,11 +282,10 @@ def monitor(root, parent, generation, memory_fd, pipe_fd):
             age = time.monotonic() - before
             if age >= THRESHOLD and before != reported and time.monotonic() >= retry_at:
                 try:
-                    command = subprocess.check_output(["/bin/ps", "-p", str(parent), "-o", "command="],
-                                                      text=True, timeout=CLOSE_SECONDS)
-                except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as exc:
+                    alive = not processes.exit_evidence(parent_identity)
+                except (CoordinatorError, OSError) as exc:
                     failures += 1
-                    code = 1 if isinstance(exc, subprocess.TimeoutExpired) else 2 if isinstance(exc, subprocess.CalledProcessError) else 3
+                    code = 3
                     retry_at = time.monotonic() + retry_delay
                     struct.pack_into("QQd", memory, 40, failures, code, time.time() + retry_delay)
                     event("watchdog_lookup_failed", error=type(exc).__name__, message=str(exc)[:512],
@@ -270,10 +293,10 @@ def monitor(root, parent, generation, memory_fd, pipe_fd):
                     retry_delay = min(RETRY_MAX_SECONDS, retry_delay * 2)
                     # Continue draining the nonblocking pipe even while parent
                     # identity cannot be checked. Never signal an unproved PID.
-                    command = None
-                if command is None:
+                    alive = None
+                if alive is None:
                     pass
-                elif str(root) not in command or os.getppid() != parent:
+                elif not alive:
                     event("watchdog_ownership_lost", parent=parent)
                     break
                 else:
@@ -286,8 +309,16 @@ def monitor(root, parent, generation, memory_fd, pipe_fd):
                           threshold_seconds=THRESHOLD, parent=parent, dump_integrity="possibly_truncated")
                     if struct.unpack_from("d", memory)[0] < 0:
                         break
-                    os.kill(parent, signal.SIGUSR2)
-                    reported = before
+                    try:
+                        from coordinator.leases import control
+                        result = control(root, "owner/diagnostic", {"worker": parent_identity}, timeout=CLOSE_SECONDS)
+                        if result.get("sent"):
+                            reported = before
+                    except (CoordinatorError, OSError, EOFError):
+                        # An owner restart or an exit race is not evidence that
+                        # the worker ended; retry without signalling it ourselves.
+                        retry_at = time.monotonic() + retry_delay
+                        retry_delay = min(RETRY_MAX_SECONDS, retry_delay * 2)
             readable, _, _ = select.select([pipe_fd], [], [], INTERVAL)
             if readable:
                 data = os.read(pipe_fd, 65536)
@@ -306,4 +337,5 @@ def monitor(root, parent, generation, memory_fd, pipe_fd):
 
 
 if __name__ == "__main__":
-    monitor(sys.argv[1], *(int(value) for value in sys.argv[2:]))
+    monitor(sys.argv[1], *(int(value) for value in sys.argv[2:6]),
+            json.loads(sys.argv[6]) if len(sys.argv) > 6 else None)

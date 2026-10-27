@@ -186,7 +186,7 @@ class History:
 
     async def observe(self, listener, actor, connection=None):
         self.daemon.check_native_stop()
-        connection = connection or self.daemon.connections[listener["id"]]
+        connection = connection or self.daemon.listener_connection(listener)
         connection.check_intake()
         from .recovery import capacity
         cp = self.checkpoint(actor) or {}

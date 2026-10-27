@@ -27,6 +27,37 @@ class CoordinatorError(RuntimeError):
                 "kind": "failure" if self.operational else "refusal"}
 
 
+def stop_control_command(command):
+    """A whole shell command containing only the documented stop invocation."""
+    if not isinstance(command, str) or any(mark in command for mark in (";", "|", "`", "$(", "<", ">", "\n")):
+        return False
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return False
+    if words[:1] == ["cd"]:
+        if len(words) < 4 or words[2] != "&&" or Path(words[1]).resolve() != Path(__file__).resolve().parents[1]:
+            return False
+        words = words[3:]
+    if not words or not Path(words.pop(0)).name.lower().startswith("python"):
+        return False
+    if words[:1] == ["-B"]:
+        words.pop(0)
+    if words[:2] != ["-m", "coordinator"]:
+        return False
+    words = words[2:]
+    if words[:1] == ["--state"] and len(words) >= 2:
+        words = words[2:]
+    if words[:2] != ["daemon", "stop"]:
+        return False
+    words = words[2:]
+    if "--park" in words:
+        words.remove("--park")
+    if words[:1] == ["--state"] and len(words) == 2:
+        words = []
+    return not words
+
+
 def state_root(value=None):
     return Path(value or os.environ.get("SOFTWARE_WORKFLOWS_STATE") or
                 "~/.local/state/software-workflows").expanduser().absolute()
@@ -129,8 +160,11 @@ def venv_fds():
 def clean_environment(source=None):
     """Detach from the launching Claude session and its push gate, keeping user configuration."""
     environment = dict(os.environ if source is None else source)
-    if environment.get("CLAUDE_PLUGIN_OPTION_WRITER_MCP_SERVERS"):
-        environment.setdefault("SOFTWARE_WORKFLOWS_WRITER_MCP_SERVERS", environment["CLAUDE_PLUGIN_OPTION_WRITER_MCP_SERVERS"])
+    for option in ("WRITER_MCP_SERVERS", "WRITER_PARK_IDLE_SECONDS", "MEMORY_WARN_RATIO", "MEMORY_CRITICAL_RATIO",
+                   "MEMORY_HYSTERESIS", "OWNER_JOURNAL_BYTES"):
+        key = "CLAUDE_PLUGIN_OPTION_" + option
+        if key in environment:
+            environment.setdefault("SOFTWARE_WORKFLOWS_" + option, environment[key])
     for key in tuple(environment):
         if key in {"CLAUDECODE", "CLAUDE_PID", "CLAUDE_ENV_FILE", "CLAUDE_EFFORT", "CLAUDE_PROJECT_DIR",
                    "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA", "CLAUDE_JOB_DIR"} or key.startswith(
@@ -363,14 +397,14 @@ class Client:
             time.sleep(0.05)
         raise CoordinatorError("DAEMON_OUTDATED", "The older coordinator release did not stop", details, True)
 
-    def stop(self, timeout=30):
+    def stop(self, timeout=30, park=False):
         """Stop the running daemon, holding the upgrade lock. One that drains (2.4.0 and later) decides
         itself; for one from before 2.4.0 its ledger is read first, and the stop is refused while lead
         work is in flight there."""
         with self.upgrading(timeout):
             status = self.call("daemon/status", {"brief": True})
             if "draining-stop" in (status.get("capabilities") or []) and status.get("boot"):
-                return self.call("daemon/stop", {"expect": {"pid": status.get("pid"), "boot": status["boot"]}})
+                return self.call("daemon/stop", {"expect": {"pid": status.get("pid"), "boot": status["boot"]}, "park": park})
             pending = lead_work_in_flight(self.state)
             if pending:
                 raise CoordinatorError("NOT_QUIESCENT", "Lead work is in flight in the older coordinator; stop it "
@@ -378,6 +412,10 @@ class Client:
             return self.call("daemon/stop")
 
     def ensure(self, timeout=30, python=None, inherited_fds=None):
+        from .owner_journal import inspect
+        if inspect(self.state)["inhibited"]:
+            raise CoordinatorError("AUTOSTART_INHIBITED", "Coordinator was explicitly stopped; run daemon start to resume",
+                                   {"start": self.stop_command().rsplit("stop", 1)[0] + "start"}, True)
         try:
             status = self.status()
         except CoordinatorError as exc:
@@ -398,6 +436,21 @@ class Client:
                 self.retire(status, timeout)
         raise CoordinatorError("DAEMON_OUTDATED", "An older coordinator release kept taking the daemon's place",
                                {"running": status.get("version"), "pid": status.get("pid")}, True)
+
+    def resume(self):
+        from .leases import control
+        from .owner_journal import inspect
+        owner = inspect(self.state)
+        if owner["inhibited"]:
+            try:
+                control(self.state, "owner/start")
+            except (FileNotFoundError, ConnectionRefusedError):
+                os.environ["SOFTWARE_WORKFLOWS_EXPLICIT_START"] = "1"
+                try:
+                    return self.start()
+                finally:
+                    os.environ.pop("SOFTWARE_WORKFLOWS_EXPLICIT_START", None)
+        return self.ensure()
 
     def settled(self, status, timeout):
         """The status of the daemon this client just started, once it has finished recovery and admits
@@ -420,11 +473,17 @@ class Client:
         environment = launch_environment()
         if inherited_fds:
             environment["CODEX_ORACLE_VENV_LOCK"] = str(inherited_fds[0])
-        subprocess.Popen([python or daemon_python(), "-B", "-m", "coordinator", "daemon", "serve",
+        from .owner_journal import inspect
+        owner = inspect(self.state)["custodian"]
+        if owner and owner.get("agent"):
+            from .leases import control
+            control(self.state, "owner/status")  # socket activation, never a competing supervisor
+        else:
+            subprocess.Popen([python or daemon_python(), "-B", "-m", "coordinator", "daemon", "serve",
                           "--state", str(self.state)], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, close_fds=True, pass_fds=inherited_fds,
-                         cwd=str(Path(__file__).resolve().parents[1]), env=environment)
+                             cwd=str(Path(__file__).resolve().parents[1]), env=environment)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:

@@ -118,7 +118,9 @@ class Runs:
         data = [dict(row, data=json.loads(row["data"])) for row in rows[:limit]]
         listener = self.store.get((self.store.get(run.get("root_actor") or "", required=False) or {}).get("listener") or "", required=False) or {}
         from .dormancy import view
+        from .retention import archives
         return {"run": run["id"], "listener": view(listener), "data": data, "cursor": data[-1]["seq"] if data else cursor,
+                "archives": archives(self.store, [r["id"] for r in self.store.all("listener", run["id"])]),
                 "more": len(rows) > limit, "state": self.reported(self.store.get(run["id"]))[0]}
 
     def cancel_current(self, runid, generation):
@@ -198,6 +200,7 @@ class Runs:
                 continue  # ended to settle an input (end_writer): nothing runs there; its queue is read on its replacement
             try:
                 from .native import page
+                connection = self.daemon.listener_connection(self.store.get(actor["listener"]))
                 async for queued in page(connection, "thread/queue/list", {"threadId": actor["thread"]}):
                     for entry in queued["data"]:
                         if not self.cancel_current(runid, generation):
@@ -232,8 +235,8 @@ class Runs:
                         for process in reservation.get("processes", []):
                             if not self.cancel_current(runid, generation):
                                 return self.superseded(runid, generation)
-                            await finish_thread(processes.terminate, process, actor["session"])
-            except (CoordinatorError, OSError, AttributeError) as exc:
+                            await self.daemon.leases.call("end-member", payload={"listener": actor["listener"], "member": process})
+            except (CoordinatorError, OSError) as exc:
                 failures.append({"actor": actor["id"], "code": getattr(exc, "code", type(exc).__name__)})
         return self.cancel_current(runid, generation) or self.superseded(runid, generation)
 

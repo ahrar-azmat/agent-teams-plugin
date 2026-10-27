@@ -12,8 +12,10 @@ def main(argv=None):
     parser.add_argument("--state", help="External private state directory")
     sub = parser.add_subparsers(dest="command", required=True)
     daemon = sub.add_parser("daemon", help="Start/discover/status/stop the independent daemon")
-    daemon.add_argument("action", choices=["start", "status", "stop", "serve", "worker"])
+    daemon.add_argument("action", choices=["start", "status", "stop", "serve", "worker", "install-agent", "uninstall-agent"])
     daemon.add_argument("--state", dest="daemon_state")
+    daemon.add_argument("--park", action="store_true", help="Inhibit automatic starts after the drain")
+    daemon.add_argument("--consent", action="store_true", help="Explicit consent for the requested LaunchAgent change")
     rpc = sub.add_parser("rpc", help="Call a documented C2 RPC method with JSON params")
     rpc.add_argument("method")
     rpc.add_argument("params", nargs="?", default="{}", help="JSON object, or '-' for stdin")
@@ -54,12 +56,15 @@ def main(argv=None):
             return serve(args.directory, plan, args.native_home)
         client = Client(state)
         if args.command == "daemon":
-            if args.action == "start":
-                value = client.ensure()
+            if args.action in ("install-agent", "uninstall-agent"):
+                from .launch_agent import manage
+                value = manage(state_root(state), args.action.removesuffix("-agent"), consent=args.consent)
+            elif args.action == "start":
+                value = client.resume()
             elif args.action == "status":
                 value = client.call("daemon/status")
             else:
-                value = client.stop()
+                value = client.stop(park=args.park)
         elif args.command == "admission":
             client.ensure()
             client.timeout = 1800

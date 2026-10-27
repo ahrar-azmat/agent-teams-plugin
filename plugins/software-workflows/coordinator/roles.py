@@ -1,4 +1,5 @@
 """Hide lead authority in inherited MCP servers without removing other servers."""
+from . import owned
 import json
 import re
 
@@ -43,13 +44,18 @@ def apply(config, restrictions):
     import tomllib
     # Coalesce existing explicit dotted overrides before adding a table overlay;
     # two -c assignments to the same table otherwise replace earlier leaves.
-    value = tomllib.loads("\n".join(k + "=" + native.toml(v) for k, v in config.items()))
     def merge(target, patch):
         for key, item in patch.items():
             if isinstance(item, dict) and isinstance(target.get(key), dict):
                 merge(target[key], item)
             else:
                 target[key] = item
+    # A readmission can contain a coalesced table plus newer dotted leaf
+    # overrides. Each native -c assignment is independent; parsing them as one
+    # TOML document incorrectly rejects that valid table/leaf combination.
+    value = {}
+    for key, item in config.items():
+        merge(value, tomllib.loads(key + "=" + native.toml(item)))
     merge(value, restrictions)
     return value
 
@@ -135,7 +141,7 @@ async def exec_policy(argv0, cwd, config):
 
     @asynccontextmanager
     async def connection(overrides):
-        process = await asyncio.create_subprocess_exec(*argv0, "app-server", "--listen", "stdio://",
+        process = await owned.spawn(*argv0, "app-server", "--listen", "stdio://",
             *native.override_args(overrides), cwd=cwd, env=native.environment(SOFTWARE_WORKFLOWS_ROLE="writer"),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             limit=16 * 1024 * 1024, start_new_session=True)

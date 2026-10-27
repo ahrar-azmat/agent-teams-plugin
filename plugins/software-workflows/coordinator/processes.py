@@ -5,6 +5,7 @@ Codex identity markers are returned; process environments are never logged.
 """
 import ctypes
 import errno
+from functools import lru_cache
 import os
 from pathlib import Path
 import signal
@@ -23,8 +24,8 @@ class ProcBSDInfo(ctypes.Structure):
 
 
 class ProcUniqueInfo(ctypes.Structure):
-    # XNU PROC_PIDUNIQIDENTIFIERINFO (17), the measured 56-byte installed ABI. The original
-    # parent's unique ID survives reparenting; a PID or executable name does not.
+    # XNU PROC_PIDUNIQIDENTIFIERINFO (17), the measured 56-byte installed ABI.
+    # parent_unique follows reparenting; retain lineage before the parent exits.
     _fields_ = [("uuid", ctypes.c_uint8 * 16), ("unique", ctypes.c_uint64),
                 ("parent_unique", ctypes.c_uint64), ("version", ctypes.c_int32),
                 ("parent_version", ctypes.c_int32), ("reserved2", ctypes.c_uint64),
@@ -51,6 +52,17 @@ def _unreadable(pid, error):
     return CoordinatorError("PROCESS_UNREADABLE", "Cannot verify process birth identity", {"pid": pid, "errno": error})
 
 
+@lru_cache(maxsize=1)
+def boot_session():
+    if sys.platform == "darwin":
+        lib = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+        buffer, size = ctypes.create_string_buffer(128), ctypes.c_size_t(128)
+        if lib.sysctlbyname(b"kern.bootsessionuuid", buffer, ctypes.byref(size), None, 0):
+            raise OSError(ctypes.get_errno(), "Cannot read boot session")
+        return buffer.value.decode().lower()
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
 def _bsd(lib, pid):
     """(start, run state, parent, user) of the process holding the PID, or None when no process of this user does.
 
@@ -65,7 +77,7 @@ def _bsd(lib, pid):
     as for any process (measured)."""
     info = ProcBSDInfo()
     if lib.proc_pidinfo(pid, 3, 1, ctypes.byref(info), ctypes.sizeof(info)) == ctypes.sizeof(info):
-        return (info.start_sec, info.start_usec), info.status, info.ppid, info.uid
+        return (info.start_sec, info.start_usec), info.status, info.ppid, info.uid, info.pgid
     error = ctypes.get_errno()
     if error == errno.ESRCH:
         return None
@@ -87,7 +99,7 @@ def _bsd(lib, pid):
         return None  # it ended meanwhile
     if size.value != ctypes.sizeof(KinfoProc):
         raise _unreadable(pid, None)
-    return (kinfo.start_sec, kinfo.start_usec), kinfo.stat, short.ppid, short.uid
+    return (kinfo.start_sec, kinfo.start_usec), kinfo.stat, short.ppid, short.uid, short.pgid
 
 
 def identity(pid, _attempt=0):
@@ -102,7 +114,7 @@ def identity(pid, _attempt=0):
         unique = ProcUniqueInfo()  # answered for any process, another user's too (measured)
         if lib.proc_pidinfo(pid, 17, 1, ctypes.byref(unique), ctypes.sizeof(unique)) != 56:
             error = ctypes.get_errno()
-            if error == errno.ESRCH:
+            if error == errno.ESRCH and _bsd(lib, pid) is None:
                 return None
             raise CoordinatorError("PROCESS_KERNEL_IDENTITY", "Kernel process identity is unavailable", {"pid": pid, "errno": error})
         # Check the PID did not change between the kernel reads.
@@ -114,16 +126,18 @@ def identity(pid, _attempt=0):
             if _attempt < 3:
                 return identity(pid, _attempt + 1)
             raise CoordinatorError("PROCESS_REUSED", "PID changed during kernel identity lookup", {"pid": pid})
-        (start_sec, start_usec), status, ppid, uid = first
+        (start_sec, start_usec), status, ppid, uid, pgid = first
         return {"pid": pid, "birth": str(start_sec) + ":" + str(start_usec),
                 "ppid": ppid, "uid": uid, "zombie": status == 5, "stopped": status == 4,
-                "kernel_id": unique.unique, "parent_kernel_id": unique.parent_unique}
+                "kernel_id": unique.unique, "parent_kernel_id": unique.parent_unique,
+                "version": unique.version, "boot_session": boot_session(), "pgid": pgid}
     if sys.platform.startswith("linux"):
         directory = Path("/proc") / str(pid)
         try:
             parts = (directory / "stat").read_text().rsplit(")", 1)[1].split()
             return {"pid": pid, "birth": parts[19], "ppid": int(parts[1]),
-                    "uid": directory.stat().st_uid, "zombie": parts[0] == "Z", "stopped": parts[0] in ("T", "t")}
+                    "uid": directory.stat().st_uid, "zombie": parts[0] == "Z", "stopped": parts[0] in ("T", "t"),
+                    "kernel_id": int(parts[19]), "version": 0, "boot_session": boot_session(), "pgid": int(parts[2])}
         except (FileNotFoundError, ProcessLookupError):  # a process reaped while its entry is read reads ESRCH
             return None
         except PermissionError:
@@ -132,6 +146,98 @@ def identity(pid, _attempt=0):
             # the PID is no writer's (not run on Linux).
             raise CoordinatorError("PROCESS_UNREADABLE", "Cannot verify process birth identity", {"pid": pid})
     raise CoordinatorError("PROCESS_PLATFORM", "No reliable process identity backend")
+
+
+def exit_evidence(record):
+    """Unreadable is an error, never proof of exit. An exec keeps kernel_id."""
+    if record.get("boot_session") and record["boot_session"] != boot_session():
+        return "another_boot"
+    current = identity(record["pid"])
+    if current is None:
+        return "pid_absent"
+    if current["birth"] != record["birth"] or (record.get("kernel_id") is not None and
+                                              current.get("kernel_id") != record["kernel_id"]):
+        return "different_identity"
+    return "zombie" if current["zombie"] else None
+
+
+def signal_identity(record, number):
+    """Conditioned signal; stale exec versions are re-read, not classified as exits.
+
+    A changing executable may postpone a signal; the owner retains REAPING and retries.
+    No successful signal is itself exit evidence.
+    """
+    if exit_evidence(record):
+        return False
+    current = identity(record["pid"])
+    if current is None or current["birth"] != record["birth"] or current["kernel_id"] != record.get("kernel_id", current["kernel_id"]):
+        return False
+    if sys.platform != "darwin":
+        # pidfd pins the task even if its numeric PID is reused after inspection.
+        fd = os.pidfd_open(current["pid"])
+        try:
+            if not exit_evidence(record):
+                signal.pidfd_send_signal(fd, number)
+        finally:
+            os.close(fd)
+        return True
+    token = (ctypes.c_uint32 * 8)(os.getuid(), os.geteuid(), os.getegid(), os.getuid(), os.getgid(),
+                                 current["pid"], 0, current["version"])
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    result = lib.proc_signal_with_audittoken(ctypes.byref(token), number)
+    if result == errno.ESRCH:
+        # Inspect again now. The owner will retry a still-live exec on its next service step.
+        exit_evidence(record)
+        return False
+    if result:
+        raise OSError(result, "Identity-conditioned signal refused")
+    return True
+
+
+def lineage(records, exclude=()):
+    """Snapshot descendants while parent links exist; never infer ownership by a name."""
+    retained = {r.get("kernel_id", r["birth"]): r for r in records}
+    live = {r["pid"] for r in records if not exit_evidence(r)}
+    if sys.platform == "darwin":
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        size = lib.proc_listpids(1, 0, None, 0)
+        while True:
+            buffer = (ctypes.c_int * (size // 4 + 128))()
+            count = lib.proc_listpids(1, 0, buffer, ctypes.sizeof(buffer))
+            if count < 0:
+                raise _unreadable(0, ctypes.get_errno())
+            if count < ctypes.sizeof(buffer):
+                break
+            size = ctypes.sizeof(buffer) * 2
+        candidates = {}
+        for pid in buffer[:count // 4]:
+            if pid > 0:
+                short = ProcBSDShortInfo()
+                if lib.proc_pidinfo(pid, 13, 1, ctypes.byref(short), ctypes.sizeof(short)) == ctypes.sizeof(short):
+                    candidates[pid] = short.ppid
+                elif pid in live and ctypes.get_errno() != errno.ESRCH:
+                    raise _unreadable(pid, ctypes.get_errno())
+    else:
+        candidates = {}
+        for path in Path("/proc").iterdir():
+            if path.name.isdigit():
+                current = identity(int(path.name))
+                if current:
+                    candidates[current["pid"]] = current["ppid"]
+    while True:
+        found = {pid for pid, parent in candidates.items() if parent in live} - live - set(exclude)
+        if not found:
+            break
+        for pid in found:
+            current = identity(pid)
+            if current and current["ppid"] in live:
+                parent = next((m for m in retained.values() if m["pid"] == current["ppid"]), None)
+                if parent and not exit_evidence(parent) and (current.get("parent_kernel_id") is None or
+                        current["parent_kernel_id"] == parent.get("kernel_id")):
+                    retained[current.get("kernel_id", current["birth"])] = current
+                    live.add(pid)
+            candidates.pop(pid, None)
+    return list(retained.values())
 
 
 def arguments(pid):
