@@ -3,6 +3,41 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.10] — 2026-10-28
+
+The push gate no longer asks for an acknowledgement because a single-quoted pattern ends in `$`, as in
+`grep -c ': OK$' sums.txt`. The git shim still decides every push and commit the shell runs, however the command was
+written (coordinator/VERIFY.md, 2.4.10). The coordinator's code is 2.4.9's.
+
+### Fixed: `$'` in an ordinary command asked for an acknowledgement
+- Until now `$'` anywhere in a Bash command counted as a possible push, because ANSI-C quoting can build the verb
+  (`git $'\x70\x75\x73\x68'`). Every single-quoted word that ends in `$` contains `$'` as well.
+  - On 10-28 a session's read-only check of release hashes was refused this way:
+    `cd …; shasum -a 256 -c SHA256SUMS > …; grep -vc ': OK$' …; grep '^diff --git' …`. That session had not run git
+    yet, so the shim was not proven live and the text gate was in charge.
+  - The worker's exemption for such commands covered only a closed list of readers without redirection. This command
+    had `cd`, `shasum`, `echo` and redirections.
+- Now `$'` alone is not a push. The other readings are unchanged: a literal `git`, `push` or `commit` after
+  de-escaping and quote removal, and a push or commit word next to `$`, `\` or a backtick. The exemption is gone with
+  the rule it softened.
+  - A verb the shell assembles reaches the git shim as plain `git push`, and the shim decides it on its exact
+    arguments.
+- Measured: each command was replayed as a PreToolUse payload in a session without the shim's marker, on Python 3.9.6
+  and 3.15.
+  - For the user's command (its folder moved to scratch), the installed 2.4.9 gate denied it, and 2.4.10 is silent.
+  - It is the same for `sed -n '/^done$/p'`, `awk '/x$/'`, `echo $'a\tb'` and a `grep … ': OK$' > out.txt`.
+  - `git push`, `git commit`, `G=git; "$G" push`, `g$'\x69t' push` and `$'/usr/bin/git' push` are denied as before.
+- Measured at exec, in a disposable repo with a bare remote: `git $'\x70\x75\x73\x68' origin HEAD:refs/heads/main`,
+  `u='t pu'; g$'i'$u'sh' …` and `g$'\x69t' push …`.
+  - Without the shim each push landed.
+  - With the shim each was refused with `git push origin HEAD:refs/heads/main` named, and the remote stayed empty.
+
+### Known limits
+- The text gate no longer sees a verb assembled from ANSI-C quoting or from an expansion's value; the shim decides
+  that push or commit. It goes unchecked only when it runs git by absolute path, or in a session whose shim is not on
+  `PATH`. The trust model is unchanged: the gate is a guardrail against forgetting a review, not a security boundary.
+- 2.4.9's known limits stand. Those marked for 2.4.10 move to 2.4.11.
+
 ## [software-workflows 2.4.9] — 2026-10-27
 
 The coordinator no longer dumps its threads' stacks from a signal handler, and a late diagnostic signal can no longer
@@ -226,7 +261,8 @@ blocks every stop, and 2.4.7's known limits from review are fixed. On 10-26 the 
 
 ### Known limits
 - Codex code_review turn 86 found no CRITICAL or HIGH defect in the fix round, and said Do not ship for six it rates
-  lower. They are pushed at the user's direction and are to be fixed in 2.4.10 (2.4.9 is the watchdog hotfix):
+  lower. They are pushed at the user's direction and are to be fixed in 2.4.11 (2.4.9 is the watchdog hotfix, 2.4.10
+  the push gate's):
   - A memory refusal while a dormant writer is re-verified (`RESOURCE_PAUSED`: the compressor at its warning line,
     a malformed memory setting or an unreadable kernel reading) records UNKNOWNs for its checkout, and the writer is then replaced instead of verified again read-only (MEDIUM).
   - A crash in the middle of dropping a writer's service namespace leaves its lease active, with credentials for
@@ -254,7 +290,7 @@ blocks every stop, and 2.4.7's known limits from review are fixed. On 10-26 the 
 - `unknown/restore` still reads every actor and operation record of the ledger on the event loop, as in 2.4.7: on
   the user's ledger (15,261 operations, 1.5 GB) each restore holds the coordinator for seconds. The lead's release
   settlement of 43 paths held the live 2.4.7 coordinator this way, and a status call waited 94 s. To be fixed
-  first in 2.4.10, with the other whole-kind reads on the loop.
+  first in 2.4.11, with the other whole-kind reads on the loop.
 - The ledger does not shrink by itself: VACUUM it while the coordinator is stopped.
 
 ## [software-workflows 2.4.7] — 2026-10-27

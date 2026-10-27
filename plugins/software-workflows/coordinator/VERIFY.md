@@ -13912,7 +13912,8 @@ The writer's own run on the final source (`r248-w/round3/static-final-results.js
 Python 3.11 and checked the untracked files' whitespace, all exit 0.
 
 ### Known limits
-- **Turn 86's findings**, pushed at the user's direction and to be fixed in 2.4.10 (2.4.9 is the watchdog hotfix):
+- **Turn 86's findings**, pushed at the user's direction and to be fixed in 2.4.11 (2.4.9 is the watchdog hotfix,
+  2.4.10 the push gate's):
   - `recovery.py:148` (MEDIUM): re-verifying a legacy dormant listener calls `dormancy.recover()` outside the
     normal error classification. A `RESOURCE_PAUSED` from its offline reader's launch records checkout-wide
     UNKNOWNs and quarantines the listener. On retry the writer is replaced instead of verified read-only again.
@@ -13941,7 +13942,7 @@ Python 3.11 and checked the untracked files' whitespace, all exit 0.
   - The live 2.4.7 daemon's `loop-stalls.log` at 21:11 showed its loop inside `restore_unknown` → `store.all` →
     `selected`, during the lead's settlement of the 43 release paths.
   - A `daemon/status` call meanwhile took 94.05 s.
-  - To be fixed first in 2.4.10, with a sweep of every whole-kind read on the loop.
+  - To be fixed first in 2.4.11, with a sweep of every whole-kind read on the loop.
 - **Catalog 073** fails on the final source (above).
 - **The first start:** the full first start of this release on a 12.1 GB ledger, with recovery and retention over
   real content, has not been run. The shape replica's ledger was 559 MB, and the index build was measured on a copy
@@ -14070,3 +14071,64 @@ at a time, with gate and session variables stripped:
     re-attaching alone loses the hook receipts Codex does not save (`rollout/src/policy.rs:214`).
 - **No thread stacks are written for a stall.** An out-of-process sampler is not built.
 - **2.4.8's known limits stand.** Those marked for 2.4.9 move to 2.4.10.
+
+## 2.4.10
+
+One change to the push gate (`hooks/push_gate.py`, the coordinator README's shim paragraph). A `$'` alone no longer
+sends a Bash command to the gate's decision, and the worker's exemption for such commands (`_ansi_c_data_only`) is
+removed with the rule (`_ansi_c_quote`). Measured on 10-28 between 00:55 and 01:05 on the user's Mac, with the installed
+2.4.9 (byte-identical to HEAD's `push_gate.py`) as the red.
+
+### What it fixes
+- In the user's Sales_Profiler session, a read-only check of release hashes was denied with a one-shot
+  acknowledgement:
+  `cd …/round11 && shasum -a 256 -c SHA256SUMS > …; echo "shasum exit=$?"; grep -vc ': OK$' …; grep -c ': OK$' …;
+  shasum -a 256 …; wc -l …; grep '^diff --git' round11-only.diff`.
+- The only trigger was the `$'` that `': OK$'` contains. The session had just started, so its shim had not written the
+  `.live` marker yet and the text gate was in charge.
+- 2.4.9's exemption did not apply: it allows only a closed list of readers, without redirection, and this command
+  has `cd`, `shasum`, `echo` and redirections.
+
+### The PreToolUse replay (`r2410/gate_compare.py`)
+- **The setup.**
+  - Each command is a PreToolUse Bash payload with a new session id, so no `.live` marker exists.
+  - The cwd is a fresh one-commit repo. Acks and shim state are in a scratch folder, and the coordinator state is a
+    folder that does not exist.
+  - Each command runs through the installed 2.4.9 gate and this tree's, under `/usr/bin/python3` (3.9.6) and Python
+    3.15. The two interpreters agreed on every row.
+- **The user's command,** its folder moved to scratch (no git word, verb or quote is in the path): 2.4.9 denied it,
+  and 2.4.10 is silent.
+- **Denied by 2.4.9, silent in 2.4.10:**
+  - `grep -c ': OK$' sums.txt > out.txt`, `sed -n '/^done$/p' log.txt`, `awk '/x$/' f`, `echo $'a\tb'`;
+  - `git $'\x70\x75\x73\x68'` and `u='t pu'; g$'i'$u'sh'`. Both assemble the verb, and the shim decides them (below).
+- **Silent in both:** `grep -vc ': OK$' sums.txt`, `grep -v '^\s*$' f | wc -l`,
+  `docker ps --format '{{.Names}}' | grep -E '^web$'`, `ls -la` and `git status`.
+- **Denied in both:** `git push`, `git commit -m x`, `G=git; "$G" push`, `cd /tmp && git push`, `g$'\x69t' push`,
+  `$'/usr/bin/git' push` and `eval "g$'"''"\x69t' push"`. Each has a push or commit word beside `$` or `\`, or a
+  literal `git push` after quote removal.
+- Without `$'` in the command the two gates run the same code: every removed branch required it.
+
+### The shim at exec (`r2410/shim_probe.py`)
+- **The setup.** A disposable repo with one commit and a bare remote. Each command runs with `/bin/bash -c`, first
+  without the shim and then with this tree's `hooks/gitshim` first on `PATH`; the remote is recreated before each run.
+- **Calibration, without the shim:** `git $'\x70\x75\x73\x68' origin HEAD:refs/heads/main`,
+  `u='t pu'; g$'i'$u'sh' origin HEAD:refs/heads/main` and `g$'\x69t' push origin HEAD:refs/heads/main` each exited 0,
+  and `refs/heads/main` landed in the remote.
+- **With the shim:** each exited 1, the gate named `git push origin HEAD:refs/heads/main`, and the remote stayed
+  empty.
+- **Control:** `g$'\x69t' status --short` through the shim exited 0.
+
+### Static checks (`r2410/static_checks2410.py`, on the final tree)
+- every plugin `.py` compiles under Python 3.15 (83 files), and the 14 hook-run files under the system Python 3.9.6;
+- `coordinator/hooks.py --check`: exit 0, compatible, protocol `jsonl-v1`;
+- ruff (F821, F822, F823, F811, F841, F401): 35 findings against installed 2.4.9's 35, none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.10.
+
+### Known limits
+- **The text gate no longer reads a verb that ANSI-C quoting or an expansion's value assembles.** The shim decides
+  such a push or commit when it runs. It goes unchecked only when git runs by absolute path, or in a session whose
+  shim is not on `PATH`, as with the text gate's other documented evasions.
+- **The coordinator's code is 2.4.9's,** but a 2.4.10 client still replaces a 2.4.9 daemon, because the daemon's
+  version is the plugin's.
+- **2.4.9's known limits stand.** Those marked for 2.4.10 move to 2.4.11.

@@ -415,181 +415,14 @@ GIT_PUSH_COMMIT_RE = _PushCommitMatcher()
 _PREFILTER_RE = re.compile(r"(?i)git|push|commit|pwsh|powershell")
 
 
-# A `$'` occurrence is LIVE when a BACKSLASH appears between it and the next
-# `'` (or the end of the command). Round 49 replaced an escape-aware scan with
-# this parity-INDEPENDENT question; see `_ansi_c_quote`.
-def _ansi_c_quote(command):
-    """Is ANSI-C quoting PRESENT? Round 29: `$'` can build the verb itself
-    (`g$'\\x69t'`, `git $'\\x70\\x75\\x73\\x68'`), nothing literal survives
-    stripping, so its mere presence is detection.
-
-    FIVE attempts to exempt the blank-line idiom `grep -v '^\\s*$'` — where the
-    `$` is the last character of a single-quoted word and the `'` merely closes
-    it — were each REFUTED by blind review, and the arc is the finding:
-      * a quote-state scan (round 46, 2 HIGH) swallowed executable text inside
-        `$(...)`, backticks, `eval` strings and here-docs;
-      * a "closing shape" rule (round 47, 1 HIGH): the delimiter after `$'` can
-        be the string's FIRST character;
-      * requiring a TERMINATED body in raw text (round 48, 2 HIGH): reparsing
-        changes backslash PARITY, so three backslashes reach the inner shell as
-        two and the quote closes;
-      * a parity-INDEPENDENT span rule (round 49, 3 HIGH): parity was never the
-        property in question — `eval "g$'"''"\\x69t' ..."` invents no backslash,
-        it DELETES the empty quotes, so the span's closing quote never reaches
-        the inner shell;
-      * restricting the span rule to a "single-parse" command (round 51,
-        6 HIGH): a launcher denylist is defeated by `"eval"` and `/bin/bash`,
-        an expansion can supply a word SEPARATOR (`u='t pu'; g$'i'$u'sh'` is
-        `git push`), and a delimiter stack balances on QUOTED delimiters and
-        erases the real command.
-
-    Every refutation came through a mechanism that re-reads or expands text,
-    and three of them are not decidable from text at all, because the deciding
-    content is an expansion's VALUE. This module already says so — "a denylist
-    of launchers recurs forever; a whitelist of one shape ends it" — and the
-    trust model places execution-boundary enforcement in the exact-argv git
-    shim (`hooks/gitshim`, 2.0). Round 51 therefore WITHDREW the exemption:
-    a `$'` is detection. Over-detection is the designed failure direction;
-    under-detection never was.
-
-    Round 52 keeps that unconditional PARENT predicate. Only the Bash WORKER
-    may exempt a command whose SOLE prefilter trigger is `$'`, after proving
-    every command and argument belongs to a closed, non-expanding top-level
-    grammar. Every dollar must be single-quoted data; substitutions,
-    redirections, unsupported syntax and unfinished parses are refused.
-    Every literal argv[0] must be an allowlisted utility that cannot re-read
-    arguments as shell commands, with executing/following utility options
-    excluded and Docker limited to inspection (stats requires --no-stream).
-    Unlike the quote scans, delimiter shapes, parity rules and launcher
-    denylists above, this proof excludes ALL other parses and expansions,
-    rather than trying to recognize their effects. Quote state then describes
-    the ONLY shell parse that can occur, so `$'` can only close literal data.
-    Anything not proven retains detection and today's acknowledgement."""
-    return "$'" in command
-
-
-def _ansi_c_data_only(command):
-    """Prove the worker-only round-52 exception; unsupported means False."""
-    if ("$'" not in command or
-            _PREFILTER_RE.search(re.sub(r"[\"'$]", "", _deescaped(command))) is not None):
-        return False
-
-    def allowed(argv):
-        if not argv or argv[0] not in {
-                "grep", "egrep", "fgrep", "wc", "head", "tail", "cat", "cut",
-                "tr", "uniq", "sort", "jq", "ls", "docker"}:
-            return False
-        for arg in argv[1:]:
-            option = arg.split("=", 1)[0]
-            if argv[0] == "sort" and option.startswith("--") and option != "--":
-                if "--compress-program".startswith(option):
-                    return False  # GNU long options accept abbreviations
-            if argv[0] == "tail":
-                if option.startswith("--") and option != "--":
-                    if any(name.startswith(option) for name in ("--follow", "--retry")):
-                        return False
-                elif arg.startswith(("-", "+")) and ("f" in arg or "F" in arg):
-                    return False  # includes clusters and obsolete -10f / +10f
-        if argv[0] != "docker":
-            return True
-        if len(argv) < 2:
-            return False
-        if argv[1] in ("volume", "network"):
-            if argv[2:3] != ["ls"]:
-                return False
-        elif argv[1] not in ("ps", "images", "info", "version", "inspect", "logs", "stats"):
-            return False
-        for arg in argv[2:]:
-            if arg.startswith(("--host", "--context", "--config")):
-                return False
-            if arg.startswith("-") and not arg.startswith("--") and ("H" in arg or "c" in arg):
-                return False  # connection overrides, including short clusters
-        if argv[1] != "stats":
-            return True
-        no_stream, options, i = False, True, 2
-        while i < len(argv):
-            arg = argv[i]
-            i += 1
-            if not options:
-                continue
-            if arg == "--":
-                options = False
-            elif arg == "--format":
-                if i == len(argv):
-                    return False
-                i += 1  # its value is data, even if it spells --no-stream
-            elif arg.startswith("--format="):
-                continue
-            elif arg in ("--no-stream", "--no-stream=true"):
-                no_stream = True
-            elif arg in ("-a", "--all", "--all=true", "--all=false",
-                         "--no-trunc", "--no-trunc=true", "--no-trunc=false"):
-                continue
-            elif arg.startswith("-"):
-                return False  # unknown or contradictory options stay detected
-        return no_stream
-
-    argv, word = [], []
-    quote, last_operator = "", ""
-    started, i = False, 0
-    while i < len(command):
-        char = command[i]
-        i += 1
-        if (not char.isprintable() and char != "\t") or char == "`":
-            return False
-        if quote == "'":
-            if char == "'":
-                quote = ""
-            else:
-                word.append(char)  # backslashes and dollars remain literal
-            continue
-        if char in "$\\!":
-            return False
-        if quote == '"':
-            if char == '"':
-                quote = ""
-            else:
-                word.append(char)
-            continue
-        if char in "'\"":
-            quote, started = char, True
-            continue
-        if char in "<>(){}[]*?~#":
-            return False
-        if char in " \t;|&":
-            if started:
-                argv.append("".join(word))
-                word, started = [], False
-            if char in " \t":
-                continue
-            operator = char
-            if char in "|&" and i < len(command) and command[i] == char:
-                operator += char
-                i += 1
-            if operator == "&" or not allowed(argv):
-                return False
-            argv, last_operator = [], operator
-            continue
-        word.append(char)
-        started = True
-    if quote:
-        return False
-    if started:
-        argv.append("".join(word))
-    return allowed(argv) if argv else last_operator == ";"
-
-
 def _maybe_git(command):
     """The PARENT's only look at the command (round 40): a LINEAR pre-filter
     that is a SUPERSET of every `_detected` channel — each of them needs one
-    of these words to survive de-escaping and quote/dollar stripping, or a
-    `$'` to be present at all (`_ansi_c_quote`, an unconditional predicate:
-    `echo $'x'` passes here, as on 1.17.2) — so the full detection and the
-    decision both run in the WORKER under the one deadline. Whatever passes
-    here is examined there; whatever fails here cannot be a push/commit to
-    any channel."""
-    if _ansi_c_quote(command):
-        return True
+    of these words to survive de-escaping and quote/dollar stripping — so the
+    full detection and the decision both run in the WORKER under the one
+    deadline. Whatever passes here is examined there; whatever fails here
+    cannot be a push/commit to any channel. A `$'` alone passed here from
+    round 29 to 2.4.9; see `_detected` for why it no longer does."""
     return _PREFILTER_RE.search(re.sub(r"[\"'$]", "", _deescaped(command))) is not None
 
 # Repository-redirection forms: the digest binds the review to the hook's
@@ -1576,17 +1409,17 @@ def _detected(command):
     if (re.search(r"[$\\`]", command)
             and re.search(r"(?i)\b(?:push|commit)\b", stripped)):
         return True
-    if _ansi_c_quote(command):
-        # ANSI-C quoting can BUILD the verb itself (`git $'\\x70\\x75\\x73\\x68'`,
-        # `g$'\\x69't p$'\\x75'sh`) — nothing literal survives stripping, so
-        # a LIVE occurrence (a backslash before the next quote — rounds
-        # 46–49) is detection (round 29). An escape-free `$'abc'` is `'abc'`
-        # and the channels above already read it. A cooperative agent has
-        # no reason to hex-assemble a command; the rare legitimate use costs
-        # one prompt. Full evasion-proofing is impossible for a text hook
-        # (documented trust model); execution-boundary enforcement is the
-        # exact-argv git shim's (2.0).
-        return True
+    # From round 29 to 2.4.9 a `$'` anywhere was detection by itself: ANSI-C
+    # quoting can BUILD the verb (`git $'\\x70\\x75\\x73\\x68'`), so nothing
+    # literal survives stripping. It also stopped every command whose
+    # single-quoted data ends in `$` (`grep -c ': OK$' sums.txt`) for an
+    # acknowledgement, and each narrowing (rounds 46-52) was refuted or kept
+    # it. 2.4.10 withdraws the rule. A verb the shell assembles reaches the
+    # exact-argv git shim (`hooks/gitshim`, 2.0) as `git push`, and the shim
+    # decides it there. An escape-free `$'abc'` is `'abc'`, which the channels
+    # above read. Beyond both stays an assembled verb run by absolute path,
+    # or in a session without the shim on PATH, like a text hook's other
+    # evasions (documented trust model: a guardrail against forgetting).
     toks = _tokenize(command)
     if toks is None:
         return False
@@ -3312,11 +3145,7 @@ def main() -> int:
         # parent's deadline (round 40: detection ran in the parent, outside
         # any bound, and one regex was quadratic)
         try:
-            if (str(data.get("tool_name") or "").lower() == "bash"
-                    and _ansi_c_data_only(command)):
-                print(NOT_DETECTED)
-            else:
-                print(_evaluate(data) if _detected(command) else NOT_DETECTED)
+            print(_evaluate(data) if _detected(command) else NOT_DETECTED)
         except Exception as exc:
             print(_deny(EVAL_FAILED_REASON.format(why=f"worker crashed: {type(exc).__name__}: {exc}")))
         return 0

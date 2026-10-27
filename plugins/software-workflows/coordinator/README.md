@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.9 / P1
+# Writer coordinator — software-workflows 2.4.10 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -486,16 +486,14 @@ gate and Office consumer changes are outside P1's write boundary.
 The git shim (`hooks/gitshim/git`), the `PATH` line the SessionStart hook writes and
 the push gate skip every plugin version's shim (a folder holding `git` beside a
 `push_gate.py`) and every exec-path mirror: `PATH` holds one shim, this version's,
-first, and the shim runs the real git behind it. The push gate's evaluation worker
-lets a Bash command through whose only trigger is ANSI-C quoting (`$'`) once it
-proves the command belongs to a closed grammar: allowlisted readers that cannot run
-their arguments (`grep`, `egrep`, `fgrep`, `wc`, `head`, `tail` without following,
-`cat`, `cut`, `tr`, `uniq`, `sort` without a compress program, `jq`, `ls`) and Docker
-inspection (`ps`, `images`, `info`, `version`, `inspect`, `logs`, `volume ls`,
-`network ls`, `stats --no-stream`, with no host, context or config override),
-joined by `;`, `|`, `||` or `&&`, every `$` single-quoted data, and no substitution,
-expansion, redirection or background job. A command it cannot prove keeps the
-existing acknowledgement.
+first, and the shim runs the real git behind it. The push gate's text reading of a
+Bash command looks for a push or commit written in letters: `git`, `push` or
+`commit` after de-escaping and quote removal, or a push or commit word beside `$`,
+`\` or a backtick. ANSI-C quoting (`$'`) alone is not a trigger since 2.4.10, so
+`grep -c ': OK$' sums.txt` runs without an acknowledgement. A verb the shell
+assembles (`git $'\x70\x75\x73\x68'`) reaches the shim as plain `git push`, and the
+shim decides it on its exact arguments. One run by git's absolute path, or in a
+session whose shim is not on `PATH`, is outside this guardrail.
 
 ## RPC and C2 contract
 
