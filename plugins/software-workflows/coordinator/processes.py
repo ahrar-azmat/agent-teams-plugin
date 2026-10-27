@@ -134,6 +134,26 @@ def identity(pid, _attempt=0):
     raise CoordinatorError("PROCESS_PLATFORM", "No reliable process identity backend")
 
 
+def arguments(pid):
+    """Read argv only, without spawning a helper or retaining environment data."""
+    if sys.platform == "darwin":
+        lib = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
+        mib = (ctypes.c_int * 3)(1, 49, int(pid))
+        size = ctypes.c_size_t(0)
+        if lib.sysctl(mib, 3, None, ctypes.byref(size), None, 0):
+            raise _unreadable(pid, ctypes.get_errno())
+        buffer = ctypes.create_string_buffer(size.value)
+        if lib.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0):
+            raise _unreadable(pid, ctypes.get_errno())
+        raw = buffer.raw[:size.value]
+        argc, rest = int.from_bytes(raw[:4], sys.byteorder), raw[4:]
+        position = rest.find(b"\0")
+        while position + 1 < len(rest) and rest[position + 1] == 0:
+            position += 1
+        return rest[position + 1:].split(b"\0", argc)[:argc]
+    return (Path("/proc") / str(pid) / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
+
+
 def markers(pid):
     if sys.platform == "darwin":
         lib = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
@@ -189,10 +209,19 @@ def terminal_root(listener, operation, terminal, known=()):
     return dict(before, native=operation["native"], process_id=terminal["processId"], lineage=True, terminal_bound=True)
 
 
-def baseline():
+def baseline(vanished=None):
     """Complete birth identities before authorizing an opaque command."""
     try:
-        result = subprocess.run(["/bin/ps", "-ax", "-o", "pid=,uid=,stat="], capture_output=True, text=True, timeout=15)
+        with subprocess.Popen(["/bin/ps", "-ax", "-o", "pid=,uid=,stat="], stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as scan:
+            try:
+                output, error = scan.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                scan.kill()
+                scan.communicate()
+                raise
+            result = subprocess.CompletedProcess(scan.args, scan.returncode, output, error)
+            enumerator = scan.pid
     except (OSError, subprocess.SubprocessError) as exc:  # a fork refused under load, a ps that hangs
         raise CoordinatorError("PROCESS_SCAN", "Cannot establish a command's process baseline", {"error": type(exc).__name__})
     if result.returncode:
@@ -205,6 +234,10 @@ def baseline():
             record = identity(pid)
             if record and not record["zombie"]:
                 records.append(record)
+            elif vanished is not None and pid != enumerator:
+                # A listed birth disappeared before inspection. It could have
+                # forked after enumeration; absence is not a complete inventory.
+                vanished.append({"pid": pid, "reason": "exited during enumeration"})
     return records
 
 

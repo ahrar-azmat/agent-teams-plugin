@@ -129,6 +129,8 @@ def venv_fds():
 def clean_environment(source=None):
     """Detach from the launching Claude session and its push gate, keeping user configuration."""
     environment = dict(os.environ if source is None else source)
+    if environment.get("CLAUDE_PLUGIN_OPTION_WRITER_MCP_SERVERS"):
+        environment.setdefault("SOFTWARE_WORKFLOWS_WRITER_MCP_SERVERS", environment["CLAUDE_PLUGIN_OPTION_WRITER_MCP_SERVERS"])
     for key in tuple(environment):
         if key in {"CLAUDECODE", "CLAUDE_PID", "CLAUDE_ENV_FILE", "CLAUDE_EFFORT", "CLAUDE_PROJECT_DIR",
                    "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA", "CLAUDE_JOB_DIR"} or key.startswith(

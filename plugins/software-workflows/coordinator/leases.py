@@ -15,6 +15,7 @@ import subprocess
 import sys
 import uuid
 
+from .locks import finish_thread
 from .client import CoordinatorError, launch_environment, venv_fds
 
 
@@ -216,12 +217,12 @@ class Leases:
     async def call(self, action, cwd=""):
         async with self.lock:
             try:
-                return await asyncio.to_thread(self.exchange, action, cwd)
+                return await finish_thread(self.exchange, action, cwd)
             except (OSError, EOFError, ValueError) as exc:
                 # Acquiring may already have succeeded. Retain every reference
                 # and rebuild redundancy before another admission can proceed.
                 try:
-                    await asyncio.to_thread(self.repair)
+                    await finish_thread(self.repair)
                 except Exception as repair_error:
                     raise CoordinatorError("CUSTODIAN_LOST", "Lease references retained; redundancy unavailable, production refused",
                                            {"cause": getattr(repair_error, "code", type(repair_error).__name__)}, operational=True) from repair_error

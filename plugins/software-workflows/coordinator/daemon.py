@@ -1,6 +1,7 @@
 """Detached singleton supervisor, async JSONL RPC, and private native listeners."""
 import asyncio
 import base64
+from collections import deque
 import fcntl
 import json
 import os
@@ -15,12 +16,13 @@ import subprocess
 import sys
 import time
 
+from .locks import KeyedLocks, finish_all
 from .client import CoordinatorError, validate_state, venv_fds, launch_environment
+from . import telemetry
 from .store import Store, uid, digest, encoded, WINDOW_ACTIVE
 from .ledger import Ledger, normalize, patch_scope, read_path
 from .custody import Custody
 from . import native, tools, processes, runtime, participants, routing
-from .locks import KeyedLocks
 
 VERSION = runtime.plugin_version()  # in daemon/status, so that a newer client can retire this release
 
@@ -66,15 +68,76 @@ NATIVE_APPLIED_FLUSH_S = 0.1
 NATIVE_APPLIED_BATCH = 256
 
 
+class NativeBacklog:
+    """Coalesced wakeup over committed rows, with one live dispatch cursor.
+
+    This cursor is not native_applied: dispatch, application and request-handler
+    completion have different obligations. Only the current row is decoded in
+    memory; the (subject, kind, seq) index holds any committed backlog.
+    """
+    def __init__(self, store, listener, cursor):
+        self.store, self.listener = store, listener
+        self.cursor = self.highwater = cursor
+        self.ready = asyncio.Event()
+        self._unfinished_tasks = 0
+        self.received = self.dispatched = self.applied = self.applied_bytes = self.max_pending = 0
+        self.active_bytes = 0
+
+    def publish(self, sequence, count):
+        self.highwater = sequence
+        self._unfinished_tasks += count
+        self.received += count
+        self.max_pending = max(self.max_pending, self._unfinished_tasks)
+        self.ready.set()
+
+    async def get(self):
+        while not self._unfinished_tasks:
+            self.ready.clear()
+            await self.ready.wait()
+        row = self.store.db.execute("SELECT seq,data FROM events WHERE subject=? AND kind='native' "
+                                    "AND seq>? AND seq<=? ORDER BY seq LIMIT 1",
+                                    (self.listener, self.cursor, self.highwater)).fetchone()
+        if row is None:
+            raise CoordinatorError("NATIVE_BACKLOG", "Committed native backlog lost its row")
+        self.cursor = row[0]
+        self.dispatched += 1
+        self.active_bytes = len(row[1].encode())
+        return row[0], json.loads(row[1])
+
+    def task_done(self):
+        self._unfinished_tasks -= 1
+        self.active_bytes = 0
+
+    def status(self):
+        return {"received": self.received, "dispatched": self.dispatched, "applied": self.applied,
+                "applied_bytes": self.applied_bytes, "pending": self._unfinished_tasks,
+                "max_pending": self.max_pending, "cursor": self.cursor, "highwater": self.highwater}
+
+
 class Daemon:
     def __init__(self, root):
         self.store = Store(root)
         self.ledger = Ledger(self.store)
         self.custody = Custody(self.store, self.ledger)
         self.connections, self.queues, self.workers, self.tasks = {}, {}, {}, set()
+        self.native_applying = {}
+        self.native_stop_error = None
+        self.retiring_listeners = set()
+        self.lead_commands = set()  # live calls that still own their subprocess exit status
+        self.custody_settlements = KeyedLocks()  # group -> one inventory/observation/release owner
+        self.services = {}
         self.listener_requests = {}
         self.native_progress, self.native_progress_count = {}, 0
         self.native_progress_flush = None
+        self.settlements = {}
+        self.loop_lag = {"last_seconds": 0.0, "max_seconds": 0.0, "samples": 0}
+        self.birth = processes.identity(os.getpid())["birth"]
+        self.writer_status = {}
+        from .dormancy import Dormancy
+        self.dormancy = Dormancy(self)
+        from .writer_profile import setting, suggestion
+        self.writer_profile = setting()
+        self.writer_profile["suggestion"] = suggestion(self.store)
         # Listener id -> the task following that listener's own log, and how far it was read.
         self.log_tails, self.log_offsets = {}, {}
         self.request_locks, self.actor_locks, self.unit_locks = KeyedLocks(), KeyedLocks(), KeyedLocks()
@@ -105,7 +168,16 @@ class Daemon:
         self.boot = uid("boot")
         self.draining = self.closing = False
         self.inflight, self.rpc_tasks = {}, set()
+        self.rpc_writers = {}
         self.stop = asyncio.Event()
+        self.ledger.terminating = self.stop
+        self.ledger.retiring = self.listener_retiring
+        self.native_intake_closed = False
+        self.native_slice_until = 0.0
+        self.native_tickets = deque()
+        self.native_waiters = {}
+        self.native_granted = set()
+        self.native_service = None
         from .messages import Messages
         self.messages = Messages(self)
         self.ledger.messages = self.messages  # a release outside the ledger tells the leads (Ledger.notify_released)
@@ -124,6 +196,8 @@ class Daemon:
         async with self.lease_locks.hold(checkoutid):
             checkout = self.store.get(checkoutid)
             evidence = await self.leases.call("acquire", checkout["root"])
+            from .admissions import check
+            check("lease acquired")
             checkout["compatibility_lease"] = evidence
             self.store.save(checkout)
             return evidence
@@ -177,10 +251,37 @@ class Daemon:
         return keys
 
     def background(self, awaitable):
-        task = asyncio.create_task(awaitable)
+        # A long-lived observer is not part of the admission that started it.
+        # Owned preparation/finish tasks retain their context explicitly.
+        context = telemetry.detached_context()
+        task = asyncio.create_task(awaitable, context=context)
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
         task.add_done_callback(self.task_done)
+        return task
+
+    def start_service(self, name, factory):
+        """Supervise process-lifetime duties, including unexpected cancellation."""
+        if self.stop.is_set():
+            return
+        state = self.services.setdefault(name, {"restarts": 0})
+        state.update(state="running", started=time.monotonic())
+        task = self.background(factory())
+        def ended(completed):
+            if self.stop.is_set():
+                state.update(state="stopped", reason="daemon stopping")
+                return
+            error = None if completed.cancelled() else completed.exception()
+            reason = "cancelled" if completed.cancelled() else type(error).__name__ if error else "returned"
+            state["restarts"] += 1
+            # A broken service must not form a restart/commit busy loop. Retry
+            # indefinitely, 1..30 s, resetting after 30 s of healthy service.
+            failures = 0 if time.monotonic() - state["started"] >= 30 else state.get("failures", 0)
+            delay = min(30, 2 ** min(failures, 5))
+            state.update(state="restarting", reason=reason, failures=failures + 1, retry_after=delay)
+            self.store.event("service/restarting", name, dict(state))
+            asyncio.get_running_loop().call_later(delay, self.start_service, name, factory)
+        task.add_done_callback(ended)
         return task
 
     def task_done(self, task):
@@ -188,13 +289,36 @@ class Daemon:
             exception = task.exception()
             self.store.event("background/failure", None, {"code": getattr(exception, "code", type(exception).__name__)})
 
+    def watch_listener_task(self, task, listener, role):
+        def ended(completed):
+            if self.stop.is_set() or self.listener_retiring(listener):
+                return
+            current = self.store.get(listener, required=False)
+            if not current or current["state"] in ("stopped", "dead") or role == "log" and not current.get("log"):
+                return
+            error = None if completed.cancelled() else completed.exception()
+            # Replaying a lost queue item must precede later applications. Stop
+            # visibly and let startup replay the durable suffix, rather than
+            # restarting a consumer past an interrupted journal application.
+            self.store.event("service/failed", listener, {"service": role,
+                "reason": "cancelled" if completed.cancelled() else type(error).__name__ if error else "returned",
+                "action": "daemon stopping; journal replay required"})
+            self.closing, self.ready = True, False
+            self.stop.set()
+        task.add_done_callback(ended)
+        return task
+
     def status(self, checkout=None, brief=False):
         """The daemon's identity and readiness; unless brief, every run's writers too. A client checking
         readiness asks for brief: the full answer decodes each run's claims and custody."""
         from .recovery import recovering_counts, startup_counts
         from .lead_calls import legacy_status
-        writers = []
-        for run in [] if brief else self.store.all("run"):
+        cached = self.writer_status.get(checkout)
+        epoch = self.store.status_epoch
+        writers = cached[1] if not brief and cached and cached[0] == epoch else []
+        rebuild = not brief and not (cached and cached[0] == epoch)
+        messages = list(self.store.all("message")) if rebuild else ()
+        for run in self.store.all("run") if rebuild else ():
             if checkout and not participants.contains(self.store, run["unit"], checkout):
                 continue
             unit = self.store.get(run["unit"])
@@ -203,6 +327,7 @@ class Daemon:
                                       required=False) or {}
             writers.append({"run": run["id"], "unit": unit["id"], "task": run["task"], "state": self.runs.reported(run)[0],
                             "capabilities": listener.get("capabilities"),
+                            "listener": {k: listener.get(k) for k in ("state", "dormant_at", "dormant_reason", "history_gaps", "writer_profile")},
                             **({"capability_fallback": listener["capability_fallback"]} if listener.get("capability_fallback") else {}),
                             "actors": [a for a in self.store.all("actor", unit["id"])],
                             "claims": self.custody.claims(run["checkout"], unit["id"]),
@@ -210,11 +335,17 @@ class Daemon:
                             **participants.surface(self, unit),
                             "pending_requests": [r for kind in ("claim_request", "release_request", "custody_request")
                                                  for r in self.store.all(kind, unit["id"]) if r["state"] in ("pending", "pending_lead", "waiting")],
-                            "messages": [m for m in self.store.all("message") if m.get("unit") == unit["id"] and m["state"] != "acknowledged"]})
+                            "messages": [m for m in messages if m.get("unit") == unit["id"] and m["state"] != "acknowledged"]})
+        if rebuild:
+            self.writer_status[checkout] = (epoch, writers)
         return {"ready": self.ready, "generation": self.store.generation, "pid": os.getpid(),
                 "boot": self.boot, "capabilities": ["draining-stop"], "draining": self.draining,
-                "birth": processes.identity(os.getpid())["birth"], "state_root": str(self.store.root),
+                "birth": self.birth, "state_root": str(self.store.root),
                 "endpoint": getattr(self, "endpoint", None),
+                "event_loop_lag": dict(self.loop_lag),
+                "services": {name: dict(state) for name, state in self.services.items()},
+                "checkout_scans": self.ledger.scans.status(),
+                "checkout_locks": [lock.status() for lock in self.ledger.locks.values() if lock.locked() or lock.waiting],
                 "locks": {"rpc": len(self.request_locks), "actor": len(self.actor_locks),
                           "message": len(self.messages.locks), "unit": len(self.unit_locks),
                           "checkout": len(self.ledger.lifecycle)},
@@ -227,10 +358,30 @@ class Daemon:
                 "history_capacity": {"limit": self.history.incremental_limit, "active": self.history.incremental_active,
                                      "queued": self.history.incremental_queued},
                 "native_decode": dict(native.DECODE_METRICS), "history_observers": self.history.active,
+                "native_intake": self.intake_status(),
                 "lead_edits": self.pending_lead_edits(),
                 "lead_edit_legacy_limit": legacy_status(self.store),
-                "ended": dict(self.ended), "silent": len(self.silent),
+                "ended": dict(self.ended), "silent": len(self.silent), "dormancy": self.dormancy.status(), "writer_mcp_profile": self.writer_profile,
                 "sqlite": sqlite3.sqlite_version, "version": VERSION, **({} if brief else {"writers": writers})}
+
+    def intake_status(self):
+        # Counters only: no SQL, payloads, or per-request profile-file writes.
+        # Summarize before JSON encoding so frequent status polls do not export
+        # one large metrics object per listener on the measured service path.
+        result = {"journal": {}, "application": {}, "rpc": {}}
+        for ident, connection in self.connections.items():
+            queue = self.queues.get(ident)
+            sources = {"journal": connection.intake.status() if connection.intake else {},
+                       "rpc": connection.rpc_metrics,
+                       "application": queue.status() if isinstance(queue, NativeBacklog) else {}}
+            for section, values in sources.items():
+                for key, value in values.items():
+                    if key in ("cursor", "highwater"):
+                        continue
+                    current = result[section].get(key, 0)
+                    result[section][key] = (max(current, value) if key.startswith("max_") or key == "oldest_seconds"
+                                            else current + value)
+        return result
 
     async def create_run(self, params, revision=None):
         if set(params) - {"checkout", "project", "cwd", "dispatch_cwd", "mode", "task", "paths", "model", "fixture", "workflow"} or params.get("mode", "native") not in ("lead", "native"):
@@ -267,6 +418,19 @@ class Daemon:
 
     async def admit_checkout(self, checkout, params):
         self.ledger.require_owned(checkout)
+        from . import admissions
+        file_admission = admissions.CURRENT.get() is not None and params.get("mode") == "lead"
+        if file_admission:
+            # Creating the session mapping for its first file call is metadata
+            # work. Its path reservation and pre-image verification provide the
+            # admission fence; it must not join whole-checkout observation or
+            # publication recovery queues. Those retain their own obligations.
+            admissions.check("lead session metadata")
+            snapshot = await telemetry.to_thread(self.ledger._metadata, checkout["root"])
+            admissions.check()
+            if snapshot["identity"] != checkout["identity"] or snapshot["repository"] != checkout["repository"]:
+                raise CoordinatorError("CHECKOUT_IDENTITY_CHANGED", "Checkout identity changed before lead attachment")
+            return snapshot
         from .publish import Publisher
         for publication in list(self.store.all("publication")):
             if not publication.get("group") and self.store.get(publication["unit"])["checkout"] == checkout["id"] and publication["phase"] not in ("complete", "abandoned"):
@@ -277,7 +441,7 @@ class Daemon:
                         # A recoverable journal is local to its unit. Its claims
                         # continue to exclude overlap without wedging the checkout.
                         self.store.event("publication/recovery_refused", publication["id"], exc.envelope())
-        snapshot = await asyncio.to_thread(self.ledger._metadata, checkout["root"])
+        snapshot = await telemetry.to_thread(self.ledger._metadata, checkout["root"])
         if snapshot["identity"] != checkout["identity"] or snapshot["repository"] != checkout["repository"]:
             raise CoordinatorError("CHECKOUT_IDENTITY_CHANGED", "Checkout identity changed before unit creation")
         await self.ledger.reconcile(checkout)
@@ -289,8 +453,8 @@ class Daemon:
                 return path != "*" and any(overlaps(normalize(checkout, path)["key"], normalize(checkout, c["path"])["key"]) for c in claims)
             unexplained = [u["path"] for u in self.store.unresolved(checkout["id"]) if not explained(u["path"])]
             from . import gitio
-            index = await asyncio.to_thread(gitio.entries, checkout["root"])
-            base_index = await asyncio.to_thread(gitio.entries, checkout["root"], snapshot["base"])
+            index = await telemetry.to_thread(gitio.entries, checkout["root"])
+            base_index = await telemetry.to_thread(gitio.entries, checkout["root"], snapshot["base"])
             unexplained += [p for p in set(index) | set(base_index) if index.get(p) != base_index.get(p) and not explained(p)]
             if unexplained:
                 raise CoordinatorError("DIRTY_UNEXPLAINED", "Unexplained dirt requires allow_dirty=true; this grants no receipts", {"paths": sorted(set(unexplained))})
@@ -308,6 +472,8 @@ class Daemon:
             if self.store.get(ident, required=False):
                 raise CoordinatorError("RUN_EXISTS", "Collect the existing durable run; do not replay its dispatch", {"run": ident})
         lead = params.get("mode") == "lead"
+        from .admissions import check
+        check("unit metadata commit")
         with self.store.transaction():
             self.store.put("unit", unitid, {"checkout": checkout["id"], "run": ident, "base": snapshot["base"],
                            "branch": snapshot["branch"], "state": "open", **project_fields}, checkout["id"])
@@ -341,20 +507,26 @@ class Daemon:
             return {"run": ident, "unit": unitid, "attempt": attemptid, "actor": actorid,
                     "policy": self.store.get(actorid).get("policy"), **participants.surface(self, unitid)}
         except BaseException as exc:
+            self.check_native_stop()
             run = self.store.get(ident)
             if run.get("production_started"):
                 self.store.event("workflow/dispatch_detached", ident, {"code": getattr(exc, "code", type(exc).__name__)})
                 return {"run": ident, "unit": unitid, "actor": actorid, "state": run["state"], "reconcile_required": True}
-            run.update(state="refused", refusal=getattr(exc, "code", type(exc).__name__))
-            self.store.save(run)
-            for listener in list(self.store.all("listener", ident)):
-                await self.stop_listener(listener)
-            for checkoutid in snapshots:
-                for claim in self.custody.claims(checkoutid):
-                    if claim["unit"] == unitid:
-                        claim["state"] = "released"
-                        self.store.save(claim)
-                await self.release_lease(checkoutid)
+            async def rollback(reason):
+                run.update(state="refused", refusal=reason)
+                self.store.save(run)
+                for listener in list(self.store.all("listener", ident)):
+                    await self.stop_listener(listener)
+                for checkoutid in snapshots:
+                    for claim in self.custody.claims(checkoutid):
+                        if claim["unit"] == unitid:
+                            claim["state"] = "released"
+                            self.store.save(claim)
+                    await self.release_lease(checkoutid)
+            from .locks import finish
+            await finish(rollback(getattr(exc, "code", type(exc).__name__)))
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             if isinstance(exc, CoordinatorError):
                 raise CoordinatorError(exc.code, str(exc), dict(exc.details, safe_to_fallback=not bool(revision), run=ident), exc.operational) from exc
             raise CoordinatorError("NATIVE_START_" + type(exc).__name__, "Native startup failed before production execution; resources were released",
@@ -465,6 +637,7 @@ class Daemon:
         """A writer's app-server with exactly the coordinator's hooks trusted: a first, threadless one reports their
         hashes, and the one kept starts with that trust."""
         command, _ = self.hook_config()
+        profile_base_config = config
         spawned = []
         try:
             listener = await self.spawn_listener(actor, config, home)
@@ -484,31 +657,63 @@ class Daemon:
             # merged from the native config API, never read from CODEX_HOME files.
             effective = await connection.call("config/read", {"cwd": cwd, "includeLayers": False})
             from .roles import overlay, apply
+            from .writer_profile import configure, verify
+            selected = self.writer_profile
+            policy, profile = await configure(connection, effective.get("config", {}), cwd, selected)
             config = apply(config, overlay(effective.get("config", {})))
+            config = apply(config, policy)
             prior_trust = effective.get("config", {}).get("hooks", {}).get("state", {})
             config.setdefault("hooks", {})["state"] = dict(prior_trust, **trust)
             await self.stop_listener(listener)
             listener = await self.spawn_listener(actor, config, home)
             spawned.append(listener["id"])
             connection = self.connections[listener["id"]]
+            verify((await connection.call("config/read", {"cwd": cwd, "includeLayers": False}))["config"], profile)
             listed = await connection.call("hooks/list", {"cwds": roots})
             own = native.coordinator_hooks(listed, roots, command=command)
             if len(own) != 2 or any(h["trustStatus"] != "trusted" or not h["enabled"] for h in own):
                 raise CoordinatorError("HOOK_TRUST", "Precise native hook trust was not honored")
-            listener.update(hooks=own, config_digest=digest(effective))
+            listener.update(hooks=own, config_digest=digest(effective), writer_profile=profile, profile_base_config=profile_base_config)
             self.store.save(listener)
             return listener
-        except Exception:
-            # No app-server of a failed admission outlives it; the caller keeps its binding and can admit again.
-            # Each is threadless, so nothing of the unit runs there: one that does not drain is killed.
-            for ident in spawned:
-                try:
-                    await self.stop_listener(self.store.get(ident), kill=True)
-                except (CoordinatorError, OSError) as exc:
-                    self.store.event("listener/stop_refused", ident, {"code": getattr(exc, "code", type(exc).__name__)})
+        except BaseException:
+            # These listeners are still threadless; finish every owned retirement.
+            async def cleanup():
+                for ident in spawned:
+                    try:
+                        await self.stop_listener(self.store.get(ident), kill=True)
+                    except (CoordinatorError, OSError) as exc:
+                        self.store.event("listener/stop_refused", ident, {"code": getattr(exc, "code", type(exc).__name__)})
+            from .locks import finish
+            await finish(cleanup())
+            raise
+
+    async def offline_listener(self, actor, original):
+        from .writer_profile import configure, verify
+        from .roles import apply, overlay
+        config = self.readmission_config(original.get("profile_base_config", original["config"]))
+        reader = await self.spawn_listener(actor, config, original.get("home"))
+        try:
+            connection = self.connections[reader["id"]]
+            cwd = actor.get("cwd") or self.store.get(actor["checkout"])["root"]
+            effective = (await connection.call("config/read", {"cwd": cwd, "includeLayers": False}))["config"]
+            policy, profile = await configure(connection, effective, cwd, self.writer_profile)
+            selected = apply(apply(config, overlay(effective)), policy)
+            await self.stop_listener(reader, kill=True)
+            reader = await self.spawn_listener(actor, selected, original.get("home"))
+            connection = self.connections[reader["id"]]
+            verify((await connection.call("config/read", {"cwd": cwd, "includeLayers": False}))["config"], profile)
+            reader.update(writer_profile=profile, purpose="offline_history")
+            self.store.save(reader)
+            return reader
+        except BaseException:
+            from .locks import finish
+            await finish(self.stop_listener(reader, kill=True))
             raise
 
     async def spawn_listener(self, actor, config, home=None, incarnation=None):
+        from .writer_profile import require_valid
+        require_valid(self.writer_profile)
         ident = incarnation or uid("listener")
         directory = self.store.root / "listeners" / ident
         directory.mkdir(mode=0o700, exist_ok=True)
@@ -534,12 +739,12 @@ class Daemon:
         finally:
             os.close(descriptor)
         try:
-            birth = await asyncio.to_thread(processes.identity, process.pid)
+            birth = await telemetry.to_thread(processes.identity, process.pid)
             if birth is None:
                 code = await process.wait()
                 raise CoordinatorError("LISTENER_START", "Native listener exited before its process identity could be recorded", {"exit_code": code}, True)
             self.store.put("listener", ident, {"actor": actor["id"], "run": actor["run"], "unit": actor["unit"],
-                           "socket": str(socket), "binary": binary, "binary_digest": await asyncio.to_thread(native.file_digest, binary),
+                           "socket": str(socket), "binary": binary, "binary_digest": await telemetry.to_thread(native.file_digest, binary),
                            "endpoint_allocation": allocation,
                            "pid": process.pid, "birth": birth["birth"], "incarnation": ident, "state": "starting",
                            "kernel_id": birth.get("kernel_id"),
@@ -558,30 +763,34 @@ class Daemon:
                                             "diagnostic": self.native_log(self.store.get(ident)).get("startup_diagnostic")}, True)
                 await asyncio.sleep(0.02)
         except BaseException:
-            # It never served, so nothing was admitted to it: end it and what it started (its own process group, while
-            # this daemon has not reaped it), so no failed start outlives its error.
-            if process.returncode is None:
+            async def cleanup():
+                # It never served, so nothing was admitted to it: end it and what it started (its own process group, while
+                # this daemon has not reaped it), so no failed start outlives its error.
+                if process.returncode is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                await process.wait()
-            try:
-                runtime.cleanup(allocation)
-                cleaned = True
-            except (CoordinatorError, OSError) as exc:  # recorded; the start's own error is the one raised
-                cleaned = False
-                self.store.event("listener/cleanup_refused", ident, {"code": getattr(exc, "code", type(exc).__name__)})
-            Path(log).unlink(missing_ok=True)
-            record = self.store.get(ident, required=False)
-            if record:
-                record.update(state="stopped", allocation_cleaned=cleaned)
-                self.store.save(record)
+                    runtime.cleanup(allocation)
+                    cleaned = True
+                except (CoordinatorError, OSError) as exc:  # recorded; the start's own error is the one raised
+                    cleaned = False
+                    self.store.event("listener/cleanup_refused", ident, {"code": getattr(exc, "code", type(exc).__name__)})
+                Path(log).unlink(missing_ok=True)
+                record = self.store.get(ident, required=False)
+                if record:
+                    record.update(state="stopped", allocation_cleaned=cleaned)
+                    self.store.save(record)
+            from .locks import retire
+            await retire(cleanup)
             raise
         try:
             await self.attach(self.store.get(ident))
         except BaseException:
-            await self.stop_listener(self.store.get(ident), kill=True)  # attached to nothing: nothing runs there
+            from .locks import finish
+            await finish(self.stop_listener(self.store.get(ident), kill=True))  # nothing runs there
             raise
         return self.store.get(ident)
 
@@ -748,6 +957,9 @@ class Daemon:
         end when the call was direct (the turn ends after its direct calls' dispatches, and native sends in order),
         or for its app-server's exit, whichever comes first (a Post hook native cancelled sends no outcome)."""
         operation = self.store.get(operation["id"])
+        ident = operation.get("native", {}).get("listener")
+        if self.listener_retiring(ident) and self.native_unapplied(ident):
+            return  # replay the listener's hook/item evidence before judging its log
         aborted = operation.get("result_ready") and not operation.get("returned")
         if operation["state"] == "prepared" and aborted:
             await self.withdraw(operation["id"], operation.get("custody"), "NATIVE_ABANDONED")
@@ -766,17 +978,72 @@ class Daemon:
         elif operation["kind"] == "command" and aborted:
             await self.settle_actor(self.store.get(operation["actor"]))
 
+    def listener_retiring(self, ident):
+        connection = self.connections.get(ident)
+        return ident in self.retiring_listeners or bool(connection and connection.retiring)
+
+    def native_unapplied(self, ident):
+        self.flush_native_progress()
+        applied = self.store.get("native_applied:" + ident, required=False) or {}
+        return self.store.db.execute("SELECT 1 FROM events WHERE kind='native' AND subject=? AND seq>? LIMIT 1",
+                                     (ident, applied.get("sequence", 0))).fetchone() is not None
+
     async def executor_exited(self, listener, unfinished=None):
         """Its app-server has exited: nothing it admitted can still write. Quarantines stop holding the paths they
         kept for a write that might still finish. With `unfinished`, a patch it never reported ending is
         quarantined for that reason, as a crash gap is."""
         query = "SELECT * FROM records INDEXED BY window_{} WHERE {} AND json_extract(data,'$.native.listener')=? ORDER BY id"
-        if unfinished:
+        # A stopped process is not evidence that its queued completion was absent.
+        # Detach normally replays it; an interrupted retirement leaves this
+        # judgement to the next reconcile, after the same durable suffix.
+        if unfinished and not self.native_unapplied(listener["id"]):
             for operation in list(self.store.selected(query.format("operation", WINDOW_ACTIVE["operation"]), (listener["id"],))):
                 if operation["kind"] == "patch" and operation["state"] in ("allowed", "running"):
                     await self.ledger.quarantine(operation, unfinished)
         for operation in list(self.store.selected(query.format("executing", WINDOW_ACTIVE["executing"]), (listener["id"],))):
             self.ledger.end_execution(operation)
+
+    async def native_turn(self):
+        """FIFO cooperative service: n live tickets ahead means at most n+1 grants.
+
+        A grant always permits a step, even if another step overran 2 ms before
+        its owner resumed. No release or lock spans arbitrary application awaits.
+        Cheap consecutive steps share a slice only when nobody is owed service.
+        """
+        loop = asyncio.get_running_loop()
+        if not self.native_tickets and not self.native_granted and self.native_service is None and loop.time() < self.native_slice_until:
+            return
+        owner = asyncio.current_task()
+        future = self.native_waiters.get(owner)
+        if future is None:
+            future = loop.create_future()
+            self.native_waiters[owner] = future
+            self.native_tickets.append((owner, future))
+        if self.native_service is None:
+            self.native_service = loop.call_soon(self.native_grant)
+        try:
+            await future
+        finally:
+            self.native_waiters.pop(owner, None)
+            self.native_granted.discard(owner)
+
+    def native_grant(self):
+        self.native_service = None
+        while self.native_tickets:
+            owner, future = self.native_tickets.popleft()
+            if future.done():
+                continue
+            loop = asyncio.get_running_loop()
+            self.native_slice_until = loop.time() + native.JOURNAL_BATCH_AGE_S
+            self.native_granted.add(owner)
+            future.set_result(None)
+            if self.native_tickets:
+                self.native_service = loop.call_soon(self.native_grant)
+            break
+
+    def check_native_stop(self):
+        if self.native_stop_error is not None:
+            raise self.native_stop_error
 
     async def tail_native_log(self, listenerid):
         """Follow a live listener's log. A failure to read it is recorded, never fatal: a result read late only
@@ -793,6 +1060,15 @@ class Daemon:
                 await asyncio.sleep(NATIVE_LOG_POLL_S)
                 continue
             try:
+                offset = max(self.store.get(listenerid + ":log")["offset"], self.log_offsets.get(listenerid, 0))
+                try:
+                    grew = os.stat(listener["log"]).st_size > offset
+                except FileNotFoundError:
+                    grew = False
+                if not grew:
+                    await asyncio.sleep(NATIVE_LOG_POLL_S)
+                    continue
+                await self.native_turn()
                 for ident in self.read_native_log(listenerid):
                     self.background(self.settle_returned(self.store.get(ident)))
                 failure = None
@@ -805,8 +1081,11 @@ class Daemon:
             await asyncio.sleep(NATIVE_LOG_POLL_S)
 
     async def attach(self, listener):
+        if self.native_intake_closed:
+            raise CoordinatorError("DAEMON_STOPPING", "Native intake has ended", operational=True)
         ident = listener["id"]
         await self.detach_listener(ident)
+        self.retiring_listeners.discard(ident)
         self.flush_native_progress()
         # New notifications cannot prove that an older incarnation's received
         # journal suffix was applied. Hold its high-water mark before opening
@@ -823,26 +1102,78 @@ class Daemon:
             self.store.put("native_applied", key, progress, ident)
         tail = self.log_tails.get(ident)
         if not tail or tail.done():
-            self.log_tails[ident] = self.background(self.tail_native_log(ident))
-        queue = asyncio.Queue()
+            self.log_tails[ident] = self.watch_listener_task(self.background(self.tail_native_log(ident)), ident, "log")
+        queue = NativeBacklog(self.store, ident, received or 0)
         self.queues[ident] = queue
         self.listener_requests[ident] = set()
         def inbound(message):
+            if message.get("method") == "coordinator/closeEscalated":
+                # The close timer ends before the connection is joined and
+                # SQLite closes, including after the forced-stop intake fence.
+                self.store.event("native/close_escalated", ident, message["params"])
+                return
+            inbound_batch([(0, message, 0, time.monotonic())])
+
+        def inbound_batch(entries):
+            if self.native_intake_closed:
+                # No successful journal barrier may cover discarded input.
+                raise native.Retired()
+            traces = []
+            began = time.monotonic()
             # Receipt and ownership must commit together. Replay can run while the
             # notification worker is behind; a live request is still owned by this
             # generation even before its handler has been scheduled.
             with self.store.transaction():
-                sequence = self.store.event("native", ident, message)
-                if "id" in message:
-                    self.store.put("native_obligation", "native_obligation:" + str(sequence),
-                        {"sequence": sequence, "generation": self.store.generation, "state": "pending"}, ident)
-            queue.put_nowait((sequence, message))
+                for _, message, _, _ in entries:
+                    trace = self.completion_trace(listener, message)
+                    with telemetry.using([trace]):
+                        sequence = self.store.event("native", ident, message)
+                        if "id" in message:
+                            self.store.put("native_obligation", "native_obligation:" + str(sequence),
+                                {"sequence": sequence, "generation": self.store.generation, "state": "pending"}, ident)
+                    if trace:
+                        traces.append((trace, sequence))
+            ended = time.monotonic()
+            for trace, traced_sequence in traces:
+                trace.add("journal_receipt", began, ended)
+                trace.marks["journaled"] = ended
+                trace.marks["sequence"] = traced_sequence
+            # This publication is strictly after COMMIT; failed batches leave
+            # neither an application wakeup nor a claimed receipt high-water.
+            queue.publish(sequence, len(entries))
+
+        def intake_failure(details):
+            self.native_stop_error = connection.intake_error
+            self.closing, self.ready = True, False
+            self.stop.set()
+            for current in self.connections.values():
+                if current.intake is not None:
+                    current.intake.wake()
+                for waiter in current.response_waits:
+                    waiter.changed()
+            try:
+                if self.store.db.in_transaction:
+                    raise RuntimeError("Journal rollback did not end its transaction")
+                self.store.event("native/journal_failure", ident, details)
+            except Exception as diagnostic:
+                print(json.dumps({"event": "native/journal_failure", "listener": ident,
+                                  "details": details, "diagnostic_error": type(diagnostic).__name__}),
+                      file=sys.stderr, flush=True)
+            finally:
+                # Even an unavailable database must not strand the owner/waiters
+                # or prevent the visible stop and next-generation replay.
+                self.closing, self.ready = True, False
+                self.stop.set()
         from .admission import Admission
         schema, _ = await Admission(self.store).schema()
         try:
-            connection = await native.Connection.connect(listener["socket"], inbound, native.Schema(schema))
+            connection = await native.Connection.connect(listener["socket"], inbound, native.Schema(schema),
+                on_batch=inbound_batch, turn=self.native_turn, on_failure=intake_failure, check_stop=self.check_native_stop)
+            if self.native_intake_closed:
+                await connection.close(abort=True)
+                raise CoordinatorError("DAEMON_STOPPING", "Native intake has ended", operational=True)
             self.connections[ident] = connection
-            self.workers[ident] = self.background(self.native_worker(listener, queue))
+            self.workers[ident] = self.watch_listener_task(self.background(self.native_worker(listener, queue)), ident, "native application")
             initialized = await connection.initialize()
         except BaseException:
             await self.detach_listener(ident)
@@ -853,33 +1184,56 @@ class Daemon:
         return connection
 
     async def detach_listener(self, ident):
-        """Close intake, drain journaled evidence, then remove the consumer.
-
-        Native requests can be blocked on custody. Their durable pending records
-        are recovery evidence; cancellation must not re-execute them.
-        """
-        connection = self.connections.get(ident)
-        if connection:
-            await connection.close()
-        worker, queue = self.workers.get(ident), self.queues.get(ident)
-        current = asyncio.current_task()
-        if worker is current:
+        """Retire intake and consumers without abandoning their owned cleanup."""
+        if self.workers.get(ident) is asyncio.current_task():
             # Run teardown after this notification's task_done, never self-await.
             self.background(self.detach_listener(ident))
             return
-        if worker and not worker.done() and queue:
-            await queue.join()
-        requests = self.listener_requests.pop(ident, set())
-        for request in requests:
-            if request is not current:
-                request.cancel()
-        await asyncio.gather(*(r for r in requests if r is not current), return_exceptions=True)
-        if worker:
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
+        from .locks import retire
+        await retire(self._detach_listener, ident, asyncio.current_task())
+
+    async def _detach_listener(self, ident, owner):
+        from .locks import cancel_and_join
+        began = time.monotonic()
+        self.retiring_listeners.add(ident)
+        connection = self.connections.get(ident)
+        worker = self.workers.get(ident)
+        if not self.stop.is_set():
+            if connection:
+                await connection.close()
+            # Local close can cancel a consumer's pending native RPC. Queued
+            # evidence remains in the journal; attach/replay covers that suffix.
+            # queue.join() cannot finish after that consumer has ended.
+        closed = time.monotonic()
+        requests = self.listener_requests.get(ident, set())
+        consumers = {task for task in requests if task is not owner}
+        if worker and worker is not owner:
+            consumers.add(worker)
+        await cancel_and_join(consumers)
+        if connection and self.stop.is_set():
+            await connection.close(abort=True)
+        self.listener_requests.pop(ident, None)
         self.connections.pop(ident, None)
         self.workers.pop(ident, None)
         self.queues.pop(ident, None)
+        consumed = replayed = time.monotonic()
+        if not self.stop.is_set():
+            # The replay cursor only proves evidence was stored. Receipt reads
+            # can still have been cancelled after that cursor advanced.
+            if self.native_unapplied(ident):
+                from .recovery import replay_native
+                await replay_native(self, self.store.get(ident))
+            replayed = time.monotonic()
+            query = ("SELECT * FROM records INDEXED BY window_operation WHERE " + WINDOW_ACTIVE["operation"]
+                     + " AND json_extract(data,'$.native.listener')=? ORDER BY id")
+            for operation in list(self.store.selected(query, (ident,))):
+                if operation["kind"] == "patch" and not operation.get("parent_operation"):
+                    await self.maybe_verify(operation)
+        ended = time.monotonic()
+        self.store.event("listener/detached", ident, {
+            "started": began, "ended": ended, "seconds": ended - began, "draining": self.draining,
+            "close_seconds": closed - began, "consumers_seconds": consumed - closed,
+            "replay_seconds": replayed - consumed, "receipts_seconds": ended - replayed})
 
     async def launch_writer(self, actor, params):
         for checkoutid in participants.checkout_ids(self.store, actor["unit"]):
@@ -907,6 +1261,8 @@ class Daemon:
         connection = self.connections[listener["id"]]
         actor["listener"] = listener["id"]
         self.store.save(actor)
+        from .writer_profile import context
+        profile_line = context(listener["writer_profile"]) if listener["writer_profile"]["mode"] == "list" else ""
         response = await connection.call("thread/start", {"cwd": cwd,
                                           **({"projectId": unit["project"], "runtimeWorkspaceRoots": roots} if unit.get("project_revision") else {}),
                                           "model": workflow["model"] if workflow else params.get("model", "gpt-6-astra"), "approvalPolicy": "never",
@@ -916,14 +1272,17 @@ class Daemon:
                                           "Never publish or rewrite Git state: the lead records. "
                                           "Messages require ack from the named recipient. Child fallback ack format: C1_ACK <message-id>. "
                                           + "Workspace roots in order: " + json.dumps(roots) + ". Paths are absolute or relative to the actual tool cwd. "
-                                          "Qualified coordinator paths use {root_id: checkout-id, path: repository-relative-path}."})
+                                          "Qualified coordinator paths use {root_id: checkout-id, path: repository-relative-path}." +
+                                          ("\n" + profile_line if profile_line else "")})
         from .projects import verify_thread
         verify_thread(response, unit, cwd, roots)
         actor.update(thread=response["thread"]["id"], session=response["thread"]["id"], policy=native.policy_echo(response))
+        if profile_line:
+            actor["writer_profile_context"] = profile_line
         self.store.save(actor)
         listener = self.store.get(listener["id"])
         listener["root_thread"] = actor["thread"]
-        listener["services"] = await asyncio.to_thread(processes.inventory, listener, None)
+        listener["services"] = await telemetry.to_thread(processes.inventory, listener, None)
         self.store.save(listener)
         admitted = await admission.writer_gate(self, listener["id"], response, fixture=bool(fixture))
         run = self.store.get(actor["run"])
@@ -946,7 +1305,7 @@ class Daemon:
     async def listener_exited(self, listener, seconds):
         deadline = time.monotonic() + seconds
         while True:
-            current = await asyncio.to_thread(processes.identity, listener["pid"])
+            current = await telemetry.to_thread(processes.identity, listener["pid"])
             if not current or current["birth"] != listener["birth"] or current["zombie"]:
                 return True
             if time.monotonic() >= deadline:
@@ -967,16 +1326,22 @@ class Daemon:
         return True
 
     async def stop_listener(self, listener, drain_s=5, kill=False):
+        from .locks import retire
+        await retire(self._stop_listener, listener, drain_s, kill)
+
+    async def _stop_listener(self, listener, drain_s=5, kill=False):
         """SIGTERM its app-server, then SIGCONT (one stopped by a signal acts on neither until it is continued), and
         wait `drain_s` for Codex's graceful exit. One still draining then is kept (LISTENER_DRAIN), or killed: with
         `kill`, for an app-server with nothing of its unit in flight, and always for one found stopped or behind a dead
         connection (recovery.end_wedged). SIGKILL ends a stopped process too."""
         listener = self.store.get(listener["id"])
-        if listener["state"] == "stopped" and listener.get("allocation_cleaned"):
+        if listener["state"] == "dormant" or listener["state"] == "stopped" and listener.get("allocation_cleaned"):
             return
+        began_stop = time.monotonic()
         listener["state"] = "stopping"
         self.store.save(listener)
         await self.detach_listener(listener["id"])
+        detached = time.monotonic()
         kill = kill or bool(listener.get("wedged"))
         if self.signal_listener(listener, signal.SIGTERM):
             began = time.monotonic()
@@ -988,6 +1353,7 @@ class Daemon:
             self.store.event("listener/exit", listener["id"], {"seconds": round(time.monotonic() - began, 2), "exited": exited, "killed": killed})
             if not exited:
                 raise CoordinatorError("LISTENER_DRAIN", "Native listener did not finish draining; retained ownership")
+        exited_at = time.monotonic()
         if listener.get("endpoint_allocation"):
             if Path(listener["endpoint_allocation"]["directory"]).exists():
                 runtime.cleanup(listener["endpoint_allocation"])
@@ -1000,6 +1366,11 @@ class Daemon:
             # Applied to its operations; the log also holds policy text, which C1 does not keep.
             Path(listener["log"]).unlink(missing_ok=True)
             self.log_offsets.pop(listener["id"], None)
+        ended = time.monotonic()
+        self.store.event("listener/stopped", listener["id"], {
+            "started": began_stop, "ended": ended, "seconds": ended - began_stop, "draining": self.draining,
+            "detach_seconds": detached - began_stop, "exit_seconds": exited_at - detached,
+            "settle_seconds": ended - exited_at})
 
     async def resolve_actor(self, listener, thread, session=None, connection=None):
         async with self.actor_locks.hold((listener["id"], thread)):
@@ -1070,7 +1441,7 @@ class Daemon:
         # merely because it outlives a command or has a familiar executable name.
         prior = any(op["kind"] in ("command", "mcp") and op.get("native", {}).get("listener") == listener["id"]
                     for op in self.store.all("operation", listener["unit"]))
-        services = None if prior else await asyncio.to_thread(processes.inventory, listener, None)
+        services = None if prior else await telemetry.to_thread(processes.inventory, listener, None)
         listener = self.store.get(listener["id"])
         if services is not None:
             listener["services"] = services
@@ -1103,7 +1474,7 @@ class Daemon:
         if native.file_digest(Path(__file__).with_name("hooks.py")) != listener["hook_digest"]:
             raise CoordinatorError("HOOK_PROGRAM_CHANGED", "Hook program changed since admission")
         if hook_process:
-            if not await asyncio.to_thread(processes.descendant, hook_process, listener):
+            if not await telemetry.to_thread(processes.descendant, hook_process, listener):
                 raise CoordinatorError("HOOK_PROCESS", "Hook client is not a birth-verified listener descendant")
             listener = self.store.get(listener["id"])
             helpers = []
@@ -1236,6 +1607,8 @@ class Daemon:
                 # Its run was cancelled while this call was being admitted.
                 await self.withdraw(operation["id"], operation.get("custody"), "RUN_CANCELLED")
                 raise CoordinatorError("RUN_CANCELLED", "This run was cancelled: its calls do not run")
+            if operation["kind"] == "command":
+                self.settlements.setdefault(operation["id"], telemetry.Trace(operation["id"], operation["actor"], armed=False))
             operation["state"] = "allowed"
             operation["decision"] = "allow"
             self.store.save(operation)
@@ -1294,11 +1667,190 @@ class Daemon:
                 self.flush_native_progress()
             self.native_progress_flush = self.background(flush())
 
+    def completion_trace(self, listener, message):
+        received = time.monotonic()
+        params = message.get("params", {})
+        item = params.get("item", {})
+        if message.get("method") != "item/completed" or item.get("type") != "commandExecution":
+            return None
+        operation = self.find_operation(listener, params.get("threadId"), params.get("turnId"), item.get("id"))
+        if not operation or operation["state"] in ("denied", "reconciled", "verified"):
+            return None
+        if operation["id"] not in self.settlements:
+            self.settlements[operation["id"]] = telemetry.Trace(operation["id"], operation["actor"], armed=False)
+        trace = self.settlements[operation["id"]]
+        trace.arm(received)
+        return trace
+
+    def start_loop_supervisor(self):
+        """Restart even an unexpected exit of the supervisory coroutine."""
+        if self.stop.is_set():
+            return
+        from .watchdog import CLOSE_SECONDS, RETRY_MAX_SECONDS
+        began = time.monotonic()
+        task = self.background(self.supervise_loop_lag())
+        def ended(task):
+            if self.stop.is_set():
+                return
+            failure = "cancelled" if task.cancelled() else str(task.exception() or "returned")[:512]
+            delay = getattr(self, "loop_supervisor_delay", CLOSE_SECONDS)
+            if time.monotonic() - began >= RETRY_MAX_SECONDS:
+                delay = CLOSE_SECONDS
+            self.loop_supervisor_delay = min(RETRY_MAX_SECONDS, delay * 2)
+            reason = "supervisor task ended while service remained open: " + failure
+            self.loop_lag["supervisor"] = {"state": "restarting", "reason": reason,
+                                           "since": time.time(), "retry_at": time.time() + delay}
+            self.store.event("watchdog/supervisor_task_exited", None, {"reason": reason, "retry_seconds": delay})
+            asyncio.get_running_loop().call_later(delay, self.start_loop_supervisor)
+        task.add_done_callback(ended)
+
+    async def supervise_loop_lag(self):
+        """Own diagnostics until stop is irreversible, including failed drains."""
+        from .watchdog import CLOSE_SECONDS, RETRY_MAX_SECONDS
+        from .locks import finish
+        delay = CLOSE_SECONDS
+
+        def health(state, reason):
+            self.loop_lag["supervisor"] = {"state": state, "reason": reason, "since": time.time()}
+
+        async def reap():
+            watchdog = getattr(self, "diagnostic_watchdog", None)
+            if watchdog is not None:
+                self.loop_lag.update(await watchdog.close())
+                self.diagnostic_watchdog = None
+                self.loop_lag["watchdog_pid"] = None
+
+        try:
+            while not self.stop.is_set():
+                began = time.monotonic()
+                try:
+                    watchdog = getattr(self, "diagnostic_watchdog", None)
+                    if watchdog is not None and watchdog.closing:
+                        health("restarting", "reaping previous watchdog helper")
+                        await reap()
+                    health("running", "heartbeat and helper supervision")
+                    await self.measure_loop_lag()
+                    reason = "heartbeat supervisor returned while service remained open"
+                except asyncio.CancelledError:
+                    if self.stop.is_set():
+                        break
+                    asyncio.current_task().uncancel()
+                    reason = "heartbeat supervisor cancelled while service remained open"
+                except Exception as exc:
+                    reason = type(exc).__name__ + ": " + str(exc)[:512]
+                if self.stop.is_set():
+                    break
+                if time.monotonic() - began >= RETRY_MAX_SECONDS:
+                    delay = CLOSE_SECONDS
+                watchdog = getattr(self, "diagnostic_watchdog", None)
+                health("restarting", reason)
+                self.loop_lag.update(diagnostic_error=reason, diagnostic_last_error=reason,
+                    watchdog_retry_at=time.time() + delay,
+                    watchdog_unreaped=watchdog.process.pid if watchdog and watchdog.process else None)
+                self.store.event("watchdog/supervisor_exited", None, {
+                    "reason": reason, "retry_seconds": delay,
+                    "unreaped_helper": self.loop_lag["watchdog_unreaped"]})
+                await asyncio.sleep(delay)
+                delay = min(RETRY_MAX_SECONDS, delay * 2)
+        finally:
+            async def retire():
+                nonlocal delay
+                # An unreaped child can still own a pending signal. Never
+                # restore/reuse the handler or abandon ownership on reap failure.
+                while getattr(self, "diagnostic_watchdog", None) is not None:
+                    try:
+                        await reap()
+                    except Exception as exc:
+                        reason = type(exc).__name__ + ": " + str(exc)[:512]
+                        health("restarting", "termination waiting for helper reap: " + reason)
+                        self.store.event("watchdog/reap_failed", None, {"reason": reason, "retry_seconds": delay})
+                        await asyncio.sleep(delay)
+                        delay = min(RETRY_MAX_SECONDS, delay * 2)
+                health("stopped" if self.stop.is_set() else "restarting",
+                       "daemon irreversibly terminating" if self.stop.is_set() else "supervisor task ending")
+            await finish(retire())
+
+    async def measure_loop_lag(self):
+        from .watchdog import Watchdog, THRESHOLD, INTERVAL, SEGMENT_BYTES, CLOSE_SECONDS, RETRY_MAX_SECONDS
+        watchdog = getattr(self, "diagnostic_watchdog", None)
+        retry_at, delay, started = 0.0, CLOSE_SECONDS, 0.0
+        reported_dumps = reported_failures = 0
+        restarts = self.loop_lag.get("watchdog_restarts", -1) + 1
+        self.loop_lag.update(traceback_file=str(self.store.root / "loop-stalls.log"), threshold_seconds=THRESHOLD,
+                             diagnostic_bytes_limit=2 * SEGMENT_BYTES)
+        async def retire():
+            nonlocal watchdog
+            outcome = await watchdog.close()
+            self.loop_lag.update(outcome)
+            if outcome["helper_forced"]:
+                self.store.event("watchdog/output_possibly_lost", None, outcome)
+            watchdog = self.diagnostic_watchdog = None
+        def retry(error):
+            nonlocal retry_at, delay
+            retry_at = time.monotonic() + delay
+            self.loop_lag.update(diagnostic_error=error, diagnostic_last_error=error,
+                                 watchdog_pid=None, watchdog_retry_at=time.time() + delay)
+            delay = min(RETRY_MAX_SECONDS, delay * 2)
+        try:
+            while not self.stop.is_set():
+                if watchdog is None and time.monotonic() >= retry_at:
+                    try:
+                        candidate = Watchdog(self.store.root, self.store.generation)
+                        await candidate.start()
+                    except Exception as exc:
+                        error = type(exc).__name__ + ": " + str(exc)[:512]
+                        retry(error)
+                        self.store.event("watchdog/start_failed", None, {"error": error, "retry_at": self.loop_lag["watchdog_retry_at"]})
+                    else:
+                        watchdog, started = candidate, time.monotonic()
+                        self.diagnostic_watchdog = watchdog
+                        reported_dumps = reported_failures = 0
+                        self.loop_lag.update(watchdog_pid=watchdog.process.pid, watchdog_restarts=restarts,
+                                             watchdog_retry_at=None, diagnostic_error=None, watchdog_unreaped=None)
+                        if restarts:
+                            self.store.event("watchdog/restarted", None, {"pid": watchdog.process.pid, "restarts": restarts})
+                        restarts += 1
+                sample = watchdog.beat() if watchdog else {"wall": time.time(), "monotonic": time.monotonic(),
+                                                           "generation": self.store.generation}
+                await asyncio.sleep(INTERVAL)
+                lag = max(0.0, time.monotonic() - sample["monotonic"] - INTERVAL)
+                self.loop_lag.update(last_seconds=lag, max_seconds=max(lag, self.loop_lag["max_seconds"]),
+                                     samples=self.loop_lag["samples"] + 1, heartbeat=sample)
+                if watchdog is None:
+                    continue
+                status = watchdog.status()
+                self.loop_lag.update(status)
+                if status["lookup_failures"] != reported_failures:
+                    self.store.event("watchdog/lookup_failed", None, status)
+                    reported_failures = status["lookup_failures"]
+                if watchdog.dumps != reported_dumps:
+                    self.store.event("watchdog/dump_possibly_truncated", None, watchdog.status())
+                    reported_dumps = watchdog.dumps
+                if watchdog.process.returncode is not None:
+                    error = "watchdog exited: " + str(watchdog.process.returncode)
+                    self.store.event("watchdog/exited", None, {"pid": watchdog.process.pid,
+                                     "returncode": watchdog.process.returncode, "output_integrity": "possibly_lost"})
+                    await retire()  # Reaped before restoring SIGUSR2 or creating another pipe.
+                    retry(error)
+                elif time.monotonic() - started >= RETRY_MAX_SECONDS:
+                    delay = CLOSE_SECONDS
+        finally:
+            async def close_watchdog():
+                if watchdog is not None:
+                    await retire()
+            # serve() can cancel this task after closing has already begun.
+            # It must still wait for the owned helper and retire its signal FD.
+            from .locks import finish
+            await finish(close_watchdog())
+
     async def native_worker(self, initial, queue):
         while True:
             sequence, message = await queue.get()
             listener = self.store.get(initial["id"])
+            self.native_applying[listener["id"]] = {"sequence": sequence, "method": message.get("method")}
             try:
+                await self.native_turn()
+                self.check_native_stop()
                 if "id" in message:
                     # The worker cannot await a tool that may itself need notifications.
                     # Intake already durably recorded ownership with the journal row.
@@ -1309,7 +1861,13 @@ class Daemon:
                     pending.add(task)
                     task.add_done_callback(pending.discard)
                 else:
-                    await self.notification(listener, message["method"], message.get("params", {}))
+                    trace = self.completion_trace(listener, message)
+                    if trace:
+                        trace.add("journal_queue", trace.marks.get("journaled", trace.started), time.monotonic())
+                        trace.marks["application"] = time.monotonic()
+                    with telemetry.using([trace]), telemetry.span("application"):
+                        await self.notification(listener, message["method"], message.get("params", {}))
+                self.check_native_stop()
                 key = "native_applied:" + listener["id"]
                 applied = self.store.get(key, required=False) or {}
                 # Failures freeze the contiguous applied prefix. Recovery replays the
@@ -1319,7 +1877,11 @@ class Daemon:
                     params = message.get("params", {})
                     if params.get("threadId") and message.get("method") in ("item/completed", "turn/completed", "thread/reverted"):
                         self.history.schedule(listener, params["threadId"])
+                if isinstance(queue, NativeBacklog):
+                    queue.applied += 1
+                    queue.applied_bytes += queue.active_bytes
             except Exception as exc:
+                self.check_native_stop()
                 code = getattr(exc, "code", type(exc).__name__)
                 key = "native_applied:" + listener["id"]
                 applied = self.store.get(key, required=False) or {}
@@ -1345,12 +1907,19 @@ class Daemon:
                     self.store.unknown(key, path or "*", "native evidence processing failed",
                                        {"listener": listener["id"], "code": code})
             finally:
+                self.native_applying.pop(listener["id"], None)
                 queue.task_done()
 
     async def apply_native_request(self, listener, message, obligation):
         try:
             await self.native_request(listener, message)
+            self.check_native_stop()
+        except asyncio.CancelledError:
+            # Receipt is durable, application is not. The next generation
+            # handles the pending request exactly as after a crash.
+            raise
         except BaseException:
+            self.check_native_stop()
             obligation.update(state="failed")
             self.store.save(obligation)
             raise
@@ -1359,9 +1928,20 @@ class Daemon:
             self.store.save(obligation)
 
     async def native_request(self, listener, message):
+        params = message.get("params", {})
+        if message["method"] == "item/tool/call":
+            ident = "dynamic:" + listener["id"] + ":" + params["threadId"] + ":" + params["callId"]
+            async with self.request_locks.hold(ident):
+                await self._native_request(listener, message)
+            return
+        await self._native_request(listener, message)
+
+    async def _native_request(self, listener, message):
+        self.check_native_stop()
         connection = self.connections.get(listener["id"])
         if not connection:
-            return
+            raise native.Retired()
+        connection.check_intake()
         method, params = message["method"], message.get("params", {})
         if method != "item/tool/call":
             await connection.send({"id": message["id"], "error": {"code": -32601,
@@ -1372,26 +1952,43 @@ class Daemon:
         ident = "dynamic:" + listener["id"] + ":" + params["threadId"] + ":" + params["callId"]
         existing = self.store.get(ident, required=False)
         if existing and existing.get("response"):
+            self.complete_dynamic_obligations(ident)
             await connection.send({"id": message["id"], "result": existing["response"]})
             return
-        if existing:
+        if existing and existing.get("stage") != "preparing":
             # A completed effect may precede its durable response. Never execute
             # the tool again merely because the native server repeats the request.
             response = tools.result({"error": {"code": "DYNAMIC_UNCERTAIN", "message":
                                     "Previous tool invocation has uncertain completion; inspect durable status before a new request."}}, False)
             existing.update(state="uncertain", response=response)
             self.store.save(existing)
+            self.complete_dynamic_obligations(ident)
             self.store.event("dynamic/replay_refused", ident, {"generation": self.store.generation})
             await connection.send({"id": message["id"], "result": response})
             return
         actor = await self.resolve_actor(listener, params["threadId"])
-        self.store.put("dynamic", ident, {"actor": actor["id"], "native": params, "state": "pending"}, actor["unit"])
+        self.check_native_stop()
+        self.store.put("dynamic", ident, {"actor": actor["id"], "native": params, "state": "pending",
+                                         "stage": "preparing", "generation": self.store.generation}, actor["unit"])
+        def effect():
+            self.check_native_stop()
+            invocation = self.store.get(ident)
+            invocation.update(stage="effect")
+            self.store.save(invocation)
         try:
-            response = tools.result(await tools.dispatch(self, actor, params["tool"], params["arguments"]))
+            response = tools.result(await tools.dispatch(self, actor, params["tool"], params["arguments"], effect=effect))
         except CoordinatorError as exc:
             response = tools.result({"error": exc.envelope()}, False)
+        self.check_native_stop()
         self.store.put("dynamic", ident, {"actor": actor["id"], "state": "completed", "response": response})
+        self.complete_dynamic_obligations(ident)
         await connection.send({"id": message["id"], "result": response})
+
+    def complete_dynamic_obligations(self, ident):
+        for obligation in list(self.store.selected("SELECT * FROM records WHERE kind='native_obligation' "
+                "AND json_extract(data,'$.dynamic')=? AND json_extract(data,'$.state')='pending'", (ident,))):
+            obligation.update(state="completed", replay="response")
+            self.store.save(obligation)
 
     async def notification(self, listener, method, params):
         if method == "thread/reverted":
@@ -1465,7 +2062,8 @@ class Daemon:
                 # status does not say whether its cells were terminated): its outcome, or its app-server's exit,
                 # settles it. Its handler is done, so nothing more is written for it.
             await self.settle_actor(actor)
-            await asyncio.gather(*(self.ledger.reconcile(self.store.get(key)) for key in participants.checkout_ids(self.store, actor["unit"])))
+            await finish_all(*(self.ledger.reconcile(self.store.get(key), reason="turn-end observation",
+                owner={"kind": "turn", "actor": actor["id"], "turn": turn}) for key in participants.checkout_ids(self.store, actor["unit"])))
             if run.get("workflow"):
                 self.background(self.writer.advance(run["id"]))
         elif method == "hook/completed":
@@ -1499,7 +2097,8 @@ class Daemon:
                     # Admitted, then settled on native's own end of it: no effect, or a reconciled command. Its
                     # items travel apart from a failed result and can arrive after the settlement: they complete
                     # its record, admitted, never unmediated, and never reopen it. A patch settled as no effect
-                    # that native then reports applied is quarantined.
+                    # that native then reports applied gets a separate conflict
+                    # obligation; its old terminal outcome is not rewritten.
                     key = "started_item" if method == "item/started" else "completed_item"
                     if key == "completed_item" or not operation.get(key):
                         operation[key] = item
@@ -1511,7 +2110,7 @@ class Daemon:
                             for record in [operation] + [self.store.get(part) for part in operation.get("parts", [])]:
                                 record.pop("no_effect", None)
                                 self.store.save(record)
-                        await self.ledger.quarantine(operation, "native reported a patch applied after reporting it failed")
+                        self.ledger.conflicting_evidence(operation, "native reported a patch applied after reporting it failed", item)
                     return
                 # A denied call (refused or withdrawn) that native runs anyway is unmediated.
                 if not operation or not operation.get("hook_valid") or operation["state"] == "denied":
@@ -1589,6 +2188,7 @@ class Daemon:
         return operation
 
     async def maybe_verify(self, operation):
+        operation = self.store.get(operation["id"])
         if operation["state"] not in ("prepared", "allowed", "running"):
             return
         if (operation["kind"] == "patch" and operation.get("completed_item")
@@ -1631,7 +2231,7 @@ class Daemon:
                 for terminal in terminals:
                     if terminal.get("itemId") != intent["native"].get("call") and terminal.get("processId") not in other["terminals"]:
                         continue
-                    root = await asyncio.to_thread(processes.terminal_root, listener, intent, terminal, list(observed.values()))
+                    root = await telemetry.to_thread(processes.terminal_root, listener, intent, terminal, list(observed.values()))
                     if root:
                         observed[(root["pid"], root["birth"])] = root
                 other = self.store.get(other["id"])
@@ -1651,7 +2251,7 @@ class Daemon:
             for other in self.custody.unit_active(actor["unit"]):
                 if other["id"] != reservation["id"] and other.get("group", other["id"]) != reservation.get("group", reservation["id"]) and self.store.get(other["actor"]).get("listener") == listener["id"]:
                     separate += [p for p in other.get("observed_processes", []) if p.get("ownership") != "listener-domain"]
-            found = await asyncio.to_thread(processes.inventory, listener, actor["session"],
+            found = await telemetry.to_thread(processes.inventory, listener, actor["session"],
                                             reservation.get("observed_processes", reservation.get("processes", [])),
                                             operation, separate, reservation.get("ambiguous_processes", []), reservation.get("process_baseline", []))
             reservation = self.store.get(reservation["id"])
@@ -1698,8 +2298,13 @@ class Daemon:
         """Release the custody of each of the actor's commands that has ended. Returns the custody groups still held
         only for native's end of the call: no process or terminal of it remains, and its result, Post hook or
         completed item is still to be read."""
-        async with self.actor_locks.hold("settle:" + actor["id"]):
-            return await self._settle_actor(actor, resolve_quarantine)
+        traces = [trace for trace in self.settlements.values() if trace.actor == actor["id"]]
+        with telemetry.using(traces):
+            began = time.monotonic()
+            async with self.actor_locks.hold("settle:" + actor["id"]):
+                for trace in traces:
+                    trace.add("actor_lock_wait", began, time.monotonic())
+                return await self._settle_actor(actor, resolve_quarantine)
 
     async def settle_before_claim(self, actor, listener, cutoff):
         """Settle the unit's commands before its patch claims paths. A command with no process or terminal left holds
@@ -1727,13 +2332,17 @@ class Daemon:
                     pass
 
     async def _settle_actor(self, actor, resolve_quarantine):
+        self.check_native_stop()
         if not actor.get("listener"):
             return []
         listener = self.store.get(actor["listener"])
         connection = self.connections.get(listener["id"])
+        if connection:
+            connection.check_intake()
         if not connection or connection.closed:
             return []
-        terminals = await connection.call("thread/backgroundTerminals/list", {"threadId": actor["thread"]})
+        with telemetry.span("terminal_inventory"):
+            terminals = await connection.call("thread/backgroundTerminals/list", {"threadId": actor["thread"]})
         if terminals.get("nextCursor"):
             raise CoordinatorError("TERMINAL_PAGINATION", "Native terminal inventory is incomplete")
         settled_groups, awaiting = set(), []
@@ -1746,7 +2355,8 @@ class Daemon:
             settled_groups.add(group)
             reservation = self.store.get(group)
             members = reservation.get("members", [reservation["id"]])
-            await self.observe_processes(actor, reservation, resolve_quarantine=resolve_quarantine, terminals=terminals["data"])
+            with telemetry.span("process_inspection"):
+                await self.observe_processes(actor, reservation, resolve_quarantine=resolve_quarantine, terminals=terminals["data"])
             reservation = self.store.get(reservation["id"])
             operation = self.store.get(reservation.get("operation"), required=False)
             if not operation:
@@ -1777,20 +2387,30 @@ class Daemon:
                 if handler_ended(operation) or not operation.get("result_ready"):
                     awaiting.append(reservation["id"])
                 continue
-            await asyncio.gather(*(self.ledger.reconcile(self.store.get(self.store.get(key)["checkout"]),
-                                                        reason="opaque command effects") for key in members))
-            # One transaction: an operation recorded reconciled apart from its custody's release would leave
-            # that custody held, in every repository it spans, for a command that has ended.
-            async with self.custody.condition:
-                with self.store.transaction():
-                    operation = self.store.get(operation["id"])
-                    operation.update(state="reconciled", attribution="UNKNOWN-context-only")
-                    self.store.save(operation)
-                    for key in members:
+            trace = self.settlements.get(operation["id"])
+            if trace:
+                trace.marks.setdefault("eligible", time.monotonic())
+            def release(operation_id=operation["id"], member_ids=members, trace=trace):
+                # Runs in the observation transaction: bytes, acknowledgements
+                # and custody release cannot be separated by a daemon crash.
+                with telemetry.span("custody_release"):
+                    current = self.store.get(operation_id)
+                    current.update(state="reconciled", attribution="UNKNOWN-context-only")
+                    self.store.save(current)
+                    for key in member_ids:
                         member = self.store.get(key)
                         if member["state"] != "released":
                             self.custody.release_held(member)
+                    if trace:
+                        trace.marks["released"] = time.monotonic()
+            applications = [{"caller": "_settle_actor", "checkout": self.store.get(self.store.get(key)["checkout"]), "paths": None} for key in members]
+            await self.ledger.scans.observe(applications, "opaque command effects",
+                action={"kind": "custody-release", "operation": operation["id"], "members": members}, on_observed=release)
+            async with self.custody.condition:
                 self.custody.condition.notify_all()
+            trace = self.settlements.pop(operation["id"], None)
+            if trace and trace.armed:
+                self.store.event("operation/settlement", operation["id"], trace.result())
         return awaiting
 
     async def lead_edit(self, params, restore=False, mark=None):
@@ -1814,13 +2434,14 @@ class Daemon:
             from .operations import prepare
             operation = await prepare(self.ledger, actor, kind, {"expected": expected}, expected)
         try:
-            await asyncio.gather(*(asyncio.to_thread(self.install_images, self.store.get(key), values) for key, values in expected.items()))
+            await finish_all(*(telemetry.to_thread(self.install_images, self.store.get(key), values) for key, values in expected.items()))
             if operation.get("parts"):
                 from .operations import verify
                 return await verify(self.ledger, operation, expected, "restore" if restore else "exact", {"executor": "coordinator"})
             return await self.ledger.verify(operation, images, "restore" if restore else "exact", {"executor": "coordinator"})
         except BaseException as exc:
-            await self.ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__))
+            from .locks import finish
+            await finish(self.ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__)))
             raise
 
     async def expected_images(self, checkout, changes):
@@ -1833,7 +2454,7 @@ class Daemon:
             if mode not in (None, "100644", "100755"):
                 raise CoordinatorError("FILE_MODE", "Only regular file modes are supported")
             content = base64.b64decode(change["bytes_base64"], validate=True) if mode else None
-            expected[path] = {"blob": await asyncio.to_thread(self.store.blob, content) if content is not None else None, "mode": mode}
+            expected[path] = {"blob": await telemetry.to_thread(self.store.blob, content) if content is not None else None, "mode": mode}
         return expected
 
     def install_images(self, checkout, expected):
@@ -1921,9 +2542,19 @@ class Daemon:
                       if not self.awaiting_outcome(o)]
         lead_operations = [o for o in operations if o["kind"] in ("lead-edit", "restore", "lead-command")]
         methods = [method for task, method in self.inflight.items() if task is not asyncio.current_task()]
+        from .executors import pending as pending_executors
         counts = {
+            # Includes the dequeued item until its finally calls task_done().
+            # Requests leave that queue before their separate handler finishes.
+            "native_applications": sum(queue._unfinished_tasks for queue in self.queues.values()),
+            # Includes a decoded capacity waiter and the staged uncommitted batch.
+            "native_receipts": sum(connection.intake.received - connection.intake.committed
+                                   for connection in self.connections.values() if connection.intake is not None),
+            "native_requests": sum(not task.done() for tasks in self.listener_requests.values() for task in tasks),
             "recovery": int(not self.ready) + len(self.recovering),  # writers, units, checkouts startup recovery is still reconciling
             "history": self.history.active + len(self.history.scheduled),
+            "observations": len(self.ledger.scans.live) + sum(p.task is not None for p in self.ledger.scans.producers.values()),
+            "preimage_readers": sum(len(readers) for readers in getattr(self, "admission_reads", {}).values()),
             # One waiting only for the lead's decision on an unproven input runs nothing (Runs.awaiting_lead).
             "workflows": sum(r["state"] not in TERMINAL | {"idle"} and not self.settling_on_outcomes(r) and not self.runs.awaiting_lead(r)
                              for r in self.store.all("run") if r.get("workflow") or r["state"] == "admitting"),
@@ -1933,6 +2564,7 @@ class Daemon:
             # delivery in flight, and a stop never waits for it.
             "deliveries": sum(self.delivery_owed(m) for m in self.store.all("message")),
             "lead_hooks": len(hooks), "lead_operations": len(lead_operations),
+            "external_editors": len(pending_executors(self.store)),
             "other_operations": len(operations) - len(lead_operations),
             "publication_rpcs": sum(m in ("unit/publish", "unit/recover") for m in methods),
             "mutating_rpcs": sum(m not in READ_RPC and m != "daemon/stop" for m in methods),
@@ -1941,7 +2573,8 @@ class Daemon:
 
     def pending_lead_edits(self):
         from .lead_calls import blockers
-        return blockers(self.store)
+        from .executors import describe
+        return blockers(self.store) + describe(self.store)
 
     async def drain(self, params):
         current = {"pid": os.getpid(), "boot": self.boot, "version": VERSION}
@@ -1953,6 +2586,7 @@ class Daemon:
         if pending:
             raise CoordinatorError("NOT_QUIESCENT", "Settle pending work before stopping",
                                    {"pending": pending, "listener_reconciles": list(self.listener_reconciles.values()),
+                                    "native_applications": dict(self.native_applying),
                                     "lead_edits": self.pending_lead_edits()})
         self.draining = True
         try:
@@ -1979,7 +2613,7 @@ class Daemon:
             # before detaching listeners or releasing leases/closing SQLite.
             self.closing = True
             for listener in list(self.store.all("listener")):
-                if listener["state"] not in ("stopped", "dead"):
+                if listener["state"] not in ("stopped", "dead", "dormant"):
                     await self.stop_listener(listener)
             for checkout in list(self.store.all("checkout")):
                 await self.release_lease(checkout["id"], stopping=True)
@@ -2002,6 +2636,7 @@ class Daemon:
                 self.inflight.pop(task, None)
 
     async def dispatch_admitted(self, method, params):
+        self.check_native_stop()
         if method == "daemon/status":
             return self.status(params.get("checkout"), bool(params.get("brief")))
         if method == "checkout/query":
@@ -2013,6 +2648,11 @@ class Daemon:
             from .lead_batches import submit
             from .locks import finish
             return await finish(submit(self, params.get("calls")))
+        if method == "lead-hook/dispatch":
+            from .intents import FILES
+            if params["payload"].get("tool_name") in FILES:
+                from . import admissions
+                return await admissions.dispatch(self, params["payload"])
         if not self.ready:
             raise CoordinatorError("RECOVERING", "Coordinator is reconciling durable state before admitting work", operational=True)
         if self.recovering:
@@ -2162,24 +2802,45 @@ class Daemon:
             for path, image in entries:
                 routed = routing.route(self.store, actor, path, params.get("cwd"))
                 groups.setdefault(routed["checkout"], {})[routed["path"]] = image
-            expected = {key: await self.expected_images(self.store.get(key), values) for key, values in groups.items()}
-            await self.custody.acquire(actor, [routing.qualified(key, p) for key, values in expected.items() for p in values])
-            if len(expected) == 1:
-                key, images = next(iter(expected.items()))
-                return await self.ledger.prepare(dict(actor, checkout=key), "lead-edit", {"expected": images}, list(images))
-            from .operations import prepare
-            return await prepare(self.ledger, actor, "lead-edit", {"expected": expected}, expected)
+            from . import executors
+            owner = await executors.begin(self, params.get("executor"), actor, {key: list(values) for key, values in groups.items()})
+            try:
+                expected = {key: await self.expected_images(self.store.get(key), values) for key, values in groups.items()}
+                await self.custody.acquire(actor, [routing.qualified(key, p) for key, values in expected.items() for p in values],
+                                           executor=owner["id"])
+                if len(expected) == 1:
+                    key, images = next(iter(expected.items()))
+                    operation = await self.ledger.prepare(dict(actor, checkout=key), "lead-edit", {"expected": images}, list(images),
+                                                          native={"executor": owner["id"]})
+                else:
+                    from .operations import prepare
+                    operation = await prepare(self.ledger, actor, "lead-edit", {"expected": expected}, expected,
+                                              identity={"executor": owner["id"]})
+                executors.bind(self.store, owner, operation)
+                return self.store.get(operation["id"])
+            except BaseException:
+                executors.finish(self, owner, "preparation refused before execution")
+                raise
         if method == "operation/complete":
             operation = self.store.get(params["operation"])
+            if operation.get("executor"):
+                from .executors import complete
+                return await complete(self, operation)
             if operation["kind"] != "lead-edit" or operation["state"] != "prepared":
                 raise CoordinatorError("OPERATION_STATE", "Only a prepared lead edit can complete through RPC")
             try:
                 if operation.get("parts"):
                     from .operations import verify
-                    return await verify(self.ledger, operation, operation["intended"]["expected"], "exact", {"executor": "lead-editor"})
-                return await self.ledger.verify(operation, operation["intended"]["expected"], "exact", {"executor": "lead-editor"})
+                    result = await verify(self.ledger, operation, operation["intended"]["expected"], "exact", {"executor": "lead-editor"})
+                else:
+                    result = await self.ledger.verify(operation, operation["intended"]["expected"], "exact", {"executor": "lead-editor"})
+                if operation.get("executor"):
+                    from . import executors
+                    executors.finish(self, self.store.get(operation["executor"]), "explicit operation/complete")
+                return result
             except BaseException as exc:
-                await self.ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__))
+                from .locks import finish
+                await finish(self.ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__)))
                 raise
         if method == "lead-command":
             from .recovery import lead_command
@@ -2284,13 +2945,24 @@ class Daemon:
         raise CoordinatorError("METHOD", "Unknown unit method")
 
     async def rpc(self, reader, writer):
+        from .admissions import STARTED
+        token = STARTED.set(None)
         task = asyncio.current_task()
         self.rpc_tasks.add(task)
+        self.rpc_writers[task] = writer
         try:
-            await self.rpc_request(reader, writer)
+            # Accept callbacks already queued when the listener closes must not
+            # start work after the irreversible serve fence.
+            if not self.stop.is_set():
+                await self.rpc_request(reader, writer)
         finally:
+            # Cancellation can arrive during framing, dispatch or reply drain.
+            # Never leave a transport waiting for a client to read or send EOF.
+            writer.transport.abort()
             self.inflight.pop(task, None)
+            self.rpc_writers.pop(task, None)
             self.rpc_tasks.discard(task)
+            STARTED.reset(token)
 
     async def rpc_request(self, reader, writer):
         request = {}
@@ -2313,6 +2985,10 @@ class Daemon:
             if set(request) - {"id", "method", "params", "key"}:
                 raise CoordinatorError("RPC_FIELDS", "Unknown RPC envelope field")
             method, params, key = request["method"], request.get("params", {}), request.get("key")
+            payload = params.get("payload", {}) if method == "lead-hook/dispatch" else {}
+            if payload.get("hook_event_name") == "PreToolUse":
+                from .admissions import STARTED, peer_started
+                STARTED.set(peer_started(writer))
             self.admit_rpc(method, params)
             # Includes requests queued on an idempotency lock, before dispatch.
             self.inflight[asyncio.current_task()] = method
@@ -2336,8 +3012,20 @@ class Daemon:
                     except CoordinatorError as exc:
                         answer = {"error": exc.envelope()}
                     if key:
-                        self.store.db.execute("UPDATE idempotency SET state='completed',response=? WHERE key=?", (encoded(answer), key))
+                        if (answer.get("error") or {}).get("code") in ("WRITER_START_FAILED", "WRITER_START_PENDING"):
+                            # No input was submitted by this refusal. Its separate durable
+                            # start operation remains joinable, including with the same key.
+                            self.store.db.execute("DELETE FROM idempotency WHERE key=?", (key,))
+                        else:
+                            self.store.db.execute("UPDATE idempotency SET state='completed',response=? WHERE key=?", (encoded(answer), key))
             response = dict(answer, id=request.get("id"))
+        except native.IntakeStopped as exc:
+            # This is an operational stop, not a completed business outcome.
+            # Leave a keyed request pending: a retry must reconcile its durable
+            # effects, never replay it merely because this envelope was sent.
+            error = CoordinatorError(exc.code, "Native intake stopped locally; retry on the serving daemon and reconcile pending work",
+                                     dict(exc.details, retryable=True), operational=True)
+            response = {"id": request.get("id"), "error": error.envelope()}
         except Exception as exc:
             error = exc if isinstance(exc, CoordinatorError) else CoordinatorError("OPERATIONAL_FAILURE", type(exc).__name__, operational=True)
             response = {"id": request.get("id"), "error": error.envelope()}
@@ -2346,7 +3034,8 @@ class Daemon:
             await writer.drain()
         finally:
             writer.close()
-            await writer.wait_closed()
+            from .locks import wait_closed
+            await wait_closed(writer)
 
     async def compact_history(self):
         """Before 2.4.1 an opaque operation copied every head into its record, and released custody kept the
@@ -2385,98 +3074,123 @@ class Daemon:
             if not self.ready or self.draining:
                 continue
             try:
-                await self.leases.call("ping")
-            except CoordinatorError as exc:
-                self.store.event("lease/redundancy_unavailable", None, exc.envelope())
-                continue
-            # What startup recovery is still reconciling stays its own until it is done (recovery.recover_writers):
-            # its writers' custody and retries, its runs' cancels and inputs, its checkouts' leases.
-            recovering = self.recovering
-            held = list(self.store.held_custody())
-            for actor in list(self.store.all("actor")):
-                if (actor.get("listener") and ("run", actor.get("run")) not in recovering
-                        and any(c["actor"] == actor["id"] for c in held)):
-                    try:
-                        await self.settle_actor(actor)
-                    except (CoordinatorError, OSError):
-                        pass  # custody remains held; no optimistic release
-            from .recovery import settle_lead_command, watch_answers, retry_due, startup_obligation
-            for reservation in held:
-                if (reservation.get("lead_root") and ("checkout", reservation.get("checkout")) not in recovering
-                        and self.store.get(reservation["id"])["state"] != "released"):
-                    await settle_lead_command(self, reservation)
-            watch_answers(self)
-            # A writer whose reconcile failed holds its unit's work until it is reconciled again. Once its retry is
-            # due, it is retried here in either case:
-            # - a startup incident, which stays owed even for a finished run (only a retryable one; one that
-            #   cannot pass stays quarantined for the lead);
-            # - while work is owed to it (writer_owed), or when it was ended stopped or behind a dead connection
-            #   (recovery.end_wedged: its replacement is due now).
-            # Otherwise its next resume reconciles it. Its backoff is no work under way, so it holds no stop; an
-            # attempt it starts enters reconcile_listener's stop fence like any other.
-            for listener in list(self.store.selected("SELECT * FROM records WHERE kind='listener' AND "
-                                                     "json_extract(data,'$.recovery_state')='failed'")):
-                if (retry_due(self, listener)
-                        and ("run", listener["run"]) not in recovering
-                        and self.store.get(listener["actor"]).get("listener") == listener["id"]
-                        and (startup_obligation(self.store, listener["run"]) or listener.get("wedged")
-                             or self.writer_owed(listener["unit"]))):
-                    self.readmit(listener["run"])
-            await self.messages.retry()
-            # Only runs this loop can act on: every finished run is history. A plain run's prepared continuation
-            # (transition_pending) is submitted again too: its writer was being replaced when run/resume prepared it.
-            for run in list(self.store.selected("SELECT * FROM records WHERE kind='run' AND ((json_extract(data,'$.cancel_requested') "
-                    "AND json_extract(data,'$.state')!='cancelled') OR json_extract(data,'$.state')='transition_pending' OR "
-                    "(json_extract(data,'$.workflow') IS NOT NULL AND "
-                    "json_extract(data,'$.state') NOT IN ('completed','failed','interrupted','blocked','refused','cancelled'))) ORDER BY id")):
-                if ("run", run["id"]) in recovering:
+                try:
+                    await self.leases.call("ping")
+                except CoordinatorError as exc:
+                    self.store.event("lease/redundancy_unavailable", None, exc.envelope())
                     continue
-                if run.get("cancel_requested") and run["state"] != "cancelled":
-                    await self.runs.settle_cancel(run["id"])
-                    continue
-                if self.runs.expired(run):
-                    # This list was read before the awaits of the runs ahead of it, and a resume renews a deadline:
-                    # the cancel checks it again on the run as it is when it begins.
-                    self.background(self.runs.cancel(run, expired=True))
-                    continue
-                # A workflow whose turn/start result was lost (submission_uncertain) is advanced too: the advance settles
-                # that input, reading native at most each 2 s (writer.py); one nothing shows waits for the lead's resume.
-                if run.get("workflow") and run["state"] in ("settling", "transition_pending", "submission_uncertain"):
-                    try:
-                        await self.writer.advance(run["id"])
-                    except CoordinatorError as exc:
-                        self.store.event("workflow/advance_refused", run["id"], exc.envelope())
-                elif not run.get("workflow") and run["state"] == "transition_pending":
-                    self.writer.resubmit(run["id"])
-            for checkout in list(self.store.all("checkout")):
-                if ("checkout", checkout["id"]) not in recovering:
-                    await self.release_lease(checkout["id"])
+                # What startup recovery is still reconciling stays its own until it is done (recovery.recover_writers):
+                # its writers' custody and retries, its runs' cancels and inputs, its checkouts' leases.
+                recovering = self.recovering
+                held = list(self.store.held_custody())
+                for actor in list(self.store.all("actor")):
+                    if (actor.get("listener") and ("run", actor.get("run")) not in recovering
+                            and any(c["actor"] == actor["id"] for c in held)):
+                        try:
+                            await self.settle_actor(actor)
+                        except (CoordinatorError, OSError):
+                            pass  # custody remains held; no optimistic release
+                from .recovery import settle_lead_command, watch_answers, retry_due, startup_obligation
+                for reservation in held:
+                    if (reservation.get("lead_root") and ("checkout", reservation.get("checkout")) not in recovering
+                            and self.store.get(reservation["id"])["state"] != "released"):
+                        await settle_lead_command(self, reservation)
+                watch_answers(self)
+                # A writer whose reconcile failed holds its unit's work until it is reconciled again. Once its retry is
+                # due, it is retried here in either case:
+                # - a startup incident, which stays owed even for a finished run (only a retryable one; one that
+                #   cannot pass stays quarantined for the lead);
+                # - while work is owed to it (writer_owed), or when it was ended stopped or behind a dead connection
+                #   (recovery.end_wedged: its replacement is due now).
+                # Otherwise its next resume reconciles it. Its backoff is no work under way, so it holds no stop; an
+                # attempt it starts enters reconcile_listener's stop fence like any other.
+                for listener in list(self.store.selected("SELECT * FROM records WHERE kind='listener' AND "
+                                                         "json_extract(data,'$.recovery_state')='failed'")):
+                    if (retry_due(self, listener)
+                            and ("run", listener["run"]) not in recovering
+                            and self.store.get(listener["actor"]).get("listener") == listener["id"]
+                            and (startup_obligation(self.store, listener["run"]) or listener.get("wedged")
+                                 or self.writer_owed(listener["unit"]))):
+                        self.readmit(listener["run"])
+                await self.messages.retry()
+                await self.ledger.scans.retry()
+                # Only runs this loop can act on: every finished run is history. A plain run's prepared continuation
+                # (transition_pending) is submitted again too: its writer was being replaced when run/resume prepared it.
+                for run in list(self.store.selected("SELECT * FROM records WHERE kind='run' AND ((json_extract(data,'$.cancel_requested') "
+                        "AND json_extract(data,'$.state')!='cancelled') OR json_extract(data,'$.state') IN ('transition_pending','submission_uncertain') OR "
+                        "(json_extract(data,'$.workflow') IS NOT NULL AND "
+                        "json_extract(data,'$.state') NOT IN ('completed','failed','interrupted','blocked','refused','cancelled'))) ORDER BY id")):
+                    if ("run", run["id"]) in recovering:
+                        continue
+                    if run.get("cancel_requested") and run["state"] != "cancelled":
+                        await self.runs.settle_cancel(run["id"])
+                        continue
+                    if self.runs.expired(run):
+                        # This list was read before the awaits of the runs ahead of it, and a resume renews a deadline:
+                        # the cancel checks it again on the run as it is when it begins.
+                        self.background(self.runs.cancel(run, expired=True))
+                        continue
+                    # A workflow whose turn/start result was lost (submission_uncertain) is advanced too: the advance settles
+                    # that input, reading native at most each 2 s (writer.py); one nothing shows waits for the lead's resume.
+                    if run.get("workflow") and run["state"] in ("settling", "transition_pending", "submission_uncertain"):
+                        try:
+                            await self.writer.advance(run["id"])
+                        except CoordinatorError as exc:
+                            self.store.event("workflow/advance_refused", run["id"], exc.envelope())
+                    elif not run.get("workflow") and run["state"] == "transition_pending":
+                        self.writer.resubmit(run["id"])
+                    elif not run.get("workflow") and run["state"] == "submission_uncertain":
+                        try:
+                            await self.writer.settle_uncertain(run["id"])
+                        except CoordinatorError as exc:
+                            self.store.event("run/input_settlement_refused", run["id"], exc.envelope())
+                for checkout in list(self.store.all("checkout")):
+                    if ("checkout", checkout["id"]) not in recovering:
+                        await self.release_lease(checkout["id"])
+            except native.Retired:
+                if self.stop.is_set() or asyncio.current_task().cancelling():
+                    raise
+                self.store.event("maintenance/retry", None, {"reason": "native connection retired"})
 
     async def serve(self):
+        from .locks import finish
         from .recovery import recover, recover_writers
         from . import children
-        # Before any child process: one stopped by a signal must never freeze this loop (children.py). Measured on
-        # this loop as it starts, not assumed of the interpreter, with the probe shown red on the known-bad watcher.
+        allocation = server = None
+        previous_sigint = signal.getsignal(signal.SIGINT)
+        loop = asyncio.get_running_loop()
+        def request_stop():
+            self.stop.set()
+            self.closing = True
+            self.ready = False
+        def interrupt(signum, frame):
+            # Schedule the entire transition and wake the selector. Calling
+            # Event.set in a raw handler can interrupt waiter registration.
+            # Repeated SIGINTs request the same stop, never Runner's abrupt exit.
+            loop.call_soon_threadsafe(request_stop)
+        signal.signal(signal.SIGINT, interrupt)
         try:
-            self.child_watcher = await children.start(asyncio.get_running_loop())
-        except Exception as exc:
-            self.child_watcher = {"ok": False, "code": getattr(exc, "code", type(exc).__name__)}
-        self.store.event("daemon/child_watcher", None, self.child_watcher)
-        if self.upgrade_fd is not None:
-            asyncio.get_running_loop().call_later(UPGRADE_HOLD_S, self.release_upgrade)
-        allocation = runtime.allocate("rpc")
-        socket = Path(allocation["path"])
-        try:
-            server = await asyncio.start_unix_server(self.rpc, path=socket)
-        except OSError as exc:
-            raise CoordinatorError("SOCKET_BIND", "Coordinator RPC socket failed to bind",
-                                   {"path": str(socket), "bytes": len(os.fsencode(socket)),
-                                    "measured_limit": runtime.capacity(), "errno": exc.errno}, True) from exc
-        os.chmod(socket, 0o600)
-        self.endpoint = runtime.endpoint_info(socket)
-        runtime.atomic_json(self.store.root / "endpoint.json", {"state": str(self.store.root),
-                            "generation": self.store.generation, "allocation": allocation})
-        async with server:
+            # Before any child process: one stopped by a signal must never freeze this loop (children.py). Measured on
+            # this loop as it starts, not assumed of the interpreter, with the probe shown red on the known-bad watcher.
+            try:
+                self.child_watcher = await children.start(asyncio.get_running_loop())
+            except Exception as exc:
+                self.child_watcher = {"ok": False, "code": getattr(exc, "code", type(exc).__name__)}
+            self.store.event("daemon/child_watcher", None, self.child_watcher)
+            if self.upgrade_fd is not None:
+                asyncio.get_running_loop().call_later(UPGRADE_HOLD_S, self.release_upgrade)
+            allocation = runtime.allocate("rpc")
+            socket = Path(allocation["path"])
+            try:
+                server = await asyncio.start_unix_server(self.rpc, path=socket)
+            except OSError as exc:
+                raise CoordinatorError("SOCKET_BIND", "Coordinator RPC socket failed to bind",
+                                       {"path": str(socket), "bytes": len(os.fsencode(socket)),
+                                        "measured_limit": runtime.capacity(), "errno": exc.errno}, True) from exc
+            os.chmod(socket, 0o600)
+            self.endpoint = runtime.endpoint_info(socket)
+            runtime.atomic_json(self.store.root / "endpoint.json", {"state": str(self.store.root),
+                                "generation": self.store.generation, "allocation": allocation})
             # Calls are admitted once the ledger is consistent (recover); each writer's own reconcile then runs in the
             # background, and a call for one still reconciling waits for it (recovery.recovered, writer_ready).
             plan = await recover(self)
@@ -2487,17 +3201,102 @@ class Daemon:
             self.ready = True
             self.release_upgrade()
             self.background(recover_writers(self, plan))
-            self.background(self.maintenance())
+            self.start_loop_supervisor()
+            self.start_service("maintenance", self.maintenance)
+            from .executors import observe as observe_executors
+            self.start_service("executors", lambda: observe_executors(self))
             from .lead_calls import observe
-            self.background(observe(self))
+            self.start_service("lead_calls", lambda: observe(self))
             self.background(self.compact_history())
             await self.stop.wait()
-        for task in list(self.tasks):
+        finally:
+            # Unlike a tentative drain, leaving serve is irreversible. Fence
+            # supervisor callbacks before cancelling any background work, also
+            # when asyncio.run cancels us for SIGINT or startup raises.
+            self.stop.set()
+            self.closing = True
+            self.ready = False
+            try:
+                await finish(self.close_serving(allocation, server))
+            finally:
+                signal.signal(signal.SIGINT, previous_sigint)
+
+    async def close_serving(self, allocation, server):
+        """Join resource users before releasing anything, despite cancellation."""
+        from .locks import cancel_and_join, joined
+        if server is not None:
+            # Python 3.12+ wait_closed also waits for idle connections.
+            server.close()
+        started = time.monotonic()
+        handlers = set(self.rpc_tasks)
+        methods = [self.inflight[task] for task in handlers if task in self.inflight]
+        for task in handlers - self.inflight.keys():
+            self.rpc_writers[task].transport.abort()
             task.cancel()
-        await asyncio.gather(*list(self.tasks), return_exceptions=True)
-        runtime.cleanup(allocation)
+        pending = set()
+        if handlers:
+            # The one-second grace bounds clients, not running filesystem IO.
+            # Cancellation may shorten the grace but cannot skip the joins.
+            try:
+                _, pending = await asyncio.wait(handlers, timeout=STOP_DRAIN_S)
+            except asyncio.CancelledError:
+                pending = {task for task in handlers if not task.done()}
+        # Stream transports support abort on every accepted Python (3.11+).
+        # Server.abort_clients/close_clients were only added in Python 3.13.
+        for writer in list(self.rpc_writers.values()):
+            writer.transport.abort()
+        await cancel_and_join(handlers, interval=STOP_DRAIN_S)
+        if server is not None:
+            while True:
+                try:
+                    await server.wait_closed()
+                    break
+                except asyncio.CancelledError:
+                    continue
+        self.store.event("daemon/rpc_shutdown", None, {
+            "handlers": len(handlers), "cancelled": len(pending),
+            "methods": methods, "grace_seconds": STOP_DRAIN_S,
+            "seconds": time.monotonic() - started})
+        # Fence new evidence, but keep connections open while their consumers
+        # finish cancellation and compensation. Aborting them first turns an
+        # intentional stop into NATIVE_DISCONNECTED evidence failures.
+        self.native_intake_closed = True
+        # Cancellation cleanup can hand work to another tracked owner. Drain
+        # each resulting generation before closing its shared resources too.
+        while self.tasks:
+            tasks = list(self.tasks)
+            await cancel_and_join(tasks, interval=STOP_DRAIN_S)
+        while True:
+            try:
+                await self.ledger.scans.close()
+                break
+            except asyncio.CancelledError:
+                continue
+        # Consumers can no longer call or journal. Retire and join the
+        # untracked receivers before SQLite; native app-server processes stay.
+        connections = list(self.connections.values())
+        await joined(asyncio.gather(*(connection.close(abort=True) for connection in connections),
+                                    return_exceptions=True), propagate_cancel=False)
+        self.connections.clear()
+        if self.native_service is not None:
+            self.native_service.cancel()
+            self.native_service = None
+        for _, future in self.native_tickets:
+            future.cancel()
+        self.native_tickets.clear()
+        self.native_waiters.clear()
+        self.native_granted.clear()
+        self.store.event("daemon/native_intake_closed", None, {"receivers": len(connections)})
+        if hasattr(self, "admission_executor"):
+            self.admission_executor.shutdown(wait=True, cancel_futures=True)
+        # No unconditional finally: an unsuccessful join must never release the
+        # database or descriptors still owned by its unfinished users.
+        if allocation is not None:
+            runtime.cleanup(allocation)
+        self.release_upgrade()
         for descriptor in self.ledger.ownership.values():
             os.close(descriptor)
+        self.ledger.ownership.clear()
         self.store.db.close()
 
     def release_upgrade(self):
@@ -2553,7 +3352,8 @@ def worker(root):
                 os.set_inheritable(daemon.upgrade_fd, False)  # never into an app-server or a command
             asyncio.run(daemon.serve())
         except Exception as exc:
-            error = exc if isinstance(exc, CoordinatorError) else CoordinatorError("DAEMON_STARTUP", type(exc).__name__, operational=True)
+            error = exc if isinstance(exc, CoordinatorError) else CoordinatorError(
+                "DAEMON_STARTUP", type(exc).__name__ + ": " + str(exc)[:1024], operational=True)
             runtime.atomic_json(root / "startup-error.json", {"time": time.time(), "error": error.envelope()})
             return 3
     return 0

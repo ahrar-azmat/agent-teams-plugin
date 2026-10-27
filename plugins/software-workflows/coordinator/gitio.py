@@ -13,8 +13,10 @@ import time
 
 from treedigest import git_argv, git_env, GIT_SAFE_CONFIG, routing_env_names
 from .client import CoordinatorError
+from . import telemetry
 
 
+@telemetry.measured("git")
 def git(root, args, data=None, index=None, normal_config=False, extra_env=None, check=True):
     env = git_env()
     if index:

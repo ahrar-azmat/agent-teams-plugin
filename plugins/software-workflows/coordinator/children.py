@@ -14,6 +14,7 @@ import select
 import signal
 import threading
 import time
+from .locks import finish_thread, retire
 
 EXITED = tuple(getattr(os, name) for name in ("CLD_EXITED", "CLD_KILLED", "CLD_DUMPED") if hasattr(os, name))
 
@@ -123,11 +124,42 @@ async def start(loop):
     the interpreter's watcher is kept, since it is correct here. Elsewhere (a pidfd) the interpreter's watcher is
     kept and probed. `ok` is the probe on this loop's watcher; `trusted`, whether that probe has shown a red."""
     default = type(getattr(loop, "_watcher", None)).__name__
-    calibration = await asyncio.to_thread(calibrate) if installable(loop) else None
+    calibration = await finish_thread(calibrate) if installable(loop) else None
     watcher = install(loop) if calibration and not calibration["ok"] else None
     result = await verify(watcher)
     return dict(result, default=default, installed=watcher is not None, calibration=calibration,
                 trusted=bool(calibration and not calibration["ok"]))
+
+
+async def terminate(process, timeout=5, *, group=False):
+    """Retire an unreaped direct child, including escalation and the final reap.
+
+    returncode=None retains direct-child ownership, so its PID cannot be reused.
+    The timeout bounds graceful exit, not a kernel that cannot reap SIGKILL.
+    """
+    async def close():
+        if process.returncode is None:
+            try:
+                if group:
+                    os.killpg(process.pid, signal.SIGTERM)
+                else:
+                    process.terminate()
+            except ProcessLookupError:
+                pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout)
+        except asyncio.TimeoutError:
+            if process.returncode is None:
+                try:
+                    if group:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                except ProcessLookupError:
+                    pass
+            await process.wait()
+
+    await retire(close)
 
 
 async def verify(watcher, probe_s=0.05, rescue_s=2.0):
@@ -163,6 +195,7 @@ async def verify(watcher, probe_s=0.05, rescue_s=2.0):
     finally:
         rescue.cancel()
         kill()
+        await retire(process.wait)
     seen = watcher is None or watcher.reported > reported
     return {"watcher": type(asyncio.get_running_loop()._watcher).__name__, "stopped_gap_s": round(gap, 3),
             "exit_code": code, "exit_reported": seen, "ok": gap < probe_s + STALL_S and code == -signal.SIGKILL and seen}

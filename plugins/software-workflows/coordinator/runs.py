@@ -6,11 +6,11 @@ import os
 import time
 from pathlib import Path
 
+from .locks import KeyedLocks, finish_thread
 from .client import CoordinatorError
 from .store import uid, digest
 from .writer import TERMINAL
 from . import processes, participants, rollout
-from .locks import KeyedLocks
 
 
 class Runs:
@@ -70,8 +70,10 @@ class Runs:
         unit = self.store.get(run["unit"])
         surface = participants.surface(self.daemon, unit)
         state, turns = self.reported(run)
+        listener = self.store.get((self.store.get(run.get("root_actor") or "", required=False) or {}).get("listener") or "", required=False) or {}
+        from .dormancy import view
         return {"run": run["id"], "revision": run.get("_revision", 0) + surface["participant_revision"], "backend": "native", "unit": unit["id"], "unit_state": unit["state"],
-                "phase": run.get("phase"), "state": state, "turns": turns, "created": run.get("created", 0),
+                "phase": run.get("phase"), "state": state, "listener": view(listener), "turns": turns, "created": run.get("created", 0),
                 "dispatch_cwd": run.get("dispatch_cwd"), "target_cwd": run.get("target_cwd"),
                 "claims": [c for p in surface["participants"] if p["checkout"] == run["checkout"] for c in p["claims"]],
                 "custody": [{k: v for k, v in c.items() if k != "process_baseline"}
@@ -114,7 +116,9 @@ class Runs:
         rows = list(self.store.db.execute("SELECT * FROM events WHERE seq>? AND subject IN (" + placeholders + ") ORDER BY seq LIMIT ?",
                                          [cursor, *sorted(subjects), limit + 1]))
         data = [dict(row, data=json.loads(row["data"])) for row in rows[:limit]]
-        return {"run": run["id"], "data": data, "cursor": data[-1]["seq"] if data else cursor,
+        listener = self.store.get((self.store.get(run.get("root_actor") or "", required=False) or {}).get("listener") or "", required=False) or {}
+        from .dormancy import view
+        return {"run": run["id"], "listener": view(listener), "data": data, "cursor": data[-1]["seq"] if data else cursor,
                 "more": len(rows) > limit, "state": self.reported(self.store.get(run["id"]))[0]}
 
     def cancel_current(self, runid, generation):
@@ -190,7 +194,7 @@ class Runs:
             if not actor.get("listener"):
                 continue
             connection = self.daemon.connections.get(actor["listener"])
-            if not connection and self.store.get(actor["listener"]).get("recovery_error") == "ENDED":
+            if not connection and (self.store.get(actor["listener"]).get("recovery_error") == "ENDED" or self.store.get(actor["listener"])["state"] == "dormant"):
                 continue  # ended to settle an input (end_writer): nothing runs there; its queue is read on its replacement
             try:
                 from .native import page
@@ -228,7 +232,7 @@ class Runs:
                         for process in reservation.get("processes", []):
                             if not self.cancel_current(runid, generation):
                                 return self.superseded(runid, generation)
-                            await asyncio.to_thread(processes.terminate, process, actor["session"])
+                            await finish_thread(processes.terminate, process, actor["session"])
             except (CoordinatorError, OSError, AttributeError) as exc:
                 failures.append({"actor": actor["id"], "code": getattr(exc, "code", type(exc).__name__)})
         return self.cancel_current(runid, generation) or self.superseded(runid, generation)
@@ -287,7 +291,7 @@ class Runs:
             from .recovery import reconcile_listener
             for ident in {a["listener"] for a in self.store.all("actor", run["unit"]) if a.get("listener")}:
                 listener = self.store.get(ident)
-                if listener.get("recovery_error") == "ENDED":
+                if listener.get("recovery_error") == "ENDED" or listener["state"] == "dormant":
                     continue  # ended to settle an input (end_writer): nothing runs there, and a cancel needs no replacement
                 if listener.get("recovery_state") == "failed" and listener.get("retry_at", 0) > time.time():
                     continue  # its retry is not due yet: a start that keeps failing is not tried every 2 s
@@ -835,7 +839,7 @@ class Runs:
         if not listener.get("pid"):
             return False
         try:
-            current = await asyncio.to_thread(processes.identity, listener["pid"])
+            current = await finish_thread(processes.identity, listener["pid"])
         except CoordinatorError:
             return True  # its process cannot be read
         return bool(current and current["birth"] == listener.get("birth") and not current.get("zombie"))
@@ -878,6 +882,9 @@ class Runs:
         generation = self.store.get(run["id"]).get("cancel_generation", 0)
         async with self.daemon.writer.locks.hold(run["id"]):
             from .recovery import reconcile_listener
+            if self.store.get(run["unit"])["state"] != "open":
+                raise CoordinatorError("UNIT_FROZEN", "Reopen a sealed unit before resuming; published units cannot resume")
+            await self.daemon.dormancy.start(run["id"], "resume")
             # A prior input whose native outcome is not known is settled first: by reads, or by ending the app-server
             # it went to and reading what that saved (settle_inputs). Never resumed beside it, nor left unresumable.
             # A replacement reads what a rollout could not tell.

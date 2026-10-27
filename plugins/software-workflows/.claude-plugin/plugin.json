@@ -1,7 +1,7 @@
 {
   "name": "software-workflows",
   "description": "Agent-teams orchestration with Codex as the cross-model advisor and writer: the Codex Oracle MCP server (architect_review, code_review, research, codex_query, abraham and its run tools) and the hooks that gate plan mode and git push on a Codex review.",
-  "version": "2.4.6",
+  "version": "2.4.7",
   "author": {
     "name": "Ahrar Ahmad"
   },
@@ -15,6 +15,12 @@
       "description": "The Codex Office is the live pixel view of your Codex runs, in your browser at http://127.0.0.1:8765/; watching it costs no tokens. open (default): start it the first time a session uses a Codex tool, and open it in your browser once per session. background: start it the same way, but never open the browser. off: never start it automatically; /software-workflows:office still starts it. The SOFTWARE_WORKFLOWS_OFFICE environment variable, when set, overrides this for the sessions that have it.",
       "default": "open",
       "options": ["open", "background", "off"]
+    },
+    "writer_mcp_servers": {
+      "type": "string",
+      "title": "Writer MCP servers",
+      "description": "Writer MCP servers: all (default), or a JSON list of exact server names. Changes apply at the next coordinator start.",
+      "default": "all"
     }
   },
   "keywords": [

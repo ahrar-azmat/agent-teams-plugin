@@ -12765,3 +12765,853 @@ Not measured:
 - a day-long soak;
 - a cold supervisor and admission launch (the fixtures pre-admit writers and scope the filesystem scan);
 - arbitrary single-item sizes.
+
+### The live switch, 2.4.5 to 2.4.6 (10-23 to 10-24)
+The user's coordinator, read from its ledger (read-only) and `daemon/status`: a 6.46 GB ledger and 29 connected
+writers, across Sales_Profiler and three SmartPay checkouts.
+- `projects/switch246.py` asked 2.4.5 for its draining stop through the 2.4.6 client's own `ensure()`, every 8 s.
+  2.4.5 refused 809 times in 1 h 59 min (`NOT_QUIESCENT`: writer turns, a workflow, deliveries, custody, lead hooks,
+  mutating RPCs; the user's writers worked throughout). It accepted the 810th, at about 00:44 IST on 10-24.
+  2.4.6 served at once (`recovery/serving` after 12.58 s).
+- Native capability admission calibrated again for 2.4.6 (44 probes, 00:45:56 to 00:47:28), so the first writer
+  reconciled after 118 s.
+- The first 2.4.6 recovery reconciled 30 writers, 30 units and 4 checkouts in 848 s (14 min 8 s). Every writer
+  read its whole history once, four at a time, to build its checkpoint (`history/fallback` "missing"). Large real
+  histories read slowly: 4,022 items in 104.7 s, 6,232 in 89.0 s, 4,414 in 114.7 s, about 0.5 s a 25-item page,
+  where the synthetic 251 MB history read at 2 ms a page. Later reads are incremental.
+- The writer of run a5fc2475, quarantined since 10-23 07:55 and retried every 5 minutes (2.4.5's known limit),
+  healed at 00:59:41. Its `*` UNKNOWN was resolved (`unknown/recovery_resolved`).
+- At the end, no startup quarantine was pending. During the recovery no lead admission failed and no lead call
+  ran unadmitted. The unresolved UNKNOWNs were the same before and after: 3 on Smartpay_Backend, 72 on
+  Sales_Profiler.
+- No 2.4.5 app-server was left. The script reported one pre-stop pid (35824) alive; that was PID reuse (a
+  playwright-mcp node process started 13 minutes earlier), and its listener is recorded dead and replaced.
+  Neither the daemon nor the app-servers carry session or gate variables or shims.
+- After the switch: brief `daemon/status` in 7.4 ms; the worker at 30 % CPU, where 2.4.5's ran at 42 to 85 %. The
+  old writer's app-server, at about 90 % CPU on its full history read all evening, is gone.
+
+## 2.4.7
+
+Every change below was run for real on the checkout: one codebase, no copies, disposable state for every daemon,
+native writers on the installed Codex 0.163.0 app-server with the fixture model, and lead hooks run by the system
+Python 3.9 (`/usr/bin/python3`).
+- Baselines are 2.4.6's installed copy. Each round's reds are the tree before that round's fix, as the writer measured
+  them.
+- The writer's commands are the `COMMAND_JSON` records in `r247-w/acceptance-report.log` (round 1) and
+  `r247-w/round2/` to `round17/acceptance-report.log`. Its reports are `implementation-report.md` beside each, and
+  rounds 15 to 17 list their selected commands in `selected-index.json`.
+- The lead re-ran the writer's decisive commands from those records, changing only case names and runtime
+  directories, each batch's summary beside its logs (all under the lead's scratchpad):
+  - `r247-lead/logs9` and `logs10`: the round-1 tree;
+  - `r247-lead/logs12`: the round-2 tree;
+  - `r247-lead/logs13`: the round-3 tree;
+  - `r247-lead/logs14`: the round-4 tree, every decisive case of rounds 1 to 4 (stopped for round 5 after the
+    first recovery pair's baseline);
+  - `r247-lead/logs15`: the round-5 tree, every decisive case of rounds 1 to 5 (stopped for round 6 after the
+    first recovery pair's baseline; one small recipe failed its own assertion, below);
+  - `r247-lead/logs16`: the round-6 tree, every decisive case of rounds 1 to 6 through the 27-writer matrix
+    (stopped for round 7 during the 30-writer matrix);
+  - `r247-lead/logs17`: the round-7 tree, every decisive case of rounds 1 to 7 through the small suite (stopped
+    for round 8 in its 16th recipe);
+  - `r247-lead/logs18`: the round-8 tree, every decisive case of rounds 1 to 8 through the SIGKILL boundaries and
+    the four-settlement cohort (stopped for round 9 at the small suite);
+  - `r247-lead/logs19`: the round-9 tree, every decisive case of rounds 1 to 9 through the small suite's first 22
+    recipes (stopped for round 10);
+  - `r247-lead/logs20`: the round-10 tree, every decisive case of rounds 1 to 10 through the 27-writer matrix with
+    the 2.4.7 hook (stopped for round 11);
+  - `r247-lead/logs21`: the round-11 tree, every decisive case of rounds 1 to 11 through the small suite's first 13
+    recipes (stopped for round 12);
+  - `r247-lead/logs22`: the round-12 tree, every decisive case of rounds 1 to 12 through the small suite (stopped
+    for round 13 at the matrix);
+  - `r247-lead/logs23`: the round-13 tree, every decisive case of rounds 1 to 13 through the small suite (stopped
+    for round 14; its U1 run found B1);
+  - `r247-lead/logs24`: the round-14 tree, every decisive case of rounds 1 to 14;
+  - `r247-lead/logs25`: the round-15 tree, 102 cases through the small suite's 28th recipe (stopped when the batch
+    filled the disk: it kept about 200 MB of each case; the lead's later batches remove every case whole and keep
+    15 GiB free);
+  - `r247-lead/logs26`: the round-16 tree, 41 cases (stopped for round 17);
+  - `r247-lead/logs27`: the release tree, every decisive case of rounds 1 to 17.
+- The runs shared the host with the user's live 2.4.6 coordinator and its writers: load average 4.7 to 7 in rounds
+  1 to 14, 5.9 to 17.2 in rounds 15 to 17, and in the lead's `logs27` 15.3 to 22.4 (median 17.5) at the start of
+  batch 27's cases and 21.3 to 46.6 at the start of batch 27b's, up to 62.2 during its bursts (a TypeScript
+  compile, a jest worker, two editor renderers and a browser near 100 % CPU each, `fseventsd`, a virtual machine).
+  Each run's values are in the tables. Homebrew replaced Python 3.15.0 with 3.15.1 at 12:48 during batch 27b; its
+  four burst runs ran on 3.15.1.
+- The incident replica is the live checkout's shape only (file sizes, a stat-only inventory, seed 7): 3,284 files
+  (90,460,253 bytes), 4,733 ledger heads, 701,847 retained native rows (2.66 GB of JSON, a 2.914 GB SQLite ledger).
+  Four real native commands complete while four lead Writes run through a real hook, beside 23 or 26 more writers.
+  No client file, name, content or native history was read.
+
+No test files were added.
+
+### Lead file admission (units U3 and U4, round 1; P2, round 2; F, round 16; H, round 17)
+The incident replica, the four lead Writes arriving 0.7 s after the first command's completion. On the release tree
+the hooks run as `hooks.json` starts them, the interpreter and the hook's path (the measurement module loads through
+`PYTHONPATH`), with the host at load average 10.8 to 14.4:
+
+| Case | 2.4.6 | 2.4.7, the writer | 2.4.7, the lead |
+|---|---|---|---|
+| 27 writers, installed 2.4.6 hook | Pre 3.11 to 3.12 s; all 4 Writes ran unadmitted; 1 UNKNOWN per path ("stale pre-image at operation admission"); the lead's re-run: 3.12 to 3.14 s, 4 UNKNOWNs (`logs9`) | five runs, each beside an idle-selector probe: all 20 Writes admitted at once and verified; Pre at most 0.758 to 1.563 s a run (p50 0.579 to 1.516 s) | six runs at load 17.0 to 22.4, each beside an idle-selector probe: 18 of 24 first Writes admitted at once (at most 1.170 to 2.072 s a run); 6 denied `LEAD_ADMISSION_BUSY` at 2.135 to 3.038 s, 2 in one run and all 4 in its repeat (which fails the recipe's 2.5 s bound), each retried and admitted in 0.280 to 1.255 s; none ran unadmitted, 0 UNKNOWNs |
+| 27 writers, 2.4.7 hook | — | three runs: all 12 admitted; at most 1.092 to 1.196 s a run | three runs at load 16.5 to 21.7: all 12 admitted; at most 1.125 to 1.891 s a run |
+| 30 writers, installed hook | — | three runs: all 12 admitted; at most 0.816 to 1.307 s a run | six runs: at load 16.3 to 17.2 all 12 admitted, at most 1.790 to 2.051 s a run, each run then stopped by the fixture's 60 s window for the draining stop; with a 180 s window, at load 22.9 to 28.6, 4 of 12 admitted at once (at most 1.802 to 2.629 s), 8 denied busy at 2.200 to 2.955 s, each retried and admitted in 0.562 to 1.202 s (two of these three runs fail the 2.5 s bound) |
+| 30 writers, 2.4.7 hook | — | three runs: all 12 admitted; at most 0.960 to 1.119 s a run | four runs at load 16.2 to 35.8: 13 of 16 admitted at once (at most 1.634 to 2.400 s a run); 3 denied busy at 2.623 to 2.630 s, each retried and admitted in 0.204 to 0.620 s (the two runs with denials fail the 2.5 s bound) |
+| every case | | 0 fail-open edits, 0 lead-path UNKNOWNs; every deadline from the hook's kernel birth (`deadline_source` "peer birth"); every call closed, its claims released, a draining stop accepted | 0 fail-open edits (all 169 hook answers were decisions); 0 lead-path UNKNOWNs in the 16 runs that recorded them; `peer birth` in the 11 runs that reached the source check; every call closed, a draining stop accepted |
+
+Where a first Pre's time went, from the hook's spawn to its exit (the release tree's 56 first calls; each row's
+maximum can belong to a different call):
+
+| | the writer | the lead |
+|---|---|---|
+| hook start to daemon receipt (Python 3.9 start, imports, connect, accept, read) | at most 0.239 to 0.765 s a run | at most 0.409 to 1.987 s a run (76 first calls, 19 runs) |
+| receipt to decision | at most 0.447 to 1.062 s a run | at most 0.669 to 2.075 s a run |
+| reply to hook exit | at most 0.015 to 0.093 s a run | at most 0.021 to 0.195 s a run |
+
+The budget is 2.0 s from the hook process's start, so the hook's own start and every wait before the daemon reads its
+request count. Rounds 1 to 15 counted 1.0 s from the daemon's receipt, and under the host's load the receipt itself
+came 0.5 to 1.4 s after the hooks started: round 15's 27-writer sample answered in 2.69 to 2.80 s (all four denied,
+none run unadmitted), and the lead's re-run of a lone edit with no writers (small recipe 14, `logs25`) was denied at
+load 12.3. Round 16 counted the budget from the hook's start and has the daemon take native steps one at a time. Its
+strict red is a lone edit whose first pre-image read is held 1.15 s at import: denied at 1.079 s on the round-15
+tree, admitted at 1.497 s after (1.532 s on the release tree, its deadline from peer birth; the lead's re-run
+1.271 s, also from peer birth). The 2.5 s target is the installed hook's 3 s client timeout less 0.5 s. The writer's
+measured maxima are below it. The lead's re-runs, at load 16.2 to 35.8, are not: 17 of 76 first edits were denied
+busy at 2.135 to 3.038 s and some were admitted at up to 2.629 s, the daemon deciding up to 0.97 s past its deadline
+when its event loop was not free (Known limits). Each hook still had its answer within its own socket wait (all 169
+answers were decisions), and no edit ran unadmitted.
+
+Lone lead edits (small recipe 14) on the release tree, ten runs at load 14.1 to 17.2: all admitted and verified, Pre
+0.099 to 0.465 s, Post 0.067 to 0.085 s; the lead's re-runs: ten at load 17.0 to 18.6, all admitted and verified, Pre
+0.100 to 0.412 s, Post 0.069 to 0.145 s.
+
+Which process is a hook (H, round 17): the kernel start is used only for a Python interpreter whose one script
+argument is a software-workflows `hooks/coordinator_lead.py` that its plugin's `hooks.json` declares. Two clients
+older than 2 s with the hook's file name only as data (a `-c` program naming it in a comment; a script given the
+hook's path as an argument) were denied `LEAD_ADMISSION_BUSY` on the round-16 tree, which matched the name anywhere
+in the command line; on the release tree each gets a budget from its own request and is admitted and verified
+(`deadline_source` "receipt" and "supplied"). The real 2.4.4, 2.4.5 and 2.4.6 hooks and the 2.4.7 hook kept the
+peer-birth deadline, 1.90 to 1.93 s of it left at receipt. The lead's re-runs: the same, both runs (`receipt` and
+`supplied`, each edit verified with one exact receipt and no UNKNOWN; the four real hooks `peer birth`, 1.656 to
+1.932 s left at receipt).
+
+Other admission cases, on the release tree (the writer's final small suite, re-run whole by the lead):
+- Write, Edit, MultiEdit and NotebookEdit with preparation blocked: each denied in 1.354 to 1.356 s (round 1), and
+  in 1.995 to 2.004 s from the hook's spawn on the release tree, at its 2.0 s budget (small recipe 21; the lead's
+  re-run: 1.998 to 2.007 s, no UNKNOWN). The
+  Post, PostToolUseFailure and batch evidence was durable within 0.9 to 2.8 ms, before the blocked reads finished;
+  three unrelated claims kept; a grant whose reply was lost kept its paths until its verified Post.
+- The real 2.4.4 hook: denied; its PostToolBatch omits the call; the claim is released by the 120 s legacy expiry
+  and a draining stop is then accepted (the lead's re-run: the claim released 120.09 s after the call began, then
+  the stop accepted). Round 2 fixed the round-1 tree, where that call held
+  its paths for good (turn 64).
+- Startup: a lead Write before the daemon serves is denied naming "coordinator startup recovery", its generation
+  and what it is still recovering, retry estimate 1 s (round 3, Q8). The round-2 tree named the call's own
+  admission id, with a 0.05 s estimate from the scan producer.
+
+### Settlement scans (P1, round 2)
+| Case | Before the fix | 2.4.7, the writer | The lead's re-runs |
+|---|---|---|---|
+| a settlement, receipt to custody release, 27 / 30 writers | 16.28 to 18.30 s, 13.15 to 15.00 s of it waiting for the checkout lock (round-1 tree, 2.4.6's settlement) | 3.43 to 3.60 s / 3.39 to 3.80 s; eligible to release 1.23 to 2.17 s | round-2 tree (`logs12`): 3.15 to 4.17 s / 3.63 to 3.93 s, eligible to release 1.18 to 2.72 s; release tree (`logs27`, load 16.2 to 28.6): 3.24 to 10.95 s / 2.83 to 11.64 s, eligible to release 1.50 to 9.50 s (the writer's release-tree runs: 2.35 to 6.55 s) |
+| scans and bytes read, 27 / 30 writers (round 2) | — | 23 scans, 2,080.6 MB / 25, 2,261.5 MB | 23 scans, 2,080.6 MB / 25, 2,261.5 MB |
+| a lead call still open while a scan applies | — | one exact lead receipt after its Post; only its path read again; an unrelated change's UNKNOWN names its custody and observation | the same |
+| the lead's call settled before the scan applies | — | the same receipt; the exclusion version forces only that path's re-read | the same |
+| daemon SIGKILLed during the scan | — | pending observation and custody survive; the restart observes once; 1 UNKNOWN | the same |
+| SIGKILLed inside the commit, before COMMIT | — | no partial acknowledgement or release; the restart observes once; 1 UNKNOWN | the same |
+| SIGKILLed after COMMIT | — | the original acknowledgement, release and UNKNOWN kept; no duplicate | the same |
+| four settlements of one change | four transitions | one UNKNOWN naming all four custodies and observations; one commit | the same |
+
+### Scope, exclusion and shared work (review turn 66, round 3)
+Reds are the round-2 tree. Each interleaving was forced at import in a disposable daemon; the daemon, ledger, scan
+producer, executor and native connections were real.
+
+| Case | Round-2 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| Q1: a narrow completion sharing a whole-checkout scan while an unrelated held lead path is unreadable | the held path got an unreadable UNKNOWN from the narrow completion | no UNKNOWN or release on it; the whole-checkout observation's own result unchanged | the same |
+| Q2: `Foo` and `foo` prepared at once on a case-insensitive checkout, between the two locked phases | both prepared | one prepared, the other `OPERATION_BUSY` | the same |
+| Q3: an admission's quarantine creates the scan producer, an ordinary settlement queued, the admission expires | the settlement's observation failed `CLAIM_CONFLICT`; custody held; checkout "filesystem reconciliation incomplete" | the admission denied; the settlement committed and released its custody; no checkout quarantine | the same |
+| Q4: prepare, daemon SIGKILL, restart, the editor writes, explicit `operation/complete` | owner retired; head kept the old blob | the final bytes observed as the UNKNOWN head; the crash-gap UNKNOWN kept; owner settled; stop accepted | the same |
+| Q5: an idle daemon for 605 s | 541,356 bytes written and 5,955 faulthandler re-arms | 0 bytes, 0 re-arms, no new thread; a 1.2 s GIL-held stall dumped with its UTC start; two 17 MiB inherited segments trimmed to 16 MiB | the same: 605.0 s idle, 0 bytes, 0 re-arms, no new thread; the 1.19 s stall dumped once; the inherited segments trimmed to 16 MiB |
+| Q6: 1,000 committed observations and 300 guard failures, then a restart | 120 commits and 80 failures added 200 rows | 1 pending row; the restart finds it through `observation_pending` and replays it once, then none | the same |
+| Q7: an exception in the scan producer's setup | two observers still waiting after 1.017 s | both get the error in 0.013 s; the next observation succeeds | the same |
+
+### Observation identity and diagnostics (review turn 67, round 4)
+Reds are the round-3 tree, forced the same way.
+
+| Case | Round-3 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| R1: a narrow observation of an absent path `x` (through `checkout/reconcile(paths=…)` and through an unadmitted call's completion) shares a whole-checkout scan; a lead creates `x` and its Write verifies before the narrow application | the verified head overwritten by absence; a deletion UNKNOWN on `x` | the verified revision and blob kept; no UNKNOWN; only `x` read again; the whole-checkout member's result unchanged | the same, in both ways; the whole-checkout member 4,734 / 4,735 paths, no UNKNOWN |
+| R2: four frozen observers, one failing before its commit while another waits; a same-owner retry and a later turn's observation arrive in the window, after a file change | the old scan acknowledged the replacement; the change was missed | each acknowledged only by a scan that started after its request, with its own incarnation; the change observed | the same, both variants |
+| R2: 40 distinct failed turn owners, three cycles | — | one repair row after each handoff, none after the repair; the handoff names all 40 and records `acknowledged: false`; no UNKNOWN | the same: 40, then 1, then 0 in each of three cycles |
+| R3: the watchdog SIGSTOPped during a forced 337,860-byte dump into a 65,536-byte pipe, then a daemon stop | status blocked past 1.5 s; the stop past 120 s | loop lag at most 12.3 ms; status names the possible truncation; stopped in 1.154 s; the owned watchdog killed and reaped | stopped in 1.165 s, daemon exit 0; possibly truncated in status; the watchdog reaped |
+
+### Maintenance and watchdog failure paths (review turn 68, round 5)
+Reds are the round-4 tree, forced the same way. The lead could not re-run them: that tree no longer exists, and no
+copy was kept. Its column is the release tree.
+
+| Case | Round-4 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| S1: four frozen observers in a daemon with a native writer; one commits the merged acknowledgement for the other three while they are held before reading it; an unrelated failure makes maintenance run in that window | the three held observers failed `NOT_FOUND` | all four results returned; each completion action ran once; no error, no UNKNOWN | the same: four results, callbacks 1, 1, 1, 1; no error, no UNKNOWN |
+| S2: a real native `apply_patch` whose receipt verification is held after its file write while maintenance repairs the same path | the repair recorded the patch's bytes as UNKNOWN and moved the head; the patch was quarantined `REVISION_CHANGED`; 2 UNKNOWNs | the repair deferred (`OBSERVATION_BUSY`, still pending); the patch verified; the repair completed after it; no UNKNOWN | the same: the repair pending `OBSERVATION_BUSY` while the patch was held, no UNKNOWN; the patch verified |
+| S2: the patch starting between the repair's scan and its commit | — | the check under the commit lock deferred the repair; the patch verified; no UNKNOWN | the same |
+| S3: a stopped watchdog at the daemon's stop, its ownership lookup delayed past its bound / failing | the stop took 14.177 s, leaving the watchdog and the lookup's `ps` running / the watchdog left running | stopped in 1.176 / 1.146 s; the watchdog reaped; no lookup process started | stopped in 1.116 / 1.119 s, daemon exit 0; no watchdog and no lookup process left |
+| S3: the close's caller cancelled | — | the watchdog reaped and SIGUSR2 given back in 1.096 s | 1.094 s |
+| S3: the watchdog fails to start | the previous SIGUSR2 handler not restored | restored; no watchdog | the same |
+| S4: one parent lookup times out during a stall; a second stall; the watchdog killed from outside; a third stall | a lookup error ended the watchdog for good, with no dump and no event (the red's error was an `OSError` from the probe's own malformed path; the green forces a timeout) | the failure in status and in `watchdog/lookup_failed`; the second stall dumped; the kill journaled (`watchdog/exited`) and the watchdog replaced (`watchdog/restarted`); the third stall dumped | the same: one `TimeoutExpired` counted; three dumps; the replacement (restarts 1) dumped the third |
+
+### Custody windows and watchdog supervision (review turn 69, round 6)
+Reds are the round-5 tree, forced the same way: real admitted native commands write B and restore A; injection at
+import only holds an observer between its scan and its commit until the command's custody is released. The lead
+could not re-run the reds: that tree no longer exists, and no copy was kept. Its column is the release tree.
+
+| Case | Round-5 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| T1 (a): a repair's narrow observer held until a command's A, B, A window closes | B recorded as the UNKNOWN head while the file held A; the next lead edit's preparation failed `STALE_BASE` (retried once inside the call, and the red ledger has its `stale pre-image at operation admission` UNKNOWN) | A kept; no UNKNOWN; the 17-byte path read again; the next lead edit admitted | the same: A kept, the 17-byte path read again, no UNKNOWN, the next edit admitted |
+| T1 (b): an ordinary settlement held past a later settlement's no-change commit, both commands undeclared (whole-checkout custody) | the older settlement committed B after the later one released | A kept; both commands reconciled and released; one shared whole-checkout re-scan (90,460,321 bytes) | the same: A kept, both commands released, the whole custody re-checked through one shared whole-checkout scan, no UNKNOWN |
+| T1 (c): an unadmitted call's completion in the same window | B recorded as the UNKNOWN head with no custody named; the next lead edit's preparation failed `STALE_BASE` | A kept; no UNKNOWN; the next lead edit admitted | the same as (a) |
+| T2: a draining stop that rolls back after its fence, for longer than a heartbeat | RPC service resumed, the heartbeat froze, and a later stall dumped nothing | the same watchdog kept; heartbeats continued (16 to 82 samples); status shows supervision running; a later stall dumped a timestamped traceback | the same: the stop refused (the forced lease failure), the same watchdog, supervision running, a later stall dumped |
+| T2: the watchdog not reaped after its SIGKILL (a failed wait injected) | supervision ended and diagnostics did not recover | the process id and error in status and `watchdog/supervisor_exited`; the same child reaped before a replacement started (13 to 55 samples); a later stall dumped | the same, journaled as `watchdog/supervisor_exited` naming the unreaped helper and its error, then `watchdog/restarted` (restarts 1); a later stall dumped |
+| T2: the supervisor task itself cancelled while the daemon serves | — | journaled (`watchdog/supervisor_task_exited`) and restarted; a later stall dumped | the same: `watchdog/supervisor_exited`, `watchdog/supervisor_task_exited`, `watchdog/restarted`; a later stall dumped |
+
+The epochs are rows in the ledger: reopening a fixture's ledger read-only after its daemon exited showed them (2, 4
+and 2 in the three T1 cases).
+
+### Custody states and daemon termination (review turn 70, round 7)
+Reds are the round-6 tree. In U1 a real lead command writes B and restores A; injection at import fails its process
+inventory, which quarantines its custody, and holds an ordinary checkout reconcile between its scan and its commit
+until the successful retry releases that custody. In U2 and U3 the daemon, its watchdog and the signals are real.
+The lead could not re-run the reds: that tree no longer exists, and no copy was kept. Its column is the release tree.
+
+| Case | Round-6 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| U1: a lead command's custody quarantined, then released directly by the retry, while an observer waits between its scan and its commit | B recorded as an UNKNOWN head, with no custody named, after the file was back at A | A kept; no UNKNOWN; the 17-byte path read again; the next lead admission admitted | the same: A kept, the 17-byte path read again, no UNKNOWN, the next Write admitted |
+| U2: SIGINT to a serving daemon with its watchdog running | alive after 6.006 s; the stop never set | exited in 0.125 s; the watchdog reaped; SIGUSR2 given back; tasks and locks released | exit 0 in 0.124 s; the watchdog gone, SIGUSR2 given back, no task or ownership left |
+| U2: the main `serve()` task cancelled | alive after 6.001 s | exited in 0.180 s, the same checks | exit 1 in 0.229 s, the same checks |
+| U2: an exception in `serve()` after supervision started | alive after 6.002 s | exited in 0.183 s, the same checks | exit 1 in 0.233 s, the same checks |
+| U2: the real `worker()` entry point: SIGINT, cancellation, an exception | — | exit status 0, 1 and 3 in 0.067, 0.089 and 0.082 s; the watchdog reaped; `worker.lock` free | exit 0, 1 and 3 in 0.120, 0.155 and 0.086 s; the watchdog gone, `worker.lock` free |
+| U3: the retirement task itself cancelled, then `close()` called again | the second close raised `CancelledError`; the stopped watchdog left alive, SIGUSR2 not given back | a new attempt killed and reaped it in 1.206 s; SIGUSR2 given back | 1.209 s; SIGUSR2 given back |
+
+Custody has three states: `held` and `quarantined` are active windows, and `released` is history. The writer's
+audit lists every writer of a custody row and every query that reads one (`r247-w/round7/custody-lifecycle-audit.json`).
+The lead's probe of a disposable ledger on the release tree:
+- reopening it left `PRAGMA schema_version` at 62;
+- a held whole-checkout custody set the checkout's version to 1, held to quarantined moved it to 2, a metadata-only
+  save left it at 2, and quarantined to released moved it to 3;
+- a quarantined custody of `a/x` moved to `b/y` bumped both paths, and deleting it bumped `b/y` again.
+
+### Termination with clients connected (review turn 71, round 8)
+Reds are the round-7 tree. The clients are real Unix-socket connections to the daemon's RPC socket; only the
+interleavings, the cancellation and the failures were forced at import. The lead could not re-run the reds: that tree
+no longer exists, and no copy was kept. Its column is the release tree.
+
+| Case | Round-7 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| SIGINT with one client that sent part of a request, or nothing | alive after 6.0 s; `worker.lock` held | exited in 0.123 / 0.172 s; the watchdog reaped; `worker.lock` free | exit 0 in 0.121 / 0.171 s; the watchdog gone, `worker.lock` free |
+| the main `serve()` task cancelled, an exception after supervision, a startup failure, each with an idle client | alive after 6.0 s | exited in 0.126 / 0.179 / 0.027 s | 0.184 / 0.180 / 0.034 s (exit 1, 3 and 3) |
+| a draining stop accepted, then a client connects and sends nothing | the stop answered; the worker alive after 6.3 s | exited in 0.412 s | 0.411 s |
+| SIGINT while a `lead-command` RPC waits for its command | alive after 6.0 s | exited in 1.551 s: the operation quarantined, its custody and process identity kept; the restart settled it after the command ended (two crash-gap UNKNOWNs) | exit 0 in 1.548 s, the operation and custody kept; the restart released the custody, ledger integrity `ok`, two UNKNOWNs |
+
+### Termination with running file work (review turn 72, round 9)
+Reds are the round-8 tree. A real lead hook or native writer drives each case; injection at import holds a file write
+in its thread, fails a sibling, or removes the Python 3.13 server methods. The lead could not re-run the reds: that
+tree no longer exists, and no copy was kept. Its column is the release tree.
+
+| Case | Round-8 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| W1 (a): a lead edit cancelled while its write runs in a thread | the quarantine and the release of descriptors and SQLite ran before the write ended | the write ended, then the quarantine read its final bytes, then resources closed (3.067 s); the restart's integrity check passed | the same order, 3.053 s; the final bytes read |
+| W1 (b): a restore cancelled the same way | the restore's write still ran after the quarantine and the release | the restored bytes read only after the write ended (3.076 s) | the same, 3.057 s |
+| W1 (c): one of two sibling writes fails while the other still writes | the quarantine began while the sibling still wrote | both outcomes taken before the quarantine (3.382 s) | the same, 3.378 s; the sibling's injected `OSError` answered `OPERATIONAL_FAILURE` |
+| W2: three SIGINTs while a lead edit's write is held | the quarantine used the closed SQLite connection | the repeated interrupts did not cut the joins short; exited in 3.057 s | the same, 3.058 s |
+| W2: three SIGINTs while a lead command runs | resources closed with a handler and four background owners still running | everything joined before the close; exited in 3.529 s; the restart kept the crash-gap semantics | the same, 3.556 s |
+| every asyncio task cancelled, as the runner does at exit | — | the write ended, then the quarantine, then the close (3.076 s) | the same order, 3.062 s |
+| W3: the Python 3.12 server API (no `Server.abort_clients`) | `AttributeError` skipped the joins; the worker exited 3 | no 3.13-only call; exited 0 in 0.121 s; the watchdog gone, `worker.lock` free | the same: exit 0 in 0.121 s |
+
+The sibling-failure recipe left its fixture's replacement app-server running after it exited (the lead's re-runs on
+the round-9 and round-10 trees, and the writer's own sweep). The release tree's acceptance uses a recipe that ends
+that process itself: it ended its replacement app-server itself (SIGTERM), and after no case was a process left for the lead's runner to end.
+
+### Termination races (review turn 73, round 10)
+Reds are the round-9 tree, forced at import in real daemon and native fixture runs. The lead could not re-run the
+reds: that tree no longer exists, and no copy was kept. Its column is the release tree.
+
+| Case | Round-9 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| X1: a native patch's verification read fails after the stop cancelled it | alive after 7.209 s: the error quarantined, then the worker back waiting on its queue | exited in 1.272 s, including a 1.2 s held read; the `OSError` kept in `operation/verification_cancelled`; the compensation finished; the restart found the completed item and no executing owner | exited 0 in 1.256 s; the read's failure kept; the restart found the patch quarantined `patch verification cancelled` with its 2 UNKNOWNs |
+| X1: a background task that swallows its first cancellation | — | cancelled again 1 s later, and ended (1.03 s) | cancelled again and ended, 1.023 s |
+| X2: SIGINT inside the stop event's waiter registration | the stop set, one waiter registered, alive after 6.007 s | exited in 0.128 s; the watchdog gone, SIGUSR2 given back, no task or ownership left | the stop set by the window's own SIGINT, and every check as recorded (the watchdog gone, SIGUSR2 given back, no task or ownership left); the process ended 0.026 s after the fixture's second SIGINT, but by that signal: it came after `serve` had put the previous handler back, and Python's default handler raised `KeyboardInterrupt` in asyncio's loop close (exit -2; every earlier run of this case exited 0; see Known limits) |
+| X2: SIGINT to an idle daemon whose selector waits 60 s | — | the selector woke; exited 0.075 s after the signal | four of five runs beside the matrix: the selector woke, exit 0 0.076 to 0.145 s after the signal (selector timeouts 60.001 to 60.049 s); the fifth never reached a long wait within the probe's 5 s, because a 50 ms timer was armed again after the park, as in three of the writer's round-17 attempts, and asserted nothing about the signal |
+| X2: the real `worker()` entry point, SIGINT in the same window | — | exited in 0.599 s, including the fixture's 0.5 s pause; `worker.lock` free, the watchdog gone | exit 0 in 0.644 s; `worker.lock` free, the watchdog gone |
+| X3: a native completion arriving as SQLite closes | it reached the closed connection: `ProgrammingError` | nothing reached the ledger after the close; every receiver finished first; the restart recovered the completion from native history | the same: nothing after the close, every receiver finished; the restart: the call `native ended the call without its Post hook`, 2 UNKNOWNs |
+
+The restarts after X1 and X3 keep the crash gap's caution: the interrupted patch is "patch verification cancelled",
+and a call whose Post hook never arrived is "native ended the call without its Post hook". The completion is
+recovered; the missing Post is not invented.
+
+### Shutdown evidence and owned children (review turn 74, round 11)
+Reds are the round-10 tree with real native fixtures; injection at import only holds a native reply or stops an owned
+child. The lead could not re-run the reds: that tree no longer exists, and no copy was kept. Its column is the
+release tree.
+
+| Case | Round-10 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| Y1: SIGINT while a native worker waits for a finished read-only turn's terminal inventory (the real `thread/backgroundTerminals/list` reply held) | stopped in 0.177 s, with `native/reconcile_failure` `NATIVE_DISCONNECTED` and a new checkout-wide `*` UNKNOWN, still there after the restart | stopped in 0.071 s; no new UNKNOWN or failure; the restart replayed the notification (applied progress 5 to 32) and a following lead edit verified | stopped in 0.126 s; no failure or UNKNOWN; the restart replayed it (applied progress 13 to 35) and the following edit verified |
+| Y2: SIGINT during an admission check whose calibration app-server cannot stop within a second (SIGSTOPped) | the round-10 close restored at import: the daemon exited in 2.421 s and left the child and its runtime directory | exited in 11.490 s, after TERM, the 10 s grace, KILL, the reap and the cleanup; no child or directory left | exited in 11.474 s (daemon exit 0); no child or directory left |
+| a stop cancelling a native patch's verification after its read succeeded | — | stopped in 1.233 s; no quarantine or UNKNOWN; the restart verified the patch | stopped in 1.224 s; no UNKNOWN; the restart verified the patch |
+| an app-server killed while the daemon serves (the recipe ends its replacement app-server itself) | — | `NATIVE_DISCONNECTED`, the evidence failure and the two transport-gap UNKNOWNs, as before; no process left | the same, in both forms: one evidence failure, two UNKNOWNs; the recipe ended its replacement app-server |
+
+Y2's red is a control on the edited tree: the exact round-10 `ProbeListener.close` put back at import. The writer's
+runs on the unedited round-10 tree stalled before the stop (that fixture lacked the daemon's child watcher), so no
+whole-tree red exists for Y2. The green's 11.5 s is the 1 s RPC grace, the 10 s calibration grace, then the kill and
+the reap.
+
+### Retirement and the graceful close (review turn 75, round 12)
+Reds are the round-11 tree with real native fixtures; injection at import only holds a native reply, stops an
+app-server behind a full socket buffer, or cancels every task as the runner does. Each red's recorded source hashes
+are the round-11 tree's. The lead could not re-run the reds: that tree no longer exists, and no copy was kept. Its
+column is the release tree.
+
+| Case | Round-11 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| Z1: a draining stop (`daemon/stop`) while a native worker waits for a finished read-only turn's terminal inventory (the real reply held), every other blocker settled | accepted; then `native/reconcile_failure` `NATIVE_DISCONNECTED` and a new checkout-wide `*` UNKNOWN | refused `NOT_QUIESCENT` naming the application (listener, sequence 25, `turn/completed`); accepted once it had applied; no failure or UNKNOWN; the restart replayed it and a following lead edit verified | refused `NOT_QUIESCENT` (listener, sequence 26, `turn/completed`), accepted once it had applied; stopped in 1.406 s; no failure or UNKNOWN; the following edit verified |
+| Z2: an app-server SIGSTOPped behind a full socket send buffer (8,380,486 bytes), an ordinary detach while serving, then SIGINT | the worker alive after 6.011 s, its lock held | the close cut off after the 1 s grace (`native/close_escalated`); exited in 1.040 s; no failure or UNKNOWN | cut off after 1.002 s; exited in 1.020 s; no failure or UNKNOWN |
+| Z3: every task cancelled, as the runner does, while a graceful close waits for its transport; then the peer released | alive after 6.008 s, the retirement retrying (49.6 % CPU sampled) | the shared close waiter left uncancelled; exited 0.083 s after the release | the shared close waiter left uncancelled; exited in 0.178 s |
+
+A graceful close's bound is 1 s. 100 real close round trips with Codex 0.163.0 took 0.209 ms at the median, 0.333 ms
+at p99 and 0.431 ms at most, a local flush and close at most 0.218 ms (`r12-close-calibration`,
+`r12-peer-close-calibration`). It is fixed, not a setting, and bounds only a close the daemon makes itself: a peer
+that has read nothing for 1 s is cut off, and `native/close_escalated` records the connection and how long it
+waited. The lead's re-runs journaled it once per connection, after 1.002 s in Z2 and in A2; a forced close after a finished graceful close armed no timer. The lead's calibrations: round trips 0.257 ms at the median, 0.428 ms at p99 and 0.465 ms at most; local closes at most 0.909 ms.
+
+The writer's audit lists every path on which the daemon closes a connection or stops a listener, and every
+protected join and the waiter it awaits (`r247-w/round12/retirement-audit.md`). Each local close marks the
+connection as retiring before its first wait: its pending native calls are cancelled and replayed by the next start,
+never failed `NATIVE_DISCONNECTED`. A connection the peer loses while the daemon serves is recorded as before.
+On this host (macOS, Python 3.15) the daemon's exit watcher reaps each child it signals on the event loop, and sets
+its return code in the same step, so a child with no return code still holds its process id; the watchdog is reaped
+by `Popen.poll`. No process-reuse defect was found, and no identity check was added.
+
+### Retiring a listener while serving (review turn 76, round 13)
+Reds are the round-12 tree with real Codex 0.163.0 fixtures; injection at import only pauses a patch verification's
+read or holds a journaled notification. Each red's recorded source hashes are the round-12 tree's.
+
+| Case | Round-12 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| A1: a listener stopped while serving (an ordinary detach) while a native patch's verification read is paused | quarantined "patch verification cancelled"; 2 UNKNOWNs | verified; no UNKNOWN; a following lead edit verified | the same: verified before and after the restart, no UNKNOWN; the following edit verified |
+| A1: the same, the listener ended as a wedged app-server's | quarantined "patch verification cancelled"; 2 UNKNOWNs | verified; no UNKNOWN; a following lead edit verified | the same |
+| A1: a completed patch whose evidence is still queued behind a held notification when its listener stops | quarantined "app-server stopped before the patch ended"; 2 UNKNOWNs | verified; no UNKNOWN; the restart and a following lead edit verified | the same |
+| A2: an app-server SIGSTOPped behind a full socket buffer, its graceful close cut off, then the forced close | two `native/close_escalated` rows | one, after 1.001 s; exited in 1.036 s | one, after 1.002 s; exited in 1.026 s |
+| A2: a forced close after a graceful close that had finished | one escalation, for an abort that never waited | none; no timer armed | the same: no escalation, no timer |
+
+A local retirement marks its listener as retiring until a new attachment replaces it. A cancellation that comes
+only from the daemon retiring that listener is handled as the daemon's own stop is; a joined worker's real failure
+keeps its cause and its handling. Each connection has one close state: one grace timer, armed only while a graceful
+flush is pending, and at most one escalation. The writer's audit lists every retirement path and every consumer it
+cancels (`r247-w/round13/retirement-audit.md`).
+
+Round 13's own intermediate edit had over-escaped the close frame's bytes; the final frame is RFC 6455's empty masked
+close, two header bytes and a four-byte mask, as in round 12, and the final calibrations exchanged it with a real
+peer 100 times.
+
+### Outcomes and their owners (review turn 77 and the lead's U1 re-run, round 14)
+Reds are the round-13 tree with real Codex 0.163.0 fixtures and real commands; injection at import only holds a
+call's resumption after its process exited, pauses a patch verification's read, or holds a `turn/start` before it
+reaches native. Each red's recorded source hashes are the round-13 tree's. B1 was found by the lead's re-run of U1
+on the round-13 tree (`logs23`): maintenance settled the command in the moment after its process exited.
+
+| Case | Round-13 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| B1: maintenance settles a lead command's custody (quarantined `PROCESS_SCAN`) after its process exited, before its call records the exit status | exit 0, and a checkout-wide `*` UNKNOWN "lead reconciled command absence without exit status" | exit 0 recorded by the call itself; custody released; no UNKNOWN; the next lead admission admitted | the same: exit 0 from the call, the `PROCESS_SCAN` custody released, no UNKNOWN, the next Write admitted |
+| B1: the explicit `custody/reconcile` in the same window | — | no missing exit status; the call's own exit 0 releases the custody | the same |
+| B1: the daemon killed while the command runs, restarted after it ended | — | the crash-gap `*` UNKNOWN kept; no exit status invented | the same: the operation reconciled `UNKNOWN-context-only` with no exit code; the two `*` UNKNOWNs (interrupted, absence without exit status) |
+| C1: a listener stopped while serving after the journal replay applied its patch's evidence, the verification read paused | quarantined, unfinished patch; the paths' UNKNOWNs | verified; no UNKNOWN; the restart and a following lead edit verified | the same: verified before and after the restart, no UNKNOWN; the following edit verified |
+| C1: the same for a patch over two checkouts | — | both parts and the parent verified; no UNKNOWN | the same: the parent and both parts verified, no UNKNOWN; the following edit verified (`final-c1-composite-alone`; its run beside other cases passed every product check, then failed the recipe's own cleanup check: a leftover app-server's command line no longer named the case when read again) |
+| C2: recovery reconciles the writer while the notification worker's verification of the same patch is paused | `operation/verified`, then a `REVISION_CHANGED` quarantine of the same operation | one `operation/verified`; no quarantine or UNKNOWN | the same: one `operation/verified`, no UNKNOWN; the following edit verified |
+| C2: the same for a patch over two checkouts | each part verified, then parent and parts quarantined `REVISION_CHANGED` | one receipt per part, the parent verified with them; no UNKNOWN; the restart and a following lead edit verified | the same: the parent and both parts verified, two `operation/verified`, no UNKNOWN; the following edit verified |
+| C2: bytes that differ from the patch's result | — | quarantined `POSTIMAGE_MISMATCH`, as before; no `operation/verified` | the same: quarantined `POSTIMAGE_MISMATCH` with its 2 UNKNOWNs |
+| C3: a plain run's writer retired (a stopped app-server ended through a watch answer) before its `turn/start` reached native | running, its phase `submitting`, nothing to settle it | uncertain at once, then `submission_uncertain` by maintenance's reads; the same input id; nothing sent | the same: `uncertain` at once, `unproven` after maintenance's reads (the run `submission_uncertain`); nothing sent |
+| C3: the same for a workflow run | the same | the same | the same, for its `analysis` phase |
+| U1 run five times | — | each exit 0; no UNKNOWN | the same, five times: exit 0, custody released, no UNKNOWN |
+
+A lead command's call registers itself before its process starts and leaves after its own settlement, so
+maintenance and `custody/reconcile` leave its exit status to it; the registration lives in the daemon's memory, so a
+restarted daemon has none and keeps the crash gap. Every path that verifies a patch (the notification worker, a
+listener's retirement, recovery, a lead edit or restore, an editor's completion, a direct `operation/complete`)
+takes the operation's completion lock, the parent's for a part, after its own call or executor ownership and before
+any checkout lock; inside it the operation is read again, and one already verified with the same evidence or the
+same results is returned as it is. A retirement while the daemon serves joins the listener's consumers, replays the
+journal suffix not yet applied, then settles every outstanding patch of that listener whatever the cursor says. A
+`turn/start` cut off that way keeps its input id and is marked uncertain; maintenance reads native for it at most
+every 2 s and never sends it again. The writer's audits list every caller of each (`r247-w/round14/implementation-report.md`).
+
+### Custody settlement, retirement and terminal operations (review turn 78, round 15)
+Reds are the round-14 tree with real Codex 0.163.0 fixtures and real commands; injection at import only pauses a
+process inventory, a native history call or a verification between its steps. Each red's recorded source hashes are
+the round-14 tree's. The lead could not re-run the reds: that tree no longer exists, and no copy was kept. Its column
+is the release tree.
+
+| Case | Round-14 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| D1: maintenance's inventory of a lead command paused after it found no process, while the command forks a child that outlives it and its own call settles | maintenance's older, empty inventory was saved over the newer one and released the custody while the child still ran; the child's later write was outside any custody | the stale inventory discarded (`custody/inventory_discarded`); the custody kept until the child had exited and a new inventory found nothing, then released; the child's write an UNKNOWN that names the custody (`lead command opaque effects`), as any unattributed write of a lead command is | the same: the custody held with the child as its one process, released after it exited; one such UNKNOWN on the child's file |
+| D2: a listener retired while maintenance waits on its native history call | maintenance ended and nothing restarted it | the call's retirement is that item's outcome (`maintenance/retry`); maintenance went on, completed the pending repair, and after the rebind recorded the input `unproven` (the run `submission_uncertain`), sent no second time | the same: maintenance running after the retirement, the repair done, the input `unproven`, nothing sent again |
+| D3: a second verifier reaching an operation already quarantined (a real mismatch) | a second quarantine and more UNKNOWNs | one quarantine with one operation UNKNOWN; the second verifier returned the terminal outcome | the same: one operation UNKNOWN (`POSTIMAGE_MISMATCH`) |
+| D3: a verifier reaching an operation already restored | the restoration undone by a quarantine | the restored operation kept; no new UNKNOWN | the same: `resolved` before and after, no UNKNOWN, no error |
+| a long-lived service (maintenance, the external-editor observer, the lead-call observer) ended while serving | — | journaled `service/restarting` and started again with backoff; a native consumer's unexpected end stops the daemon (`service/failed`) | the same: all three cancelled, three `service/restarting`, all three running again, each with one restart |
+
+Settlement of one custody group (the reservation and its members) is serialized; each pass reads the reservation,
+its members and the operation again and records their revisions, and a release checks them again under the custody
+condition. `ledger.terminal` reads an operation's parent again and is called before and after every verification
+step; new evidence that contradicts a terminal outcome is one `operation_conflict` record with its UNKNOWNs, answered
+`OPERATION_EVIDENCE_CONFLICT`.
+
+### The decision bound (review turn 79, round 16)
+Reds are the round-15 tree, run with the same instrument as the greens: every callback or task step of 2 ms or more
+with its owner, SQL statements of 1 ms or more, executor queueing and thread CPU, the hook's own start, connect and
+exit, calibrated on a blocked loop, a CPU spin and a GIL-holding thread.
+
+| Case | Round-15 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| a lone lead edit whose first pre-image read is held 1.15 s | denied `LEAD_ADMISSION_BUSY` at 1.079 s, naming its own pre-image read | admitted at 1.497 s; exact receipt; no UNKNOWN (1.532 s on the release tree, its deadline from peer birth) | admitted at 1.271 s, exact receipt, no UNKNOWN, its deadline from peer birth |
+| the 27-writer matrix with the installed hook, beside the idle-selector probe, three times | not reproduced past 2.5 s: at most 1.635, 1.637 and 1.482 s (round 15's own sample: 2.69 to 2.80 s) | see Lead file admission | on the release tree, past 2.5 s again in one of six runs, at load 22.4 (Lead file admission) |
+| a lone edit, five times under load | all admitted | all admitted | the same |
+
+The daemon takes native steps (receiving a notification, applying one, a log batch) through one first-in, first-out
+turn, so a burst of writers' work cannot run ahead of a hook's accept and read; the turn owns no native call or file
+read. An admission reads only the heads of its own paths and still compares every overlapping exclusion version; its
+first file read, blob check and intended result are one executor job.
+
+The writer's audit (`r247-w/round16/implementation-report.md`, G) lists every place where a retirement's `Retired`
+can become an ordinary `CancelledError` (`asyncio.shield`, `gather(return_exceptions=True)`, timeouts, cleanup
+under `except BaseException`) and, for each, the durable record that keeps the item's obligation. A real stop still
+propagates.
+
+### Hook entry points and dependency retirement (review turn 80, round 17)
+Reds are the round-16 tree; each red's recorded source hashes are the round-16 tree's. The lead could not re-run the
+reds: that tree no longer exists, and no copy was kept. Its column is the release tree.
+
+| Case | Round-16 tree | 2.4.7 | The lead's re-run |
+|---|---|---|---|
+| H: two clients older than 2 s, the hook's file name only as data (in a `-c` program's comment; a script's argument) | both denied `LEAD_ADMISSION_BUSY`: their process birth set an expired deadline | each admitted on its own request's budget (`receipt`, `supplied`) and verified; the real 2.4.4 to 2.4.6 and 2.4.7 hooks kept `peer birth` | the same: `receipt` and `supplied` budgets of 2.0 s, each edit verified with one exact receipt and no UNKNOWN; the 2.4.4, 2.4.5, 2.4.6 and 2.4.7 hooks `peer birth`, with 1.902, 1.932, 1.656 and 1.928 s left at receipt |
+| I: `joined()` of a plain Future given `Retired` | `CancelledError` caused by `Retired` | `Retired`; a Task raising it, a Task awaiting it, and an owner cancelled first (`CancelledError` from `Retired`) as before | the same four outcomes |
+| I: the owner cancelled while the dependency Task is ready to resume | — | the owner's `CancelledError` wins, `Retired` its cause | the same |
+
+`joined()` waits on a private future that the dependency only wakes, never fails, so a cancellation it sees is the
+owner's; the dependency's own outcome is read afterwards.
+
+### Blob reuse (U2, round 1)
+| Case | 2.4.6 | 2.4.7 | The lead's re-runs |
+|---|---|---|---|
+| steady snapshot of the replica | 0.964 to 1.075 s; 3,284 temporary files and fsyncs each | 0.419 to 0.443 s; none | the same (`logs9`, release-tree suite) |
+| a corrupted blob, read and reused | — | `BLOB_CORRUPT` both ways | the same |
+
+### External editor lifetime (U5, round 1; P3, round 2; Q4, round 3)
+| Case | 2.4.6 | 2.4.7 | The lead's re-runs |
+|---|---|---|---|
+| a direct prepare whose editor exits | executor ignored; operation stays prepared; stop refused | live owner and descendant hold; matching bytes verify after the last exit; own claims released; stop accepted | the same |
+| mismatched bytes | — | quarantined, with UNKNOWN; lifetime ends; stop accepted | the same |
+| the daemon restarted while the editor lives | — | crash gap kept, even when the bytes match the intent | the same |
+| an orphan the editor spawned before prepare | stop accepted while it lived (intermediate round-1 tree) | held by original-parent lineage until it exits | the same |
+| fork, then exit, during enumeration | the child missed; exclusion released (round-1 tree) | the reparented child held until it exits | the same |
+| explicit and automatic completion together | a verified edit later quarantined `REVISION_CHANGED` (round-1 tree) | one exact receipt; no quarantine | the same |
+| failed explicit completion | ownership kept; drain refused (round-1 tree) | end recorded first; operation quarantined; ownership ended; drain accepted | the same |
+
+One lead run of the orphan-editor recipe (`logs15`, the round-5 tree) failed its own assertion. It read the editor's
+claims as soon as it saw `verified`, 1.1 ms before the ledger records their release: `operation/verified`, then the
+claim's release, `execution_ended` and `executor/settled` (events 20 to 22). The verification and the release are
+separate transactions, and the claim was released. From round 6 the recipe waits for the release, bounded.
+
+### Configuration (U1, round 1)
+| Case | 2.4.6 | 2.4.7 | The lead's re-runs |
+|---|---|---|---|
+| `SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY` `abc`, `0`, `-1`, `" 2"`, `+2`, `2.0` | type-only startup errors; `" 2"` and `+2` started | each refused `CONFIG`, naming the setting; `2` and `7` start | the same |
+| another startup exception | `DAEMON_STARTUP` "ValueError" | its type and message, at most 1,024 characters | the same |
+
+### Recovery and the burst
+27 writers holding 1,997.86 MB of synthetic histories and a 2.66 GB journal (321,357 rows): the first recovery as
+one `Daemon.serve` with real native hooks, then a SIGKILL and a restart on the same state. Installed 2.4.6 and the
+tree interleaved, freshly synthesized histories every run:
+
+| Run | 2.4.6, first / restart s | tree, first / restart s | lead Pre p99 / max s (tree) |
+|---|---|---|---|
+| the writer, round 1 | 60.07 / 1.30 | 66.42 / 1.37 | 0.307 / 0.365 |
+| the lead, round-1 tree (`logs10`) | 62.15, 58.77 / 1.41, 2.13 | 67.60, 77.24 / 1.44, 1.31 | 0.185 / 0.273, 0.259 / 0.273 |
+| the writer, round 2 | 58.63, 55.76, 62.70 | 61.10, 57.13, 54.48 | 0.242 / 0.261 to 0.182 / 0.377 |
+| the lead, round-2 tree (`logs12`) | 58.65, 77.54 / 1.23, 1.35 | 50.37, 67.54 / 1.22, 1.40 | 0.141 / 0.413, 0.227 / 0.504 |
+| the writer, round 3 | 51.26, 61.51, 56.57 / 1.22 to 1.32 | 50.33, 69.14, 51.75 / 1.26 to 1.35 | 0.130 / 0.238 to 0.234 / 0.276 |
+| the lead, round-3 tree (`logs13`) | 60.27, 60.98, 57.77 | 60.11, 55.39, 71.70 / 1.20 to 1.51 | |
+| the writer, round 4 | 51.68, 52.64, 77.71 / 1.24 to 1.65 | 52.56, 47.31, 69.00 / 1.21 to 1.29 | 0.172 / 0.205 to 0.288 / 0.308 |
+| the lead, round-4 tree (`logs14`, the first pair's baseline only) | 54.83 / 1.31 | — | — |
+| the writer, round 5 before its last edit | 56.71, 59.06, 53.66 | 51.49, 50.07, 69.94 | |
+| the writer, round 5 | 55.97, 57.66, 75.33 | 53.43, 50.40, 74.44 / 1.29 to 1.39 | 0.167 to 0.220 / 0.214 to 0.527 |
+| the writer, round 6 | 53.60, 65.42, 58.24 | 49.13, 63.96, 56.39 / 1.22 to 1.37 | |
+| the writer, round 7 | 57.04, 62.60, 57.02, 62.74, 58.60, 86.81 | 76.78, 47.88, 73.25, 70.54, 59.85, 73.02 | |
+| the writer, round 8 | 60.42, 69.36, 76.93 | 61.27, 88.01, 87.04 / 1.27 to 1.58 | |
+| the writer, round 9 (six pairs, both orders) | 80.21, 64.71, 68.65, 86.02, 79.72, 82.42 | 67.19, 69.81, 63.73, 79.51, 103.24, 74.91 / 1.27 to 1.70 | |
+| the writer, round 9, fixed requests | 60.06, 64.85 | 59.18, 59.26 | |
+| the writer, round 10, fixed requests (2.4.6 first, then tree first) | 61.29, 50.50 | 58.66, 50.75 / 1.22, 1.43 | 0.226 / 0.226, 0.294 / 0.294 |
+| the writer, round 10, continuous load (2.4.6 first, then tree first) | 79.47, 60.63 | 52.17, 53.89 / 1.34, 1.28 | 0.231 / 0.265, 0.159 / 0.489 |
+| the writer, round 11, fixed requests (2.4.6 first, then tree first) | 55.84, 68.01 | 59.97, 68.16 / 1.40, 1.41 | 0.424 / 0.424, 0.258 / 0.258 |
+| the writer, round 12, fixed requests (2.4.6 first, tree first, 2.4.6 first) | 54.19, 60.28, 53.18 | 52.59, 58.80, 58.97 / 1.25, 1.36, 1.44 | 0.248 / 0.248, 0.483 / 0.483, 0.489 / 0.489 |
+| the writer, round 15, fixed requests (four pairs, both orders) | 77.65, 66.41, 82.14, 97.52 / 1.32 to 1.81 | 68.70, 61.37, 70.08, 68.51 / 1.52 to 1.65 | 0.299 / 0.299 to 0.884 / 0.884 |
+| the writer, round 16, fixed requests (tree first, then 2.4.6 first) | 58.34, 60.00 / 1.30, 1.46 | 59.88, 56.99 / 1.37, 1.30 | 0.387 / 0.387, 0.209 / 0.209 |
+| the writer, release tree, fixed requests (tree first, then 2.4.6 first; load 13.4 to 15.3) | 101.25, 110.66 / 1.68, 1.60 | 85.73, 89.31 / 1.63, 1.62 | 0.180 / 0.180, 0.432 / 0.432 |
+| the lead, release tree, fixed requests (tree first, then 2.4.6 first; load 17.6 to 20.0; `logs27`) | 132.76, 110.62 / 4.65, 3.61 | 139.41, 118.70 / 3.88, 3.81 | 0.660 / 0.660, 0.649 / 0.649 |
+
+The writer's third pair before its last edit was 16.29 s slower on the tree, more than that trio's 5.41 s spread
+on 2.4.6. It is unexplained: worker CPU and the listener journal's timings differed, and host load alone did not
+account for it (`r247-w/round5/ab-host-comparison.json`, `ab-journal-comparison.json`).
+
+Rounds 7 and 8 measured slower tree recoveries again. Round 9 measured where the time went, with the event-loop
+thread's CPU, every SQL statement and commit, and scheduling delay, in both orders. A lead edit's admission saved
+each of its phase labels in a commit of its own, about 25 commits a call. Since round 9 the labels are kept in memory
+and saved with the call's next durable change; a crash can lose only a label that was about to be replaced. After
+that change round 9's six pairs averaged 76.96 s on 2.4.6 and 76.40 s on the tree, with 12.9 % less event-loop CPU.
+
+The release tree's comparison, on its final source, runs a fixed set of requests (500 full and 500 brief status
+calls, 25 changing lead Writes, 25 writer turns) in both orders, every history synthesized fresh by its own command,
+at a one-minute host load of 13.4 to 15.3:
+- The first recovery took 101.25 and 110.66 s on 2.4.6, 85.73 and 89.31 s on the tree: 87.52 s against 105.95 s on
+  average, 17.4 % faster. 2.4.6's own two runs were 9.41 s apart, the tree's 3.58 s.
+- Event-loop CPU was 26.13 s on 2.4.6 and 24.29 s on the tree on average (7.0 % less), the whole daemon's 29.44 and
+  27.50 s (6.6 % less), SQL time 7.24 and 5.78 s (20.2 % less).
+- Leaving out the fixture's own writes, the tree ran 24,853 transactions against 24,561: 292 more, 1.19 %. Explicit
+  COMMITs took 0.101 and 0.086 s; with the statements they close, 1.707 and 1.811 s.
+- The lead's re-runs of the same two pairs, at a load of 17.6 to 20.0: 132.76 and 110.62 s on 2.4.6, 139.41 and
+  118.70 s on the tree, 129.05 s against 121.69 s on average, 6.1 % slower; each tree run was 6.65 and 8.07 s behind
+  its pair, its listeners' summed journal replay 5.97 and 9.25 s longer. Event-loop CPU and SQL time were not
+  measured in these runs. The two sets of pairs disagree: neither shows which version recovers faster on this host.
+- Round 16's pairs, the same way at a lower load: 58.34 and 60.00 s on 2.4.6, 59.88 and 56.99 s on its tree (58.44
+  against 59.17 s on average, 6.3 % less loop CPU). Round 15's four pairs: 66.41 to 97.52 s on 2.4.6, 61.37 to
+  70.08 s on its tree. Round 12's two clean pairs: 60.28 and 53.18 s on 2.4.6, 58.80 and 58.97 s on its tree (3.8 %
+  slower on average, with less CPU and SQL time).
+- Round 11's two pairs measured the same way: 55.84 and 68.01 s on 2.4.6, 59.97 and 68.16 s on its tree.
+- Round 10's continuous-load pairs (requests until recovery finishes, so a longer recovery serves more): 2.4.6 took
+  79.47 and 60.63 s, the round-10 tree 52.17 and 53.89 s.
+- Every run reconciled all 27 writers and 28 listeners, with no quarantine or hook warning; no run was left out.
+
+The round-1 tree's slower first recovery came mostly from status answering under the fixture's polling (about 35
+full and 43 brief `daemon/status` a second; `r247-lead/profile-recovery.md`). Round 2 caches the full answer:
+its median fell from 7.5 to 3.2 to 5.4 ms. Every run reconciled all 27 writers, with no quarantine and every
+changing lead Write verified; a restart decoded 40,887 to 46,028 bytes of history.
+
+The streamed burst, 27 writers × 20 turns, 23 deltas a message, real Python 3.9 Pre, Post and batch hooks:
+
+| | the writer, round 5 | the writer, round 11 | the writer, round 12 | the writer, release tree | the lead, release tree |
+|---|---|---|---|---|---|
+| events | 21,606 in 61.30 s (21,147 a minute) | 21,610 in 61.36 s (21,129 a minute) | 21,616 in 61.66 s (21,034 a minute) | 21,603 in 61.34 s (21,133 a minute) | 8,276 in 67.56 s (7,351 a minute), 10,309 in 68.35 s (9,050) and 11,377 in 65.78 s (10,378), at load 19 to 62: 189, 243 and 270 of the 540 turns recorded when measured, so each run failed its 540-turn check |
+| lead Pre p50 / p99 / max | 0.107 / 0.598 / 0.666 s (n=202) | 0.107 / 0.780 / 1.031 s (n=198) | 0.119 / 1.085 / 1.135 s (n=167) | 0.106 / 1.109 / 1.128 s (n=154) | 1.176 / 2.238 / 2.238 s (n=35), 1.067 / 2.272 / 2.272 s (n=37), 1.084 / 2.346 / 2.346 s (n=37) |
+| writer Pre p50 / p99 / max | 0.337 / 0.538 / 0.546 s (n=540) | 0.353 / 0.714 / 0.835 s (n=540) | 0.429 / 0.747 / 0.807 s (n=540) | 0.624 / 0.938 / 1.042 s (n=540) | 1.282 / 2.344 / 2.600 s, 1.277 / 2.022 / 2.126 s, 1.218 / 1.813 / 2.029 s (n=540 each) |
+| warnings, denials, quarantines, lead-path UNKNOWNs | 0 | 0 | 0 | 0 | 0 in all three |
+| the final draining stop | — | — | 31.04 s: refused `LISTENER_DRAIN` after 28.22 s (an app-server still exiting), then accepted in 2.72 s; no native-application refusal | 87.09 s: eight `LISTENER_DRAIN` refusals of 5.0 to 21.3 s each, then accepted in 11.38 s; no native-application refusal | not reached: each run stopped at its 540-turn check |
+
+The lead's burst A/B (batch 27b): installed 2.4.6 (its daemon and both hooks) and the tree, alternated 2.4.6 first.
+2.4.6's first run recorded all 21,600 events in 69.90 s (18,540 a minute) at load 22.6 to 51.8, lead Pre p50 / p99
+/ max 1.295 / 3.282 / 3.282 s (n=29), and its draining stop was accepted in 5.34 s. Its second run, at a load of 24.9
+at its start, stopped at the fixture's check before a lead Write runs: the hook had returned while the daemon was
+still admitting the call (`admitting`, the 10-23 pattern), and the daemon's later replies found the hook's
+connection gone. The tree's two runs, at 27.6 to 62.2, are the second and third runs in the lead's column above: no
+lead Pre over 2.346 s and no denial, but the ledger behind the app-servers. The daemon's own CPU had a median of 11
+to 14 % in each run that sampled it, 2.4.6's first included.
+
+### Review findings (Codex code_review, session 01a14eac, turns 63 to 81)
+- Turn 63, of the plan: REJECT. A 10 s answer cannot help a hook whose client gives up at 3 s, and an unadmitted
+  edit's reconcile is an UNKNOWN by design. It asked for a bound on the whole decision, a durable admission
+  attempt apart from the call's execution, phase measurements before any performance fix, and an owner for direct
+  preparations. Round 1 did those.
+- Turn 64, of round 1: do not ship. HIGH: a call denied busy by the real 2.4.4 hook held its paths for good (that
+  hook sends no end for a denied call). HIGH: process enumeration could miss a child forked as its parent exited.
+  MEDIUM: explicit and automatic completion raced; a failed explicit completion kept its editor's ownership; an
+  expired preparation still queued and read; each admission kept its whole completion payload. LOW: the busy text
+  named an internal task. Fixed in round 2.
+- Turn 65, of the round-2 design: CONCERNS. Sharing one reconcile result across callers can corrupt attribution;
+  scanning outside the lock needs per-path versions or a stale image rolls a newer head back; a stat-based cache
+  needs a stronger contract (round 2 kept hashing). Round 2 is that design.
+- Turn 66, of round 2: do not ship. HIGH: a narrow observation took a whole-checkout cohort member's unreadable and
+  outside-ledger results (Q1); preparation's second locked phase skipped the normalized overlap check (Q2); a
+  shared scan producer inherited an admission's deadline (Q3). MEDIUM: an explicit completion after a restart
+  quarantine skipped the editor's final bytes (Q4); the watchdog wrote a heartbeat every 100 ms without bound and
+  re-armed a C thread each time (Q5); observation records were never removed and startup filtered them all (Q6).
+  LOW: a producer setup failure stranded its waiters (Q7). It rejected the lead's claim that denying a lead edit
+  during startup is a defect: the whole-decision budget includes waiting for readiness (documented; Q8 fixed its
+  text). Fixed in round 3.
+- Turn 67, of round 3: do not ship. HIGH: a path a narrow observation asked for but the shared whole-checkout scan
+  never listed (absent, no head) escaped revalidation and was applied as absent, so a lead's verified create in the
+  window became a deletion (R1). HIGH: a replacement observer that reused a pending record could be acknowledged
+  from its predecessor's frozen scan, missing a change made in between (R2). MEDIUM: the watchdog's signal-side
+  pipe blocked the daemon while its helper was stopped, and its close waited without bound (R3). Fixed in round 4.
+- Turn 68, of round 4: do not ship. R1 closed, and the round-4 fixes for R2 and R3 held. HIGH: maintenance removed
+  every committed observation record, including one a merged member still had to read; that member failed
+  `NOT_FOUND`, and for a native notification a checkout-wide `*` UNKNOWN followed although its observation and
+  release had succeeded (S1). HIGH: a repair excluded only lead edits, restores and executing operations, so a
+  native patch between its write and its receipt verification lost its base and was quarantined
+  `REVISION_CHANGED` (S2). MEDIUM: an ownership lookup that timed out or failed at a stop left the stopped watchdog
+  and the lookup's `ps` running (S3). MEDIUM: one failed parent lookup ended the watchdog for the daemon's life
+  (S4). Fixed in round 5.
+- Turn 69, of round 5: do not ship. S1 fixed, S3's lookup and signal defects fixed, S4's retries and supervision
+  present, S2's native-patch race fixed. HIGH: a command that wrote B and restored A between a repair's scan and its
+  commit left no trace in the scan's tokens or in the custody check, so the repair could commit the stale B as an
+  UNKNOWN head while the file held A, and a later lead admission would fail `STALE_BASE` (T1). MEDIUM: a draining
+  stop that rolled back (`LISTENER_DRAIN`, a lease failure) had already ended watchdog supervision, and nothing
+  restarted it (T2). It refuted the lead's narrower reading, that only a watchdog surviving SIGKILL could end
+  supervision. It also read the lead's batch15 failure (below) as a probe race. Fixed in round 6.
+- Turn 70, of round 6: do not ship. T2 fixed, and T1 fixed for ordinary `held` custody. HIGH: the epochs counted
+  only `held` custody, while the ledger treats a quarantined reservation as active too. A lead command whose custody
+  was quarantined after a process-inventory error, then released directly, left no trace, so a delayed observation
+  could still commit its stale B (U1). MEDIUM: cancelling the daemon's main task (SIGINT, or an exception escaping
+  `serve()` after supervision started) left the stop unset; the supervisor swallowed the runner's final cancellation
+  and the worker never exited (U2). LOW: a retirement attempt that was itself cancelled was never retried (U3). It
+  confirmed the lead's hypotheses on U2 and U3 and refuted the lead's reading that round 6 closed T1. Fixed in round 7.
+- Turn 71, of round 7: do not ship. U1 and U3 fixed. MEDIUM: leaving the RPC server's context waited for every open
+  connection before the stop was fenced, so one idle client, or one that had sent part of a request, kept the worker,
+  its watchdog and `worker.lock` alive for good (V1). It confirmed the lead's hypothesis on that wait. It did not
+  establish the lead's second, that the pre-image pool's shutdown could block the loop, because cancellation joins
+  running readers first. It left the third unproven: the round-7 tree's slower recoveries need custody transitions
+  correlated with rescans in the same runs. Fixed in round 8.
+- Turn 72, of round 8: do not ship. V1 fixed; U1 and U3 intact. MEDIUM: a cancelled lead edit or restore did not
+  wait for the file writes it had started in threads, so its quarantine observation and the daemon's release of
+  descriptors and SQLite could run while a write was still going (W1). MEDIUM: a second SIGINT during the shutdown
+  grace let the runner cancel the cleanup itself, which then released shared resources while handlers still used
+  them (W2). MEDIUM: `Server.abort_clients()` exists only on Python 3.13+, while the daemon accepts 3.11 (W3). It
+  left the lead's hypothesis, that the slower round-7 and round-8 recoveries were host noise, unproven: it asked for
+  the coordinator thread's CPU, SQL and commit costs and scheduling delay, in both run orders. Fixed and measured in
+  round 9.
+- Turn 73, of round 9: do not ship. W1, W2 and W3 fixed. MEDIUM: a background task whose joined thread work failed
+  after the stop had cancelled it lost the cancellation: the native patch worker quarantined the error, went back to
+  waiting on its queue, and the stop waited for it for good (X1). MEDIUM: the SIGINT handler set the stop event
+  directly; a signal inside the event's waiter registration woke no one, so the daemon never exited, and later
+  SIGINTs changed nothing (X2). MEDIUM: native connections' receivers were outside the daemon's task set, so a
+  notification arriving as SQLite closed could reach the ledger after the close (X3). It confirmed the lead's
+  hypothesis on the signal handler. It refuted the second, that a lead edit's decision waits for a running pre-image
+  read: the deadline answers without it. It found no performance blocker in the recovery measurement, and corrected
+  its accounting: leaving out fixture-only writes, the tree's extra work was about 202 transactions a run (0.82 %),
+  and the commit time includes running the statements. Fixed in round 10.
+- Turn 74, of round 10: do not ship. X1, X2 and X3 fixed in their original forms. Two MEDIUM findings came from round
+  10's own shutdown changes. The daemon closed native connections before cancelling the work waiting on them, so a
+  worker reading a finished turn's terminal inventory got `NATIVE_DISCONNECTED`, handled it as a real evidence
+  failure and recorded a checkout-wide `*` UNKNOWN that the next start could not resolve (Y1). The new retry that
+  cancels lingering tasks every second could interrupt the retirement of an admission check's calibration
+  app-server, which runs in its own session, so the daemon could exit with it alive (Y2). It confirmed the lead's
+  hypothesis on the connection order and refuted the one on the pre-image pool's shutdown (its readers are joined
+  first). It read the recovery figures as supporting only the measured comparison: about 211 more transactions a
+  run (0.86 %) and 0.025 s more commit time, with lower CPU. Fixed in round 11.
+- Turn 75, of round 11: do not ship. Y2 fixed, and Y1 fixed on SIGINT. MEDIUM: an accepted draining stop could still
+  close a native connection while a terminal-inventory read was outstanding: a finished read-only turn no longer
+  counted as active, the drain was accepted, and the ordinary close failed the read, so the same checkout-wide `*`
+  UNKNOWN followed (Z1). MEDIUM: a graceful connection close, now protected from cancellation, had no deadline: with
+  an app-server that stopped reading and a full socket buffer it never ended, and the stop waited for it before the
+  abort that would have released it (Z2). MEDIUM: the protected retirement retried every cancellation, including one
+  returned by an already-cancelled close waiter that each retry awaited again, so it could loop for good (Z3). It
+  confirmed the lead's hypothesis on the graceful close. It corrected the lead's account of how Python 3.15 signals a
+  child (the transport calls `os.kill` directly) without finding a process-reuse defect on this host. It left the
+  cause of the release tree's slower recovery means unproven, with less CPU and SQL time and no performance blocker.
+  Fixed in round 12.
+- Turn 76, of round 12: do not ship. Z1's draining-stop race, Z2's unbounded close and Z3's retry loop fixed. MEDIUM:
+  retiring one listener while the daemon kept serving (a detach, a wedged app-server's replacement, a readmission)
+  still cancelled its notification worker as if the work had failed. A patch verification in flight was quarantined
+  "patch verification cancelled" with a permanent UNKNOWN, because only the daemon's own stop counted as a stop; and
+  a completed patch whose evidence was still queued was judged unfinished before that evidence was applied, after
+  which its replay could not restore it (A1). LOW: a forced close after a finished graceful close armed another grace
+  timer at once and journaled a second escalation for an abort that never waited (A2). It confirmed the lead's
+  hypothesis on that second escalation and refuted the other two: that no round-12 path let a local retirement
+  record failure evidence, and that the tree was fit to ship. Fixed in round 13.
+- Turn 77, of round 13: do not ship. A2 fixed, and A1 fixed in the three forms recorded. MEDIUM: a retirement while
+  serving still judged a completed patch unfinished when the journal replay had already applied its evidence: the
+  replay advanced the applied cursor without verifying the patch, a verifier paused on its read was cancelled, the
+  detach then skipped verification because nothing looked unapplied, and the listener's stop quarantined the patch
+  (C1). MEDIUM, also in 2.4.6: recovery and the notification worker could verify the same operation; the second found
+  the head the first had moved, treated it as `REVISION_CHANGED` and quarantined the verified patch with permanent
+  UNKNOWNs (C2). MEDIUM, from round 13: a submission cut off by a retirement while serving (a stopped app-server
+  ended through a watch answer) kept its phase `submitting`, with nothing left to settle it (C3). It refuted the
+  lead's hypotheses that A1 held on every path, that this submission window could not be reached, and that round 12
+  had sent a malformed close frame (round 13's own intermediate edit had, and round 13 corrected it). It left the
+  cause of the slower draining stops unproven until each listener's detach is measured apart from its exit. Fixed in
+  round 14.
+- Turn 78, of round 14: do not ship. B1, C1, C2 (for single and composite patches) and A2 fixed; C3 persisted its
+  uncertainty and settled the recorded cases. HIGH, from round 14: maintenance's process inventory, begun before the
+  command forked a surviving child, could return empty after the command's own newer inventory had kept the child,
+  overwrite that survivor list, and release the custody while the child still wrote (D1). HIGH, older than round 14:
+  a listener retired while maintenance waited on a native history call cancelled maintenance itself, and nothing
+  restarted it (D2). MEDIUM, older than round 14: a queued verifier that found its operation already quarantined or
+  restored went on and quarantined it again, adding permanent UNKNOWNs; round 14's own C2 mismatch control showed two
+  quarantines (D3). It refuted the lead's hypothesis that round 14 held on every path. It attributed round 14's
+  accepted matrix drains to waiting for app-servers to exit (33.58 to 39.48 s against at most 0.068 s of detach work)
+  without explaining round 13's slower ones. Fixed in round 15.
+- Turn 79, of round 15: do not ship. D1, D2 and D3 fixed; no other HIGH or CRITICAL defect. MEDIUM: the installed
+  hook's decisions in the 27-writer matrix took 2.687 to 2.801 s, every one past the 2.5 s acceptance, with each call
+  denied and none run unadmitted; a later 2.161 s repeat does not undo that. It left the lead's reading, that the time
+  went before the daemon's receipt, unproven (start to receipt reached 1.382 s, receipt to decision 1.415 s); refuted
+  the lead's claim that a `CoordinatorError` could end maintenance (recovery catches it and quarantines the custody);
+  and noted that `asyncio.shield` and `gather(return_exceptions=True)` can turn `Retired` into a plain cancellation,
+  without a lost obligation established. Fixed and measured in round 16 (the decision bound, and G's audit).
+- Turn 80, of round 16: needs changes. D1 to D3 stay fixed, and the latency finding is closed: it checked all 14
+  matrix exports itself (56 of 56 Writes admitted, no UNKNOWN, at most 1.817 s with the installed hook and 1.003 s
+  with the new one). MEDIUM, from round 16: any Python `-c` program with `coordinator_lead.py` in its text, a comment
+  or a file name kept as data, was treated as the hook; once it had lived 2 s, its process birth gave every request an
+  expired deadline, so each edit was denied busy, and a supplied deadline could not correct it (H). LOW: the README
+  said `joined()` kept every `Retired` of a dependency, but a plain Future failed with `Retired` came back as a plain
+  cancellation; no production caller joins one (I). It refuted the lead's claim that the argument check could not
+  misclassify a client, and left a universal end-to-end bound unproven: a timeout callback cannot run while the loop
+  is occupied, and a failed peer lookup falls back to the receipt. Fixed in round 17.
+- Turn 81, of round 17: ship it, with no CRITICAL, HIGH or MEDIUM defect. H fixed: a `-c` program or a script with
+  extra arguments is never the hook, aged clients were admitted on their own request budgets, and the real 2.4.4 to
+  2.4.6 and new hooks kept `peer birth`. I fixed: `joined()` waits on a private future and reads the dependency's
+  outcome afterwards. It checked all 14 matrix exports again (56 of 56 admitted, every deadline from peer birth, at
+  most 1.563 s installed and 1.196 s new) and all 189 selected source manifests against the tree. LOW, new: the
+  hook-layout classification is cached for the daemon's life, negative answers too, so a checkout whose `hooks.json`
+  briefly lacks the declaration keeps the receipt fallback after it is restored, and unrelated script paths stay in the
+  cache. It refuted in part the lead's claim that the cache could not classify harmfully. The LOW is a known limit of
+  2.4.7 (below).
+
+### Native intake under load (review turn 82's regression, round 18)
+- On 10-25 the lead's burst A/B found a release blocker.
+  - Installed 2.4.6 journaled all 540 turns of a 27 × 20 streamed burst.
+  - The tree recorded 162 of 540. 24 of its 27 listeners went NATIVE_UNCERTAIN applying their first burst
+    turn/completed: the response sat behind unjournaled notifications for more than the 60 s call timeout. That gave
+    24 checkout-wide `*` UNKNOWNs.
+- Round 18 changes three things:
+  - responses are read ahead of the notifications queued before them;
+  - notifications are committed in groups;
+  - the native turn is time-sliced.
+- Writer measurements on the final source (r247-w/round18/implementation-report.md):
+  - five tree bursts at 540/540 with 0 UNKNOWNs;
+  - the 14-case F matrix with every Pre under 2.5 s (max 2.475 s);
+  - 133 catalog selections green.
+- The lead's re-run (r247-lead/logs30), at load 32 to 37: the tree journaled 17,659 and 18,140 events a minute, and
+  installed 2.4.6 18,191.
+
+### Journal failure, fair slices and local waits (review turn 83, round 19)
+- J1: a journal COMMIT that fails stops native intake locally.
+  - The applied prefix is kept, with no failed prefix, reconcile failure or UNKNOWN.
+  - A restart replays the journal (0.154 s in the targeted green).
+  - Strict red r19-red-j1, on the source before the edit: failed application sequence 43 and a checkout-wide UNKNOWN
+    that survived the restart.
+- S1: a native-turn owner with n live tickets ahead of it gets its step within n + 1 grants.
+  - Red: one light waiter waited until grant 1218 behind a heavy backlog.
+  - Green: both light workers advanced 726 applications, and 801 with real hooks (Pre 1.010 s).
+- R1: a peer response held behind local capacity is no longer NATIVE_UNCERTAIN.
+  - Red: NATIVE_UNCERTAIN at 60.003 s while the journal was gated for 66.003 s.
+  - Green: the same request resolved after 66.023 s, with 179 receipts committed.
+  - A genuinely unanswered peer still gives NATIVE_UNCERTAIN at 60.001 s.
+- L1: a recovery scope that is retired, or that fails, releases its dependents.
+  - Strict red r19-l1-scope-red-arranged: five scopes were retained, with no snapshot and no recovery/complete.
+  - Greens: completion in 0.223 s, and 0.233 s for the injected defect.
+- L2: an admitted RPC cut off by a local intake stop gets the operational, retryable NATIVE_INTAKE_STOPPED. Its
+  idempotency row stays pending.
+- The owned-RPC stop takes 1.023 s, twice; the diagnostic red took 6.006 s. A stop no longer starts a full-checkout
+  quarantine scan for the waiter it cancelled.
+
+### Exited writers become dormant; the writer MCP profile (round 21)
+Writer measurements on the 03:47 freeze (r247-w/round21/implementation-report.md):
+- G1: an accepted installed-2.4.6 drain was followed by recovery.
+  - 42 terminal writers became dormant in 8.056 s, and one mid-workflow writer was replaced.
+  - Offline readers peaked at four (59 MB).
+  - No terminal writer was resumed. There was no history gap, UNKNOWN or startup quarantine.
+  - The next restart left all 43 dormant.
+- G4: ten same-thread cold starts took p50 / p90 / max 0.601 / 0.617 / 0.623 s with every server, and 0.600 / 0.608 /
+  0.619 s with two servers selected.
+- G7: the calibrated MCP matrix covered user stdio servers, a plugin stdio server and HTTP.
+  - Excluded servers had zero startups or requests across the writer, its child, a cold resume, exec preflight and a
+    plugin refresh.
+  - Skills-only plugins stayed enabled.
+- G8: 605 s idle with no maintenance, native call or diagnostic bytes.
+- D5: after a 2.4.6 drain, 27 synthetic histories (2.0 GB, a 2.66 GB journal) plus a hook writer all became dormant in
+  146.3 s. Four readers peaked at 142 MB, and the restart after that took 0.450 s.
+- The lead's diff-read, r247-lead/round21-diffread.md (D1 to D7):
+  - status counted failures by scanning events;
+  - whole plugins were disabled;
+  - an invalid setting stopped the daemon;
+  - "all" mode enumerated plugins;
+  - the comparison read the journal once per actor;
+  - startup recovery included dead listeners;
+  - the context line could repeat.
+  All seven were fixed before the freeze.
+- The lead's re-runs on the freeze (r247-lead/logs31) all exited 0: G1, G2, G4 (all and two), G5, G6, G7 (all, list,
+  userlist), and D5 (28 dormant, 0 gaps, 144.3 s).
+
+### Review findings (Codex code_review, session 01a14eac, turns 82 to 84)
+- Turn 82 (release record): two MEDIUMs, fixed before round 18.
+- Turn 83: Do not ship.
+  - HIGH: a journal failure froze the applied prefix and left `*` UNKNOWNs.
+  - MEDIUM: native-turn slice starvation.
+  - MEDIUM: N2 needed complete matched pairs.
+  Round 19 fixed the first two. N2 is not complete in this release (Known limits).
+- Turn 84 (rounds 19 and 21): Do not ship.
+  - HIGH: dormant listeners broke sealing, publication and reopening.
+  - MEDIUM: an abandoned dynamic request stayed pending for good.
+  - MEDIUM: a cancel during a demand start left the replacement running.
+  - MEDIUM: `run/terminals` raised KeyError for a dormant listener.
+  - Its verdicts on the lead's hypotheses: the profile line on a fresh writer appears once (refuted); the false-gap
+    claim needs per-type classification (unproven). All four are known limits of this release, fixed in 2.4.8.
+- The release was pushed at the user's direction (10-27: "push even if things break"), with these four as
+  known limits.
+
+### Static checks on the release tree
+`r247-lead/static_checks.py`, with the version at 2.4.7 (`r247-lead/static-final`):
+- every plugin `.py` compiles in memory under Python 3.15.1 (71 files), and the 14 hook-run files under the system
+  Python 3.9.6;
+- `coordinator/hooks.py --check`: exit 0, compatible, protocol `jsonl-v1`;
+- ruff (F821, F822, F823, F811, F841, F401): 35 findings against 2.4.6's 35, none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.7.
+
+### Known limits
+- A lead edit's 2.0 s budget from its hook's start is a target, not a guarantee. In the writer's matrix, at a host
+  load of 10.8 to 14.4, the installed hook's whole Pre took at most 1.563 s and the new hook's 1.196 s. In the
+  lead's re-runs, at load 16.2 to 35.8, edits were admitted at up to 2.629 s and 2.400 s, and 17 of 76 first edits
+  were denied busy at 2.135 to 3.038 s, the decision up to 0.97 s past the deadline; each was retried and admitted,
+  and none ran unadmitted. The hook's own timeout is 3 s. The deadline is a timer on the daemon's event loop: a loop
+  or a host stalled past it still answers late, and past the hook's timeout the installed hooks let the call run
+  unadmitted, as before.
+- The hook's start is the kernel's record of its process, read on macOS for the exact `hooks.json` invocation
+  (`python3` running the plugin's `hooks/coordinator_lead.py` and nothing else). Elsewhere, or when the lookup
+  fails, the budget starts at the daemon's receipt, recorded as `receipt`; the 2.4.7 hook also sends its own
+  deadline, which can only shorten the budget.
+- Whether a script is the plugin's hook is decided once per daemon and path, from the plugin's manifest and
+  `hooks.json`: a checkout whose `hooks.json` briefly lacks the declaration keeps the receipt fallback until the
+  daemon restarts, and each distinct script path a client runs stays cached (review turn 81, LOW).
+- A denied edit is retried by the lead (the model), not by the hook.
+- A second SIGINT that arrives after the daemon's `serve` has returned, while `asyncio.run` closes its loop, reaches
+  Python's default handler: the worker ends by `KeyboardInterrupt` (signal 2) after its stop has completed and
+  released everything, and the supervisor, which ends with its worker only on exit 0 or 3, starts a new one (from
+  its code; not run with two SIGINTs). 2.4.6 had no handler of its own, so any second SIGINT during its stop ended
+  it that way; 2.4.7 takes repeated SIGINTs as the same stop until `serve` returns. Seen once, in the lead's re-run
+  of X2, whose fixture sends a second SIGINT after the window's own.
+- A 2.4.4 hook's denied call keeps its paths until the 120 s legacy expiry.
+- Direct `operation/prepare` needs kernel lineage that survives reparenting: macOS only; elsewhere it is refused
+  `EXECUTOR_LINEAGE`. A process whose ancestry cannot be proven holds an editor's paths until it exits.
+- A failed observation's repair waits while another change, a call, a process or custody holds its paths or its
+  checkout; on a checkout that is never idle it stays pending (one per set of checkouts) until the checkout is free
+  or the next start.
+- The final recovery comparison is two fixed-request pairs, one in each order, on one shared host, run by the writer
+  at a load of 13.4 to 15.3 and by the lead at 17.6 to 20.0. In the writer's pairs the tree's first recovery was
+  15.52 and 21.35 s faster, with less CPU and SQL time; in the lead's, 6.65 and 8.07 s slower. Round 16's pairs were
+  1.54 s slower and 3.01 s faster, round 12's 1.48 s faster and 5.79 s slower. They do not prove equal or better speed under every load, and how much of each difference is the host is
+  not established. The tree runs about 1.2 % more SQLite transactions a recovery. Earlier rounds' slow tree runs
+  (16.29 s in round 5, and rounds 7 and 8) are not each explained.
+- A stop ends the daemon's own calibration app-servers before it exits: TERM, up to 10 s for one to exit, then KILL
+  and the reap (11.49 s measured with one that was stopped). One the kernel cannot reap keeps the daemon from exiting;
+  nothing it owns is released meanwhile.
+- A close the daemon makes of a native connection waits at most 1 s for its close frame, then cuts the connection
+  off and journals it (`native/close_escalated`). The bound is fixed. Each connection is escalated at most once.
+- A draining stop stops the app-servers one after another. One still exiting 5 s after its TERM refuses the stop
+  (`LISTENER_DRAIN`, as in 2.4.6), as does work still active (`NOT_QUIESCENT`), and the stop is asked again. On the
+  release tree, in the matrix at a host load of 10.8 to 14.4, the accepted stop came 30.3 to 106.2 s after the first
+  request, of which the app-servers' exits took 19.7 to 65.9 s and detaching every listener at most 0.07 s (round 16,
+  at a load of 5.9 to 12.5: 7.2 to 59.9 s; the lead's re-runs of the release tree, at 16.2 to 35.8: 8.7 to 136.4 s,
+  detaching at most 0.28 s); in the burst, after eight refusals over 87.09 s (the writer's run; the lead's burst runs stopped at their 540-turn check before it).
+- A stream close joins CPython's shared close waiter (`StreamReaderProtocol._get_close_waiter`), and the drain counts
+  each listener queue's unfinished items (`asyncio.Queue._unfinished_tasks`): both read on the installed Python 3.15
+  only (3.15.0, and 3.15.1 for the lead's last runs; both have them). Python 3.11 to 3.14 were not run.
+- Under heavy host load the daemon records native notifications more slowly than 2.4.6. Each is taken through the
+  daemon's one first-in, first-out native turn and journaled in its own SQLite commit (`synchronous=FULL`) on the
+  event loop. In the lead's bursts at load 19 to 62 the ledger held 189 to 270 of 540 turns when measured, where
+  2.4.6 at 22.6 to 51.8 held all 540; the writer's runs at load 15 to 19 kept up (21,133 a minute). Nothing was
+  lost or quarantined and every writer reconciled; work that waits on those notifications runs later. Which of the
+  two costs it is, is not established. The user's coordinator has recorded 1,000 native notifications in 0.68 s,
+  and about 8,500 a minute over several seconds.
+- Y2's red is a control on the edited tree (the round-10 close put back at import); no run of the unedited round-10
+  tree showed it.
+- Every watchdog dump is marked possibly truncated: faulthandler cannot report a short write.
+- The replica's journal is 2.66 GB, not the live 6.46 GB; it reproduced the hook timeout and unadmitted Writes with
+  one UNKNOWN per file, not the incident's three.
+Not measured:
+- weeks of uptime with the watchdog (10 idle minutes, forced stalls, a stopped watchdog and rotation were measured);
+- an editor lifetime on Linux;
+- the incident's own checkout.

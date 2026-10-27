@@ -226,9 +226,18 @@ creates, changes or deletes one.
   custody: files they may have changed, until the command and anything it left running have exited.
   Whatever nobody can explain is **UNKNOWN**.
 - **A writer's tools.** It sees your MCP servers, minus the lead's tools: no `abraham`, no
-  `coordinator_*` lead tools. A server of yours that fails to start does not stop a write.
+  `coordinator_*` lead tools. A server of yours that fails to start does not stop a write. To start
+  only some of them for writers, set the plugin option `writer_mcp_servers` (`/config`) to a JSON
+  list of exact server names, such as `["MCP_DOCKER"]`; `all`, the default, keeps every one. It
+  applies when the coordinator next starts.
+- **Finished writers.** When the coordinator starts, a writer whose run has finished and whose
+  app-server has exited stays dormant: its saved history is checked, and it starts again only when
+  you resume it or message it.
 - **Your own edits.** In a checkout the coordinator has registered, Claude's Edit and Write go through
-  a hook. They are recorded as yours, and refused on a path another writer claims. A Bash command
+  a hook. They are recorded as yours, and refused on a path another writer claims. One the
+  coordinator cannot admit within about two seconds of the hook starting (its checkout busy settling
+  commands, or the daemon still starting) is refused before it runs, `LEAD_ADMISSION_BUSY`, naming
+  what it waited for and when to retry; Claude retries it as a new call. A Bash command
   that changes files is recorded as yours when, while it ran, no writer was working, no command was
   held and no other lead Bash command was running in any repository the coordinator has registered.
   Otherwise what it changed is UNKNOWN. A command run from a folder that holds several registered
@@ -252,7 +261,8 @@ creates, changes or deletes one.
   release's coordinator, which migrates the state. It stops only the daemon it checked, and only
   when nothing is in flight. While something is (a lead edit or command, a writer's turn, a
   publication), that call is refused with `DAEMON_OUTDATED`, and the old daemon keeps serving.
-  Lead edits made during the replacement wait for the new daemon. A coordinator from before 2.4.0 is
+  Lead edits made during the replacement wait for the new daemon; one that arrives while it is
+  still recovering is refused as busy and retried. A coordinator from before 2.4.0 is
   never stopped by a call. Stop it once, when no session is editing, with the command the refusal
   names. Sessions that still run an older release keep working until you restart them.
 
@@ -535,6 +545,7 @@ Set these in the environment Claude Code starts with. Every one is optional.
 | `SOFTWARE_WORKFLOWS_RUNTIME` | Where the coordinator's sockets live (default `/tmp/c1-<uid>`). Keep it short: macOS limits a socket path to 104 bytes. |
 | `SOFTWARE_WORKFLOWS_PYTHON` | The Python (3.11+) the coordinator daemon runs on (default: the server's). |
 | `SOFTWARE_WORKFLOWS_RECOVERY_CONCURRENCY` | How many writers the coordinator recovers at once (default 4). A full read of a writer's history takes one of these slots. A positive integer; a running coordinator keeps the value it started with. |
+| `SOFTWARE_WORKFLOWS_WRITER_MCP_SERVERS` | Overrides the plugin option `writer_mcp_servers`: `all` or a JSON list of exact MCP server names that writers start. Read when the coordinator starts. |
 | `SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY` | How many short history reads run at once beside recovery (default 2): a live writer's catch-up, a message's delivery check, settling a resume's or a cancel's inputs. A positive integer; a running coordinator keeps the value it started with. |
 
 The server's venv lives in the plugin's data directory

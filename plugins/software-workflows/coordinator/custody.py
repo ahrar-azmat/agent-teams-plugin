@@ -4,6 +4,7 @@ import re
 import shlex
 import time
 
+from .locks import finish_thread
 from .client import CoordinatorError
 from .ledger import normalize, overlaps
 from .store import uid
@@ -329,7 +330,7 @@ class Custody:
     def unit_active(self, unitid):
         return list(self.store.held_custody(unit=unitid))
 
-    async def acquire(self, actor, paths, cwd=None, mark=None, lead_call=None):
+    async def acquire(self, actor, paths, cwd=None, mark=None, lead_call=None, executor=None, effect=None):
         """Claim these paths for the actor's unit. A path outside the ledger (ledger.unwatched) is neither claimed nor
         held against another unit's claim: nothing there is recorded, so nothing there refuses an edit (2.4.0-2.4.3
         claimed it, and another unit's edit of the same ignored file was refused CLAIM_CONFLICT). Those are returned
@@ -344,7 +345,11 @@ class Custody:
         normalized = {key: [p for p in values if p["path"] not in outside[key]] for key, values in normalized.items()}
         normalized = {key: values for key, values in normalized.items() if values}
         outside = [qualified(key, path) for key, values in sorted(outside.items()) for path in sorted(values)]
-        async with self.condition:
+        from .locks import held
+        async with held(self.condition):
+            from . import admissions
+            admissions.check("claim reservation")
+            admission = admissions.mark()
             from .lead_calls import refuse
             for key, values in groups.items():
                 refuse(self.store, key, values, lead_call, "RESTORE_EXECUTING" if mark else "CLAIM_CONFLICT")
@@ -355,6 +360,8 @@ class Custody:
                 require_writable(self.store, actor["unit"], key)
             conflicts = [dict(conflict, checkout=key, root=self.store.get(key)["root"])
                          for key, values in normalized.items() for conflict in self.conflicts(key, actor["unit"], values)]
+            if effect is not None:
+                effect()
             if conflicts:
                 request = uid("request")
                 self.store.put("claim_request", request, {"actor": actor["id"], "unit": actor["unit"],
@@ -369,6 +376,12 @@ class Custody:
                     for path in values:
                         existing = held.get(path["key"])
                         if existing:
+                            if existing.get("executor") not in (None, executor):
+                                existing.pop("executor")
+                                self.store.save(existing)
+                            if existing.get("admission") not in (None, admission):
+                                existing.pop("admission")
+                                self.store.save(existing)
                             if existing.get("restore") not in (None, mark):
                                 existing.pop("restore")  # this call holds it too: no longer the restore's alone
                                 self.store.save(existing)
@@ -377,7 +390,9 @@ class Custody:
                             ident = uid("claim")
                             held[path["key"]] = self.store.put("claim", ident, dict(path, checkout=key, root=self.store.get(key)["root"],
                                                                unit=actor["unit"], actor=actor["id"], state="held",
-                                                               **({"restore": mark} if mark else {})), actor["unit"])
+                                                               **({"restore": mark} if mark else {}),
+                                                               **({"admission": admission} if admission else {}),
+                                                               **({"executor": executor} if executor else {})), actor["unit"])
                             result.append(ident)
                 self.store.event("claim/acquired", actor["id"], {"claims": result})
             return {"claims": result, **({"outside": outside} if outside else {})}
@@ -480,7 +495,7 @@ class Custody:
                                         self.store.get(item["checkout"]), r["paths"], r["id"]))]
                     if not conflicts and not pending and not lead_pending:
                         if process_baseline is None:
-                            process_baseline = await asyncio.to_thread(baseline)
+                            process_baseline = await finish_thread(baseline)
                             continue  # Recheck every checkout after the asynchronous collection.
                         break
                     process_baseline = None

@@ -3,15 +3,14 @@
 Only literal replacement semantics are admitted. Fuzzy matching and notebook
 serialization have no measured full-image adapter and receive a concrete refusal.
 """
-import asyncio
 import codecs
 import hashlib
 import os
 import time
 
+from .locks import KeyedLocks, finish_all, finish_thread
 from .client import CoordinatorError
 from .ledger import hidden, normalize
-from .locks import KeyedLocks
 from .observations import checkout_at
 from .store import digest, uid
 
@@ -156,7 +155,7 @@ async def window(daemon, checkout, mine, ident):
     other lead calls advance durable counters; completed exec writers leave a
     changed lock-file stamp. None disappears when it leaves the active set."""
     # The one await comes first: everything after it reads the store without yielding.
-    if any(busy for busy, _ in await asyncio.gather(*(asyncio.to_thread(exec_window, c)
+    if any(busy for busy, _ in await finish_all(*(finish_thread(exec_window, c)
                                                     for c in daemon.store.all("checkout")))):
         return None
     return quiet(daemon, checkout, mine, ident)
@@ -264,7 +263,7 @@ async def dispatch(daemon, payload):
             # becomes visible before the reconcile below is settled there as not its doing.
             for key in [key for key, (until, _) in HIDDEN.items() if until < time.time()]:
                 del HIDDEN[key]
-            listings = await asyncio.gather(*(asyncio.to_thread(hidden, c) for c in reach))
+            listings = await finish_all(*(finish_thread(hidden, c) for c in reach))
             HIDDEN[ident] = (deadline, dict(zip([c["id"] for c in reach], listings)))
     from .lead import attach
     mapping = await attach(daemon, checkout["id"], session, cwd=payload.get("cwd"), hook=True)

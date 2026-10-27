@@ -5,15 +5,18 @@ calling these methods. Historical events and UNKNOWN records are append-only.
 """
 from contextlib import contextmanager
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import threading
 import time
 import uuid
 
 from .client import CoordinatorError, validate_state
+from . import telemetry
 
 
 # Unreconciled operations: admission and custody look only at these, per checkout.
@@ -34,10 +37,18 @@ LEAD_BATCH_PENDING = "kind='lead_batch' AND json_extract(data,'$.state')='pendin
 LEAD_BATCH_ITEM_PENDING = "kind='lead_batch_item' AND json_extract(data,'$.state')='pending'"
 LEAD_BATCH_LEGACY = "kind='lead_batch' AND coalesce(json_extract(data,'$.schema'),1)=1"
 
+def custody_window(prefix=""):
+    """Every unreleased custody reservation is an active effect window.
+    Quarantine preserves exclusion until process/terminal evidence allows release.
+    Use the same predicate for occupancy indexes, queries and epoch transitions.
+    """
+    return prefix + "kind='custody' AND json_extract(" + prefix + "data,'$.state')!='released'"
+
+
 WINDOW_ACTIVE = {
     "actor": "kind='actor' AND (json_extract(data,'$.active_turn') IS NOT NULL OR json_extract(data,'$.state')='running')",
     "operation": "kind='operation' AND json_extract(data,'$.state') IN ('prepared','allowed','running')",
-    "custody": "kind='custody' AND json_extract(data,'$.state')!='released'",
+    "custody": custody_window(),
     # A quarantined patch native may still be writing (ledger.quarantine executing=True).
     "executing": "kind='operation' AND json_extract(data,'$.executing') IS NOT NULL",
     "lead_edit": "kind='lead_hook' AND json_extract(data,'$.execution.phase') IN ('admitting','open','settling')",
@@ -61,14 +72,17 @@ def digest(value):
 def fsync_dir(path):
     fd = os.open(path, os.O_RDONLY)
     try:
-        os.fsync(fd)
+        telemetry.fsync(fd)
     finally:
         os.close(fd)
 
 
 class Store:
     def __init__(self, root):
+        self.status_epoch = 0
         self.root = validate_state(root, create=True)
+        self._validated_blobs = {}
+        self._blob_publish = threading.RLock()
         for name in ("blobs", "listeners", "indexes", "schemas", "calibrations"):
             directory = self.root / name
             directory.mkdir(mode=0o700, exist_ok=True)
@@ -187,9 +201,14 @@ class Store:
                 ("lead_batch_pending", "id", LEAD_BATCH_PENDING),
                 ("lead_batch_item_pending", "coalesce(json_extract(data,'$.retry_after'),0),id", LEAD_BATCH_ITEM_PENDING),
                 ("lead_batch_legacy", "id", LEAD_BATCH_LEGACY),
+                ("observation_pending", "json_extract(data,'$.retry_key'),id", "kind='observation' AND json_extract(data,'$.state')='pending'"),
+                ("observation_terminal", "id", "kind='observation' AND json_extract(data,'$.state')!='pending'"),
                 ("claim_checkout", "json_extract(data,'$.checkout'),id", "kind='claim' AND json_extract(data,'$.state')='held'"),
                 # Every native notification and hook finds its operation by call id; every admission
                 # checks the checkout's unreconciled operations.
+                ("writer_mcp_usage", "coalesce(json_extract(data,'$.completed'),json_extract(data,'$.created'))",
+                 "kind='operation' AND json_extract(data,'$.completed_item.type')='mcpToolCall' AND "
+                 "json_extract(data,'$.completed_item.status')='completed'"),
                 ("operation_call", "json_extract(data,'$.native.call'),id", "kind='operation'"),
                 ("live_operation", "json_extract(data,'$.checkout'),id", LIVE_OPERATION),
                 # A patch's admission and receipt look for custody released since it began.
@@ -199,6 +218,63 @@ class Store:
             ):
                 self.db.execute("CREATE INDEX IF NOT EXISTS " + name + " ON records(" + expression + ") WHERE " + condition)
             self.db.execute("CREATE INDEX IF NOT EXISTS unknown_checkout ON unknowns(checkout)")
+        # Exclusion epochs detect even a lead admission that starts and ends
+        # during a scan. Heads detect byte transitions separately. The trigger
+        # changes no epoch for ordinary native journal/progress saves.
+        self.db.executescript("""
+        CREATE TABLE IF NOT EXISTS path_versions(
+          checkout TEXT NOT NULL, path TEXT NOT NULL, version INTEGER NOT NULL,
+          PRIMARY KEY(checkout,path));
+        CREATE TRIGGER IF NOT EXISTS path_exclusion_insert AFTER INSERT ON records
+        WHEN NEW.kind='lead_hook' OR (NEW.kind='operation' AND json_extract(NEW.data,'$.kind') IN ('patch','lead-edit','restore'))
+        BEGIN
+          INSERT INTO path_versions(checkout,path,version)
+          SELECT json_extract(NEW.data,'$.checkout'), value, 1 FROM json_each(NEW.data,'$.paths') WHERE value IS NOT NULL AND json_extract(NEW.data,'$.checkout') IS NOT NULL
+          ON CONFLICT(checkout,path) DO UPDATE SET version=version+1;
+        END;
+        CREATE TRIGGER IF NOT EXISTS path_exclusion_update AFTER UPDATE ON records
+        WHEN (NEW.kind='lead_hook' OR (NEW.kind='operation' AND json_extract(NEW.data,'$.kind') IN ('patch','lead-edit','restore')))
+          AND (json_extract(NEW.data,'$.state','$.paths','$.executing','$.execution.phase','$.generation','$.checkout')
+               IS NOT json_extract(OLD.data,'$.state','$.paths','$.executing','$.execution.phase','$.generation','$.checkout'))
+        BEGIN
+          INSERT INTO path_versions(checkout,path,version)
+          SELECT checkout,path,1 FROM (
+            SELECT json_extract(NEW.data,'$.checkout') AS checkout,value AS path FROM json_each(NEW.data,'$.paths')
+            UNION SELECT json_extract(OLD.data,'$.checkout'),value FROM json_each(OLD.data,'$.paths')
+          ) WHERE checkout IS NOT NULL AND path IS NOT NULL
+          ON CONFLICT(checkout,path) DO UPDATE SET version=version+1;
+        END;
+        """)
+        # A command can change bytes and restore them before settling. Heads
+        # alone cannot detect an image sampled inside that completed window.
+        # Persist acquisition/release epochs in the same transaction as custody.
+        # The empty path is reserved for whole-checkout custody (not a filename).
+        with self.transaction():
+            for action in ("INSERT", "UPDATE", "DELETE"):
+                refs = ("OLD", "NEW") if action == "UPDATE" else ("OLD",) if action == "DELETE" else ("NEW",)
+                condition = " OR ".join(custody_window(ref + ".") for ref in refs)
+                if action == "UPDATE":
+                    condition = "(" + condition + ") AND (json_extract(NEW.data,'$.state','$.checkout','$.level','$.keys','$.paths','$.excludes') IS NOT " + \
+                        "json_extract(OLD.data,'$.state','$.checkout','$.level','$.keys','$.paths','$.excludes'))"
+                scopes = []
+                for ref in refs:
+                    scopes.append("SELECT json_extract(" + ref + ".data,'$.checkout') AS checkout, value AS path "
+                        "FROM json_each(CASE WHEN json_extract(" + ref + ".data,'$.level')='paths' "
+                        "THEN coalesce(json_extract(" + ref + ".data,'$.keys'),json_extract(" + ref + ".data,'$.paths'),'[]') "
+                        "ELSE '[\"\"]' END) WHERE " + custody_window(ref + "."))
+                name = "custody_epoch_" + action.lower()
+                definition = ("CREATE TRIGGER " + name +
+                    " AFTER " + action + " ON records WHEN " + condition + " BEGIN "
+                    "INSERT INTO path_versions(checkout,path,version) SELECT checkout,path,1 FROM (" +
+                    " UNION ".join(scopes) + ") WHERE checkout IS NOT NULL AND path IS NOT NULL "
+                    "ON CONFLICT(checkout,path) DO UPDATE SET version=version+1; END")
+                existing = self.db.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
+                if not existing or existing[0] != definition:
+                    # Upgrade held-only triggers atomically; unchanged starts do no
+                    # schema writes and no historical custody rows are rewritten.
+                    if existing:
+                        self.db.execute("DROP TRIGGER " + name)
+                    self.db.execute(definition)
         generation = self.get("daemon", required=False)
         self.generation = (generation or {}).get("generation", 0) + 1
         self.put("meta", "daemon", {"generation": self.generation, "pid": os.getpid(),
@@ -206,31 +282,58 @@ class Store:
 
     @contextmanager
     def transaction(self):
-        self.db.execute("BEGIN IMMEDIATE")
+        measured = bool(telemetry.CURRENT.get())
+        if measured:
+            with telemetry.span("sql_begin", False):
+                self.db.execute("BEGIN IMMEDIATE")
+        else:
+            self.db.execute("BEGIN IMMEDIATE")
         try:
             yield
-        except BaseException:
-            self.db.execute("ROLLBACK")
+            if measured:
+                with telemetry.span("sql_commit", False):
+                    self.db.execute("COMMIT")
+            else:
+                self.db.execute("COMMIT")
+        except BaseException as exc:
+            # COMMIT can fail with the transaction still active (notably BUSY).
+            # Other SQLite errors may already have rolled it back. Never leave
+            # the next owner inside this transaction, or hide the original error.
+            if self.db.in_transaction:
+                try:
+                    self.db.execute("ROLLBACK")
+                except BaseException as rollback:
+                    exc.add_note("Rollback also failed: " + type(rollback).__name__ + ": " + str(rollback))
             raise
-        else:
-            self.db.execute("COMMIT")
 
+    @telemetry.measured("sql_work", False)
     def event(self, kind, subject, data):
         return self.db.execute("INSERT INTO events(time,kind,subject,data) VALUES(?,?,?,?)",
                                (time.time(), kind, subject, encoded(data))).lastrowid
 
+    @telemetry.measured("sql_work", False)
     def put(self, kind, ident, data, parent=None):
+        if kind in {"run", "unit", "actor", "listener", "checkout", "claim", "custody", "message", "claim_request",
+                    "release_request", "custody_request", "participant", "publication", "publication_group", "project_revision", "resolution"}:
+            self.status_epoch += 1
         self.db.execute("""INSERT INTO records(id,kind,parent,data) VALUES(?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET data=excluded.data,revision=records.revision+1""",
                         (ident, kind, parent, encoded(data)))
         return dict(data, id=ident)
 
     def get(self, ident, required=True):
-        row = self.db.execute("SELECT * FROM records WHERE id=?", (ident,)).fetchone()
+        if telemetry.CURRENT.get():
+            with telemetry.span("database_fetch", False):
+                row = self.db.execute("SELECT * FROM records WHERE id=?", (ident,)).fetchone()
+        else:
+            row = self.db.execute("SELECT * FROM records WHERE id=?", (ident,)).fetchone()
         if row is None:
             if required:
                 raise CoordinatorError("NOT_FOUND", "Record does not exist", {"id": ident})
             return None
+        if telemetry.CURRENT.get():
+            with telemetry.span("json_materialization", False):
+                return dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
         return dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
 
     def save(self, record):
@@ -241,13 +344,24 @@ class Store:
         if parent is not None:
             query += " AND parent=?"
             args.append(parent)
-        for row in self.db.execute(query + " ORDER BY id", args):
-            yield dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
+        yield from self.selected(query + " ORDER BY id", args)
 
     def selected(self, query, args=()):
         """Decode only records selected by an internal, parameterized query."""
-        for row in self.db.execute(query, args):
-            yield dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
+        if not telemetry.CURRENT.get():
+            for row in self.db.execute(query, args):
+                yield dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
+            return
+        with telemetry.span("database_fetch", False):
+            cursor = self.db.execute(query, args)
+        while True:
+            with telemetry.span("database_fetch", False):
+                row = cursor.fetchone()
+            if row is None:
+                return
+            with telemetry.span("json_materialization", False):
+                record = dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
+            yield record  # no measurement context remains open across a yield
 
     def live_operations(self, checkout):
         return self.selected("SELECT * FROM records WHERE " + LIVE_OPERATION +
@@ -301,41 +415,92 @@ class Store:
         own = self.db.execute("SELECT revision FROM records WHERE id=? AND kind='lead_hook'", (ident,)).fetchone()
         return [clock["effects"], clock["lead_hooks"] - (own["revision"] if own else 0)]
 
+    @staticmethod
+    def _blob_stamp(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    @telemetry.measured("hashing_blob_io")
     def blob(self, content):
-        """Persist before referencing; works with bytes or a binary stream."""
+        """Hash first: reusing durable content creates and syncs nothing.
+
+        A validated blob is reusable only while its file identity and change times
+        match this generation's validation. Source streams are rewound for a new
+        publication; non-seekable streams are buffered without creating a file.
+        """
+        if isinstance(content, bytes):
+            content = io.BytesIO(content)
+        if not content.seekable():
+            content = io.BytesIO(content.read())
+        position = content.tell()
         h = hashlib.sha256()
-        fd, name = tempfile.mkstemp(prefix="pending-", dir=self.root / "blobs")
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                chunks = (content,) if isinstance(content, bytes) else iter(lambda: content.read(1 << 20), b"")
-                for chunk in chunks:
+        io_count = telemetry.IO.get()
+        measured = bool(telemetry.CURRENT.get())
+        for chunk in iter(lambda: content.read(1 << 20), b""):
+            if io_count is not None:
+                io_count["bytes"] += len(chunk)
+            if measured:
+                with telemetry.span("hashing", False):
                     h.update(chunk)
-                    stream.write(chunk)
-                stream.flush()
-                os.fsync(stream.fileno())
-            target = self.root / "blobs" / h.hexdigest()
-            if target.exists():
-                self.read_blob(h.hexdigest())
-                os.unlink(name)
             else:
-                os.replace(name, target)
+                h.update(chunk)
+        name = h.hexdigest()
+        target = self.root / "blobs" / name
+        # A second publisher must not reference a renamed blob before the first
+        # publisher has synced its directory. Hashing stays outside this lock.
+        with self._blob_publish:
+            try:
+                stamp = self._blob_stamp(target.stat())
+            except FileNotFoundError:
+                stamp = None
+            if stamp is not None:
+                if self._validated_blobs.get(name) != stamp:
+                    self.read_blob(name)
+                return name
+            content.seek(position)
+            fd, pending = tempfile.mkstemp(prefix="pending-", dir=target.parent)
+            try:
+                written = hashlib.sha256()
+                with os.fdopen(fd, "wb") as stream:
+                    for chunk in iter(lambda: content.read(1 << 20), b""):
+                        with telemetry.span("hashing", False):
+                            written.update(chunk)
+                        stream.write(chunk)
+                    if written.hexdigest() != name:
+                        raise CoordinatorError("UNSTABLE_READ", "Source changed while publishing receipt bytes")
+                    stream.flush()
+                    telemetry.fsync(stream.fileno())
+                os.replace(pending, target)
                 fsync_dir(target.parent)
-            return h.hexdigest()
-        except BaseException:
-            if os.path.exists(name):
-                os.unlink(name)
-            raise
+                self._validated_blobs[name] = self._blob_stamp(target.stat())
+                return name
+            except BaseException:
+                if os.path.exists(pending):
+                    os.unlink(pending)
+                raise
 
     def read_blob(self, name):
         if not name or len(name) != 64 or any(c not in "0123456789abcdef" for c in name):
             raise CoordinatorError("BLOB_ID", "Invalid receipt identifier")
         try:
-            data = (self.root / "blobs" / name).read_bytes()
+            with (self.root / "blobs" / name).open("rb") as stream:
+                before = self._blob_stamp(os.fstat(stream.fileno()))
+                data = stream.read()
+                after = self._blob_stamp(os.fstat(stream.fileno()))
         except OSError as exc:
             raise CoordinatorError("BLOB_MISSING", "Receipt bytes are unavailable", {"blob": name}, True) from exc
-        if hashlib.sha256(data).hexdigest() != name:
+        with telemetry.span("hashing", False):
+            observed = hashlib.sha256(data).hexdigest()
+        if before != after or observed != name:
+            self._validated_blobs.pop(name, None)
             raise CoordinatorError("BLOB_CORRUPT", "Receipt hash does not match", {"blob": name}, True)
+        self._validated_blobs[name] = after
         return data
+
+    @telemetry.measured("heads_fetch_materialization")
+    def heads(self, checkout):
+        """One consistent head inventory for a full observation."""
+        return {row["path"]: dict(row) for row in self.db.execute(
+            "SELECT r.* FROM revisions r JOIN heads h ON h.revision=r.id WHERE h.checkout=?", (checkout,))}
 
     def head(self, checkout, path):
         row = self.db.execute("SELECT r.* FROM revisions r JOIN heads h ON h.revision=r.id "
@@ -343,6 +508,8 @@ class Store:
         return dict(row) if row else None
 
     def revision(self, checkout, path, blob, mode, attribution, operation=None, unit=None):
+        from .admissions import check
+        check()
         previous = self.head(checkout, path)
         ident = uid("rev")
         self.db.execute("INSERT INTO revisions VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -353,6 +520,9 @@ class Store:
         return ident
 
     def unknown(self, checkout, path, reason, context, revision=None):
+        self.status_epoch += 1
+        from .admissions import check
+        check()
         ident = uid("unknown")
         self.db.execute("INSERT INTO unknowns VALUES(?,?,?,?,?,?,?)",
                         (ident, checkout, path, revision, reason, encoded(context), time.time()))

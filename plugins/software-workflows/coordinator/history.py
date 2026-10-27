@@ -12,9 +12,9 @@ from pathlib import Path
 import os
 import time
 
+from .locks import KeyedLocks, finish, finish_thread
 from . import native, participants, processes
 from .client import CoordinatorError
-from .locks import KeyedLocks, finish
 from .store import digest, uid, WINDOW_ACTIVE
 
 
@@ -27,9 +27,12 @@ VERSION = 1
 # bootstraps active, delivery/settlement/catch-up took 9/9/55 ms at 2 versus
 # 2.8 s when they shared bootstrap slots. Full scans still use recovery capacity.
 # These fixture results size this host's default, not a universal latency bound.
-HISTORY_CONCURRENCY = int(os.environ.get("SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY", "2"))
-if HISTORY_CONCURRENCY < 1:
-    raise ValueError("SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY must be a positive integer")
+HISTORY_CONCURRENCY = 2
+_capacity = os.environ.get("SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY")
+if _capacity is not None:
+    if not _capacity.isascii() or not _capacity.isdecimal() or int(_capacity) < 1:
+        raise CoordinatorError("CONFIG", "SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY must be a positive integer")
+    HISTORY_CONCURRENCY = int(_capacity)
 
 EFFECT_ITEMS = {"fileChange", "commandExecution", "mcpToolCall"}
 
@@ -139,7 +142,7 @@ class History:
             listenerid = operation["native"].get("listener")
             if listenerid not in executors:
                 listener = self.store.get(listenerid, required=False) or {}
-                current = await asyncio.to_thread(processes.identity, listener["pid"]) if listener.get("pid") else None
+                current = await finish_thread(processes.identity, listener["pid"]) if listener.get("pid") else None
                 executors[listenerid] = bool(current and current["birth"] == listener.get("birth") and not current["zombie"])
             evidence = {key: operation.get(key) for key in ("returned", "result_ready", "post_received")}
             evidence["executor_ended"] = not executors[listenerid]
@@ -148,6 +151,8 @@ class History:
         return result
 
     def valid(self, listener, actor, connection, epoch):
+        self.daemon.check_native_stop()
+        connection.check_intake()
         current = self.store.get(actor["id"])
         cp = self.checkpoint(actor)
         applied = self.store.get("native_applied:" + listener["id"], required=False) or {}
@@ -180,7 +185,9 @@ class History:
             self.incremental_slots.release()
 
     async def observe(self, listener, actor, connection=None):
+        self.daemon.check_native_stop()
         connection = connection or self.daemon.connections[listener["id"]]
+        connection.check_intake()
         from .recovery import capacity
         cp = self.checkpoint(actor) or {}
         bootstrap = not cp.get("observed") or bool(cp.get("invalid"))
@@ -213,7 +220,7 @@ class History:
         try:
             async with self.reader_locks.hold(actor["id"]):
                 async with self.incremental_capacity():
-                    reader = await self.daemon.spawn_listener(actor, original["config"], original.get("home"))
+                    reader = await self.daemon.offline_listener(actor, original)
                 connection = self.daemon.connections[reader["id"]]
                 self.readers[actor["id"]] = connection
                 try:
@@ -234,7 +241,9 @@ class History:
             if metadata.get("historyMode") != "paginated":
                 raise CoordinatorError("NATIVE_HISTORY_UNSUPPORTED", "Incremental recovery requires native paginated history",
                                        {"mode": metadata.get("historyMode"), "thread": actor["thread"]})
-            observed_identity = await asyncio.to_thread(identity, metadata)
+            observed_identity = await finish_thread(identity, metadata)
+            self.daemon.check_native_stop()
+            connection.check_intake()
             cp = self.checkpoint(actor)
             reason = None
             if not cp:
@@ -353,7 +362,7 @@ class History:
                                cursor=page.get("backwardsCursor"), boundary=page["data"][0]["id"],
                                identity=observed_identity), actor["id"])
         after = (await connection.call("thread/read", {"threadId": actor["thread"], "includeTurns": False}))["thread"]
-        after_identity = await asyncio.to_thread(identity, after)
+        after_identity = await finish_thread(identity, after)
         if not same_identity(observed_identity, after_identity):
             self.invalidate(actor, "native_identity")
             raise CoordinatorError("HISTORY_ANCHOR", "Native history changed during observation")

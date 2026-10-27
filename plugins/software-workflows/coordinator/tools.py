@@ -1,7 +1,7 @@
 """Native dynamic tools with actor identity supplied only by the listener."""
-import asyncio
 import base64
 
+from .locks import finish_thread
 from .client import CoordinatorError
 from .ledger import normalize, read_path
 from .store import uid, encoded
@@ -36,14 +36,16 @@ def result(value, success=True):
     return {"contentItems": [{"type": "inputText", "text": encoded(value)}], "success": success}
 
 
-async def dispatch(daemon, actor, name, args):
+async def dispatch(daemon, actor, name, args, effect=None):
     if name not in CONTRACTS:
         raise CoordinatorError("DYNAMIC_TOOL", "Unknown coordinator tool")
     fields, required, _ = CONTRACTS[name]
     if not isinstance(args, dict) or set(args) - set(fields) or set(required) - set(args):
         raise CoordinatorError("TOOL_ARGUMENTS", "Unknown or missing tool arguments; actor identity is native-bound")
     if name == "claim":
-        return await daemon.custody.acquire(actor, args["paths"])
+        return await daemon.custody.acquire(actor, args["paths"], effect=effect)
+    if effect is not None:
+        effect()
     if name == "release":
         return daemon.custody.release_request(actor, args["paths"])
     if name == "declare":
@@ -64,7 +66,7 @@ async def dispatch(daemon, actor, name, args):
         checkout = daemon.store.get(routed["checkout"])
         path = routed["path"]
         await daemon.ledger.reconcile(checkout, [path])
-        image = await asyncio.to_thread(read_path, daemon.store, checkout, path)
+        image = await finish_thread(read_path, daemon.store, checkout, path)
         head = daemon.store.head(checkout["id"], path)
         if head and (image["blob"], image["mode"]) != (head["blob"], head["mode"]):
             raise CoordinatorError("UNSTABLE_READ", "Read revision changed")

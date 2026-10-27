@@ -1,11 +1,10 @@
 """Versioned project seals and ordered, recoverable repository publication."""
-import asyncio
 from pathlib import Path
 import time
 
+from .locks import finish, finish_all, finish_thread
 from . import gitio, participants
 from .client import CoordinatorError
-from .locks import finish
 from .publish import Publisher, binding
 from .store import digest, uid
 
@@ -99,12 +98,12 @@ class GroupPublisher:
         operations = list(self.store.all("operation", unit["id"]))
         await self.repo.dependency_check(unit, operations)
         dependencies = self.dependencies(unit)
-        await asyncio.gather(*(self.check_dependencies(unit["id"], key, values) for key, values in dependencies.items()))
+        await finish_all(*(self.check_dependencies(unit["id"], key, values) for key, values in dependencies.items()))
         vector, seals = [], []
         prefix = unit.get("published_prefix", {})
         for member in members:
             checkout = self.store.get(member["checkout"])
-            metadata = await asyncio.to_thread(self.repo.repository_identity, checkout)
+            metadata = await finish_thread(self.repo.repository_identity, checkout)
             if metadata["branch"] != member["branch"]:
                 raise CoordinatorError("BRANCH_CHANGED", "Participant branch changed", {"root": checkout["root"]})
             view = self.view(unit, member)
@@ -124,15 +123,15 @@ class GroupPublisher:
                 if paths != part["paths"] or [latest.get(path) for path in paths] != part["rows"]:
                     raise CoordinatorError("PREFIX_PUBLISHED", "Verified work changed in an already published participant; it cannot be omitted",
                                            {"root": checkout["root"], "checkout": checkout["id"], "commit": journal["commit"]})
-                if not await asyncio.to_thread(self.repo.installed_tip, checkout, part, journal, metadata["base"]):
+                if not await finish_thread(self.repo.installed_tip, checkout, part, journal, metadata["base"]):
                     raise CoordinatorError("PUBLICATION_REF_DIVERGED", "Completed prefix is no longer installed")
                 vector.append(dict(saved["vector"], commit=journal["commit"], publication=journal["id"]))
                 continue
             rows = await self.repo.scope_rows(view, sealing=True) if paths else []
             base = member["base"]
             if metadata["base"] != base:
-                old, new = await asyncio.gather(asyncio.to_thread(gitio.entries, checkout["root"], base),
-                                                asyncio.to_thread(gitio.entries, checkout["root"], metadata["base"]))
+                old, new = await finish_all(finish_thread(gitio.entries, checkout["root"], base),
+                                                finish_thread(gitio.entries, checkout["root"], metadata["base"]))
                 for row in rows:
                     if old.get(row["path"]) != new.get(row["path"]):
                         operation = self.store.get(row["operation"])
@@ -143,9 +142,9 @@ class GroupPublisher:
             partid = uid("seal_part")
             candidate, entries = (None, {})
             if rows:
-                candidate, entries = await asyncio.to_thread(self.repo.build_tree, checkout, base, rows,
+                candidate, entries = await finish_thread(self.repo.build_tree, checkout, base, rows,
                     self.store.root / "indexes" / (partid + ".index"))
-                if candidate == await asyncio.to_thread(gitio.text, checkout["root"], ["rev-parse", base + "^{tree}"]):
+                if candidate == await finish_thread(gitio.text, checkout["root"], ["rev-parse", base + "^{tree}"]):
                     candidate = None
             provenance = digest([{k: row[k] for k in ("id", "path", "previous", "operation", "blob", "mode")} for row in rows])
             part = dict(repository=checkout["repository"], checkout=checkout["id"], root=checkout["root"], identity=checkout["identity"],
@@ -160,7 +159,7 @@ class GroupPublisher:
         for part in seals:
             if part["paths"]:
                 await self.repo.scope_rows(dict(unit, checkout=part["checkout"]), part, sealing=True)
-            metadata = await asyncio.to_thread(self.repo.repository_identity, self.store.get(part["checkout"]))
+            metadata = await finish_thread(self.repo.repository_identity, self.store.get(part["checkout"]))
             if metadata["base"] != part["base"] or metadata["branch"] != part["branch"]:
                 raise CoordinatorError("STALE_BASE", "Participant base changed while freezing", {"root": part["root"]})
         seal = dict(binding_version=2, unit=unit["id"], seal=sealid, project_revision=unit["project_revision"],
@@ -183,7 +182,7 @@ class GroupPublisher:
         seal = self.store.get(unit["seal"])
         data = []
         for item in seal["vector"]:
-            raw = await asyncio.to_thread(gitio.git, item["root"], ["diff", "--no-ext-diff", "--no-textconv", item["base"], item["candidate"]]) if item["candidate"] else None
+            raw = await finish_thread(gitio.git, item["root"], ["diff", "--no-ext-diff", "--no-textconv", item["base"], item["candidate"]]) if item["candidate"] else None
             data.append(dict(root=item["root"], checkout=item["checkout"], base=item["base"], candidate=item["candidate"],
                              unchanged=item["unchanged"], commit=item.get("commit"), diff=raw.stdout.decode("utf-8", "strict") if raw else ""))
         return {"binding": binding(seal), "diff": "\n".join("Repository: " + d["root"] + "\n" + d["diff"] for d in data), "participants": data}
@@ -193,13 +192,13 @@ class GroupPublisher:
         await self.check_dependencies(unit["id"], checkout["id"], part.get("dependencies", []))
         if part["paths"]:
             await self.repo.scope_rows(self.view(unit, part), part)
-        config = await asyncio.to_thread(self.repo.publication_guards, checkout, part)
-        base, real = await asyncio.gather(asyncio.to_thread(gitio.entries, checkout["root"], part["base"]),
-                                          asyncio.to_thread(gitio.entries, checkout["root"]))
+        config = await finish_thread(self.repo.publication_guards, checkout, part)
+        base, real = await finish_all(finish_thread(gitio.entries, checkout["root"], part["base"]),
+                                          finish_thread(gitio.entries, checkout["root"]))
         for path in part["paths"]:
             if real.get(path, []) != base.get(path, []):
                 raise CoordinatorError("UNIT_INDEX_CHANGED", "Participant has independent staged work", {"root": checkout["root"], "path": path})
-        index = Path(await asyncio.to_thread(gitio.text, checkout["root"], ["rev-parse", "--path-format=absolute", "--git-path", "index"]))
+        index = Path(await finish_thread(gitio.text, checkout["root"], ["rev-parse", "--path-format=absolute", "--git-path", "index"]))
         lock = str(index) + ".lock"
         if Path(lock).exists() and not (publication and publication.get("index_lock") and self.repo.pinned(publication["index_lock"], lock)):
             raise CoordinatorError("INDEX_LOCKED", "Foreign index lock blocks the complete group", {"root": checkout["root"]})
@@ -274,8 +273,8 @@ class GroupPublisher:
                 journal = self.store.get(journalid)
                 if journal["phase"] == "commit_created":
                     checkout, part = self.store.get(key), self.store.get(journal["seal"])
-                    tip = await asyncio.to_thread(gitio.text, checkout["root"], ["rev-parse", part["branch"]])
-                    if await asyncio.to_thread(self.repo.installed_tip, checkout, part, journal, tip):
+                    tip = await finish_thread(gitio.text, checkout["root"], ["rev-parse", part["branch"]])
+                    if await finish_thread(self.repo.installed_tip, checkout, part, journal, tip):
                         journal["phase"] = "ref_updated"
                         self.store.save(journal)
                 if journal["phase"] in ("ref_updated", "index_pending", "index_updated"):

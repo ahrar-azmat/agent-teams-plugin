@@ -3,8 +3,8 @@ import asyncio
 import json
 import time
 
+from .locks import finish, finish_thread
 from .client import CoordinatorError
-from .locks import finish
 from .store import digest, encoded, LEAD_BATCH_ITEM_PENDING, LEAD_BATCH_LEGACY
 
 # A failed delivery retries no faster than the hook's 3 s RPC timeout. This also
@@ -35,7 +35,7 @@ async def read(daemon, ident):
     row = daemon.store.db.execute("SELECT * FROM records WHERE id=?", (ident,)).fetchone()
     if row is None:
         raise CoordinatorError("NOT_FOUND", "Batch item does not exist", {"id": ident})
-    data = await asyncio.to_thread(json.loads, row["data"])
+    data = await finish_thread(json.loads, row["data"])
     return dict(data, id=row["id"], _kind=row["kind"], _revision=row["revision"])
 
 
@@ -82,7 +82,7 @@ async def migrate(daemon, ident):
     async with daemon.actor_locks.hold("lead-batch:" + ident):
         old = await read(daemon, ident)
         if "items" in old:
-            _, header, items = await asyncio.to_thread(prepared, [i["payload"] for i in old["items"]], old)
+            _, header, items = await finish_thread(prepared, [i["payload"] for i in old["items"]], old)
             commit(daemon, ident, header, items)
 
 
@@ -140,7 +140,7 @@ async def attempt(daemon, ident):
                     outcome = {"state": "owned", "owner": held, "error": error}
                 else:
                     item.update(error=error, retry_after=time.time() + RETRY_SECONDS)
-                    data = await asyncio.to_thread(encoded, {k: v for k, v in item.items() if k != "id" and not k.startswith("_")})
+                    data = await finish_thread(encoded, {k: v for k, v in item.items() if k != "id" and not k.startswith("_")})
                     daemon.store.db.execute("UPDATE records SET data=?,revision=revision+1 WHERE id=?", (data, ident))
                     return
         # Bookkeeping errors are retries, never mistaken for a call's refusal.
@@ -190,11 +190,16 @@ async def answer(daemon, ident):
             results.append(result)
         return results
     return {"batch": ident, "received": True, "settled": header["state"] == "complete",
-            "results": await asyncio.to_thread(decoded)}
+            "results": await finish_thread(decoded)}
 
 
 async def submit(daemon, calls, settle=True):
-    ident, header, items = await asyncio.to_thread(prepared, calls)
+    from .admissions import record_end
+    if isinstance(calls, list):
+        for call in calls:
+            if isinstance(call, dict):
+                record_end(daemon, dict(call, hook_event_name="PostToolBatch"))
+    ident, header, items = await finish_thread(prepared, calls)
     async with daemon.actor_locks.hold("lead-batch:" + ident):
         exists = daemon.store.db.execute("SELECT id FROM records WHERE id=?", (ident,)).fetchone()
         if not exists:
@@ -221,12 +226,12 @@ async def scan(daemon):
                 await migrate(daemon, ident)
             except Exception as exc:
                 problem(daemon, ident, exc)
-        for receipt, calls, error in await asyncio.to_thread(pending, daemon.store.root):
+        for receipt, calls, error in await finish_thread(pending, daemon.store.root):
             try:
                 if error:
                     raise CoordinatorError("OUTBOX_READ", error, operational=True)
                 await submit(daemon, calls, settle=False)
-                await asyncio.to_thread(ack_outbox, daemon.store.root, receipt)
+                await finish_thread(ack_outbox, daemon.store.root, receipt)
             except Exception as exc:
                 problem(daemon, receipt[0], exc)
     except Exception as exc:

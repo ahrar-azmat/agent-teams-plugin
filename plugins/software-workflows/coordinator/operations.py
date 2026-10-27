@@ -1,8 +1,9 @@
 """One invocation, many checkout parts, one receipt transaction."""
-import asyncio
 from contextlib import AsyncExitStack
+import asyncio
 import time
 
+from .locks import finish_all, finish_thread
 from .client import CoordinatorError
 from .ledger import patch_scope, unified_post
 from .routing import route, qualified
@@ -103,24 +104,48 @@ async def complete_patch(ledger, operation, item):
             else:
                 raise CoordinatorError("PATCH_KIND", "Unknown native patch kind")
             expected[target["checkout"]][target["path"]] = {
-                "blob": await asyncio.to_thread(store.blob, after),
+                "blob": await finish_thread(store.blob, after),
                 "mode": parts[target["checkout"]]["pre"][target["path"]]["mode"] or "100644"}
-        return await verify(ledger, operation, expected, "exact", item)
+            terminal = ledger.terminal(operation, item)
+            if terminal:
+                return terminal
+        return await ledger._verify(operation, expected, "exact", item)
+    except asyncio.CancelledError as exc:
+        await ledger.cancel_patch(operation, exc)
+        raise
     except BaseException as exc:
-        await ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__))
+        from .locks import finish
+        terminal = ledger.terminal(operation, item)
+        if terminal:
+            return terminal
+        await finish(ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__)))
         raise
 
 
 async def verify(ledger, operation, expected, attribution, evidence):
+    return await ledger.verify(operation, expected, attribution, evidence)
+
+
+async def _verify(ledger, operation, expected, attribution, evidence):
+    # The parent completion lock covers reads, validation and every part's receipt.
     parts = [ledger.store.get(key) for key in operation["parts"]]
+    for part in parts:
+        if set(expected[part["checkout"]]) - set(part.get("outside", ())) != set(part["paths"]):
+            raise CoordinatorError("PATCH_SCOPE", "Computed result does not cover every endpoint")
+    observations = await finish_all(*(ledger.verify_images(p, expected[p["checkout"]]) for p in parts))
+    terminal = ledger.terminal(operation, evidence, expected)
+    if terminal:
+        return terminal
     async with AsyncExitStack() as stack:
         for checkout in sorted({part["checkout"] for part in parts}):
             await stack.enter_async_context(ledger.lock(checkout))
+            terminal = ledger.terminal(operation, evidence, expected)
+            if terminal:
+                return terminal
         for part in parts:
             # Paths outside the ledger are written, never recorded: no receipt covers them (ledger.prepare).
             if set(expected[part["checkout"]]) - set(part.get("outside", ())) != set(part["paths"]):
                 raise CoordinatorError("PATCH_SCOPE", "Computed result does not cover every endpoint")
-        observations = await asyncio.gather(*(ledger.verify_images(p, expected[p["checkout"]]) for p in parts))
         # No receipt is visible until every repository has passed validation.
         # Recheck heads/custody after all asynchronous observations finish.
         from .custody import interfering

@@ -3,6 +3,375 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.7] — 2026-10-27
+
+A finished writer whose app-server has exited no longer comes back as an app-server when the coordinator starts. Its
+saved history is checked read-only, and it stays dormant until it is next used. On 10-26, 2.4.6 kept 42 idle writer
+families running, about 23 GB with every MCP server. Writers can also be limited to the MCP servers you name.
+Native intake keeps up with 2.4.6 under load, and a failed journal write (a full disk) stops intake locally instead
+of marking the checkout UNKNOWN. A lead's file edit has two seconds from its hook's start to be decided: it is
+admitted, or denied before it runs, with what it waited for and when to retry. On 10-23 a lead's Writes on a large
+checkout waited behind command settlements, their hooks gave up at 3 s, and the Writes ran unadmitted, leaving 12
+UNKNOWNs. Settlements now share one scan per checkout, read outside its lock. 2.4.6's two known limits are fixed.
+Each change has a real run on Codex 0.163.0 (coordinator/VERIFY.md, 2.4.7).
+
+### Changed: an exited writer stays dormant until it is used
+- A writer is recovered read-only when the coordinator starts if all of these hold: its app-server has exited, its
+  run is finished, it owes no work, and it has no startup incident.
+  - A temporary reader lists its saved history without loading a thread.
+  - Its received items are compared with what Codex saved, and the writer becomes dormant.
+  - 2.4.6 started a replacement app-server for each one, with all of its MCP servers.
+- `run/resume`, a waking message or a workflow advance starts a dormant writer once, through one persisted start that
+  every caller shares. The cold start measured 0.60 s at p50 in the fixture runs.
+  - Mail that does not wake the writer waits, and enters before its next input.
+  - Cancelling or reading a dormant run starts nothing.
+- A received item that Codex did not save is reported as `HISTORY_GAP` in status, the run log and the start notice.
+  It is not repaired.
+- Measured after an accepted 2.4.6 drain:
+  - 42 terminal writers became dormant in 8.06 s, with no replacement app-server;
+  - 27 synthetic histories (2.0 GB, a 2.66 GB journal) took 146 s, and 144 s in the lead's re-run.
+- A writer whose app-server is still running keeps it. This release has no idle timer.
+
+### Added: writers start only the MCP servers you name
+- `writer_mcp_servers` is `all` (the default) or a JSON list of exact server names; `[]` starts none.
+  - `SOFTWARE_WORKFLOWS_WRITER_MCP_SERVERS` overrides it.
+  - It applies when the coordinator starts.
+  - The list is the exact set of servers writers start, including one disabled in your Codex configuration.
+- Excluded servers are switched off with Codex's own per-server keys, so a plugin keeps its skills.
+- Refusals:
+  - an unknown name refuses the writer's launch with `WRITER_MCP_UNKNOWN`;
+  - a key Codex ignores refuses it with `WRITER_MCP_UNENFORCEABLE`;
+  - a malformed setting is shown in status and refuses writer launches, and the daemon keeps serving.
+- Status suggests a list from the last 30 days of writer MCP calls. It never applies the suggestion by itself.
+- Context from 10-26: each live writer family was 13 to 16 processes, about 546 MiB, and writers had made 88 MCP calls
+  in a week, 80 of them to one server.
+
+### Fixed: the daemon recorded notifications more slowly than 2.4.6 under load (a known limit of the development build)
+- Native responses are read ahead of the notifications queued before them. Notifications are committed in groups, and
+  the one native turn is shared in fair time slices.
+- Measured: five bursts of 27 writers × 20 turns recorded all 540 turns, with no UNKNOWN.
+- In the lead's runs at load average 32 to 37, 2.4.7 recorded 17,659 and 18,140 events a minute, against 18,191 for
+  2.4.6.
+
+### Fixed: a full disk marked the whole checkout UNKNOWN
+- On 10-20 and 10-25, live coordinators recorded checkout-wide `*` UNKNOWNs ("native evidence processing failed") when
+  the disk reached 0 bytes.
+- A journal write that fails now stops native intake locally and keeps what was already applied. A restart replays
+  everything that was journaled.
+- Measured with an injected COMMIT failure: the replay took 0.154 s, with no UNKNOWN.
+
+### Fixed: a lead's Write ran unadmitted behind command settlements
+- On 10-23, on the user's coordinator (2.4.5), a checkout with 4,733 files in the ledger: command settlements took
+  76 to 122 s, each holding the checkout's lock while it read every file. Lead Writes waited 67 s and more behind
+  them. The lead hook gave up at its 3 s client timeout and let each Write run unadmitted: 12 UNKNOWNs.
+- An anonymous replica of that checkout reproduced it on 2.4.6: 3,284 files (90.46 MB), 4,733 heads, a 2.66 GB
+  journal, 27 writers, four real commands completing and four lead Writes through the installed hook. Every Pre took
+  3.11 s, all four Writes ran unadmitted, and each path got an UNKNOWN. Most of a settlement was spent waiting for
+  the checkout's lock: 13 to 15 s.
+- Now a lead's Write, Edit, MultiEdit or NotebookEdit has one decision budget, 2.0 s from its hook process's start,
+  covering every wait: the hook's own start and connect, the daemon's accept and read, the call's own lock, custody,
+  the checkout's lock and its file reads. It is admitted, or refused before it runs with a non-operational
+  `CLAIM_CONFLICT`: `LEAD_ADMISSION_BUSY`, the paths, what it waited for and in which phase, and an estimated retry
+  time. Every installed lead hook (2.4.4 and later) denies such an answer; it does not let the call run. The lead
+  retries the edit as a new tool call.
+- On macOS the daemon takes the start from the kernel: the birth of the process at the other end of the socket, when
+  that process is a Python interpreter running a software-workflows `hooks/coordinator_lead.py` exactly as the
+  plugin's `hooks.json` starts it (the installed 2.4.4 to 2.4.6 hooks and 2.4.7's). The 2.4.7 hook also sends its
+  own deadline, which can only shorten the budget. Any other client's budget starts when its request arrives, however
+  long that client has run. Each admission records where its deadline came from (`deadline_source`: peer birth,
+  supplied or receipt), and why when the lookup fell back.
+- Writers' native work no longer runs ahead of a waiting hook: the daemon takes native steps (receiving a
+  notification, applying one, reading a log) one at a time, in arrival order, between its other work. An admission
+  reads only the ledger heads of the paths it edits, and its first file read, blob check and intended result are one
+  thread job.
+- A file call's pre-image reads have a thread pool of their own, so they never queue behind a checkout scan. A read
+  still running at the deadline is discarded: it grants nothing and records nothing.
+- A call's end (PostToolUse, PostToolUseFailure, PostToolBatch) is recorded at once, even while its preparation is
+  still running. A grant whose answer was lost keeps its paths until the call's end is seen.
+- The replica, 27 and 30 writers, both hooks, on the release tree, the host at load average 10.8 to 14.4:
+
+  | | 2.4.6 | 2.4.7 |
+  |---|---|---|
+  | lead PreToolUse, installed 2.4.6 hook | 3.11 s, then the Write ran unadmitted | admitted at once, at most 0.758 to 1.563 s a run (eight runs); the lead's re-runs at load average 16.3 to 28.6 (twelve runs): 34 of 48 first Writes admitted at once, at most 1.170 to 2.629 s a run; 14 denied `LEAD_ADMISSION_BUSY` at 2.135 to 3.038 s and retried, each admitted; none ran unadmitted |
+  | lead PreToolUse, 2.4.7 hook | — | admitted at once, at most 0.960 to 1.196 s a run (six runs); the lead's re-runs at load average 16.2 to 35.8 (seven runs): 25 of 28 admitted at once, at most 1.125 to 2.400 s a run; 3 denied busy at 2.623 to 2.630 s and retried, each admitted |
+  | Writes run unadmitted / lead-path UNKNOWNs | 4 / 4 | 0 / 0 |
+  | a settlement, receipt to custody release | 16.3 to 18.3 s | 2.35 to 6.55 s (the lead's re-runs at load average 16.2 to 28.6: 2.83 to 11.64 s) |
+
+### Fixed: every settlement read the whole checkout under its lock
+- A command's settlement read and hashed every file of its checkout while holding the checkout's lock, so
+  settlements queued behind one another and everything else waited behind them.
+- Now each checkout has one scan producer. A request arriving during a scan joins the next one, whose set of
+  requests is frozen when it starts; no later request overtakes it. The scan runs outside the lock. Under the lock,
+  the commit checks each path's head and an exclusion version (bumped by every lead call and every patch, lead edit
+  or restore that names the path); only paths that changed while the scan ran are read again.
+- A command can change a file and put it back before its settlement, which then records no change. A command
+  window's start and end each bump a version too, in the same transaction as its custody: its declared paths', or
+  the whole checkout's for a command that declared none. A window lasts while its custody is held or quarantined (a
+  failed process check quarantines it, and a later check can release it directly); a scope change while it lasts
+  bumps both the old scope and the new. One definition of an active custody serves these versions and every
+  query that asks what custody is active, so they cannot disagree. An observation whose scan overlapped a window reads its
+  scope again before it commits; a whole-checkout one joins the checkout's next shared scan. So no observation (a
+  repair, a settlement, an unadmitted call's completion, a turn end, a recovery or quarantine snapshot, a restore
+  check) records bytes from a window that has since closed. The versions are in the ledger, so a restart keeps them.
+  With no window during a scan, nothing is read again; a window during one costs a re-read of its own paths
+  (one 17-byte path in each narrow case measured).
+- One SQLite transaction commits an observation's revisions, its UNKNOWNs, its acknowledgement and the custody
+  release it completes. Ordinary observations of the same scope that share a scan also share the commit: four
+  settlements of one change get one UNKNOWN naming all four custodies.
+- Each observation is durable from its start. A daemon killed during the scan, or before the commit, observes again
+  at restart, once; one killed after the commit keeps the original UNKNOWN and release.
+- An observation of named paths sees only those paths, even when it shares a whole-checkout scan: an unreadable path
+  outside its scope is not its UNKNOWN, and it releases nothing outside its scope.
+- Every path an observation names is read and checked, even one the shared scan's inventory and the ledger both lack:
+  absent is a result of its own. A lead's verified create of that path during the scan is read again, never
+  recorded as a deletion.
+- An observation is acknowledged only by a scan that started after it asked. A retry gets a new identity even when
+  it reuses its pending record; a later turn never takes over an earlier turn's record.
+- An observation that fails before its commit keeps its pending record. Maintenance hands the failed records of one
+  set of checkouts to a single repair observation (an `observation/repair_handoff` event names each one and records
+  that this is not an acknowledgement). The operation, turn, lead call or restore that asked keeps its own
+  completion.
+- A repair never reads a path another change may still be writing. Before it reads, and again under the commit
+  lock, it waits while a native patch or a part of one, a lead edit, a restore, an executing operation, a lead call or
+  an external editor holds an overlapping path, or any custody holds the checkout. It is retried every 5 s and never
+  acknowledged with those paths left out. A lead call's completion that was never admitted uses the same check.
+- A recovery or quarantine observation leaves another current change's paths alone: a native patch's now too, not
+  only a lead edit's or a restore's. A restore is refused `RESTORE_EXECUTING` while a native patch on its paths is
+  prepared, allowed or running.
+- A committed observation's record is removed by the observer that reads it, after it has read it. Maintenance
+  never removes one, so a settlement whose acknowledgement another settlement committed still finds it. A restart
+  removes leftover records and replays only pending ones, found through an index. The audit event remains.
+
+### Fixed: a snapshot wrote and synced every file it already had
+- A full snapshot wrote each file's bytes to a temporary file and synced it before finding the blob was already
+  stored: 3,284 temporary files and 3,284 fsyncs a snapshot on the replica.
+- Now bytes are hashed first. A stored blob is reused while its file identity (device, inode, size, mtime, ctime) is
+  the one this daemon validated; otherwise it is read and checked again. A corrupt blob is refused `BLOB_CORRUPT`,
+  whether read or reused. New content is still synced and renamed into place.
+- A steady snapshot of the replica: 0.96 to 1.08 s before, 0.42 to 0.44 s after, with no temporary file or fsync.
+
+### Fixed: a direct `operation/prepare` had no lifetime (a 2.4.6 known limit)
+- A direct `operation/prepare` (the two-step editor protocol) now names its editor process, `executor` {pid, birth}.
+  It is refused `EXECUTOR_REQUIRED` without one, `EXECUTOR_GONE` when that process is not running, and
+  `EXECUTOR_LINEAGE` on a host without kernel process identities that survive reparenting (Linux).
+- While the editor or any descendant lives, its paths stay held and a draining stop answers `NOT_QUIESCENT` naming
+  it. Descendants are found by kernel lineage, so one reparented to launchd still counts; a process whose ancestry
+  cannot be proven holds too. When all have exited, matching bytes are verified; other bytes are quarantined, with
+  their UNKNOWN. Only that editor's claims are released.
+- After a daemon restart the operation stays a crash gap: its bytes are observed as UNKNOWN, never taken as its
+  intent. An explicit `operation/complete` then observes the editor's final bytes before ending its lifetime.
+- `operation/complete` on an operation that already ended returns that operation; it used to refuse
+  `OPERATION_STATE`.
+
+### Fixed: a malformed `SOFTWARE_WORKFLOWS_HISTORY_CONCURRENCY` did not name itself (a 2.4.6 known limit)
+- `abc`, `0`, `-1`, `" 2"`, `+2` and `2.0` are now refused `CONFIG` with the setting's name; 2.4.6 refused some
+  with only `ValueError` and took `" 2"` as 2.
+- Any other startup failure's `DAEMON_STARTUP` now carries the exception's message (up to 1,024 characters), not only
+  its type.
+
+### Fixed: a verified patch could be quarantined by a second verifier or by its listener's retirement
+- Recovery and the notification worker could both verify one patch; the second found the head the first had moved and
+  quarantined the verified patch `REVISION_CHANGED`, with permanent UNKNOWNs (also in 2.4.6). Every path that
+  verifies a patch now takes the operation's completion lock (the parent's, for a part of a patch over several
+  checkouts) and reads the operation again inside it; one already verified with the same evidence or results is
+  returned as it is.
+- A verifier never changes an operation that is already terminal. A quarantined or restored operation keeps its
+  outcome for unchanged evidence, checked again after every wait and before any write. Evidence that contradicts a
+  terminal outcome is recorded once (an `operation_conflict` record, with UNKNOWNs) and answered
+  `OPERATION_EVIDENCE_CONFLICT`; a restoration is never undone.
+- Stopping one app-server's listener while the daemon keeps serving (a detach, a wedged app-server's replacement, a
+  readmission) finishes the work it interrupts: a patch verification in flight completes, a completed patch whose
+  evidence is still queued is applied first, and the listener's outstanding patches are settled after its journal is
+  replayed. A `turn/start` cut off this way keeps its input id and is marked uncertain; maintenance reads native for
+  it and never sends it again.
+
+### Fixed: a lead command's exit status and custody
+- A running lead command's call owns its exit status: maintenance and `custody/reconcile` leave it to the call, so a
+  command that has just exited is never settled as absent without it (a checkout-wide `*` UNKNOWN). A restarted
+  daemon, which has no such call, keeps the crash gap.
+- A lead command's custody is released only by a process inventory that began after its completion was recorded.
+  One settlement of a custody runs at a time and reads the custody and its members again on every pass; an inventory
+  that a newer inventory, a new process or a state change has overtaken is discarded, never saved. A child the
+  command started that outlives it keeps the paths held until it exits.
+
+### Changed: a lead's file edit during startup recovery is denied
+- Until the daemon serves, a lead's Write, Edit, MultiEdit or NotebookEdit waits within its 2.0 s budget, then is
+  denied `LEAD_ADMISSION_BUSY` naming "coordinator startup recovery", with the daemon's generation, what it is still
+  recovering and an estimated retry time. 2.4.6 answered `RECOVERING`, on which the hooks let the call run
+  unadmitted. Other lead calls (Bash) are answered `RECOVERING` as before.
+
+### Changed: what `daemon/status` shows
+- The event loop's lag (last, maximum), each checkout's lock (holder, phase, waiters, the oldest waiter's age) and
+  each checkout's scan producer (the scan running and its phase, requests queued, the last scan's seconds).
+- Counts of running observations, pre-image reads and external editors; an editor's operation, scope and
+  survivors are among the pending lead edits a draining stop names.
+- Each settlement records an `operation/settlement` event: from the notification's receipt to the custody release,
+  its time split into phases that add up (journal, lock waits, terminal and process inspection, scan, commit,
+  release, and what is not attributed).
+- The full status answer is cached until a record it shows changes: its median fell from 7.5 to 3.0–5.6 ms in the
+  27-writer recovery runs.
+
+### Changed: event-loop stalls are diagnosed
+- A watchdog process reads a heartbeat the daemon publishes to shared memory every 100 ms. When the loop misses it
+  for 0.75 s, the watchdog signals the daemon, which dumps every thread's stack at C level (it works while the loop
+  holds the GIL) into `<state>/loop-stalls.log`, after a line with the stall's wall-clock start. The log is kept to
+  two 16 MiB segments. `daemon/status` names the watchdog, the file, the threshold and the limit.
+- The dump goes through a nonblocking pipe that the watchdog drains on its own, so a stopped watchdog or a slow disk
+  loses diagnostics instead of blocking the daemon. Every dump is marked possibly truncated, in status and in a
+  `watchdog/dump_possibly_truncated` event: faulthandler does not report a short write.
+- A daemon stop waits 1 s for the watchdog to exit, then kills it and waits 1 s more. The watchdog is the daemon's own
+  child, not yet reaped, so its process id cannot have been reused: the stop starts no process to check it. A stop
+  whose caller is cancelled still finishes, and SIGUSR2 is given back only once the watchdog is gone. With the
+  watchdog stopped (SIGSTOP) during a dump five times the pipe's size, the daemon kept answering (loop lag at most
+  12.3 ms) and stopped in 1.15 to 1.17 s.
+- Before signalling, the watchdog checks the daemon's command line. A check that fails or times out is counted in
+  status and journaled (`watchdog/lookup_failed`), then retried after 1 s, doubling to 30 s; the watchdog keeps
+  draining meanwhile. A watchdog that exits on its own is journaled (`watchdog/exited`), reaped and replaced with the
+  same backoff (`watchdog/restarted`). There is no retry limit, and `daemon/status` shows the next attempt. A
+  watchdog that fails to start gives SIGUSR2 back.
+- The watchdog is supervised until the daemon's stop can no longer roll back: a draining stop refused after it began
+  (`LISTENER_DRAIN`, a lease that would not release) keeps it running. `daemon/status` shows the supervisor (running,
+  restarting and why, stopped). A supervisor that ends while the daemon serves is journaled
+  (`watchdog/supervisor_exited`, `watchdog/supervisor_task_exited`) and restarted after 1 s, doubling to 30 s. A
+  watchdog still unreaped after its SIGKILL is journaled (`watchdog/supervisor_exited` naming it while the daemon
+  serves, `watchdog/reap_failed` while it stops) and reaped again on the same backoff, SIGUSR2 ignored and its descriptors kept meanwhile; no replacement starts until it is reaped. A
+  retirement attempt that fails or is itself cancelled is started again.
+- Leaving `Daemon.serve` is final on every path: a stop, SIGINT, the task cancelled, or an exception. SIGINT is
+  handed to the event loop and wakes it; a second or third SIGINT asks for the same stop and never cuts the cleanup
+  short. The daemon marks itself stopping before it cancels anything, so the supervisor cannot restart during
+  teardown. Then it stops accepting connections and closes every connection that has not sent a whole request. A
+  request already admitted gets the 1 s drain budget to finish, then is cancelled and waited for: a lead command
+  still running is quarantined with its custody kept, for the next start to settle. Then the daemon stops taking
+  notifications from the app-servers and ends its background work while their connections are still open, so work
+  interrupted in the middle of a call records nothing that a crash at that moment would not: no new UNKNOWN or
+  evidence failure, and a notification not yet applied is applied by the next start. Only then does it close the
+  connections, waiting for each receiver to finish. The app-server processes keep running; whatever was not yet
+  journaled is read again from their history at the next start, as after a crash. Then the daemon reaps the
+  watchdog, gives SIGUSR2 back, and releases its runtime directory, locks and ledger. 2.4.6 skipped that cleanup on
+  SIGINT and on an exception. Measured: a SIGINT, a cancelled `serve()` and an exception in it each ended the daemon
+  in 0.125 to 0.183 s (the lead's re-runs: 0.124 to 0.233 s), and the real `worker()` entry point in 0.067 to
+  0.089 s (0.086 to 0.155 s), the watchdog reaped and `worker.lock` free.
+- A draining stop (`daemon/stop`) also waits for the native work the daemon has taken on: a notification it has
+  journaled but not yet applied, and an app-server's request still being handled. Until they finish it answers
+  `NOT_QUIESCENT`, naming the listener, the notification's sequence and its method. A stop accepted while a finished
+  turn's terminal inventory was still being read failed that read, and a checkout-wide `*` UNKNOWN followed (measured
+  on the development tree before this fix).
+- Every close the daemon makes of a native connection, or stop of an app-server's listener, is its own retirement,
+  never a lost peer: a native call it interrupts is cancelled and applied by the next start, and nothing records
+  `NATIVE_DISCONNECTED`, an evidence failure or an UNKNOWN for it. A connection the app-server drops while the daemon
+  serves is still recorded as one.
+- Such a close waits at most 1 s for its close frame to flush, then cuts the connection off, whatever task is
+  waiting for it, and journals `native/close_escalated` with how long it waited. With an app-server stopped behind a
+  full socket buffer (8.4 MB unread), the daemon exited 1.04 s after SIGINT. 100 real close round trips with Codex
+  0.163.0 took at most 0.43 ms.
+- Cancelling work never abandons a file read or write already running in a thread. A cancelled lead edit, restore
+  or patch waits for its writes to end, then quarantines what they left; when one of several sibling writes fails,
+  the others are waited for first. A task whose work fails while it is being cancelled still stops, and the failure
+  is kept for diagnosis. The daemon cancels any task still running again every second until all have ended.
+- Retiring something the daemon owns (a child process's TERM, the wait, KILL and the reap; its runtime directory; a
+  connection) finishes before its owner sees a cancellation, however many arrive. A retirement starts again only
+  when it is itself cancelled again; a wait it depends on that was cancelled for good is an error, never a retry
+  loop, and the waits shared with other tasks (a stream's close) are joined without being cancelled. The daemon's
+  calibration app-servers, which run in a session of their own, are ended before it exits: with one that could not
+  stop, the stop took 11.49 s, the 1 s drain budget and the 10 s grace, then KILL and the reap.
+- The daemon's long-lived services (maintenance, the external-editor observer and the lead-call observer) are
+  supervised while it serves: one that ends is journaled (`service/restarting`) and started again after 1 s, doubling to 30 s, and the
+  delay resets after 30 s of healthy service. A native connection's consumer that ends unexpectedly stops the daemon
+  (`service/failed`) instead of leaving it serving without one. A native call cut off by its connection's retirement
+  is that item's outcome (`maintenance/retry`), retried after the listener rebinds; it never ends maintenance.
+- The daemon no longer calls Python 3.13's `Server.abort_clients`: it runs on Python 3.11 and later, as declared.
+- An idle daemon writes nothing and starts no thread for it: 0 bytes and 0 re-arms in 10 minutes, where the
+  development build wrote 541 KB and re-armed 5,955 times.
+
+### Measured: first recovery
+- 27 writers holding 1,997.86 MB of synthetic histories and a 2.66 GB journal (321,357 rows), first recovery,
+  installed 2.4.6 and 2.4.7 in both orders, every history synthesized fresh:
+  - a fixed set of requests (500 full and 500 brief status calls, 25 lead Writes, 25 writer turns), 2.4.7 first and
+    then 2.4.6 first, the host at load average 13.4 to 15.3: 101.25 and 110.66 s on 2.4.6, 85.73 and 89.31 s on
+    2.4.7 (17.4 % faster on average), with 7.0 % less event-loop CPU and 20.2 % less SQL time. 2.4.7 runs 292 more
+    SQLite transactions a recovery (1.19 %). Earlier development rounds measured both ways (round 16: 58.34 and
+    60.00 s on 2.4.6, 59.88 and 56.99 s on the tree), so this is the measured comparison, not a promise of a faster
+    recovery under every load;
+  - the lead's re-runs of those pairs, the host at load average 17.6 to 20.0: 132.76 and 110.62 s on 2.4.6, 139.41
+    and 118.70 s on 2.4.7 (6.1 % slower on average). The two sets disagree, so neither shows which version recovers
+    faster.
+- The cost behind slower tree recoveries in earlier development rounds: a lead edit's admission saved each phase
+  label in a commit of its own, about 25 a call. A label is now saved with the call's next durable change.
+- A hard-kill restart took 1.62 to 1.63 s on 2.4.7, decoding 42.7 to 46.0 KB of history (the lead's: 3.81 and 3.88 s,
+  decoding 44.9 and 46.0 KB, at load average 17.6 to 20.0; 2.4.6 there 3.61 and 4.65 s).
+- A burst of 27 writers × 20 turns with streamed deltas: 61.34 s, lead Pre p50 / p99 / max 0.106 / 1.109 / 1.128 s
+  (n=154), writer Pre 0.624 / 0.938 / 1.042 s (n=540); no hook warning, denial or quarantine. The lead's three runs, at
+  load average 19 to 62, recorded only 189 to 270 of the 540 turns by the time they were measured (7,351 to 10,378
+  events a minute), with lead Pre p99 2.238 to 2.346 s and no warning, denial or quarantine either. Installed 2.4.6,
+  run between them, recorded all 540 (18,540 a minute) with lead Pre p99 3.282 s, and in its next run let a lead
+  hook return before its admission ended.
+
+### Known limits
+- The 2.0 s budget is measured, not a real-time guarantee: the daemon answers at its deadline only when its event
+  loop is free to run the timer, so a loop held by one long step, or a host that does not schedule the daemon, can
+  still push an answer past the installed hook's 3 s timeout, and the installed hooks then let the call run
+  unadmitted, as before. On the release tree the slowest answer was 1.563 s (installed hook) and 1.196 s (2.4.7
+  hook) at load average 10.8 to 14.4, the hook's start to the daemon's receipt at most 0.765 s; the lead's re-runs:
+  admitted at most 2.629 s (installed hook) and 2.400 s (2.4.7 hook) at load average 16.2 to 35.8, and 17 of 76
+  first edits denied busy at 2.135 to 3.038 s, the daemon deciding up to 0.97 s past the deadline; each was retried and
+  admitted, and none ran unadmitted.
+- The kernel start is used on macOS only. Elsewhere the 2.4.7 hook's own deadline applies, and an installed hook's
+  budget starts at the daemon's receipt. A failed lookup also falls back to the receipt, and the admission records
+  why.
+- Whether a hook file is the plugin's own is decided once per daemon and path: a checkout whose `hooks.json` is
+  edited while the daemon runs keeps its first answer until the daemon restarts (only where the budget starts can
+  change), and each distinct script path a client runs stays in that cache.
+- A stop waits for file reads and writes already running in threads. A filesystem call that never returns keeps
+  the daemon from exiting: nothing is released while a write might still be running. A stop also waits for the
+  daemon's calibration app-servers to end: up to 10 s for one to exit after TERM, then KILL; one the kernel cannot
+  reap keeps the daemon from exiting.
+- A second SIGINT that comes after `serve` has returned, while `asyncio.run` closes its loop, ends the worker by
+  `KeyboardInterrupt` once its stop is complete, and the supervisor, which ends with its worker only on exit 0 or 3,
+  then starts a new worker. 2.4.6 ended that way on any second SIGINT during its stop. Seen once, in the lead's
+  re-run of a recipe that sends a second SIGINT.
+- The 1 s bound on a native connection's close is fixed, not a setting. Each connection is escalated at most once.
+- A draining stop stops the app-servers one after another (30 to 106 s with 27 to 30 writers on the loaded host; 8.7
+  to 136.4 s in the lead's re-runs at higher load). One
+  still exiting 5 s after its TERM refuses the stop with `LISTENER_DRAIN`, as in 2.4.6; asking again then stops it.
+- The stream close and the drain's queue count use CPython internals (`StreamReaderProtocol._get_close_waiter`,
+  `asyncio.Queue._unfinished_tasks`), read on the installed Python 3.15; 3.11 to 3.14 were not run.
+- A denied edit is not retried by the hook. The lead (the model) reads the denial and retries.
+- A 2.4.4 lead hook sends no host or transcript, so a denied call keeps its paths until the 120 s legacy expiry
+  (120.2 s in the run, from the call to the release; the lead's re-run 120.09 s).
+- A direct `operation/prepare` needs kernel process lineage: macOS only. Elsewhere use `lead-edit`, which the daemon
+  installs and verifies itself. An unrelated process whose ancestry cannot be proven keeps an editor's paths held
+  until it exits.
+- A repair observation waits while another change, a call, a process or custody holds its paths or its checkout. On
+  a checkout that is never idle it stays pending, one per set of checkouts, until the checkout is free or the next
+  start observes its paths.
+- Every watchdog dump is marked possibly truncated, even a complete one: faulthandler cannot report a short write.
+- A command that declares no paths makes every whole-checkout observation that overlapped its window read the whole
+  checkout again (once, shared by every observer waiting). Commands that keep opening and closing windows can make
+  an observation read again several times; it never commits a stale image to finish sooner.
+- A watchdog the kernel never reaps after its SIGKILL delays the daemon's exit. Status and the journal show it, and
+  the daemon keeps trying.
+- The replica's journal was 2.66 GB, not the live 6.46 GB, and it gave one UNKNOWN per file, not the incident's
+  three.
+
+- Review turn 84 found four defects, fixed in 2.4.8 and not in this release:
+  - sealing, publishing or reopening a unit whose writer is dormant is refused with `LISTENER_UNAVAILABLE`. Resume
+    the writer first;
+  - a tool call cut off when its app-server died stays pending, so its unit cannot be sealed;
+  - a cancel during a dormant writer's start leaves the new app-server running until the coordinator restarts;
+  - `run/terminals` fails for a dormant writer.
+- The `writer_mcp_servers` plugin option reaches the coordinator only when a hook starts it. If the Codex Oracle MCP
+  server starts it, the option is not passed: set `SOFTWARE_WORKFLOWS_WRITER_MCP_SERVERS` there (fixed in 2.4.8).
+- Plugins installed after the coordinator starts stay off for writers under a list profile, until it restarts.
+- Output that Codex shortens when it saves (long command or MCP output) can be reported as a `HISTORY_GAP`.
+- The first comparison after the switch reads each writer's whole received journal: 146 s for 27 synthetic histories
+  (2.0 GB). About 5 minutes is estimated for the live 5.5 GB.
+- This release's acceptance did not complete two runs: the matched burst pairs against 2.4.6, and a real full disk.
+
+Not measured:
+- weeks of daemon uptime with the watchdog (10 idle minutes, forced stalls and rotation were);
+- a host other than macOS for the editor lifetime;
+- the incident's own checkout and histories (client data, read by shape only).
+
 ## [software-workflows 2.4.6] — 2026-10-23
 
 Recovery reads native history from where it last stopped, a page at a time, and recovers at most four writers at

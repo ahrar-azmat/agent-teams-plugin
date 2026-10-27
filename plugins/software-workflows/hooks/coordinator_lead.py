@@ -7,6 +7,8 @@ import os
 import stat
 import time
 
+HOOK_STARTED = time.time()
+
 
 TOOLS = {"abraham", "code_review", "codex_runs", "codex_run_log", "codex_resume_run", "codex_cancel_run",
          "coordinator_claims", "coordinator_send", "coordinator_inbox", "coordinator_unit", "coordinator_seal", "coordinator_publish"}
@@ -341,6 +343,7 @@ def transcript_identity(path):
 
 def main():
     deadline = time.monotonic() + HOOK_SECONDS
+    admission_deadline = HOOK_STARTED + 2
     payload = json.load(sys.stdin)
     event, tool, session = payload.get("hook_event_name"), payload.get("tool_name", ""), payload.get("session_id", "")
     short = tool.split("__")[-1]
@@ -371,6 +374,7 @@ def main():
             # How long the host lets this call run: the coordinator cannot read the host's environment.
             data["bash_limits"] = {k: os.environ[k] for k in ("BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS") if k in os.environ}
         elif event == "PreToolUse":
+            data["admission_deadline"] = admission_deadline
             data["host"] = host_identity()
             data["transcript"] = transcript_identity(payload.get("transcript_path"))
         client = Client(state, timeout=CALL_SECONDS)

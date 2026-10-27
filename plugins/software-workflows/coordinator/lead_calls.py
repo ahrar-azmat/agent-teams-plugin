@@ -1,7 +1,7 @@
 """Claude file-call lifetime, independent of receipt/UNKNOWN state.
 
-Terminal host evidence ends a modern admitted call. Hooks with no end-evidence
-channel retain the legacy quarantine limit. Every exclusion reads the same durable
+Terminal host evidence ends every new admitted call. Calls without a usable host birth or transcript retain the legacy limit.
+An admission identity is bookkeeping, not a terminal-evidence channel. Every exclusion reads the same durable
 lead_hook.execution record, including while admission or settlement waits.
 The host-call lock serializes Pre, Posts and the observer; filesystem/host probes
 never authorize a transition using a record saved before their await.
@@ -15,6 +15,7 @@ import stat
 import threading
 import time
 
+from . import admissions
 from .client import CoordinatorError
 from .custody import normalize, overlaps
 from .ledger import read_path, UNREADABLE
@@ -27,8 +28,8 @@ PHASES = {"admitting", "open", "settling"}
 TERMINAL_OPERATIONS = {"verified", "denied", "resolved", "reconciled"}
 # 2.4.3/2.4.4's daemon maintenance quarantined prepared lead edits when
 # now - operation.created > 120 (the hook-record deadline was 180 s).
-# Retain the 120 s operation-gap availability limit ONLY for old hooks
-# supplying neither a usable host birth nor a transcript path. It is not proof
+# Retain the 120 s operation-gap availability limit for records without
+# a usable host birth or transcript path, including new admission-tagged calls. It is not proof
 # the host call ended. Each use is durable, counted and exposed in status.
 LEGACY_FILE_CALL_SECONDS = 120
 # Only for reconstructing admission time from a pre-2.4.5 hook record.
@@ -240,6 +241,7 @@ def close(store, record, state, end=None):
     execution.pop("problem", None)
     execution.pop("retry_after", None)
     store.save(record)
+    admissions.release_owned(store, record)
 
 
 def forget_marker(store, record):
@@ -291,10 +293,10 @@ async def reconcile_unadmitted(daemon, record):
         else:
             # This completion has no hold of its own. Do not observe a newer
             # admitted call's bytes, or acknowledge a partial observation.
-            from .recovery import refuse_executing
             await daemon.ledger.reconcile(checkout, record["paths"],
                 reason="lead post hook without prepared intent", ignore_pending=False, on_observed=observed,
-                guard=lambda: refuse_executing(store, checkout["id"], record["paths"]))
+                owner={"kind": "lead-call", "call": record["id"]},
+                guard=lambda: daemon.ledger.refuse_mutations(checkout["id"], record["paths"], code="RESTORE_EXECUTING"))
         forget_marker(store, record)
     except BaseException as exc:
         current = store.get(record["id"])
@@ -348,11 +350,12 @@ async def settle(daemon, record, evidence=None):
     try:
         if operation is None:
             await daemon.ledger.reconcile(checkout, record.get("paths") or None,
-                                          reason="lead call ended without a prepared image", ignore_pending=False)
+                                          reason="lead call ended without a prepared image", ignore_pending=False,
+                                          owner={"kind": "lead-call", "call": record["id"]})
             state = "unrecorded"
         elif operation["state"] == "prepared" and not end.get("rewritten"):
             expected = operation["intended"]["expected"]
-            images = {path: await asyncio.to_thread(read_path, store, checkout, path) for path in operation["paths"]}
+            images = {path: await admissions.io(read_path, store, checkout, path) for path in operation["paths"]}
             if not end.get("failed") and images == expected:
                 try:
                     await daemon.ledger.verify(operation, expected, "exact", {"executor": "Claude file tool",
@@ -373,7 +376,8 @@ async def settle(daemon, record, evidence=None):
             if operation["state"] != "quarantined":
                 await daemon.ledger.quarantine(operation, "lead call completion input differs from its admission")
             await daemon.ledger.reconcile(checkout, record.get("paths") or None,
-                                          reason="uncertain lead call ended", ignore_pending=False)
+                                          reason="uncertain lead call ended", ignore_pending=False,
+                                          owner={"kind": "lead-call", "call": record["id"]})
             state = "uncertain"
         with store.transaction():
             if operation is not None:
@@ -500,35 +504,59 @@ async def dispatch(daemon, payload):
         "paths": [path], "execution": {"phase": "admitting", "since": time.time(),
             "host": host_snapshot(payload.get("host")), "transcript": dict(payload.get("transcript") or
                 {"path": payload.get("transcript_path")}, cursor=0)}})
+    record = store.get(ident)
+    admissions.bind(record)
+    store.save(record)
     try:
+        admissions.check("recovery")
+        while not daemon.ready:
+            await asyncio.sleep(0.01)
+            admissions.check()
+        if daemon.recovering:
+            from .recovery import recovered
+            await admissions.wait(recovered(daemon, "lead-hook/dispatch", {"payload": payload}))
+        admissions.check("classification")
         from .lead import attach
         from .routing import qualified
         from .participants import require_writable
         outside = await daemon.ledger.classify(checkout, [path])
+        admissions.check("lease")
         if path in outside:
             close(store, record, "outside", {"source": "outside-ledger"})
             return {"coordinated": False, "settled": True, "outside": True}
         # A reservation is already durable before attaching, taking a lease or saving bytes can wait.
         await finish(daemon.ensure_lease(checkout["id"]))
+        admissions.check("lead attachment")
         mapping = await attach(daemon, checkout["id"], session, cwd=payload.get("cwd"), hook=True)
+        admissions.check("claims")
         actor = dict(store.get(mapping["actor"]), checkout=checkout["id"])
         record = store.get(ident)
         record.update(unit=actor["unit"], actor=actor["id"])
         store.save(record)
         require_writable(store, actor["unit"], checkout["id"])
         await daemon.custody.acquire(actor, [qualified(checkout["id"], path)], lead_call=ident)
-        pre = await asyncio.to_thread(read_path, store, checkout, path)
-        raw = store.read_blob(pre["blob"]) if pre["blob"] else b""
-        try:
-            content = intended(tool, data, raw)
-        except CoordinatorError as exc:
+        admissions.check("pre-image executor")
+        def image_for_intent():
+            # One executor owner captures the image, validates its blob and
+            # constructs the intent. This does not mutate the ledger; prepare
+            # still re-reads and validates under its two reservation phases.
+            pre = read_path(store, checkout, path)
+            raw = store.read_blob(pre["blob"]) if pre["blob"] else b""
+            try:
+                content = intended(tool, data, raw)
+            except CoordinatorError as exc:
+                return pre, None, exc
+            return pre, {"blob": store.blob(content), "mode": pre["mode"] or "100644"}, None
+        pre, image, intent_error = await admissions.io(image_for_intent)
+        if intent_error:
+            admissions.check()
             # An uncalibrated adapter still runs unrecorded, with the same lifetime exclusions.
             record = store.get(ident)
             record["execution"]["phase"] = "open"
-            record["unverified"] = exc.envelope()
+            record["unverified"] = intent_error.envelope()
             store.save(record)
-            return {"coordinated": True, "unverified": exc.code, "settled": False}
-        image = {"blob": store.blob(content), "mode": pre["mode"] or "100644"}
+            return {"coordinated": True, "unverified": intent_error.code, "settled": False}
+        admissions.check("checkout preparation")
         async def prepare():
             return await daemon.ledger.prepare(actor, "lead-edit", {"expected": {path: image}, "host_tool": tool,
                 "input_digest": signature}, [path], native={"session_id": session, "tool_use_id": call, "lead_hook": ident,
@@ -542,6 +570,7 @@ async def dispatch(daemon, payload):
         record = store.get(ident)
         record["operation"] = operation["id"]
         store.save(record)
+        admissions.check("grant")
         if operation["pre"][path] != pre:
             await daemon.ledger.quarantine(operation, "pre-image changed during host intent preparation")
             raise CoordinatorError("LEAD_PREIMAGE_CHANGED", "Prepare the edit again against the current pre-image")
@@ -555,6 +584,10 @@ async def dispatch(daemon, payload):
         # the tool on operational failure; never turn its later Post into an
         # exact receipt. A completed admission whose transport reply is lost
         # never enters here and retains its entire lifetime hold.
+        if admissions.abandoned():
+            # Its job may have waited in an executor beyond the answer deadline.
+            # Keep exclusion until terminal evidence; stale work observes nothing.
+            raise
         current = store.get(ident)
         if current["execution"]["phase"] == "admitting":
             refused = isinstance(exc, CoordinatorError) and not exc.operational
@@ -817,7 +850,10 @@ async def recover(daemon):
     bound = {r.get("operation") for r in active(store)}
     for operation in operations.values():
         native = operation.get("native") or {}
-        if operation["id"] in bound or not operation.get("executing"):
+        if operation["id"] in bound or not operation.get("executing") or operation.get("executor"):
+            # External editors have a durable birth-bound lifetime of their own.
+            # Importing them as legacy hook calls invents a second, unobservable
+            # host end and can retain exclusion after the real executor exits.
             continue
         if operation["state"] in TERMINAL_OPERATIONS:
             daemon.ledger.end_execution(operation)

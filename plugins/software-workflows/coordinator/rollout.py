@@ -27,8 +27,8 @@ from pathlib import Path
 import stat
 import re
 
+from .locks import KeyedLocks, finish_thread
 from .store import digest, uid
-from .locks import KeyedLocks
 
 
 STARTED, ENDED = ("task_started", "turn_started"), {"task_complete": "completed", "turn_complete": "completed",
@@ -135,7 +135,7 @@ async def _diagnose(store, actor, path, thread, wanted):
             raise ValueError("Unsupported rollout diagnostic needle; expected C1_MESSAGE <id>")
     key = "rollout_diagnostic:" + actor["id"]
     state = store.get(key, required=False) or {}
-    identity = await asyncio.to_thread(file_identity, path) if path else None
+    identity = await finish_thread(file_identity, path) if path else None
     if identity is None:
         return {"readable": False, "reason": "rollout file is missing"}
     prior = state.get("identity", {})
@@ -149,15 +149,20 @@ async def _diagnose(store, actor, path, thread, wanted):
     if not unchanged or not state.get("complete"):
         state.update(identity=identity, complete=False)
         store.put("rollout_diagnostic", key, {k: v for k, v in state.items() if not k.startswith("_") and k != "id"}, actor["id"])
-        stream, reason = await asyncio.to_thread(opened, path, thread)
-        if stream is None:
-            return {"readable": False, "reason": reason}
+        stream = None
+        def acquire():
+            nonlocal stream
+            stream, reason = opened(path, thread)
+            return reason
         try:
+            reason = await finish_thread(acquire)
+            if stream is None:
+                return {"readable": False, "reason": reason}
             if state["offset"]:
-                await asyncio.to_thread(stream.seek, state["offset"])
+                await finish_thread(stream.seek, state["offset"])
             finished = False
             while not finished:
-                lines, finished = await asyncio.to_thread(batch, stream)
+                lines, finished = await finish_thread(batch, stream)
                 for start, end, whole, nonempty, record in lines:
                     if not whole:
                         state.update(offset=start, damage={"reason": "ends with a record cut short", "mended": None})
@@ -206,7 +211,8 @@ async def _diagnose(store, actor, path, thread, wanted):
         except OSError as exc:
             return {"readable": False, "reason": type(exc).__name__}
         finally:
-            await asyncio.to_thread(stream.close)
+            if stream is not None:
+                await finish_thread(stream.close)
         state.update(identity=identity, complete=True)
         store.put("rollout_diagnostic", key, {k: v for k, v in state.items() if not k.startswith("_") and k != "id"}, actor["id"])
     texts, latest, after = {}, {}, ""

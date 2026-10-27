@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import time
 
+from .locks import finish_thread
 from .client import CoordinatorError
 from . import gitio, native, processes
 from .ledger import visible, normalize
@@ -94,6 +95,10 @@ class Catalog:
         await finish(self.close())
 
     async def close(self):
+        from .locks import retire
+        await retire(self._close)
+
+    async def _close(self):
         if self.process.returncode is None:
             self.process.stdin.close()
             try:
@@ -259,11 +264,11 @@ class Projects:
                 if not preparation:
                     self.store.put("project_preparation", preparationid, dict(initial, state="preparing", checkouts=[]))
                 try:
-                    bindings, prepared = await asyncio.to_thread(self.resolve_roots, initial)
+                    bindings, prepared = await finish_thread(self.resolve_roots, initial)
                     existing = list(self.store.all("checkout"))
                     for c in existing:
                         c["known_paths"] = [r[0] for r in self.store.db.execute("SELECT path FROM heads WHERE checkout=?", (c["id"],))]
-                    await asyncio.to_thread(self.validate_ownership, prepared, existing)
+                    await finish_thread(self.validate_ownership, prepared, existing)
                     registered = {}
                     for root in prepared:
                         try:
@@ -276,11 +281,11 @@ class Projects:
                     final = snapshot((await catalog.call("project/read", {"projectId": projectid}))["project"])
                     if initial != final:
                         raise CoordinatorError("PROJECT_CHANGED", "Native membership changed during registration; retry", {"before": initial, "after": final})
-                    final_bindings, final_checkouts = await asyncio.to_thread(self.resolve_roots, final)
+                    final_bindings, final_checkouts = await finish_thread(self.resolve_roots, final)
                     if bindings != final_bindings or prepared != final_checkouts:
                         raise CoordinatorError("PROJECT_ROOT_CHANGED", "Project roots or repository bases changed during registration",
                                                {"roots": initial["roots"]})
-                    await asyncio.to_thread(self.validate_ownership, final_checkouts, existing)
+                    await finish_thread(self.validate_ownership, final_checkouts, existing)
                     for binding in bindings:
                         binding["checkout"] = registered[binding["checkout_root"]]["id"]
                     revisionid = "project_revision_" + digest([initial, bindings])

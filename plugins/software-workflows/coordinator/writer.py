@@ -10,9 +10,9 @@ import json
 from pathlib import Path
 import time
 
+from .locks import KeyedLocks, finish_all
 from .client import CoordinatorError
 from . import participants, rollout
-from .locks import KeyedLocks
 from .store import uid, digest
 
 
@@ -80,6 +80,7 @@ class Writer:
             self.store.event("workflow/prepared", runid, {"phase": phase, "input_id": phase_record["input_id"]})
 
     async def submit(self, runid):
+        self.daemon.check_native_stop()
         run = self.store.get(runid)
         phase = run["phases"][run["phase"]]
         if phase["state"] != "prepared":
@@ -89,6 +90,9 @@ class Writer:
         for key in participants.checkout_ids(self.store, run["unit"]):
             await self.daemon.ensure_lease(key)
         listener = self.store.get(actor["listener"])
+        if listener["state"] == "dormant":
+            await self.daemon.dormancy.start(runid, "workflow advance")
+            listener = self.store.get(self.store.get(actor["id"])["listener"])
         if self.daemon.hook_stale(listener) and not self.unbound(listener):
             # Admitted by another release, its calls would be refused: replace it first, once its unit is quiet. The
             # input stays prepared until then, and maintenance submits it again (advance, or resubmit for a plain run).
@@ -96,6 +100,9 @@ class Writer:
                 return
             from .recovery import reconcile_listener
             await reconcile_listener(self.daemon, listener, advance=False)
+        from .writer_profile import deliver_context
+        await deliver_context(self.daemon, self.store.get(run["root_actor"]))
+        await self.daemon.messages.deliver_held(runid)
         # Everything is read again after the awaits above (a lease, a replacement): a cancel, a drain, another input
         # or another incarnation since then starts nothing, and the input stays prepared until native bindings are
         # verified again, or the next daemon. Nothing awaits between this check and the submitting state's save.
@@ -104,6 +111,7 @@ class Writer:
         actor = self.store.get(run["root_actor"])
         listener = self.store.get(actor["listener"])
         connection = self.daemon.connections.get(listener["id"])
+        self.daemon.check_native_stop()
         if (run.get("cancel_requested") or phase["state"] != "prepared" or phase["input_id"] != input_id
                 or self.unbound(listener) or self.daemon.hook_stale(listener)):
             return
@@ -118,6 +126,8 @@ class Writer:
             response = await connection.call("turn/start", {
                 "threadId": actor["thread"], "input": phase["input"], "clientUserMessageId": phase["input_id"]})
         except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError) and self.daemon.stop.is_set():
+                raise  # the durable submitting state is recovered after restart
             run = self.store.get(runid)
             phase = run["phases"][run["phase"]]
             if phase["state"] == "submitting":
@@ -125,7 +135,11 @@ class Writer:
                 if not run.get("cancel_requested"):
                     run["state"] = "submission_uncertain"
                 self.store.save(run)
-            self.store.event("workflow/submission_uncertain", runid, {"input_id": phase["input_id"]})
+            self.store.event("workflow/submission_uncertain", runid, {
+                "input_id": phase["input_id"], "listener": listener["id"],
+                "retiring": connection.retiring})
+            if isinstance(exc, asyncio.CancelledError):
+                raise  # serving maintenance owns the durable uncertain input now
             return
         finally:
             self.starting.discard(input_id)
@@ -168,6 +182,17 @@ class Writer:
                 self.advancing -= 1
                 self.resubmitting.discard(runid)
         self.daemon.background(again())
+
+    async def settle_uncertain(self, runid):
+        """Read an interrupted plain submission; only an explicit resume may resend."""
+        async with self.locks.hold(runid):
+            run = self.store.get(runid)
+            phase = run.get("phases", {}).get(run.get("phase"), {})
+            if (run["state"] != "submission_uncertain" or run.get("cancel_requested")
+                    or phase.get("state") not in ("submitting", "uncertain")
+                    or phase.get("input_id") in self.starting or not self.daemon.runs.inputs_due(runid)):
+                return
+            await self.daemon.runs.settle_inputs(runid, "resume")
 
     def observe(self, actor, method, params):
         run = self.store.get(actor["run"])
@@ -251,7 +276,7 @@ class Writer:
                 run["settlement_refusal"] = exc.envelope()
                 self.store.save(run)
                 return
-            await asyncio.gather(*(self.daemon.ledger.reconcile(self.store.get(key)) for key in participants.checkout_ids(self.store, run["unit"])))
+            await finish_all(*(self.daemon.ledger.reconcile(self.store.get(key)) for key in participants.checkout_ids(self.store, run["unit"])))
             if self.daemon.draining:
                 return
             root = self.store.get(run["root_actor"])

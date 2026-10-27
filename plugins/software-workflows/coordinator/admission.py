@@ -18,12 +18,12 @@ import tempfile
 import time
 from types import SimpleNamespace
 
+from .locks import KeyedLocks, finish_all, finish_thread, retire
 from .client import CoordinatorError
-from . import native, gitio, processes, runtime
+from . import native, gitio, processes, runtime, children
 from .fixture import Provider, action, function, patch, message, scratch_directory
 from .ledger import case_sensitive
 from .store import digest, uid, encoded, fsync_dir
-from .locks import KeyedLocks
 
 
 PROBES = ("hooks", "evidence", "dynamic", "delivery", "tty", "receipts", "reconnect", "terminals", "ownership", "policy", "validation")
@@ -73,7 +73,7 @@ class ProbeListener:
 
     async def spawn(self):
         if not self.repo_initialized:
-            await asyncio.to_thread(gitio.git, self.repo, ["init", "--quiet"])
+            await finish_thread(gitio.git, self.repo, ["init", "--quiet"])
             self.repo_initialized = True
         environment = native.environment(CODEX_HOME=str(self.home), LOG_FORMAT="json")
         if self.trace:
@@ -86,7 +86,8 @@ class ProbeListener:
                            *native.override_args(self.config), cwd=self.repo, env=environment, stdin=asyncio.subprocess.DEVNULL,
                            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE, start_new_session=True, close_fds=True)
         self.birth = processes.identity(self.process.pid)["birth"]
-        self.stderr_task = asyncio.create_task(self.consume_stderr())
+        from .telemetry import detached_context
+        self.stderr_task = asyncio.create_task(self.consume_stderr(), context=detached_context())
         deadline = asyncio.get_running_loop().time() + 20
         while True:
             try:
@@ -145,25 +146,25 @@ class ProbeListener:
         raise CoordinatorError("PROBE_TIMEOUT", "Required native observation did not arrive")
 
     async def close(self):
-        if self.connection:
-            await self.connection.close()
-            self.connection = None
-        if self.process and self.process.returncode is None:
-            current = processes.identity(self.process.pid)
-            if current and current["birth"] == self.birth:
-                self.process.send_signal(15)
-                try:
-                    await asyncio.wait_for(self.process.wait(), 10)
-                except asyncio.TimeoutError:
-                    current = processes.identity(self.process.pid)
-                    if current and current["birth"] == self.birth:
-                        self.process.kill()
-                    await self.process.wait()
-        if hasattr(self, "stderr_task"):
-            await self.stderr_task
-        if getattr(self, "allocation", None):
-            runtime.cleanup(self.allocation)
-            self.allocation = None
+        # Direct callers and context-manager exits share the same protection.
+        await retire(self._close)
+
+    async def _close(self):
+        try:
+            if self.connection:
+                await self.connection.close(abort=True)
+                self.connection = None
+        finally:
+            # Do not retire the allocation until the child is actually reaped.
+            # A cancelled retirement retries this sequence with the same owner.
+            if self.process:
+                await children.terminate(self.process, 10)
+            if hasattr(self, "stderr_task"):
+                from .locks import finish_all
+                await finish_all(self.stderr_task, return_exceptions=True)
+            if getattr(self, "allocation", None):
+                runtime.cleanup(self.allocation)
+                self.allocation = None
 
 
 @asynccontextmanager
@@ -176,7 +177,7 @@ async def serving(router=None):
     try:
         yield provider
     finally:
-        await asyncio.to_thread(provider.__exit__, None, None, None)
+        await finish_thread(provider.__exit__, None, None, None)
 
 
 @asynccontextmanager
@@ -207,7 +208,7 @@ class Admission:
 
     async def schema(self):
         binary = native.native_codex()
-        sha = await asyncio.to_thread(native.file_digest, binary)
+        sha = await finish_thread(native.file_digest, binary)
         directory = self.store.root / "schemas" / sha
         # One generation at a time for each binary: writers reconciled in parallel all attach, and two generators
         # writing the same files would interleave them.
@@ -218,7 +219,10 @@ class Admission:
                 home.mkdir(mode=0o700, exist_ok=True)
                 process = await asyncio.create_subprocess_exec(binary, "app-server", "generate-json-schema", "--experimental", "--out", str(directory),
                             env=dict(os.environ, CODEX_HOME=str(home)), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-                code = await process.wait()
+                try:
+                    code = await process.wait()
+                finally:
+                    await children.terminate(process)
                 if code:
                     raise CoordinatorError("SCHEMA_GENERATION", "Native schema generation failed", {"exit_code": code})
                 hashes = {str(p.relative_to(directory)): native.file_digest(p) for p in directory.rglob("*.json")}
@@ -247,11 +251,14 @@ class Admission:
             raise CoordinatorError("METHOD_INVENTORY", "Required native methods unavailable", {"missing": sorted(missing)})
         binary = native.native_codex()
         proc = await asyncio.create_subprocess_exec(binary, "--version", stdout=asyncio.subprocess.PIPE)
-        version = (await proc.communicate())[0].decode().strip()
+        try:
+            version = (await proc.communicate())[0].decode().strip()
+        finally:
+            await children.terminate(proc)
         # Off the event loop: the binary is 250 MB (0.1 s to hash, measured), and every writer gate reads these.
-        binary_digest, git_version, adapter = await asyncio.gather(asyncio.to_thread(native.file_digest, binary),
-                                                                   asyncio.to_thread(gitio.text, listener.repo, ["--version"]),
-                                                                   asyncio.to_thread(native.adapter_digest))
+        binary_digest, git_version, adapter = await finish_all(finish_thread(native.file_digest, binary),
+                                                                   finish_thread(gitio.text, listener.repo, ["--version"]),
+                                                                   finish_thread(native.adapter_digest))
         config = effective.get("config", {})
         complete_policy = version == "codex-cli 0.163.0" and requirements.get("requirements") is None and bool(listener.trace_rules)
         result = {"binary": binary, "binary_digest": binary_digest, "version": version,
@@ -308,7 +315,7 @@ class Admission:
         fingerprint["provider"] = thread_response.get("modelProvider")
         from .roles import verify
         catalog = await verify(adapter.connection, thread_response["thread"]["id"])
-        fingerprint["writer_catalog_digest"] = catalog["digest"]
+        fingerprint["writer_catalog_digest"] = digest([catalog["digest"], listener.get("writer_profile")])
         features = {item["name"]: item["enabled"] for item in fingerprint["features"]}
         modes = fingerprint["runtime_modes"]
         workflow = self.store.get(self.store.get(listener["actor"])["run"]).get("workflow")
@@ -331,7 +338,7 @@ class Admission:
         listener["capability_fallback"] = {name: value["error"] for name, value in capabilities.items() if value.get("fallback")}
         listener["admission_observations"] = {"endpoint": listener["endpoint"], "listener": listenerid, "cache_hit": cached, "writer_catalog": catalog}
         self.store.save(listener)
-        self.store.event("admission/writer", listenerid, {"fingerprint": binding, "fixture": fixture, "cache_hit": cached,
+        self.store.event("admission/writer", listenerid, {"writer_profile": listener.get("writer_profile"), "fingerprint": binding, "fixture": fixture, "cache_hit": cached,
                                                           "capabilities": listener["capabilities"]})
         return {"admitted": True, "fingerprint": binding, "cache_hit": cached, "effective_modes": modes}
 
@@ -586,7 +593,7 @@ class Admission:
             async with listening(directory, provider, config={"features.unified_exec_tty": False}) as listener:
                 await listener.start_thread()
                 owner = processes.identity(listener.process.pid)
-                services = await asyncio.to_thread(processes.inventory, owner, None)
+                services = await finish_thread(processes.inventory, owner, None)
                 unrelated = await asyncio.create_subprocess_exec("/bin/sleep", "10")
                 unrelated_identity = processes.identity(unrelated.pid)
                 seen, reparented, negative, marker_failures = {}, [], False, set()
@@ -601,7 +608,7 @@ class Admission:
                             await asyncio.sleep(0.02)
                             continue
                         operation = {"native": {"thread": listener.thread, "call": event["params"]["item"]["id"]}}
-                        found = await asyncio.to_thread(processes.inventory, owner, listener.thread, list(seen.values()), operation, services)
+                        found = await finish_thread(processes.inventory, owner, listener.thread, list(seen.values()), operation, services)
                         for process in found:
                             seen[(process["pid"], process["birth"])] = process
                             try:
@@ -617,7 +624,7 @@ class Admission:
                     if operation is None:
                         raise CoordinatorError("OWNERSHIP_COMMAND_MISSING", "Native command lifecycle was not observed")
                     try:
-                        await asyncio.to_thread(processes.inventory, owner, listener.thread, (), operation, services, [unrelated_identity])
+                        await finish_thread(processes.inventory, owner, listener.thread, (), operation, services, [unrelated_identity])
                     except CoordinatorError as exc:
                         negative = exc.code == "PROCESS_AMBIGUOUS" and unrelated.pid in exc.details.get("pids", [])
                     completed = [e["params"]["item"] for e in listener.events if e.get("method") == "item/completed" and
@@ -627,11 +634,7 @@ class Admission:
                             "identities": list(seen.values()), "reparented": reparented[:1],
                             "marker_unavailable_pids": sorted(marker_failures), "settled": not found}
                 finally:
-                    if unrelated.returncode is None:
-                        current = processes.identity(unrelated.pid)
-                        if current and current["birth"] == unrelated_identity["birth"]:
-                            unrelated.terminate()
-                    await unrelated.wait()
+                    await children.terminate(unrelated)
 
     async def probe_delivery(self, directory):
         async with serving(steps_router([function("exec_command", {"cmd": "sleep 1", "login": False, "yield_time_ms": 1000}), message()])) as provider:

@@ -63,10 +63,10 @@ class Messages:
     @staticmethod
     def notice(message):
         """A coordinator notice (notify), or one recovery sent before 2.4.4 (LEGACY_NOTICES), not woken since."""
-        return message["wake"] == "none" and (message.get("notice") is True or
+        return message["wake"] == "none" and (message.get("notice") is True or message.get("inject_before_turn") is True or
                                               message["sender"] == "lead" and message["text"].startswith(LEGACY_NOTICES))
 
-    async def send(self, sender, recipient, text, wake, cwd="", notice=False):
+    async def send(self, sender, recipient, text, wake, cwd="", notice=False, ident=None):
         if wake not in ("none", "queue", "start") or not isinstance(text, str) or not text:
             raise CoordinatorError("MESSAGE_ARGUMENTS", "Message needs text and explicit wake policy: none, queue or start")
         origin = None
@@ -83,7 +83,10 @@ class Messages:
             box = self.lead_box(actor)
             if box:
                 actorid, actor = box, None
-        ident = uid("msg")
+        ident = ident or uid("msg")
+        existing = self.store.get(ident, required=False)
+        if existing:
+            return existing
         fields = {"sender": sender, "recipient": actorid, "text": text, "wake": wake, "state": "persisted", "created": time.time(),
                   "attempts": [], "native_id": ident, "delivery": "pending"}
         if notice:
@@ -139,6 +142,10 @@ class Messages:
                 await self.daemon.runs.settle_delivery(message, actor)
                 return
             listener = self.store.get(actor["listener"])
+            if listener["state"] == "dormant" and self.daemon.delivery_owed(message):
+                await self.daemon.dormancy.start(actor["run"], "waking message")
+                actor = self.store.get(actor["id"])
+                listener = self.store.get(actor["listener"])
             if not listener.get("admission") or listener["state"] != "connected" or listener.get("recovery_state") in ("reconciling", "failed"):
                 return
             connection = self.daemon.connections.get(actor["listener"])
@@ -177,6 +184,13 @@ class Messages:
                 self.daemon.readmit(target["run"])
                 return
             method = "turn/steer" if active else ("thread/queue/add" if message["wake"] == "queue" else "turn/start")
+            from .writer_profile import deliver_context
+            await deliver_context(self.daemon, target)
+            self.daemon.check_native_stop()
+            if (self.store.get(target["run"]).get("cancel_requested") or
+                    self.store.get(target["id"])["listener"] != listener["id"] or connection.closed or
+                    self.store.get(listener["id"]).get("recovery_state") in ("reconciling", "failed")):
+                return
             params = {"threadId": target["thread"], "input": [{"type": "text", "text": text}], "clientUserMessageId": native_id}
             if active:
                 params["expectedTurnId"] = active
@@ -215,6 +229,24 @@ class Messages:
             if actor["kind"] == "child":
                 message["relay"] = {"state": "submitted", "actor": target["id"], "native_id": native_id}
             self.transition(message, "submitted", {"attempt": attempt, "native_id": native_id})
+
+    async def deliver_held(self, runid):
+        """Held mail enters before a prepared input. Refused mail stays durable."""
+        run = self.store.get(runid)
+        root = self.store.get(run["root_actor"])
+        for message in list(self.store.selected("SELECT * FROM records WHERE kind='message' AND json_extract(data,'$.recipient')=? ORDER BY id", (root["id"],))):
+            if message.get("wake") != "none" or message["state"] != "persisted" or message["delivery"] not in NOTICE_DELIVERIES:
+                continue
+            async with self.locks.hold(message["id"]):
+                message = self.store.get(message["id"])
+                if not self.notice(message):
+                    message["inject_before_turn"] = True
+                self.store.save(message)
+                try:
+                    await self.deliver_notice(message)
+                except (CoordinatorError, OSError) as exc:
+                    self.store.event("message/held_delivery_failed", message["id"],
+                                     {"code": getattr(exc, "code", type(exc).__name__), "run": runid})
 
     async def deliver_notice(self, message):
         """Deliver a coordinator notice (notice), under its lock, with thread/inject_items: native records it in the
@@ -271,7 +303,9 @@ class Messages:
             return
         if active and capability != "active":
             return  # proven on an idle thread only: it waits for this turn to end
-        text = "C1_NOTICE " + ident + " from the coordinator\n" + message["text"] + "\n(No reply or acknowledgement needed.)"
+        text = ("C1_MESSAGE " + ident + " from " + message["sender"] + "\n" + message["text"] +
+                "\nAcknowledge with ack(message=" + ident + ")." if message.get("inject_before_turn") else
+                "C1_NOTICE " + ident + " from the coordinator\n" + message["text"] + "\n(No reply or acknowledgement needed.)")
         attempt = uid("delivery")
         message["attempts"].append(attempt)
         message["delivery"] = "injecting"

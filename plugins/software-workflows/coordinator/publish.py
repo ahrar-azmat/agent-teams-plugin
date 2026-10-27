@@ -3,7 +3,6 @@
 The real index is never rebuilt from HEAD. An index.lock excludes normal Git
 writers while a copy of its exact contents receives only this unit's entries.
 """
-import asyncio
 import hashlib
 import json
 import os
@@ -12,9 +11,9 @@ import shutil
 import tempfile
 import time
 
+from .locks import finish, finish_thread
 from .client import CoordinatorError
 from . import gitio, processes
-from .locks import finish
 from .ledger import read_path
 from .store import digest, uid, fsync_dir
 
@@ -234,13 +233,13 @@ class Publisher:
         paths = [row["path"] for row in rows]
         operations = list(self.store.all("operation", unitid))
         await self.dependency_check(unit, operations)
-        branch = await asyncio.to_thread(gitio.text, checkout["root"], ["symbolic-ref", "HEAD"])
+        branch = await finish_thread(gitio.text, checkout["root"], ["symbolic-ref", "HEAD"])
         if branch != unit["branch"]:
             raise CoordinatorError("BRANCH_CHANGED", "Unit's named branch changed")
-        current_base = await asyncio.to_thread(gitio.text, checkout["root"], ["rev-parse", branch])
+        current_base = await finish_thread(gitio.text, checkout["root"], ["rev-parse", branch])
         if current_base != unit["base"]:
-            original = await asyncio.to_thread(gitio.entries, checkout["root"], unit["base"])
-            current = await asyncio.to_thread(gitio.entries, checkout["root"], current_base)
+            original = await finish_thread(gitio.entries, checkout["root"], unit["base"])
+            current = await finish_thread(gitio.entries, checkout["root"], current_base)
             if any(original.get(path, []) != current.get(path, []) for path in paths):
                 raise CoordinatorError("BASE_SCOPE_CHANGED", "Branch advanced through this unit's paths; a new verified operation is required")
             unit["base"] = current_base
@@ -253,7 +252,7 @@ class Publisher:
         try:
             await self.verify_working(checkout, rows)
             attempt = self.store.get(unit["seal_attempt"])
-            candidate, entries = await asyncio.to_thread(self.build_tree, checkout, unit["base"], rows, Path(attempt["index"]))
+            candidate, entries = await finish_thread(self.build_tree, checkout, unit["base"], rows, Path(attempt["index"]))
             # Validate again after asynchronous object construction; bytes alone
             # cannot resurrect an UNKNOWN or an overwritten revision identity.
             final_rows = await self.scope_rows(unit, sealing=True)
@@ -288,7 +287,7 @@ class Publisher:
             head = self.store.head(checkout["id"], row["path"])
             if not head or head["id"] != row["id"]:
                 raise CoordinatorError("REVISION_CHANGED", "Current revision differs from frozen receipt", {"path": row["path"]})
-            actual = await asyncio.to_thread(read_path, self.store, checkout, row["path"])
+            actual = await finish_thread(read_path, self.store, checkout, row["path"])
             if actual != {"blob": row["blob"], "mode": row["mode"]}:
                 raise CoordinatorError("FROZEN_BYTES_DIVERGED", "Working bytes or modes differ from the sealed receipt", {"path": row["path"]})
 
@@ -337,7 +336,7 @@ class Publisher:
         if seal.get("binding_version") == 2:
             from .group_publish import GroupPublisher
             return await GroupPublisher(self.daemon).diff(unitid)
-        result = await asyncio.to_thread(gitio.git, checkout["root"], ["diff", "--no-ext-diff", "--no-textconv", seal["base"], seal["candidate"]])
+        result = await finish_thread(gitio.git, checkout["root"], ["diff", "--no-ext-diff", "--no-textconv", seal["base"], seal["candidate"]])
         return {"binding": {key: seal[key] for key in BINDING}, "diff": result.stdout.decode("utf-8", "strict")}
 
     def publication_guards(self, checkout, seal):
@@ -407,9 +406,9 @@ class Publisher:
         if self.store.unresolved(checkout["id"], seal["paths"]):
             raise CoordinatorError("UNKNOWN_BLOCKS_PUBLICATION", "Unresolved UNKNOWN includes a frozen path")
         await self.scope_rows(unit, seal)
-        config_digest = await asyncio.to_thread(self.publication_guards, checkout, seal)
-        base_entries = await asyncio.to_thread(gitio.entries, checkout["root"], seal["base"])
-        real_entries = await asyncio.to_thread(gitio.entries, checkout["root"])
+        config_digest = await finish_thread(self.publication_guards, checkout, seal)
+        base_entries = await finish_thread(gitio.entries, checkout["root"], seal["base"])
+        real_entries = await finish_thread(gitio.entries, checkout["root"])
         # A unit's staged entry must still be the reviewed base, never someone else's independent staging.
         for path in seal["paths"]:
             if real_entries.get(path, []) != base_entries.get(path, []):
@@ -429,40 +428,40 @@ class Publisher:
         unit = dict(unit, checkout=checkout["id"])
         if publication["phase"] in ("complete", "abandoned"):
             return publication
-        await asyncio.to_thread(self.repository_identity, checkout)
+        await finish_thread(self.repository_identity, checkout)
         if publication["phase"] in ("prepared", "commit_created", "ref_updated", "index_pending"):
             await finish(self.ensure_index_lock(checkout, publication))
         if publication["phase"] == "prepared":
-            await asyncio.to_thread(self.verify_base_index, checkout, seal, publication)
+            await finish_thread(self.verify_base_index, checkout, seal, publication)
             await self.scope_rows(unit, seal)
             await self.verify_working(checkout, seal["rows"])
-            await asyncio.to_thread(self.publication_guards, checkout, seal)
+            await finish_thread(self.publication_guards, checkout, seal)
             meta = publication["metadata"]
             env = {"GIT_" + key.upper(): meta[key] for key in ("author_name", "author_email", "author_date", "committer_name", "committer_email", "committer_date")}
             def create_commit():
                 self.repository_identity(checkout)
                 return gitio.text(checkout["root"], ["commit-tree", seal["candidate"], "-p", seal["base"]],
                                   data=meta["message"].encode(), normal_config=True, extra_env=env)
-            commit = await asyncio.to_thread(create_commit)
+            commit = await finish_thread(create_commit)
             # Deterministic metadata means recovery after commit-tree, before this
             # journal write, recreates the identical object rather than a second commit.
             publication.update(phase="commit_created", commit=commit)
             self.store.save(publication)
             self.store.event("publication/commit_created", publication["id"], {"commit": commit})
         if publication["phase"] == "commit_created":
-            tip = await asyncio.to_thread(gitio.text, checkout["root"], ["rev-parse", seal["branch"]])
-            installed = await asyncio.to_thread(self.installed_tip, checkout, seal, publication, tip)
+            tip = await finish_thread(gitio.text, checkout["root"], ["rev-parse", seal["branch"]])
+            installed = await finish_thread(self.installed_tip, checkout, seal, publication, tip)
             if not installed:
-                await asyncio.to_thread(self.verify_base_index, checkout, seal, publication)
+                await finish_thread(self.verify_base_index, checkout, seal, publication)
                 await self.scope_rows(unit, seal)
                 await self.quiescent(unit)
                 await self.daemon.ledger.reconcile(checkout)
                 if self.store.unresolved(checkout["id"], seal["paths"]):
                     raise CoordinatorError("UNKNOWN_BLOCKS_PUBLICATION", "UNKNOWN arose before ref update")
                 await self.verify_working(checkout, seal["rows"])
-                if await asyncio.to_thread(self.publication_guards, checkout, seal) != publication["config_digest"]:
+                if await finish_thread(self.publication_guards, checkout, seal) != publication["config_digest"]:
                     raise CoordinatorError("PUBLICATION_CONFIG_CHANGED", "Publication configuration changed")
-                await asyncio.to_thread(gitio.reference_update, checkout["root"], seal["branch"], publication["commit"], seal["base"],
+                await finish_thread(gitio.reference_update, checkout["root"], seal["branch"], publication["commit"], seal["base"],
                                         lambda: self.repository_identity(checkout))
             publication["phase"] = "ref_updated"
             self.store.save(publication)
@@ -521,21 +520,26 @@ class Publisher:
             return await self.reconcile(publication)
         checkout, seal = self.store.get(publication.get("checkout", unit["checkout"])), self.store.get(publication["seal"])
         await finish(self.ensure_index_lock(checkout, publication))
-        metadata = await asyncio.to_thread(self.repository_identity, checkout)
+        metadata = await finish_thread(self.repository_identity, checkout)
         if metadata["branch"] != seal["branch"]:
             raise CoordinatorError("BRANCH_CHANGED", "Cannot prove abandonment on another branch")
-        tip = await asyncio.to_thread(gitio.text, checkout["root"], ["rev-parse", seal["branch"]])
+        tip = await finish_thread(gitio.text, checkout["root"], ["rev-parse", seal["branch"]])
         installed = False
         guard = gitio.reference_verification(checkout["root"], seal["branch"], tip)
-        await asyncio.to_thread(guard.__enter__)
+        entered = False
+        def enter():
+            nonlocal entered
+            guard.__enter__()
+            entered = True
         try:
-            await asyncio.to_thread(self.repository_identity, checkout)
+            await finish_thread(enter)
+            await finish_thread(self.repository_identity, checkout)
             commit = publication.get("commit")
             if commit and tip == commit:
                 installed = True
             else:
                 if commit:
-                    ancestry = await asyncio.to_thread(gitio.git, checkout["root"], ["merge-base", "--is-ancestor", commit, tip], check=False)
+                    ancestry = await finish_thread(gitio.git, checkout["root"], ["merge-base", "--is-ancestor", commit, tip], check=False)
                     if ancestry.returncode == 0:
                         installed = True
                     elif ancestry.returncode != 1:
@@ -551,7 +555,8 @@ class Publisher:
                         self.store.save(unit)
                         self.store.event("publication/abandoned", publication["id"], {"observed_tip": tip})
         finally:
-            await asyncio.to_thread(guard.__exit__, None, None, None)
+            if entered:
+                await finish_thread(guard.__exit__, None, None, None)
         if installed:
             # A crash may have lost ref_updated. Read the actual ref, not merely
             # the journal's phase, before deciding whether abandonment is legal.
@@ -642,22 +647,22 @@ class Publisher:
 
     async def ensure_index_lock(self, checkout, publication):
         self.repository_identity(checkout)
-        index = Path(await asyncio.to_thread(gitio.text, checkout["root"], ["rev-parse", "--path-format=absolute", "--git-path", "index"]))
+        index = Path(await finish_thread(gitio.text, checkout["root"], ["rev-parse", "--path-format=absolute", "--git-path", "index"]))
         record = publication.get("index_lock")
         if not record:
-            record = await asyncio.to_thread(self.new_anchor, index, publication)
+            record = await finish_thread(self.new_anchor, index, publication)
             record["checkout_identity"] = checkout["identity"]
             publication["index_lock"] = record
             self.store.save(publication)
             self.store.event("publication/index_anchor", publication["id"], record)
         if record["checkout_identity"] != checkout["identity"] or record["index"] != str(index) or record["publication"] != publication["id"]:
             raise CoordinatorError("INDEX_OWNERSHIP", "Index ownership does not match this checkout/publication")
-        state = await asyncio.to_thread(self.acquire_index, record)
+        state = await finish_thread(self.acquire_index, record)
         if state == "installed":
             # Old journals installed by renaming index.lock. Re-establish the
             # owned link before touching refs or reconciling that installation.
-            await asyncio.to_thread(os.link, record["anchor"], record["lock"], follow_symlinks=False)
-            await asyncio.to_thread(fsync_dir, index.parent)
+            await finish_thread(os.link, record["anchor"], record["lock"], follow_symlinks=False)
+            await finish_thread(fsync_dir, index.parent)
         record.update(state="held", owner=processes.identity(os.getpid()), generation=self.store.generation)
         self.store.save(publication)
         self.store.event("publication/index_locked", publication["id"], record)
@@ -665,16 +670,19 @@ class Publisher:
 
     async def update_index(self, checkout, seal, publication):
         record = await self.ensure_index_lock(checkout, publication)
-        tip = await asyncio.to_thread(self.index_identity, checkout, seal, publication)
+        tip = await finish_thread(self.index_identity, checkout, seal, publication)
         guard = gitio.reference_verification(checkout["root"], seal["branch"], tip)
         entered = False
+        def enter():
+            nonlocal entered
+            guard.__enter__()
+            entered = True
         try:
             # Both checks occur after index.lock. The prepared transaction keeps
             # HEAD and its referent fixed until replacement is durable.
-            await asyncio.to_thread(self.index_identity, checkout, seal, publication)
-            await asyncio.to_thread(guard.__enter__)
-            entered = True
-            await asyncio.to_thread(self.index_identity, checkout, seal, publication)
+            await finish_thread(self.index_identity, checkout, seal, publication)
+            await finish_thread(enter)
+            await finish_thread(self.index_identity, checkout, seal, publication)
             if self.pinned(record, record["index"]):
                 # Installation already happened before its journal checkpoint.
                 # Never truncate this inode: it is also the current index and
@@ -682,14 +690,14 @@ class Publisher:
                 if not record.get("replacement_digest") or hashlib.sha256(Path(record["index"]).read_bytes()).hexdigest() != record["replacement_digest"]:
                     raise CoordinatorError("INDEX_OWNERSHIP", "Installed index differs from the durable replacement; preserve it for explicit reconciliation")
                 return
-            record["replacement_digest"] = await asyncio.to_thread(self.build_index, checkout, seal, publication)
+            record["replacement_digest"] = await finish_thread(self.build_index, checkout, seal, publication)
             record["state"] = "replacement_ready"
             self.store.save(publication)
             self.store.event("publication/index_ready", publication["id"], {"digest": record["replacement_digest"]})
-            await asyncio.to_thread(self.install_index, checkout, seal, publication)
+            await finish_thread(self.install_index, checkout, seal, publication)
         finally:
             if entered:
-                await asyncio.to_thread(guard.__exit__, None, None, None)
+                await finish_thread(guard.__exit__, None, None, None)
             # Keep owned locks on refusal. Recovery can prove/reuse their inode;
             # removing a foreign or unjournaled lock is never a recovery action.
 

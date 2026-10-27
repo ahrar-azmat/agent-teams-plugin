@@ -131,8 +131,6 @@ async def exec_policy(argv0, cwd, config):
     values are returned in evidence. All overrides are also applied to exec.
     """
     import asyncio
-    import os
-    import signal
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
@@ -146,23 +144,24 @@ async def exec_policy(argv0, cwd, config):
             await client.initialize()
             yield client
         finally:
-            if process.returncode is None:
-                os.killpg(process.pid, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(process.wait(), 5)
-            except asyncio.TimeoutError:
-                os.killpg(process.pid, signal.SIGKILL)
-                await process.wait()
+            from .children import terminate
+            await terminate(process, group=True)
 
+    from .writer_profile import configure, selection, verify as verify_profile, require_valid
+    selected = await selection()
+    require_valid(selected)
     async with connection(config) as client:
         effective = (await client.call("config/read", {"cwd": cwd, "includeLayers": False}))["config"]
-        restrictions = overlay(effective)
+        policy, profile = await configure(client, effective, cwd, selected)
+        restrictions = apply(overlay(effective), policy)
     async with connection(apply(config, restrictions)) as client:
+        verify_profile((await client.call("config/read", {"cwd": cwd, "includeLayers": False}))["config"], profile)
         thread = await client.call("thread/start", {"cwd": cwd, "model": config["model"],
                                    "approvalPolicy": "never", "sandbox": "danger-full-access", "ephemeral": True})
         evidence = await verify(client, thread["thread"]["id"])
-        expected = {name for name, settings in (effective.get("mcp_servers") or {}).items() if settings.get("enabled", True)}
+        expected = set(profile["enabled"])
         visible = {c["server"] for c in evidence["catalogs"]} | set(evidence["unavailable"])
         if expected - visible:
             raise CoordinatorError("WRITER_CATALOG_INCOMPLETE", "Configured MCP servers missing from writer catalog", {"servers": sorted(expected - visible)})
+        evidence["writer_profile"] = profile
         return restrictions, evidence
