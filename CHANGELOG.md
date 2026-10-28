@@ -3,6 +3,78 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.13] — 2026-10-29
+
+Two changes in the coordinator. A writer whose process family no owner journal holds no longer blocks the
+coordinator's stop: through 2.4.12 such a writer was quarantined at the next start and every draining stop refused on
+it, for as long as its record stayed. And a park that memory pressure asks for but that cannot start no longer writes
+to the ledger. (`daemon.py`, `parking.py`; coordinator/VERIFY.md, 2.4.13.)
+
+### Fixed: a replaced owner journal blocked every graceful stop
+- When the owner journal is replaced, the supervisor holds none of the families recorded in the old one. The user's
+  was moved aside at the forced switch to 2.4.11 on 10-28, because it was full. A listener record that named such a
+  family and held no receipt was still asked of the supervisor's `end`, which refuses a family it does not hold
+  (`OWNER_UNREGISTERED`). So recovery quarantined the writer for good, and every draining stop aborted on it.
+- On the user's coordinator, the switch from 2.4.11 to 2.4.12 waited 4 hours and was refused 1,053 times. It could
+  never have completed: at each idle moment the stop reached such a listener first and refused.
+- Now `family_receipt` answers such a family from the processes themselves, once nothing of it can still run, and
+  saves the root's exit evidence as its receipt. The check:
+  - every identity the ledger recorded for the family must have exited: its app-server, the services and helpers it
+    started with, the processes its commands were seen to own, and the processes its unit's custody holds, saw or
+    could not attribute;
+  - then a search of the process table must find no survivor that no record names, by the thread's markers or by
+    kernel lineage (on macOS an orphan keeps its dead parent's kernel id, measured);
+  - a record without its root's identity, its thread or its service inventory keeps the refusal, as does anything
+    alive. Recovery, the draining stop, dormancy and parking all read receipts through it.
+- Codex review turn 95 found that the first version checked only the root and the custody records' process lists: a
+  dead app-server whose MCP service survived would have been answered `GONE`. The check above is the fix.
+- Measured on a real daemon, its supervisor and worker, and a real writer app-server against the loopback fixture
+  provider, on a disposable state. The setup: a connected, idle writer; the daemon ended by signal and its journal
+  moved aside; then a restart and a draining stop.
+  - The installed 2.4.12 quarantined the writer at its restart (`reconcile_failed`, permanent) and refused the stop
+    with `OWNER_UNREGISTERED` on that listener. Its daemon kept serving.
+  - This tree recovered the writer to dormant, with `pid_absent` as its receipt, and the stop completed (35 s in all).
+  - The user's case: 2.4.12 had already quarantined the writer when this tree started on the same state. This tree
+    kept the quarantine, and its draining stop stopped the writer, saved `pid_absent` as its receipt and completed
+    (36 s in all).
+  - Survivors, on the tree's own `family_receipt` over a real process tree (a stand-in app-server with a detached
+    child, then SIGKILLed): while the orphaned child lives, recorded nowhere or in the services, the lineage, or a
+    custody record's observed or unattributed processes, the answer is still `OWNER_UNREGISTERED`. So it is for a
+    process carrying the thread's markers with no lineage, and for a record without a service inventory. Once all of
+    them exit it is `GONE`. The first version answered `GONE` in every one of these cases.
+  - A live root, any other refusal, and a record without its root's birth time are still refused, as 2.4.12 refuses
+    all of them.
+
+### Fixed: parks that cannot start filled the ledger
+- At each launch under memory pressure (kernel level 2 is common in ordinary use), the coordinator asks for a park of
+  every family it has seen active since it started, stopped, dead and quarantined ones included. Each park refused
+  before its fence still saved the listener record and logged `listener/park_abandoned`. On the user's coordinator in
+  the hour to 01:3x on 10-29 that was 1,752 of 11,862 events (15%), 1,562 of them for writers that were not even
+  connected; one 2.4.9 writer logged 3,524 in 10.7 hours on 10-28.
+- Now only a connected family is attempted, and one that left is no longer asked until it is active again. A park
+  refused before its fence changes nothing and writes nothing; status still counts it by reason. A park refused after
+  its fence is recorded as before.
+- Measured on the real `Parking` class and a real coordinator store on a disposable state, under 100 rounds of the
+  requests memory pressure sends, for four listeners (stopped, quarantined, connected with an active turn, connected
+  and refused after its fence): the installed 2.4.12 logged 400 `park_abandoned` events and wrote the three that never
+  fenced 100 times each. This tree logged 100, all of them the fenced listener's, wrote the other three not at all, and
+  stopped asking the stopped and quarantined ones after the first round. Status counted the same refusals by reason
+  on both.
+
+### Known limits
+- The running 2.4.12 still has the stop defect. The user's coordinator holds three writers that were quarantined
+  without a receipt, so 2.4.12's draining stop refuses at every idle moment. Its switch to 2.4.13 is therefore made
+  the way the switch to 2.4.12 was: the stop is asked repeatedly, and at an idle moment the old daemon is ended by
+  signal and this release started under the upgrade lock.
+- Writers quarantined before this release stay quarantined, because a permanent quarantine is not retried. This
+  release's draining stop now stops them.
+- What the survivor search cannot see: a process whose environment is unreadable (macOS system binaries) and whose
+  parent and grandparent have both died, recorded nowhere. Its lineage ends at a kernel id no live process holds. This
+  is the coordinator's existing ownership limit; the family is then answered `GONE`.
+- A park refused after its fence (the writer's native thread was found active) is still attempted and logged at each
+  launch under pressure: 109 of the 1,752 in that hour.
+- Left for 2.4.14: review turn 93's push-gate items, the limits 2.4.9 carried, and `restore_unknown`.
+
 ## [software-workflows 2.4.12] — 2026-10-28
 
 The owner journal no longer keeps every process family it has ever recorded. Its compaction now keeps only what can

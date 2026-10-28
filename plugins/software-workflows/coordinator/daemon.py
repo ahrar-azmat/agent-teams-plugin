@@ -1018,11 +1018,42 @@ class Daemon:
         """The owner's FAMILY_GONE receipt for a listener's family: the ledger's copy once it holds one (`family_gone`),
         else the owner's answer to `end`, which also begins the family's reaping. spawn_listener mints every listener
         id, so a saved receipt only ever describes this record's own family; the owner forgets a family only after
-        that copy is durable, and a receipt held here is never asked for again (2.4.12)."""
+        that copy is durable, and a receipt held here is never asked for again (2.4.12). A family the owner does not
+        hold at all (its journal was replaced, as when one is moved aside) is answered from the processes once nothing
+        of it can still run (unheld_family_exit, 2.4.13). Without that, a stop, a reconcile or a park of such a
+        listener refuses for as long as its record stays."""
         if listener.get("family_gone") is not None:
             return {"listener": listener["id"], "state": "GONE", "exit_evidence": listener["family_gone"],
                     "owner_sequence": listener.get("owner_sequence")}
-        return (await self.leases.call("end", payload={"listener": listener["id"], "mode": "drain"}))["family"]
+        try:
+            return (await self.leases.call("end", payload={"listener": listener["id"], "mode": "drain"}))["family"]
+        except CoordinatorError as exc:
+            evidence = await self.unheld_family_exit(listener) if exc.code == "OWNER_UNREGISTERED" else None
+            if not evidence:
+                raise
+            return {"listener": listener["id"], "state": "GONE", "exit_evidence": [evidence],
+                    "owner_sequence": listener.get("owner_sequence")}
+
+    async def unheld_family_exit(self, listener):
+        """The root's exit evidence for a listener's family that the owner does not hold, once nothing of that family
+        can still run; else None (2.4.13). Every identity the ledger recorded for it must have exited: the root, the
+        services and helpers it started with, each process its commands were seen to own (`process_lineage`), and each
+        process its unit's custody holds, saw or could not attribute. Then the process table is searched for survivors
+        no record names (processes.inventory: the thread's markers, and kernel lineage, which an orphan keeps from its
+        dead parent). A record without its root's identity, thread or service inventory establishes nothing."""
+        if not (listener.get("pid") and listener.get("birth") and listener.get("root_thread") and "services" in listener):
+            return None
+        evidence = processes.exit_evidence(listener)
+        if not evidence:
+            return None
+        recorded = [*listener.get("services", []), *listener.get("helpers", []), *listener.get("process_lineage", [])]
+        for reservation in self.custody.unit_active(listener["unit"]):
+            recorded += [*reservation.get("processes", []), *reservation.get("observed_processes", []),
+                         *reservation.get("ambiguous_processes", [])]
+        if any(not processes.exit_evidence(member) for member in recorded):
+            return None
+        survivors = await telemetry.to_thread(processes.inventory, listener, listener["root_thread"], recorded)
+        return None if survivors else evidence
 
     async def forget_families(self, idents):
         """Let the owner drop these listeners' GONE families from its journal, once each receipt is in the ledger

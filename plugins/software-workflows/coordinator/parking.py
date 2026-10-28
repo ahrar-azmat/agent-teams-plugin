@@ -65,6 +65,12 @@ class Parking:
     def request(self, listenerid):
         if listenerid in self.tasks or self.daemon.closing:
             return
+        listener = self.store.get(listenerid, required=False)
+        if not listener or not listener.get("root_thread") or listener["state"] != "connected":
+            # Only a connected writer parks. One that left (stopped, dead, dormant, quarantined) also leaves the
+            # activity memory pressure walks at every launch, until touch() records it again (2.4.13).
+            self.activity.pop(listenerid, None)
+            return
         task = self.daemon.background(self.park(listenerid))
         self.tasks[listenerid] = task
         def done(unused):
@@ -134,6 +140,7 @@ class Parking:
         listener = store.get(listenerid)
         began = time.monotonic()
         self.attempted += 1
+        fenced = False
         try:
             # Same order as resume: input serialization, family start/park,
             # reconcile. No scheduler mutex spans these native awaits.
@@ -147,6 +154,7 @@ class Parking:
                     raise CoordinatorError("PARK_INELIGIBLE", "connection_closed")
                 listener["state"] = "parking"
                 store.save(listener)
+                fenced = True
                 self.stage(listenerid, "fenced", idle_seconds=began - self.activity.get(listenerid, began))
                 await daemon.discover_descendants(listener)
                 for actor in self.actors(listener):
@@ -234,6 +242,10 @@ class Parking:
         except Exception as exc:
             reason = str(exc) if getattr(exc, "code", None) == "PARK_INELIGIBLE" else getattr(exc, "code", type(exc).__name__)
             self.abandoned[reason] = self.abandoned.get(reason, 0) + 1
+            if not fenced:
+                # Refused before the fence, nothing changed: status counts it, and the ledger gets no record write or
+                # event (through 2.4.12 each one wrote both; on the user's coordinator 15% of all events, 10-29).
+                return
             listener = store.get(listenerid)
             # park_resume_required survives an abandoned unload. Every input
             # path joins the persisted demand before using that live server.

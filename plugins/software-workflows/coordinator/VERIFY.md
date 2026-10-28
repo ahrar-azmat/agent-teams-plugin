@@ -14389,3 +14389,121 @@ the user's Mac, with the installed 2.4.11 as the red.
 - **The switch from 2.4.11:** a graceful stop with writers in flight still waits on `NOT_QUIESCENT`, as before.
 - **The lead catalog replay** needs its inputs rebuilt before it measures anything again.
 - **2.4.11's known limits stand.** Those marked for 2.4.12 (review turn 93) and 2.4.9's move to 2.4.13.
+
+## 2.4.13
+
+Two changes. `daemon.family_receipt` answers, from the processes themselves, a listener's family that the supervisor
+does not hold at all, once nothing of it can still run (`unheld_family_exit`). And `parking` no longer attempts, or
+writes anything for, a park that cannot start. With them: the coordinator README's journal paragraph and its parking
+section. Found on the user's coordinator: the graceful switch from 2.4.11 to 2.4.12 was refused 1,053 times in 4
+hours (10-28 ~20:28 to 10-29 00:28) and could never have completed; and `listener/park_abandoned` was 15% of the
+ledger's events. Codex review turn 95 (session 01a14eac) found that the first version of the receipt fallback checked
+too little; the version below is the fix. Measured on 10-29 between 00:52 and 02:10 on the user's Mac, with the
+installed 2.4.12 as the red.
+
+### The live finding (read-only: the live ledger, the 2.4.11 code, `r2412/switch2412.log`)
+- Once nothing is pending, 2.4.11's draining stop stops every listener that is not stopped, dead or dormant, in
+  `store.all` order (`ORDER BY id`). On the user's state the first is `listener_042bb126`, a 2.4.9 writer: its
+  app-server (pid 74155) is gone, its state is `stopping`, `family_gone` is `["zombie"]` and `owner_sequence` is
+  114994. Its family was in the journal moved aside at the forced 2.4.11 switch, so the supervisor's `end` answers
+  `OWNER_UNREGISTERED` and the stop aborts. The log holds 20 such refusals between 22:31 and 22:49. The drain's
+  `finally` resets `draining` and `closing`, and nothing else was stopped.
+- 2.4.12 answers a held receipt from the ledger, so `042bb126` would pass there. But three writers that 2.4.11
+  quarantined at that start hold no receipt (`4e3d9894`, `b1626b68`, `9773b175`), and 2.4.12 asks the supervisor for
+  theirs, which gives the same refusal. (H) below reproduces it.
+- For 78 of the minutes no writer was busy, owed writer deliveries (1 to 4) also held the stop; none was owed at
+  00:3x.
+- In the hour to ~01:31 the live ledger logged 1,752 `listener/park_abandoned` events of 11,862: `not_connected`
+  1,562, `native_active_turn` 109, `active_turn` 79, two others 1 each. `042bb126` alone logged 3,524 between 07:44
+  and 18:24 on 10-28.
+
+### What it changes
+- **`family_receipt`:** a held receipt is still answered from the ledger (2.4.12). Otherwise the supervisor's `end` is
+  asked. When it refuses with `OWNER_UNREGISTERED` (it holds no such family), `unheld_family_exit` decides:
+  - the record must hold its root's `pid` and `birth`, its `root_thread` and its `services` inventory, and the root
+    must have exit evidence;
+  - every recorded identity must have exit evidence: the listener's `services`, `helpers` and `process_lineage`, and
+    each held custody reservation's `processes`, `observed_processes` and `ambiguous_processes` of the unit;
+  - `processes.inventory` (the listener, its root thread, those identities) must then return no survivor: a live
+    process carrying the thread's markers, a recorded birth, or a kernel lineage reaching the root's kernel id, with
+    its descendants.
+  - Then the answer is `GONE` with the root's evidence; otherwise the refusal stands. `executor_exited` saves the
+    answer as `family_gone` and forgets the family; the supervisor ignores a forget for a family it does not hold.
+- **Its callers:** recovery's reconcile of a dead writer (through `executor_exited`), the listener stop, dormancy and
+  parking.
+- **`Parking.request`:** a listener that is not connected with a root thread is not attempted, and leaves
+  `parking.activity`, the set memory pressure walks at each launch; `touch()` adds it back when it is active again.
+- **`Parking.park`:** a refusal before the fence (the eligibility checks, a closed connection) is counted in status
+  and returns without saving the listener or logging `listener/park_abandoned`. A refusal after the fence restores the
+  listener to `connected` and is recorded as before.
+
+### (H) A writer whose family the supervisor does not hold (`r2413/stopblock_probe.py`)
+- **The setup.** A real daemon on a disposable state, its supervisor and worker started by the CLI's own client. One
+  writer run against the loopback fixture provider, with parking off, is left connected and idle (its run
+  `completed`). Then SIGTERM goes to the supervisor, the worker and every child of the supervisor at once,
+  `owner.journal` is moved aside, the daemon is started again (recovery), and `daemon stop` is asked.
+- **The installed 2.4.12 (red):** recovery quarantined the writer (`listener/reconcile_failed`,
+  `listener/startup_quarantined`, permanent), with no receipt. The stop refused with `OWNER_UNREGISTERED` naming that
+  listener and left it `stopping`, and the daemon kept serving.
+- **This tree (green, the final code):** recovery took the writer to `dormant` (`recovery/history`,
+  `listener/dormant`), with `family_gone` `["pid_absent"]` and no quarantine. The stop completed and the daemon
+  exited, 35.1 s in all (35.2 s with the first version).
+- **H2, the user's case:** the same steps with 2.4.12 up to its quarantine; then 2.4.12 was ended by signal and this
+  tree started on the same state. The quarantine stayed, since a permanent one is not retried. The draining stop
+  stopped the writer (`listener/stopped`, `family_gone` `["pid_absent"]`) and completed, 35.9 s in all.
+- No process of the probes' states was left.
+
+### (K) Survivors of a family the supervisor does not hold (`r2413/survivor_probe.py`, turn 95)
+- **The setup.** The tree's real `Daemon.family_receipt` and `unheld_family_exit`, bound to a stand-in that holds only
+  `leases` (it answers `end` with `OWNER_UNREGISTERED`) and `custody`, over a real process tree. A stand-in app-server
+  starts a detached child (its own session, as an MCP server is) and is SIGKILLed. The child is orphaned (`ppid` 1)
+  and keeps the dead root's kernel id as its `parent_kernel_id`, measured. The first version of the fallback (the
+  root's exit and `legacy_exited`'s custody `processes` only) is replayed inline as the known-bad calibration.
+- **While the child lives:** recorded nowhere, recorded in `services`, in `process_lineage`, or in a reservation's
+  `observed_processes` or `ambiguous_processes`, this tree answers `OWNER_UNREGISTERED`; so it does for a record
+  without a `services` inventory. The first version answered `GONE` in all six.
+- **A process carrying the thread's markers, with no lineage** (a Python process; a macOS system binary's
+  environment reads empty, so `/bin/sleep` cannot carry them): this tree refuses; the first version answered `GONE`.
+- **Once everything exited:** both answer `GONE` with `["pid_absent"]`. No probe process was left.
+
+### (I) The receipt's guards (`r2413/receipt_guard_probe.py`)
+- **The setup.** As (K), with a child that exited, a running child and the probe itself as identities, the custody
+  stand-in naming a process in its `processes`.
+- **This tree:** an exited root is answered `GONE` with `["pid_absent"]`, and so is one whose custody process exited;
+  a live custody process, a live root, `OWNER_OPERATION`, and a record without its root's birth time are refused; a
+  held receipt is answered from it, with no supervisor call.
+- **The installed 2.4.12:** every case the supervisor does not hold is refused, and a held receipt is answered from
+  it.
+
+### (J) What memory pressure's park requests cost the ledger (`r2413/park_probe.py`)
+- **The setup.** The real `Parking` class on a real coordinator `Store` on a disposable state, with a stand-in daemon
+  holding only what `park()` reaches. Four listeners: stopped, quarantined, connected with an active turn, and
+  connected but refused after its fence (`native_active_turn`). Then 100 rounds of `memory.check()`'s loop: a request
+  for every listener in `parking.activity`.
+- **The installed 2.4.12:** 400 attempts; 100 `listener/park_abandoned` events for each listener (400); listener
+  record writes 100 each for the three that never fenced, and 400 for the fenced one.
+- **This tree:** 200 attempts; events 0, 0, 0 and 100 (the fenced listener's); record writes 0, 0, 0 and 400; the
+  stopped and quarantined listeners left `parking.activity` after the first round. Status counted the same refusals by
+  reason on both (`active_turn` 100, `native_active_turn` 100; 2.4.12 also `not_connected` 200).
+
+### Static checks (`r2413/static_checks2413.py`, on the final tree)
+- every plugin `.py` file compiles under 3.15 (83 files), and the hook-run files under `/usr/bin/python3` (3.9.6 14 files);
+- `hooks.py --check` compatible, protocol `jsonl-v1`;
+- the git shim parses under `sh -n`, `bash --posix -n` and zsh's sh emulation, and is executable;
+- ruff's F821/F822/F823/F811/F841/F401: 35 findings here, 35 in 2.4.12; none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.13.
+
+### Known limits
+- **The switch from 2.4.12** meets 2.4.12's refusal: the user's three writers quarantined without a receipt refuse
+  its draining stop at every idle moment. The switch is made at an idle moment by signal, along the path of
+  `projects/gated_switch_2412.py`, as the switch to 2.4.12 was.
+- **Quarantined writers stay quarantined:** a permanent quarantine is not retried. This release's draining stop
+  stops them.
+- **What the survivor search cannot see:** a process whose environment is unreadable (macOS system binaries) and
+  whose parent and grandparent have both died, recorded nowhere: its lineage ends at a kernel id no live process
+  holds. This is the coordinator's existing ownership limit.
+- **Fenced park refusals** (the native thread found active) are still attempted and logged at each launch under
+  pressure: 109 of the 1,752 in that hour.
+- **2.4.12's known limits stand.** Review turn 93's push-gate items, 2.4.9's limits and `restore_unknown` move to
+  2.4.14.

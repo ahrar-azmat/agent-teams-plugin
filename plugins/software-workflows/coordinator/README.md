@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.12 / P1
+# Writer coordinator — software-workflows 2.4.13 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -132,7 +132,18 @@ handle that launched it, within seconds of its exit: compaction keeps it for
 family ever recorded, and an 8 MiB journal filled in 9 days. Status alarms at
 60% and reports `retention_s`, `gone_retained` and `forgotten`. An exhausted or
 damaged journal refuses new ownership with retryable `RESOURCE_EXHAUSTED`; it
-never opens an unregistered payload's gate. The lifecycle measurements and any
+never opens an unregistered payload's gate. A listener whose family the
+supervisor does not hold at all (its journal was replaced, as when one is moved
+aside) is answered from the processes once nothing of that family can still run,
+with the root's exit evidence saved as its receipt. That needs every identity the
+ledger recorded for it to have exited: its app-server, the services and helpers
+it started with, the processes its commands were seen to own, and the processes
+its unit's custody holds, saw or could not attribute. A search of the process
+table must then find no survivor that no record names, by the thread's markers
+or by kernel lineage (an orphan keeps its dead parent's kernel id). A record
+without that history keeps the refusal. Through 2.4.12 such a listener was
+quarantined at the next start and refused every draining stop for as long as its
+record stayed. The lifecycle measurements and any
 remaining validation limitations are recorded in the build report.
 
 After a supervisor failure, the surviving worker transfers its held lease
@@ -1226,7 +1237,13 @@ A park requires a connected, reconciled family with no active turn, prepared or
 queued input, owed workflow work, delivery or notice, native tool request,
 background terminal, unsettled operation, custody or lead hold. Last native
 activity resets the idle interval. One demand-driven timer schedules that
-family's pending park; no parking timer remains for a dormant family.
+family's pending park; no parking timer remains for a dormant family. Memory
+pressure asks for a park of every family it has seen active, at each launch;
+only a connected one is attempted, and one that left (stopped, dead, dormant,
+quarantined) is no longer asked. A park refused before its fence changes
+nothing and writes nothing: status counts it by reason. Through 2.4.12 each such
+refusal saved the listener record and logged `listener/park_abandoned`, about
+one per listener per launch.
 
 Under the run's start/park and reconciliation locks, parking fences deliveries,
 compares saved items with received evidence, unsubscribes every loaded thread,
