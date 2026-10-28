@@ -35,6 +35,7 @@ fi
 # the subcommand, after the global options git reads before it (git.c handle_options)
 sub=
 value=
+known=
 for a do
   if [ -n "$value" ]; then value=; continue; fi
   case $a in
@@ -60,6 +61,7 @@ pack-refs|patch-id|prune|pull|range-diff|read-tree|rebase|reflog|remote|repack|r
 restore|rev-list|rev-parse|revert|rm|shortlog|show|show-branch|show-ref|sparse-checkout|stash|\
 status|stripspace|switch|symbolic-ref|tag|unpack-objects|update-index|update-ref|var|verify-commit|\
 verify-tag|version|whatchanged|worktree|write-tree)
+    known=1
     # the mirror the gate built for this git and this shim (its index: binary, exec-path, mirror,
     # the shim its `git` leads to, and the GIT_EXEC_PATH it mirrors — empty for git's own, so last:
     # read merges a run of tabs); none yet, or a stale one: the gate builds it
@@ -92,5 +94,18 @@ verify-tag|version|whatchanged|worktree|write-tree)
       exec "$real" "$@"
     fi ;;
 esac
-py=$(command -v python3 2>/dev/null) || exec "$real" "$@"  # no python3: no hook of this plugin runs either
+# the gate's interpreter: the one the SessionStart hook ran under (CODEX_GATE_PYTHON), else python3 on
+# this command's PATH. With neither, a git command this script knows still runs; commit, push and what it
+# does not know (an alias or an external command can push) are refused, never run unseen. Through 2.4.10 a
+# PATH that kept this shim first but held no python3 ran them on the real git (review of 2026-10-28,
+# turn 92).
+py=${CODEX_GATE_PYTHON:-}
+if [ -z "$py" ] || ! [ -x "$py" ]; then
+  py=$(command -v python3 2>/dev/null) || py=
+fi
+if [ -z "$py" ]; then
+  [ -n "$known" ] && exec "$real" "$@"
+  echo "git: the push gate cannot run here (no CODEX_GATE_PYTHON, no python3 on PATH): \`git $sub\` was not run" >&2
+  exit 1
+fi
 exec "$py" "${0%/*}/../push_gate.py" --argv "$real" "$@"

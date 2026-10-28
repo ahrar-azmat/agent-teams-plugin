@@ -13912,8 +13912,8 @@ The writer's own run on the final source (`r248-w/round3/static-final-results.js
 Python 3.11 and checked the untracked files' whitespace, all exit 0.
 
 ### Known limits
-- **Turn 86's findings**, pushed at the user's direction and to be fixed in 2.4.11 (2.4.9 is the watchdog hotfix,
-  2.4.10 the push gate's):
+- **Turn 86's findings**, pushed at the user's direction and to be fixed in 2.4.12 (2.4.9 is the watchdog hotfix,
+  2.4.10 and 2.4.11 the push gate's):
   - `recovery.py:148` (MEDIUM): re-verifying a legacy dormant listener calls `dormancy.recover()` outside the
     normal error classification. A `RESOURCE_PAUSED` from its offline reader's launch records checkout-wide
     UNKNOWNs and quarantines the listener. On retry the writer is replaced instead of verified read-only again.
@@ -13942,7 +13942,7 @@ Python 3.11 and checked the untracked files' whitespace, all exit 0.
   - The live 2.4.7 daemon's `loop-stalls.log` at 21:11 showed its loop inside `restore_unknown` → `store.all` →
     `selected`, during the lead's settlement of the 43 release paths.
   - A `daemon/status` call meanwhile took 94.05 s.
-  - To be fixed first in 2.4.11, with a sweep of every whole-kind read on the loop.
+  - To be fixed first in 2.4.12, with a sweep of every whole-kind read on the loop.
 - **Catalog 073** fails on the final source (above).
 - **The first start:** the full first start of this release on a 12.1 GB ledger, with recovery and retention over
   real content, has not been run. The shape replica's ledger was 559 MB, and the index build was measured on a copy
@@ -14127,8 +14127,118 @@ removed with the rule (`_ansi_c_quote`). Measured on 10-28 between 00:55 and 01:
 
 ### Known limits
 - **The text gate no longer reads a verb that ANSI-C quoting or an expansion's value assembles.** The shim decides
-  such a push or commit when it runs. It goes unchecked only when git runs by absolute path, or in a session whose
-  shim is not on `PATH`, as with the text gate's other documented evasions.
+  such a push or commit when git runs through it. It goes unchecked when git does not: by absolute path, through
+  `command -p`, in a session whose shim is not on `PATH`, or (review turn 92, fixed in 2.4.11) when the command's
+  `PATH` keeps the shim but holds no python3.
 - **The coordinator's code is 2.4.9's,** but a 2.4.10 client still replaces a 2.4.9 daemon, because the daemon's
   version is the plugin's.
 - **2.4.9's known limits stand.** Those marked for 2.4.10 move to 2.4.11.
+
+## 2.4.11
+
+Two changes, both from review turn 92 of 2.4.10: the push gate's Bash detection (`hooks/push_gate.py`), and the
+interpreter the git shim starts the gate with (`hooks/gitshim/git`, `hooks/session_start.py`); with them, the
+coordinator README's shim paragraph. Measured on 10-28 between 03:40 and 04:05 on the user's Mac, with the installed
+2.4.10 as the red, and re-run on the final tree.
+
+### What it fixes
+- Turn 92, MEDIUM: before a session's `.live` marker, read-only commands still needed an acknowledgement:
+  `grep -c 'push$' logfile` (a push word beside `$`) and `git log --grep=push` (a `git … push` word pair).
+- Turn 92, MEDIUM: `gitshim/git` ran the real git when `python3` was not on the command's `PATH`, so a `PATH` that
+  kept the shim but held no python3 let an encoded push past both the text gate and the shim.
+- Turn 92, LOW: 2.4.10's notes said the shim decides every push and commit; the CHANGELOG, the README and 2.4.10's
+  known limits above now say when it does.
+
+### The PreToolUse replay (`r2411/gate_compare.py`, corpus in `r2411/smoke.py`)
+- **The setup,** as 2.4.10's: each command is a PreToolUse payload with a new session id (no `.live` marker), in a
+  fresh one-commit repo, with scratch acks and shim state and a coordinator state that does not exist. Each runs
+  through the real hook process of the installed 2.4.10 (Python 3.15) and of this tree (3.15.2 and 3.9.6).
+  `r2411/smoke.py` runs the same corpus in process on both interpreters, PowerShell against 2.4.10's `_detected`.
+- **81 commands, 0 wrong** on both interpreters; 22 decided differently from 2.4.10.
+- **Denied by 2.4.10, silent now (19):** `grep -c 'push$' log.txt`, `git log --grep=push`,
+  `git log --oneline --grep push -n 5`, `git stash push -m wip`, `git checkout -b fix-push`,
+  `git config push.default current`, `grep -rn "git push" docs/`, `rg -n 'git commit' .`, `echo "commit: $x"`,
+  three here-documents written to a file (one with an apostrophe in its body, one `<<-`), `git diff -- docs/push.md`,
+  `git help commit`, `gh pr create --body "$(cat <<'EOF' …)"` whose body says git push and git commit, a
+  here-document captured into a variable, `man git-push`, `git remote set-url --push origin x`, and a Python
+  here-document that prints git push.
+- **Silent in both (13):** the user's command of 10-28, `grep -vc ': OK$' sums.txt`, `ls -la`, `git status`,
+  `git log -5 --stat`, `which git && git --version`, `printf '%s\n' "$(git rev-parse HEAD)"`, a `for` loop of
+  `git add`, `git log --format=… | grep -i commit`, `sed` and `awk` with `$`, `echo $'a\tb'`, and three lines of
+  `cd`, `ls` and `git status`.
+- **Silent in 2.4.10, denied now (3):** `git $'\x70\x75\x73\x68'`, `command -p git $'\x70\x75\x73\x68'` and
+  `git "$@"`: a git whose subcommand only the shell can read.
+- **Denied in both (37):**
+  - literal: `git push`, `git commit -m x`, `git -C /tmp/x push`, `cd /tmp && git push`, `FOO=1 git commit -m x`,
+    `sudo git push`, `/usr/bin/git push`, `command -p git push`, `GIT push origin main`, `xargs git push`,
+    `ssh host git push`, `git -c user.name=x commit -m y`, `git --git-dir=/x/.git --work-tree=/x push`,
+    `/usr/libexec/git-core/git-push origin main`, and `git status` with `git push` on the next line;
+  - spelled by the shell: `$'/usr/bin/git' push`, `G=git; "$G" push`, `g$'\x69t' push`, `git \` + newline + `push`,
+    `g\it push`, `g""it push`, `f() { git "$@"; }; f push`;
+  - inside what a shell runs: `bash -c 'git push'`, `sh -lc "git commit -m x"`, `zsh -e -c 'git push'`,
+    `bash <<< "git push"`, `eval "git push"`, `eval "g$'"''"\x69t' push"`, `echo "$(git push 2>&1)"`,
+    ``echo `git push` ``, `(git push)`, `{ git push; }`, a `bash <<'EOF'` and a `cat <<EOF | sh` here-document
+    holding git push, and `git commit -m "$(cat <<'EOF' …)"`;
+  - `pwsh -enc AAAA`, and `git push $'don\'t'`, whose quotes Python's shlex cannot balance (the word readings
+    decide it).
+- **PowerShell (9),** decided exactly as 2.4.10 decides them: `git push`, `Push-Location $dir`,
+  `git log --grep=push`, `Get-ChildItem`, `git commit -m x`, `grep -c 'push$' f`, `& git push`,
+  `$env:GIT_DIR='x'; git push` and `Write-Output 'commit'`.
+
+### The shim without python3 (`r2411/shim_probe.py`)
+- **The setup.** A disposable repo with one commit, `alias.p = push`, and a bare remote recreated before each run.
+  Each command runs with `/bin/bash -c` and `PATH` = the shim's folder, then
+  `/Library/Developer/CommandLineTools/usr/libexec/git-core` (git, no python3); scratch shim state and acks, a new
+  session id per run.
+- **The red, installed 2.4.10's shim:** `git push origin HEAD:refs/heads/main`, `git $'\x70\x75\x73\x68' …` and
+  `git p …` each exited 0 and `refs/heads/main` landed; `git commit -q --allow-empty -m probe` made a commit.
+- **This tree's shim, no `CODEX_GATE_PYTHON`:** all four exited 1 with "the push gate cannot run here (no
+  CODEX_GATE_PYTHON, no python3 on PATH)"; nothing landed and no commit was made.
+- **This tree's shim, `CODEX_GATE_PYTHON` = Python 3.15 or the system 3.9:** all four exited 1 with the gate's own
+  denial; nothing landed and no commit was made.
+- **Control:** `git status --short` exited 0 in all four configurations.
+- **`session_start.py`,** this tree's, with a scratch `CLAUDE_ENV_FILE`: under `/opt/homebrew/bin/python3.15` it wrote
+  one `export CODEX_GATE_PYTHON=/opt/homebrew/opt/python@3.15/bin/python3.15`, and under `/usr/bin/python3` one with
+  `/Library/Developer/CommandLineTools/usr/bin/python3`. Sourced in `sh`, each sets an executable absolute path.
+- **2.4.10's exec probe again (`r2410/shim_probe.py`, the normal `PATH`, this tree's shim):** the three assembled
+  pushes land without the shim and are refused with it, and `g$'\x69t' status --short` exits 0.
+
+### Time on the largest commands (`r2411/perf_probe.py`)
+- Fourteen commands of about 1 MiB (`COMMAND_MAX_BYTES`), in process: lines, unterminated and terminated
+  here-documents, an `eval` chain, expansions, quoted substitutions, backtick words, one quoted substitution of the
+  whole size, git option runs, shell words, pipes.
+- The slowest took 7.51 s on Python 3.15.2 and 7.79 s on 3.9.6 (one quoted substitution; 2.4.10 took 7.42 s and
+  7.79 s on it, nearly all of it shlex). Every other case finished within 4.15 s; the worker's deadline is 60 s.
+- These are in-process `_bash_detected` times. In the production hook the parent `_maybe_git` prefilter decides
+  whether the worker runs, so a command it does not flag never reaches these paths; the numbers are an upper bound for
+  a flagged command, not the hook's cost on every command. Not included is a command that repeats git's value-taking
+  options tens of thousands of times, whose parse time grows with the run (review turn 93); it is bounded by the 60 s
+  deadline and left for 2.4.12. Every answer matches 2.4.10's but for the `eval` chain, which `_bash_detected` reaches
+  at depth 4.
+
+### Static checks (`r2411/static_checks2411.py`, on the final tree)
+- every plugin `.py` compiles under Python 3.15 (83 files), and the 14 hook-run files under the system Python 3.9.6;
+- `coordinator/hooks.py --check`: exit 0, compatible, protocol `jsonl-v1`;
+- the shim parses under `sh -n`, `bash --posix -n` and zsh's sh emulation, and keeps mode 0755;
+- ruff (F821, F822, F823, F811, F841, F401): 35 findings against installed 2.4.10's 35, none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.11.
+
+### Known limits
+- **Once the shim is proven live** the text gate stands down for Bash, as since 2.0: from then on a push or commit
+  whose git does not run through the shim (by absolute path, through `command -p`, with a `PATH` without it) goes
+  unchecked.
+- **Not read:** what a program other than a shell runs (`python3 -c "…"`, `ssh host 'git push'`). A local one
+  reaches the shim through `PATH`.
+- **Read more than needed:** a word an expansion builds before push or commit (`cp "$src" push`), and a comment that
+  contains `git push`.
+- **No interpreter at all:** a git command the shim knows runs without its exec-path mirror, so a push that git itself
+  starts (`git rebase --exec 'git push'`) is not seen.
+- **Argument vs command position (turn 93, for 2.4.12):** a `git` or shell word in an argument position is still
+  looked at (`printf '%s\n' git push`), and an unquoted here-document body is data to the gate though the shell
+  expands its `$(…)`; a quoted literal `'<<'` is read as an operator.
+- **Parse time on a pathological option run (turn 93, for 2.4.12):** a command repeating git's value-taking options
+  tens of thousands of times grows in parse time with the run, bounded by the 60 s deadline.
+- **The coordinator's code is 2.4.9's,** but a 2.4.11 client replaces an older daemon, because the daemon's version
+  is the plugin's.
+- **2.4.9's known limits stand.** Those marked for 2.4.11 move to 2.4.12.

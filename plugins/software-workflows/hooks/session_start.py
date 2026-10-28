@@ -167,6 +167,10 @@ def _install_shim(data):
                  f"export CODEX_GATE_TRANSCRIPT={q(str(data.get('transcript_path') or ''))}\n"
                  f"export CODEX_GATE_STATE={q(state)}\n"
                  f"export CODEX_GATE_LIVE={q(live)}\n")
+        # the interpreter this hook runs under: the shim starts the gate with it, so a command whose
+        # PATH holds no python3 still reaches the gate (2.4.11)
+        if sys.executable and os.path.isabs(sys.executable):
+            fh.write(f"export CODEX_GATE_PYTHON={q(sys.executable)}\n")
     try:
         _prebuild_mirror(shim, state)
     except Exception:

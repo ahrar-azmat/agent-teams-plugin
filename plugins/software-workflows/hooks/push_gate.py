@@ -387,6 +387,16 @@ _PWSH_WORD_RE = re.compile(r"(?i)\b(?:pwsh|powershell)(?:\.exe)?\b")
 _PWSH_ENCODED_RE = re.compile(r"(?i)\s[\"']?-(?:e|ec|en|enc[a-z]*)\b")
 
 
+def _pwsh_encoded(text):
+    """An ENCODED PowerShell command (`pwsh -enc …`) is an opaque payload the gate cannot read (round
+    20): it counts as a potential push, so the gate always asks. Bounded per line."""
+    for line in _LINE_SPLIT_RE.split(text):
+        m = _PWSH_WORD_RE.search(line)
+        if m and _PWSH_ENCODED_RE.search(line, m.end()):
+            return True
+    return False
+
+
 class _PushCommitMatcher:
     """LINEAR replacement for the former `\\bgit\\b[^;|&\\n]*\\b(push|commit)\\b`
     regex (round 40: with N `git` words in one segment the regex rescanned
@@ -394,21 +404,15 @@ class _PushCommitMatcher:
     131 KB command stalled the parent past its deadline, and a timed-out
     hook does not block). Per segment only the FIRST `git` matters: if any
     `git` is followed by push/commit, the first one is too. The second
-    alternative — an ENCODED PowerShell command is an opaque payload the
-    gate cannot read (round 20): treat it as a potential push so it always
-    asks — is bounded the same way per line. `.search` keeps the regex
-    call shape; it returns True or None."""
+    alternative is `_pwsh_encoded`. `.search` keeps the regex call shape;
+    it returns True or None."""
 
     def search(self, text):
         for seg in _SEGMENT_SPLIT_RE.split(text):
             m = _GIT_WORD_RE.search(seg)
             if m and _PUSH_COMMIT_WORD_RE.search(seg, m.end()):
                 return True
-        for line in _LINE_SPLIT_RE.split(text):
-            m = _PWSH_WORD_RE.search(line)
-            if m and _PWSH_ENCODED_RE.search(line, m.end()):
-                return True
-        return None
+        return True if _pwsh_encoded(text) else None
 
 
 GIT_PUSH_COMMIT_RE = _PushCommitMatcher()
@@ -1375,8 +1379,202 @@ def _segments(toks):
     return segments
 
 
-def _detected(command):
-    """Is this a git push/commit (or an opaque encoded PowerShell payload)?
+# BASH DETECTION (2.4.11): which Bash commands the gate looks at is read from the command's
+# STRUCTURE, not from its words. Through 2.4.10 the word readings of `_text_detected` decided for Bash
+# too: a `git … push|commit` word pair anywhere in a segment's text, or a push/commit word beside any
+# `$`, `\` or backtick, so a read-only command asked for an acknowledgement whenever its data said push
+# or commit (`grep -c 'push$' log`, `git log --grep=push`, `git stash push`, `grep -rn "git push"
+# docs/`, a here-document that writes a script). A Bash command is now looked at only for:
+#   - a `git` word (any path; any case, since macOS finds `GIT`) whose subcommand, past git's global
+#     options, is push or commit, or is a word only the shell can read (`git $'\x70…'`, `git "$@"`);
+#   - a word an expansion builds (`"$G"`, `g$'\x69t'`) standing where git would, before a push or
+#     commit word: the shell may build git there;
+#   - `git-push` or `git-commit` (git's exec-path programs) as the command itself;
+#   - the same, recursively, inside what a shell runs: `bash -c` and `sh -lc` strings, a here-string
+#     a shell reads, `eval`, `$(…)` and backtick text, and here-documents a shell reads;
+#   - an encoded PowerShell payload (`_pwsh_encoded`).
+# Quoted words are data (`grep "git push"`), and so are here-documents anything but a shell reads
+# (`cat > notes.md <<'EOF'`). A verb the shell assembles out of this reading's sight reaches the
+# exact-argv git shim as `git push` and is decided there; the text gate decides on its own only until
+# this session's first git call shows the shim on PATH (`_shim_live`). PowerShell has no shim (Claude
+# Code applies CLAUDE_ENV_FILE to Bash), so the PowerShell tool keeps the word readings.
+_GIT_TOKEN_RE = re.compile(r"(?i)^(?:.*/)?git(?:\.exe)?$")
+_GIT_DASHED_TOKEN_RE = re.compile(r"(?i)^(?:.*/)?git-(?:push|commit)(?:\.exe)?$")
+_SHELL_TOKEN_RE = re.compile(r"(?i)^(?:.*/)?(?:sh|ash|bash|dash|ksh|mksh|zsh)$")
+# git's global options whose value is the NEXT word (git.c handle_options)
+_GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix",
+                   "--attr-source"}
+_SHELL_VALUE_OPTS = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
+_BASH_NESTING = 4  # shells inside shells: past this depth the gate looks rather than read on
+
+
+def _detected(command, tool_name="bash"):
+    """Is this a git push/commit (or an opaque encoded PowerShell payload)? Detection only decides
+    whether the gate LOOKS; classification decides what it does. A Bash command is read for its
+    structure (`_bash_detected`), any other tool's by the word readings (`_text_detected`)."""
+    if tool_name.lower() == "bash":
+        return _bash_detected(command, 0)
+    return _text_detected(command)
+
+
+def _git_subcommand(seg, i):
+    """The index in `seg` of the subcommand of the git (or possible git) at seg[i]: the first word
+    past the global options git reads before it; None when no word follows."""
+    k = i + 1
+    while k < len(seg):
+        word = seg[k]
+        if word in _GIT_VALUE_OPTS:
+            k += 2
+        elif word.startswith("-") and len(word) > 1:
+            k += 1
+        else:
+            return k
+    return None
+
+
+def _shell_c_string(seg, i):
+    """The command string the shell at seg[i] runs: its `-c` string (`bash -c`, `sh -lc`, `zsh -e
+    -c`) or a here-string it reads (`bash <<< '…'`); None for a script file or stdin."""
+    k, run = i + 1, False
+    while k < len(seg):
+        word = seg[k]
+        if word == "--":
+            k += 1
+            break
+        if word in _SHELL_VALUE_OPTS:
+            k += 2
+        elif word.startswith(("-", "+")) and len(word) > 1:
+            run = run or (word[0] == "-" and not word.startswith("--") and "c" in word[1:])
+            k += 1
+        else:
+            break
+    if run:
+        return seg[k] if k < len(seg) else None
+    if k < len(seg) and seg[k].startswith("<<<"):
+        return seg[k][3:] or (seg[k + 1] if k + 1 < len(seg) else None)
+    return None
+
+
+def _heredoc_split(command):
+    """Bash here-documents: (the command without their bodies, [the bodies a shell reads]). A body is
+    DATA for what reads it (`cat > notes.md <<'EOF'`), so the detection never reads it as commands,
+    and CODE when its operator's line names a shell, eval or source (`bash <<'EOF'`, `cat <<EOF |
+    sh`): those bodies come back for their own detection. An operator is a `<<` token of a line that
+    tokenizes on its own (inside quotes it is a word), and its body ends at the first later line equal
+    to its delimiter (leading tabs removed for `<<-`). When a line's delimiters are not all found, its
+    following lines stay commands."""
+    if "<<" not in command:
+        return command, []
+    import bisect
+    import shlex
+    lines = command.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    where = ({}, {})  # line -> its indices, as written and with leading tabs removed (`<<-`)
+    for n, line in enumerate(lines):
+        where[0].setdefault(line, []).append(n)
+        where[1].setdefault(line.lstrip("\t"), []).append(n)
+    kept, code, i = [], [], 0
+    while i < len(lines):
+        line = lines[i]
+        kept.append(line)
+        i += 1
+        if "<<" not in line:
+            continue
+        try:
+            lex = shlex.shlex(line, posix=True, punctuation_chars=";&|()<>")
+            lex.whitespace_split = True
+            lex.commenters = ""
+            toks = list(lex)
+        except ValueError:
+            continue
+        ops = []
+        for k, tok in enumerate(toks):
+            if tok != "<<":
+                continue  # `<<<`, a here-string, is another token
+            word = toks[k + 1] if k + 1 < len(toks) else ""
+            strip = word.startswith("-")
+            if strip:
+                word = word[1:] or (toks[k + 2] if k + 2 < len(toks) else "")
+            if word:
+                ops.append((word, strip))
+        if not ops:
+            continue
+        j, bodies = i, []
+        for word, strip in ops:
+            ends = where[1 if strip else 0].get(word, [])
+            at = bisect.bisect_left(ends, j)
+            if at == len(ends):
+                break
+            bodies.append("\n".join(lines[j:ends[at]]))
+            j = ends[at] + 1
+        else:
+            i = j
+            if any(_SHELL_TOKEN_RE.match(t) or t in ("eval", "source", ".") for t in toks):
+                code.extend(bodies)
+    return "\n".join(kept), code
+
+
+def _bash_tokens(text):
+    """`_tokenize` for the Bash detection: a line break OUTSIDE quotes separates commands like `;`,
+    and one inside quotes stays in its word, so a quoted here-document (`"$(cat <<'EOF' … EOF)"`)
+    keeps its lines for `_heredoc_split`. Backslash-newline pairs are removed first: the shell joins
+    those lines. None when Python's shlex cannot balance the quotes."""
+    import shlex
+    try:
+        lex = shlex.shlex(re.sub(r"\\\r?\n", "", text), posix=True, punctuation_chars=";&|()\n")
+        lex.whitespace = " \t\r"
+        lex.whitespace_split = True
+        lex.commenters = ""
+        return [tok.replace("\n", ";") if tok and set(tok) <= set(";&|()\n") else tok for tok in lex]
+    except ValueError:
+        return None
+
+
+def _bash_detected(command, depth):
+    """`_detected` for a Bash command (BASH DETECTION above)."""
+    if depth > _BASH_NESTING:
+        return True
+    if _pwsh_encoded(command) or _pwsh_encoded(_deescaped(command)):
+        return True
+    text, code = _heredoc_split(command)
+    if any(_bash_detected(body, depth + 1) for body in code):
+        return True
+    toks = _bash_tokens(text)
+    if toks is None:
+        # quotes Python's shlex cannot balance (`$'it\'s'` is one word to Bash): the word readings decide
+        stripped = re.sub(r"[\"']|\$", "", _deescaped(text))
+        return any(GIT_PUSH_COMMIT_RE.search(t) for t in (text, _deescaped(text), stripped))
+    for seg in _segments(toks) or [toks]:
+        low = [word.strip("`").lower() for word in seg]
+        lead = 0
+        while lead < len(seg) and _ASSIGN_RE.fullmatch(seg[lead]):
+            lead += 1
+        for i, word in enumerate(seg):
+            # a word an expansion builds may BE git or a shell; one that reads as an option is not
+            built = ("$" in word or "`" in word) and not word.startswith(("-", "+"))
+            if i == lead and _GIT_DASHED_TOKEN_RE.match(low[i]):
+                return True
+            if built or _GIT_TOKEN_RE.match(low[i]):
+                k = _git_subcommand(seg, i)
+                if k is not None and (low[k] in ("push", "commit")
+                                      or (not built and ("$" in seg[k] or "`" in seg[k]))):
+                    return True
+            if built or _SHELL_TOKEN_RE.match(low[i]):
+                inner = _shell_c_string(seg, i)
+                if inner is not None and _bash_detected(inner, depth + 1):
+                    return True
+            if ("$(" in word or "`" in word) and _bash_detected(re.sub(r"\$\(|[()`]", " ", word), depth + 1):
+                return True
+            if low[i] == "eval":
+                # eval joins its words and runs them: the rest of this segment is that one command
+                if _bash_detected(" ".join(seg[i + 1:]), depth + 1):
+                    return True
+                break
+    return False
+
+
+def _text_detected(command):
+    """The word readings (every tool's through 2.4.10, the PowerShell tool's since 2.4.11): is this a
+    git push/commit (or an opaque encoded PowerShell payload)?
     Checked on the RAW text, on a DE-ESCAPED copy, and on the QUOTE-REMOVED
     token stream (round 26): escape PARITY (`\\\\<nl>git push` keeps one
     backslash and a real newline — the raw text matches), and quote removal
@@ -3145,7 +3343,7 @@ def main() -> int:
         # parent's deadline (round 40: detection ran in the parent, outside
         # any bound, and one regex was quadratic)
         try:
-            print(_evaluate(data) if _detected(command) else NOT_DETECTED)
+            print(_evaluate(data) if _detected(command, str(data.get("tool_name") or "")) else NOT_DETECTED)
         except Exception as exc:
             print(_deny(EVAL_FAILED_REASON.format(why=f"worker crashed: {type(exc).__name__}: {exc}")))
         return 0

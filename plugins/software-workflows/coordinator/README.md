@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.10 / P1
+# Writer coordinator — software-workflows 2.4.11 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -486,14 +486,22 @@ gate and Office consumer changes are outside P1's write boundary.
 The git shim (`hooks/gitshim/git`), the `PATH` line the SessionStart hook writes and
 the push gate skip every plugin version's shim (a folder holding `git` beside a
 `push_gate.py`) and every exec-path mirror: `PATH` holds one shim, this version's,
-first, and the shim runs the real git behind it. The push gate's text reading of a
-Bash command looks for a push or commit written in letters: `git`, `push` or
-`commit` after de-escaping and quote removal, or a push or commit word beside `$`,
-`\` or a backtick. ANSI-C quoting (`$'`) alone is not a trigger since 2.4.10, so
-`grep -c ': OK$' sums.txt` runs without an acknowledgement. A verb the shell
-assembles (`git $'\x70\x75\x73\x68'`) reaches the shim as plain `git push`, and the
-shim decides it on its exact arguments. One run by git's absolute path, or in a
-session whose shim is not on `PATH`, is outside this guardrail.
+first, and the shim runs the real git behind it. The shim starts the gate with
+`CODEX_GATE_PYTHON`, the interpreter the SessionStart hook ran under, else with
+`python3` from `PATH`; with neither, it refuses commit, push and every subcommand it
+does not know, and runs the ones it knows (2.4.11). Until a session's first git call
+shows the shim on `PATH`, the push gate reads a Bash command for what it runs, not
+for its words (2.4.11): a `git` whose subcommand is push or commit or a word only the
+shell can read, a word an expansion builds standing where git would before push or
+commit, and the same inside `bash -c` strings, here-strings, `eval`, command
+substitutions and here-documents a shell reads. Quoted words, and here-documents
+anything else reads, are data, so `grep -c 'push$' log`, `git log --grep=push` and
+`grep -rn "git push" docs/` run without an acknowledgement. A command the shell
+assembles out of that reading's sight (`u='t pu'; g$'i'$u'sh'`) reaches the shim as
+plain `git push`, and the shim decides it on its exact arguments. A push or commit whose
+git does not run through the shim (by absolute path, through `command -p`, or in a
+session whose shim is not on `PATH`) is outside this guardrail once the text gate
+has stood down. The PowerShell tool keeps the word readings.
 
 ## RPC and C2 contract
 

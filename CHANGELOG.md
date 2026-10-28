@@ -3,11 +3,78 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.11] — 2026-10-28
+
+The push gate asks for an acknowledgement only for a Bash command whose structure puts a push or commit where the
+shell would run it: it reads the command's structure, not only its words, so the read-only commands that mention push
+or commit now run without one. It reads a command's shape well enough for ordinary use; some constructed shapes still
+over-ask, listed under Known limits and left for 2.4.12, and the git shim is the backstop that stops an assembled or
+hidden push once git runs. The git shim no longer runs git unchecked when a command's `PATH` holds no python3. Both come from review turn 92 of 2.4.10
+(coordinator/VERIFY.md, 2.4.11). The coordinator's code is 2.4.9's.
+
+### Fixed: words in a read-only command asked for an acknowledgement
+- 2.4.10 stopped a lone `$'` from counting as a push. In a session that had not run git yet (its shim not yet proven
+  live), the gate's other readings still matched words:
+  - `git` followed by push or commit anywhere in a segment: `git log --grep=push`, `git stash push`,
+    `git help commit`, `grep -rn "git push" docs/`, and a here-document that writes notes or a script;
+  - push or commit anywhere beside a `$`, `\` or backtick: `grep -c 'push$' log`, `echo "commit: $x"`, and a
+    `gh pr create --body "$(cat <<'EOF' …)"` whose text says push.
+- Now a Bash command is looked at only for:
+  - a `git` word (any path, any case) whose subcommand, past git's global options, is push or commit, or is a word
+    only the shell can read (`git $'\x70\x75\x73\x68'`, `git "$@"`);
+  - a word an expansion builds standing where git would, before push or commit (`"$G" push`, `g$'\x69t' push`);
+  - `git-push` or `git-commit` as the command;
+  - the same inside what a shell runs: `bash -c` and `sh -lc` strings, a here-string a shell reads, `eval`, `$(…)`
+    and backtick text, and a here-document a shell reads (`bash <<'EOF'`, `cat <<EOF | sh`);
+  - an encoded PowerShell payload, as before.
+  - Quoted words, and here-documents anything else reads, are data.
+- The PowerShell tool keeps the word readings: the shim is not measured for PowerShell commands.
+- Measured: 81 commands replayed as PreToolUse payloads through the real hook, with no shim marker, on Python 3.9.6
+  and 3.15.2.
+  - 19 read-only commands that 2.4.10 denied are silent. The user's command of 10-28 stays silent.
+  - 3 that 2.4.10 let through are denied: `git $'\x70\x75\x73\x68'`, `command -p git $'…'` and `git "$@"`.
+  - Every other push and commit in the set is denied as before. The 9 PowerShell commands are decided exactly as
+    2.4.10 decides them.
+
+### Fixed: the shim ran git unchecked without python3
+- The shim started the gate with `python3` from the command's own `PATH`. A `PATH` that kept the shim first but held
+  no python3 made it run the real git directly; with the shim, then git's exec-path, a push, an encoded push and an
+  alias for push landed, and a commit was made.
+- Now the SessionStart hook also writes `CODEX_GATE_PYTHON`, the interpreter it runs under, and the shim starts the
+  gate with it, else with python3 from `PATH`. With neither, commit, push and every subcommand the shim does not know
+  are refused; the git commands it knows still run.
+- Measured in a disposable repo with a bare remote, `PATH` = the shim, then
+  `/Library/Developer/CommandLineTools/usr/libexec/git-core`.
+  - With 2.4.10's shim, all three pushes landed and the commit was made.
+  - With this shim, nothing landed and no commit was made: without `CODEX_GATE_PYTHON` the shim refused, and with it
+    (3.15 or 3.9) the gate refused. `git status` ran every time.
+  - Under Homebrew's Python the hook writes the version-independent `/opt/homebrew/opt/python@3.15/bin/python3.15`.
+
+### Known limits
+- Once a session's first git call shows the shim on `PATH`, the text gate stands down for Bash, as since 2.0. From
+  then on a push or commit whose git does not run through the shim goes unchecked: by absolute path, through
+  `command -p`, or with a `PATH` without the shim.
+- What a program other than a shell runs (`python3 -c "…"`, `ssh host 'git push'`) is not read. A local one reaches
+  the shim through `PATH`.
+- A word an expansion builds before push or commit is looked at even when it is not git (`cp "$src" push`). A
+  comment that contains `git push` is still read as words.
+- With no interpreter at all, a git command the shim knows runs without its exec-path mirror, so a push that git
+  itself starts (`git rebase --exec 'git push'`) is not seen.
+- A `git` or shell word in an argument position, not a command position, is still looked at: `printf '%s\n' git push`
+  asks though printf runs no git. Review turn 93; to be addressed in 2.4.12.
+- An unquoted here-document body is data to the gate, though the shell expands its `$(…)`: a push in such a
+  substitution run by a path the shim does not see is not read, and a quoted literal `'<<'` is read as an operator.
+  Review turn 93; to be addressed in 2.4.12.
+- A command that repeats git's value-taking options tens of thousands of times is parsed in time that grows with the
+  repetition, bounded by the worker's 60 s deadline. Review turn 93; to be addressed in 2.4.12.
+- The trust model is unchanged: a guardrail against forgetting a review, not a security boundary. 2.4.9's known
+  limits stand; those marked for 2.4.11 move to 2.4.12.
+
 ## [software-workflows 2.4.10] — 2026-10-28
 
 The push gate no longer asks for an acknowledgement because a single-quoted pattern ends in `$`, as in
-`grep -c ': OK$' sums.txt`. The git shim still decides every push and commit the shell runs, however the command was
-written (coordinator/VERIFY.md, 2.4.10). The coordinator's code is 2.4.9's.
+`grep -c ': OK$' sums.txt`. A push or commit the shell assembles is decided by the git shim when git runs through it
+(coordinator/VERIFY.md, 2.4.10). The coordinator's code is 2.4.9's.
 
 ### Fixed: `$'` in an ordinary command asked for an acknowledgement
 - Until now `$'` anywhere in a Bash command counted as a possible push, because ANSI-C quoting can build the verb
@@ -34,8 +101,10 @@ written (coordinator/VERIFY.md, 2.4.10). The coordinator's code is 2.4.9's.
 
 ### Known limits
 - The text gate no longer sees a verb assembled from ANSI-C quoting or from an expansion's value; the shim decides
-  that push or commit. It goes unchecked only when it runs git by absolute path, or in a session whose shim is not on
-  `PATH`. The trust model is unchanged: the gate is a guardrail against forgetting a review, not a security boundary.
+  that push or commit when git runs through it. It goes unchecked when git does not: by absolute path, through
+  `command -p`, in a session whose shim is not on `PATH`, or (review turn 92, fixed in 2.4.11) when the command's
+  `PATH` keeps the shim but holds no python3. The trust model is unchanged: the gate is a guardrail against forgetting
+  a review, not a security boundary.
 - 2.4.9's known limits stand. Those marked for 2.4.10 move to 2.4.11.
 
 ## [software-workflows 2.4.9] — 2026-10-27
@@ -261,8 +330,8 @@ blocks every stop, and 2.4.7's known limits from review are fixed. On 10-26 the 
 
 ### Known limits
 - Codex code_review turn 86 found no CRITICAL or HIGH defect in the fix round, and said Do not ship for six it rates
-  lower. They are pushed at the user's direction and are to be fixed in 2.4.11 (2.4.9 is the watchdog hotfix, 2.4.10
-  the push gate's):
+  lower. They are pushed at the user's direction and are to be fixed in 2.4.12 (2.4.9 is the watchdog hotfix, 2.4.10
+  and 2.4.11 the push gate's):
   - A memory refusal while a dormant writer is re-verified (`RESOURCE_PAUSED`: the compressor at its warning line,
     a malformed memory setting or an unreadable kernel reading) records UNKNOWNs for its checkout, and the writer is then replaced instead of verified again read-only (MEDIUM).
   - A crash in the middle of dropping a writer's service namespace leaves its lease active, with credentials for
@@ -290,7 +359,7 @@ blocks every stop, and 2.4.7's known limits from review are fixed. On 10-26 the 
 - `unknown/restore` still reads every actor and operation record of the ledger on the event loop, as in 2.4.7: on
   the user's ledger (15,261 operations, 1.5 GB) each restore holds the coordinator for seconds. The lead's release
   settlement of 43 paths held the live 2.4.7 coordinator this way, and a status call waited 94 s. To be fixed
-  first in 2.4.11, with the other whole-kind reads on the loop.
+  first in 2.4.12, with the other whole-kind reads on the loop.
 - The ledger does not shrink by itself: VACUUM it while the coordinator is stopped.
 
 ## [software-workflows 2.4.7] — 2026-10-27
