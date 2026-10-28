@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.11 / P1
+# Writer coordinator — software-workflows 2.4.12 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -108,10 +108,29 @@ survivors TERM and two seconds, then retries KILL against surviving identities.
 Custody and execution claims stay owned until durable `FAMILY_GONE`.
 
 The preallocated journal defaults to 8 MiB, configurable through
-`SOFTWARE_WORKFLOWS_OWNER_JOURNAL_BYTES`. Its working model is 30 writers, two
-incarnations each and 16 family members with repeated snapshots. Normal records
-use at most its first 75%; the last quarter is cleanup reserve. Compaction starts
-above 50%, retaining current ownership. Status alarms at 60%. An exhausted or
+`SOFTWARE_WORKFLOWS_OWNER_JOURNAL_BYTES` (read when the journal is created). Its
+working model is 30 writers, two incarnations each and 16 family members with
+repeated snapshots. Normal records use at most its first 75%; the last quarter is
+cleanup reserve. Compaction starts above 50% and keeps what can still be asked
+for: the custodian, the inhibit flag, the worker, every family not yet `GONE`, and
+the `GONE` families whose receipt a consumer may still request. A writer's
+app-server family stays until the worker holds its `FAMILY_GONE` receipt in the
+ledger (the listener record's `family_gone`); the worker then sends `forget`, the
+supervisor records `FORGOTTEN`, and the family leaves the journal. The worker
+forgets when a writer stops, parks, dies, goes dormant or fails to start, and at
+every start again for each listener record that holds a receipt, so a forget lost
+to a crash is sent again. A writer launch abandoned before its listener record
+exists is forgotten too: by the launch's own compensation when it is cancelled, or
+by the next start's sweep when the worker it was granted to has died. From then on
+a receipt is answered from the ledger, never from the supervisor, and a process
+handle asking late about a family that has left answers from what it already
+holds. Any other `GONE` family (admission, project and role
+app-servers, helpers, members, watcher probes, workers) is asked about only by the
+handle that launched it, within seconds of its exit: compaction keeps it for
+`SOFTWARE_WORKFLOWS_OWNER_JOURNAL_RETENTION_S` seconds after its `FAMILY_GONE`
+(default three days; read at every start). Through 2.4.11 compaction kept every
+family ever recorded, and an 8 MiB journal filled in 9 days. Status alarms at
+60% and reports `retention_s`, `gone_retained` and `forgotten`. An exhausted or
 damaged journal refuses new ownership with retryable `RESOURCE_EXHAUSTED`; it
 never opens an unregistered payload's gate. The lifecycle measurements and any
 remaining validation limitations are recorded in the build report.

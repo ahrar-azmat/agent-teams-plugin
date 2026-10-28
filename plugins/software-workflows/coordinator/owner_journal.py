@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import struct
 import sys
+import time
 import uuid
 import zlib
 
@@ -22,6 +23,27 @@ MAGIC = b"SWOJ"
 # repeated snapshots. The CP1 report measures encoded lifecycles against this
 # allocation. This is a storage budget, not a limit on families or descendants.
 DEFAULT_BYTES = 8 * 1024 * 1024
+# How long a compaction keeps a GONE family that no worker forgets: one of a helper, member, watcher probe or worker.
+# Only in-memory handles of the worker that launched it ask about it, within seconds of its FAMILY_GONE; a few days
+# (the user's choice, 2026-10-28) is headroom on that. A listener's family (a writer's app-server) is asked about
+# across worker restarts, so only the worker that holds its receipt in the ledger drops it (FORGOTTEN). Through 2.4.11
+# every family stayed in every compaction, and 8 MiB filled in 9 days.
+DEFAULT_RETENTION_S = 3 * 86400
+
+
+def retention_seconds():
+    """SOFTWARE_WORKFLOWS_OWNER_JOURNAL_RETENTION_S, read at every start (unlike the size, fixed at creation)."""
+    value = os.environ.get("SOFTWARE_WORKFLOWS_OWNER_JOURNAL_RETENTION_S")
+    if value is None:
+        return DEFAULT_RETENTION_S
+    try:
+        seconds = float(value)
+    except ValueError:
+        seconds = -1.0
+    if not seconds >= 0:  # also refuses nan
+        raise CoordinatorError("INVALID_SETTING", "SOFTWARE_WORKFLOWS_OWNER_JOURNAL_RETENTION_S must be a number of "
+                               "seconds, 0 or more", {"setting": "SOFTWARE_WORKFLOWS_OWNER_JOURNAL_RETENTION_S"})
+    return seconds
 
 
 def exhausted(message, **details):
@@ -85,6 +107,9 @@ def state(records):
             result["custodian"] = row
         elif kind == "INHIBIT":
             result["inhibited"] = row["value"]
+        elif kind == "FORGOTTEN":
+            for ident in row["listeners"]:
+                result["families"].pop(ident, None)
     return result
 
 
@@ -107,6 +132,7 @@ class Journal:
         self.sequence = self.records[-1]["sequence"] if self.records else 0
         self.state = state(self.records)
         self.emergency = self.damaged
+        self.retention = retention_seconds()
 
     @staticmethod
     def allocate(path, size):
@@ -180,10 +206,11 @@ class Journal:
         rows.append({"event": "INHIBIT", "value": current["inhibited"]})
         if current["worker"]:
             rows.append({"event": "WORKER", "worker": current["worker"]})
-        # Dormant/recovering consumers may request these receipts after restart.
-        # There is no durable all-consumers acknowledgement yet, so compaction
-        # must retain the identity-bound completion records as well as live ones.
-        rows += [{"event": "SNAPSHOT", "family": f} for f in current["families"].values()]
+        # Dormant/recovering consumers may request these receipts after restart. A listener's FAMILY_GONE stays until
+        # the worker, holding it durably in its ledger, forgets the family (FORGOTTEN: absent from `current`); a GONE
+        # family of any other kind, which only in-memory handles ask about, stays for the retention (2.4.12).
+        now = time.time()
+        rows += [{"event": "SNAPSHOT", "family": f} for f in current["families"].values() if not self.expired(f, now)]
         packets = [frame(self.sequence + i + 1, row) for i, row in enumerate(rows)]
         if sum(map(len, packets)) + HEADER.size > self.size // 2:
             return False  # retain the source and refuse new ownership before invading cleanup space
@@ -224,10 +251,19 @@ class Journal:
                 os.close(fd)
             temporary.unlink(missing_ok=True)
 
+    def expired(self, family, now):
+        """A GONE family nothing can still ask about: not a listener's (the worker forgets those), and past the
+        retention since its FAMILY_GONE. One written before 2.4.12 has no time; the worker that launched it, the only
+        one that could ask, belonged to an earlier start."""
+        if family["state"] != "GONE" or family.get("kind") == "listener":
+            return False
+        gone = family.get("gone_at")
+        return gone is None or now - gone >= self.retention
+
     def status(self):
         return {"bytes": self.size, "used": self.used, "sequence": self.sequence,
                 "alarm": self.used >= self.size * .60, "cleanup_only": self.used >= self.size * .75,
-                "read_only_cleanup": self.emergency, "damaged": self.damaged}
+                "read_only_cleanup": self.emergency, "damaged": self.damaged, "retention_s": self.retention}
 
     def close(self):
         os.close(self.fd)

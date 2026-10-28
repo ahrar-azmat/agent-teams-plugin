@@ -62,6 +62,7 @@ def call_source(operation):
 # obligations remain synchronous and durable before queueing.
 NATIVE_APPLIED_FLUSH_S = 0.1
 NATIVE_APPLIED_BATCH = 256
+FORGET_BATCH = 500  # listener ids per startup forget: one owner round trip and at most one FORGOTTEN record each
 
 
 class NativeBacklog:
@@ -798,10 +799,16 @@ class Daemon:
                     cleaned = False
                     self.store.event("listener/cleanup_refused", ident, {"code": getattr(exc, "code", type(exc).__name__)})
                 Path(log).unlink(missing_ok=True)
+                family = getattr(process, "family", None) or {}
+                gone = family.get("state") == "GONE" and family.get("exit_evidence") is not None
                 record = self.store.get(ident, required=False)
                 if record:
                     record.update(state="stopped", allocation_cleaned=cleaned)
+                    if gone:
+                        record.update(owner_sequence=family["owner_sequence"], family_gone=family["exit_evidence"])
                     self.store.save(record)
+                if gone:  # a start that never served: its receipt is in the ledger, or no record can ask for it (2.4.12)
+                    await self.forget_families([ident])
             from .locks import retire
             await retire(cleanup)
             raise
@@ -1007,18 +1014,72 @@ class Daemon:
         return self.store.db.execute("SELECT 1 FROM events WHERE kind='native' AND subject=? AND seq>? LIMIT 1",
                                      (ident, applied.get("sequence", 0))).fetchone() is not None
 
+    async def family_receipt(self, listener):
+        """The owner's FAMILY_GONE receipt for a listener's family: the ledger's copy once it holds one (`family_gone`),
+        else the owner's answer to `end`, which also begins the family's reaping. spawn_listener mints every listener
+        id, so a saved receipt only ever describes this record's own family; the owner forgets a family only after
+        that copy is durable, and a receipt held here is never asked for again (2.4.12)."""
+        if listener.get("family_gone") is not None:
+            return {"listener": listener["id"], "state": "GONE", "exit_evidence": listener["family_gone"],
+                    "owner_sequence": listener.get("owner_sequence")}
+        return (await self.leases.call("end", payload={"listener": listener["id"], "mode": "drain"}))["family"]
+
+    async def forget_families(self, idents):
+        """Let the owner drop these listeners' GONE families from its journal, once each receipt is in the ledger
+        (2.4.12). Housekeeping: a refusal is recorded, and the startup sweep sends it again."""
+        idents = [ident for ident in idents if ident]
+        if not idents:
+            return 0
+        try:
+            result = await self.leases.call("forget", payload={"listeners": idents})
+        except (CoordinatorError, OSError) as exc:
+            self.store.event("owner/forget_failed", None, {"code": getattr(exc, "code", type(exc).__name__),
+                                                            "listeners": len(idents)})
+            return 0
+        return result.get("forgotten", 0)
+
+    async def forget_consumed_families(self):
+        """At start: forget every family whose receipt a listener record holds, retrying a forget lost to a crash or a
+        refusal, and covering receipts saved before 2.4.12. Also every GONE listener family that no listener record
+        names and that an earlier worker was granted: a launch abandoned between the owner's grant and its record (the
+        worker died there, or its cancelled launch could not send the forget), which nothing can ask about. This
+        worker's own launches are fenced out by the worker each family was granted to. The owner ignores listeners it
+        does not hold."""
+        idents = [row[0] for row in self.store.db.execute(
+            "SELECT id FROM records WHERE kind='listener' AND json_extract(data,'$.family_gone') IS NOT NULL")]
+        abandoned = []
+        mine = (processes.identity(os.getpid()) or {}).get("kernel_id")
+        if mine is not None:
+            try:
+                families = (await self.leases.call("owner/status"))["families"]
+            except (CoordinatorError, OSError) as exc:
+                self.store.event("owner/forget_failed", None, {"code": getattr(exc, "code", type(exc).__name__),
+                                                                "listeners": 0, "stage": "status"})
+                families = []
+            abandoned = [f["listener"] for f in families if f["kind"] == "listener" and f["state"] == "GONE"
+                         and f.get("worker") != mine and self.store.get(f["listener"], required=False) is None]
+        forgotten = 0
+        for batch in (idents, abandoned):
+            for start in range(0, len(batch), FORGET_BATCH):
+                forgotten += await self.forget_families(batch[start:start + FORGET_BATCH])
+        self.store.event("owner/forgotten", None, {"listeners": len(idents), "abandoned": len(abandoned),
+                                                    "forgotten": forgotten})
+
     async def executor_exited(self, listener, unfinished=None):
         """Its app-server has exited: nothing it admitted can still write. Quarantines stop holding the paths they
         kept for a write that might still finish. With `unfinished`, a patch it never reported ending is
         quarantined for that reason, as a crash gap is."""
         # An app-server's exit alone says nothing about the descendants it left.
         if listener.get("owner_sequence"):
-            result = await self.leases.call("end", payload={"listener": listener["id"], "mode": "drain"})
-            if result["family"]["state"] != "GONE":
+            family = await self.family_receipt(listener)
+            if family["state"] != "GONE":
                 raise CoordinatorError("FAMILY_REAPING", "Recorded descendants still hold execution custody", operational=True)
-            listener["owner_sequence"] = result["family"]["owner_sequence"]
-            listener["family_gone"] = result["family"]["exit_evidence"]
+            consumed = listener.get("family_gone") is None
+            listener["owner_sequence"] = family["owner_sequence"]
+            listener["family_gone"] = family["exit_evidence"]
             self.store.save(listener)
+            if consumed:  # the receipt is durable in the ledger now: the owner may drop its copy
+                await self.forget_families([listener["id"]])
         else:
             self.legacy_exited(listener)
         query = "SELECT * FROM records INDEXED BY window_{} WHERE {} AND json_extract(data,'$.native.listener')=? ORDER BY id"
@@ -1398,10 +1459,10 @@ class Daemon:
         detached = time.monotonic()
         kill = kill or bool(listener.get("wedged"))
         if listener.get("owner_sequence"):
-            result = await self.leases.call("end", payload={"listener": listener["id"], "mode": "drain"})
-            if result["family"]["state"] != "GONE":
+            family = await self.family_receipt(listener)
+            if family["state"] != "GONE":
                 raise CoordinatorError("LISTENER_DRAIN", "Recorded family remains alive; custody retained")
-            listener["owner_sequence"] = result["family"]["owner_sequence"]
+            listener["owner_sequence"] = family["owner_sequence"]
             self.store.save(listener)
         else:
             self.legacy_exited(listener)
@@ -3313,6 +3374,7 @@ class Daemon:
             self.ready = True
             self.release_upgrade()
             self.background(recover_writers(self, plan))
+            self.background(self.forget_consumed_families())
             self.background(self.broker.recover())
             self.start_loop_supervisor()
             self.start_service("maintenance", self.maintenance)

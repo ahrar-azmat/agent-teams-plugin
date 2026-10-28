@@ -5,7 +5,7 @@ import subprocess
 import time
 import uuid
 
-from . import leases
+from . import leases, processes
 from .client import CoordinatorError
 
 
@@ -23,8 +23,16 @@ class Process:
 
     async def poll(self):
         if self._returncode is None:
-            result = await self.authority.call("poll", payload={"listener": self.listener})
-            self._returncode = result["returncode"]
+            try:
+                result = await self.authority.call("poll", payload={"listener": self.listener})
+            except CoordinatorError as exc:
+                # Queued behind an end that finished it, the owner may have dropped the family (2.4.12): that end's
+                # outcome stands. Without one, the error stays.
+                if exc.code != "OWNER_UNREGISTERED" or self._returncode is None:
+                    raise
+                return self._returncode
+            if self._returncode is None:  # never over an outcome an end set while this poll waited
+                self._returncode = result["returncode"]
         return self._returncode
 
     async def wait(self):
@@ -33,7 +41,18 @@ class Process:
         return self._returncode
 
     async def end(self):
-        response = await self.authority.call("end", payload={"listener": self.listener, "mode": "drain"})
+        if self.family.get("state") == "GONE":
+            return self._returncode  # answered: a retried retirement, or a second close, asks again
+        try:
+            response = await self.authority.call("end", payload={"listener": self.listener, "mode": "drain"})
+        except CoordinatorError as exc:
+            # A granted family leaves the owner only once GONE (2.4.12: forgotten, or compacted past the journal's
+            # retention): unregistered, with its root's exit evidenced here too, it is that finished end, begun by
+            # this handle's poll or by another. A live or unreadable root keeps the error.
+            if exc.code != "OWNER_UNREGISTERED" or not processes.exit_evidence(self.family["root"]):
+                raise
+            self.family = dict(self.family, state="GONE")
+            return self._returncode
         self.family = response["family"]
         self._returncode = self.family.get("returncode", 0)
         return self._returncode
@@ -116,10 +135,18 @@ async def spawn(*argv, kind="helper", listener=None, **options):
             try:
                 # The exchange can commit/grant before cancellation wins its
                 # await. Its preassigned identity exists even without a result.
-                await finish(authority.call("end", payload={"listener": ident, "mode": "drain"}))
+                ended = await finish(authority.call("end", payload={"listener": ident, "mode": "drain"}))
             except CoordinatorError as exc:
                 if exc.code != "OWNER_UNREGISTERED":
                     raise
+            else:
+                if kind == "listener" and ended["family"]["state"] == "GONE":
+                    # No listener record will name this launch, so nothing can ask for its receipt (2.4.12); a forget
+                    # refused here is sent again by the next start's sweep.
+                    try:
+                        await finish(authority.call("forget", payload={"listeners": [ident]}))
+                    except (CoordinatorError, OSError):
+                        pass
         raise
     finally:
         for descriptor in descriptors + list(local.values()):

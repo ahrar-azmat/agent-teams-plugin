@@ -144,9 +144,10 @@ class Dormancy:
         current = processes.identity(listener["pid"]) if listener.get("pid") else None
         if current and current["birth"] == listener.get("birth") and not current["zombie"]:
             raise CoordinatorError("WRITER_STILL_ALIVE", "Read-only dormancy requires a verified process exit")
+        receipt = None
         if listener.get("owner_sequence"):
-            receipt = await daemon.leases.call("end", payload={"listener": listener["id"]})
-            if receipt["family"]["state"] != "GONE":
+            receipt = await daemon.family_receipt(listener)
+            if receipt["state"] != "GONE":
                 raise CoordinatorError("FAMILY_REAPING", "Dormancy requires FAMILY_GONE", operational=True)
         await replay_native(daemon, listener)
         retire_peer_requests(daemon, listener)
@@ -185,6 +186,9 @@ class Dormancy:
         with store.transaction():
             store.event("recovery/history", listener["id"], dict(history, run=listener["run"]))
             listener = store.get(listener["id"])
+            consumed = receipt is not None and listener.get("family_gone") is None
+            if receipt is not None:
+                listener["family_gone"] = receipt["exit_evidence"]
             listener.update(state="dormant", recovery_state="reconciled", dormant_at=time.time(),
                             dormant_reason="exited terminal writer recovered read-only", history_gaps=gaps,
                             dormant_proof={"exit": {"pid": listener.get("pid"), "birth": listener.get("birth"),
@@ -195,6 +199,8 @@ class Dormancy:
             store.save(listener)
             store.event("listener/dormant", listener["id"], {"run": listener["run"], "when": listener["dormant_at"],
                         "why": listener["dormant_reason"], "history_gaps": gaps})
+        if consumed:  # durable with the dormant record now: the owner may drop its copy (2.4.12)
+            await daemon.forget_families([listener["id"]])
 
         # The streamed comparison also covered every predecessor's receipts.
         previous = store.get(listener.get("replaces"), required=False)

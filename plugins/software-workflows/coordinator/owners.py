@@ -29,6 +29,7 @@ class Owner:
         self.waiters = {}
         self.deadlines = {}
         self.pending_gone = set()
+        self.forgotten = 0
 
     def record(self, event, family, cleanup=False):
         sequence = self.journal.append(event, cleanup=cleanup, family=family)
@@ -188,7 +189,7 @@ class Owner:
                     self.deadlines[ident] = (stage, deadline)
                 evidence = [processes.exit_evidence(member) for member in family["members"]]
                 if all(evidence):
-                    family = dict(family, state="GONE", exit_evidence=evidence)
+                    family = dict(family, state="GONE", exit_evidence=evidence, gone_at=time.time())
                     child = self.children.get(ident)
                     if child:
                         family["returncode"] = child.poll()
@@ -207,14 +208,38 @@ class Owner:
                 # Unreadable identities and survivors remain REAPING; retry only while cleanup is active.
                 continue
 
+    def forget(self, idents):
+        """Drop GONE families whose FAMILY_GONE receipt the worker now holds in its ledger, so the next compaction no
+        longer carries them (2.4.12). A family that is not GONE, or that an `end` still awaits, stays; a listener this
+        owner does not hold is ignored, so a repeated forget is harmless."""
+        gone = [ident for ident in dict.fromkeys(idents)
+                if (self.families.get(ident) or {}).get("state") == "GONE" and ident not in self.waiters]
+        if gone:
+            self.journal.append("FORGOTTEN", cleanup=True, listeners=gone)
+            for ident in gone:
+                del self.families[ident]
+                self.children.pop(ident, None)
+            self.forgotten += len(gone)
+        return len(gone)
+
+    def prune(self):
+        """After a compaction: drop from memory the GONE families it left out (past the retention), with their
+        reaped child handles."""
+        kept = self.journal.state["families"]
+        for ident in [i for i, f in self.families.items() if f["state"] == "GONE" and i not in kept and i not in self.waiters]:
+            del self.families[ident]
+            self.children.pop(ident, None)
+
     def status(self):
         return {"custodian": self.identity, "journal": self.journal.status(),
                 "inhibited": self.journal.state["inhibited"],
                 "cleanup": "launchd restart" if os.environ.get("SOFTWARE_WORKFLOWS_LAUNCH_AGENT") else
                            "crash cleanup on next start only",
+                "gone_retained": sum(f["state"] == "GONE" for f in self.families.values()), "forgotten": self.forgotten,
                 "families": [{"listener": f["listener"], "state": f["state"], "kind": f["kind"],
                               "pid": f["root"]["pid"], "members": len(f["members"]),
-                              "owner_sequence": f.get("owner_sequence")} for f in self.families.values()]}
+                              "owner_sequence": f.get("owner_sequence"),
+                              "worker": (f.get("worker") or {}).get("kernel_id")} for f in self.families.values()]}
 
 
 def activated_socket():
@@ -413,7 +438,8 @@ def _supervise(root, control):
                     # Compaction needs one replacement allocation and metadata headroom.
                     normal = volume.f_bavail * volume.f_frsize >= 3 * journal.size
                     try:
-                        journal.compact(normal)
+                        if journal.compact(normal):
+                            owner.prune()
                     except OSError:
                         pass  # compact retains the authoritative descriptor and inhibits uncertain appends
                 if owner.deadlines:
@@ -483,6 +509,8 @@ def _supervise(root, control):
                             # Let the worker flush the caller's stop response and
                             # join compensation; the owner still owns its end.
                             stop_worker_at = time.monotonic() + TERM_SECONDS
+                        elif action == "forget":
+                            send(connection, {"ok": True, "forgotten": owner.forget(request.get("listeners") or [])})
                         elif action == "spawn":
                             custodian.refresh(worker)
                             family = owner.launch(request, descriptors)
@@ -534,7 +562,10 @@ def _supervise(root, control):
                             processes.signal_identity(family["root"], signal.SIGSTOP)
                             send(connection, {"ok": True})
                         elif action == "poll":
-                            family = owner.families[request["listener"]]
+                            family = owner.families.get(request["listener"])
+                            if not family:  # forgotten, or compacted past the retention, once GONE (2.4.12)
+                                raise CoordinatorError("OWNER_UNREGISTERED", "No owner journal identity for this family",
+                                                       {"listener": request["listener"]})
                             process = owner.children.get(request["listener"])
                             code = process.poll() if process else (0 if processes.exit_evidence(family["root"]) else None)
                             if code is not None and family["state"] != "GONE":

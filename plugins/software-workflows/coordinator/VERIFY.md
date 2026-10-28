@@ -14242,3 +14242,150 @@ coordinator README's shim paragraph. Measured on 10-28 between 03:40 and 04:05 o
 - **The coordinator's code is 2.4.9's,** but a 2.4.11 client replaces an older daemon, because the daemon's version
   is the plugin's.
 - **2.4.9's known limits stand.** Those marked for 2.4.11 move to 2.4.12.
+
+## 2.4.12
+
+One change: the owner journal's retention (`owner_journal.py`, `owners.py`, `daemon.py`, `dormancy.py`,
+`parking.py`, `owned.py`; with them, the coordinator README's journal paragraph). Through 2.4.11 the journal's state
+kept the latest record of every family it had ever recorded, `GONE` ones included, and compaction wrote a snapshot of
+each; the user's 8 MiB journal filled in 9 days, refused new ownership and blocked the 2.4.11 switch until it was moved
+aside. Codex review turn 94 found two more paths, both fixed here: writer launches abandoned before their listener
+record, and a poll queued behind the end that finished its family. Measured on 10-28 between 18:55 and 20:16 on
+the user's Mac, with the installed 2.4.11 as the red.
+
+### What it changes
+- **`FORGOTTEN`:** a worker-channel `forget` lets the supervisor drop `GONE` families that no request waits on; the
+  journal's state drops a forgotten family, and the next compaction no longer carries it. A family that is not `GONE`,
+  one with a waiter, and one the supervisor does not hold are ignored (the answer counts only those dropped).
+- **Who forgets:** the worker, once the listener record holds the receipt (`family_gone`): `executor_exited` (a writer
+  stopped, parked or dead), dormancy (the receipt saved with the dormant record), a failed start, and a startup sweep
+  over every listener record holding one, 500 per round trip.
+- **Abandoned launches (turn 94):** `owned.spawn`'s compensation for a listener launch cancelled after its grant
+  forgets the family it ends, since no listener record will name it. The startup sweep also reads `owner/status` and
+  forgets each `GONE` listener family that no listener record names and that a worker other than this one was granted
+  (a worker that died between the grant and the record). Status entries now carry that worker's kernel id; without its
+  own identity the worker skips this part.
+- **The retention:** a `GONE` family of any other kind is kept for `SOFTWARE_WORKFLOWS_OWNER_JOURNAL_RETENTION_S`
+  after its `FAMILY_GONE` (`gone_at`, new), three days by default, read at every start (a value that is not a number
+  of seconds, 0 or more, is refused at start with `INVALID_SETTING`). Listener families never expire; only a forget
+  drops them.
+- **The consumers:** `family_receipt` answers from the ledger once it holds the receipt, else asks the supervisor's
+  `end` as before; `executor_exited`, `_stop_listener`, dormancy and parking use it. Parking no longer searches
+  `owner/status` for the family. Recovery's two `executor_exited` calls for a dead writer share one listener dict, so
+  the second answers from the ledger. The supervisor's `end` ignores `mode`, so dormancy's call (now with
+  `mode: drain`) is unchanged.
+- **The handle:** `owned.Process.end` answers again from a `GONE` answer it holds, and takes `OWNER_UNREGISTERED`
+  for a family it was granted, with its root's exit evidenced, as that family's finished end (see (D)). A live or
+  unreadable root keeps the error. `Process.poll` returns the outcome an end set while the poll waited behind it,
+  over `OWNER_UNREGISTERED`, and never overwrites a known outcome; the supervisor's `poll` answers a family it no
+  longer holds with `OWNER_UNREGISTERED`, where it raised a lookup error sent as `OWNER_OPERATION` (see (E), turn 94).
+  A failed listener start saves the receipt it got on its record and forgets the family.
+
+### (A) The journal under 600 lifecycles (`r2412/journal_probe.py`)
+- **The setup.** The real `Journal` and `Owner` classes in process, real `/bin/sleep` children through the
+  supervisor's own launch gate, SIGTERM, exit evidence, `FAMILY_GONE` and fsync, compacting exactly as
+  `owners._supervise` does. A 256 KiB journal and retention 0 make the 2.4.11 failure reachable in seconds. One
+  helper for every two listeners; each listener is forgotten after it is `GONE`, as the worker does.
+- **The installed 2.4.11:** refused new ownership (`RESOURCE_EXHAUSTED`, "cleanup reserve cannot admit new
+  ownership") at lifecycle 155, holding 155 `GONE` families, 198,219 bytes used; 17 compactions, 15 refused.
+- **This tree:** all 600 completed; 20 compactions, none refused; at most 128,260 bytes used; 6 families kept at the
+  end (the helpers gone since the last compaction).
+- **Guards:** forget returns 0 for a live family, a reaping one and an unknown id, 1 for a `GONE` one, and 0 again for
+  it; the expiry rules hold (a listener never expires, a helper 60 s gone is kept and one 4 days gone expires under
+  the default, one without `gone_at` expires, an owned one never does); a reopened journal and owner hold the same
+  families.
+- **Time:** ending a family took 14 ms at the median on both, at most 5.02 s on both (the root's five-second grace,
+  unchanged); a launch 2 ms at the median.
+
+### (C) A real daemon and real writers (`r2412/e2e2412.py`)
+- **The setup.** A disposable state, repository and fixture; the real coordinator (`coordinator daemon serve` from
+  the plugin under test: supervisor, worker), started by the CLI's own client; the installed codex's app-servers as
+  writers against the loopback fixture provider (`coordinator fixture serve`; no model or network spend). A 256 KiB
+  journal, retention 0, writers parking after 1 idle second. Ten or twelve `run/start` calls, each waited on until
+  every listener of the run holds its receipt; then `daemon stop`, a restart by the next call, and the startup sweep.
+  Read: the disposable owner journal, the ledger (read-only), `daemon/status`.
+- **The installed 2.4.11 (the red):** three writers ran; the fourth `run/start` was refused, `ADMISSION_FAILED`
+  with `RESOURCE_EXHAUSTED` (197,736 of 262,144 bytes) in every admission probe. The journal held 116 families: 105
+  helpers, 8 writers' app-servers, a watcher probe, the worker and its watchdog, all but the last two `GONE`. After
+  `daemon stop` the restarted supervisor took the lock and did not answer (`DAEMON_UNRESPONSIVE` after 30 s); it was
+  ended by hand. No `FORGOTTEN`, no sweep.
+- **This tree, before the handle change:** nine writers ran, every listener with its receipt; the tenth
+  `run/start` was refused at admission, the fingerprint step failing with `OWNER_UNREGISTERED` ((D)).
+- **This tree, final:** all 12 writers ran, each `run/start` to receipts in 28.6–29.0 s; every
+  listener (24) held its receipt and the supervisor had forgotten all 24. Before the restart the journal
+  held 6 families (4 helper:GONE, 1 watchdog:GRANTED, 1 worker:OWNED), none a writer's, in 36,404 bytes at
+  sequence 3,127. The restarted daemon's sweep read 24 listener records holding a receipt, found
+  0 abandoned launches and forgot 0 (the owner held none of them); after it the journal held
+  9 families, none a writer's. No `owner/forget_failed`, no process left; 352.5 s in all.
+
+### (D) A handle's late ask (`r2412/handle_probe.py`)
+- **Why.** (C)'s first run on this tree, before the handle change, refused its tenth writer: admission's fingerprint
+  step failed with `OWNER_UNREGISTERED` for a helper, its probe listener's `end` meeting a family the owner had
+  already dropped. Families now leave the owner, and the code has three ways for a handle to ask `end` after its
+  family is gone: after its own poll saw the exit (admission's schema step, the watchdog); a second time (project
+  discovery's `terminate` then `end`, the watcher probe's `finally`); and a retirement `locks.retire` runs again after
+  a cancellation. Which of these the fingerprint listener met is not recorded. Retention 0 makes the window as wide
+  as it gets; three days closes it in practice, but not by design.
+- **The setup.** The real `Journal` and `Owner` of this tree (64 KiB, retention 0) with real children; the
+  supervisor's own `poll` and `end` handling in process; a compaction forced between the asks. `owned.Process` of
+  this tree, or with the installed 2.4.11's `Process.end` (its source, verbatim): that pairing is this tree before
+  the handle change.
+- **2.4.11's `end`:** poll then end → `OWNER_UNREGISTERED`; end twice → `OWNER_UNREGISTERED` on the second.
+- **This tree:** poll then end → 3, the exit code the poll saw, with the family dropped before the end; end twice →
+  the first answer again (−15) without asking.
+- **Controls, both:** a family the owner does not hold, whose root is alive, stays `OWNER_UNREGISTERED`; a live
+  family ends `GONE` with its exit evidence.
+
+### (E) A poll queued behind the end that finished its family (`r2412/handle_probe2.py`, turn 94)
+- **The path.** Project discovery's close calls `terminate()`, whose task sends `end`, and then `wait()`: the poll
+  queues behind that end on the worker client's lock, and the supervisor can answer the end, compact and prune before
+  the poll runs.
+- **The setup.** As (D), with calls serialized by one asyncio lock as the worker's client serializes them, and the
+  supervisor loop's compaction after it answers the end. The red is the installed 2.4.11's `Process.poll` and
+  `Process.end` (their source, verbatim) with 2.4.11's `poll` branch, where an unknown family is a lookup error sent
+  as `OWNER_OPERATION`.
+- **2.4.11:** `wait()` failed with `OWNER_OPERATION`.
+- **This tree:** `wait()` returned −15, the end's outcome; the family had been dropped.
+
+### (F) A listener launch cancelled after its grant (`r2412/handle_probe2.py`, turn 94)
+- **The setup.** As (E); the supervisor's `spawn` commits and grants, then cancellation wins the await, and
+  `owned.spawn`'s compensation runs (the red: the installed 2.4.11's `spawn`, verbatim). Then a forced compaction.
+- **2.4.11:** the compensation ended the family and kept it: the owner held it `GONE`, and so did the compacted
+  journal (a listener family never expires).
+- **This tree:** the compensation sent `end` and then `forget`; neither the owner nor the compacted journal held it.
+
+### (G) A launch abandoned by a dying worker, on a real daemon (`r2412/abandoned_probe.py`, turn 94)
+- **The setup.** A disposable state; the real daemon started by the CLI's own client, then stopped. With it stopped,
+  the real `Journal` class appended what a worker dying between the grant and its listener record leaves: `OWNED`,
+  `GRANTED` to an earlier worker, and `FAMILY_GONE` with exit evidence, for a listener id no ledger record names. Then
+  two more starts, each read through `daemon/status` and the journal.
+- **The installed 2.4.11:** the family stayed `GONE` in the owner and the journal through both starts; no sweep.
+- **This tree:** the first start's sweep logged `abandoned: 1, forgotten: 1`; the journal holds `FORGOTTEN` naming it
+  and no longer the family, and the next start found nothing to forget. No process was left.
+
+### (B) The 2.4.8 lead catalog (`r2412/catalog2412.py`): not a measurement
+- 25 recipes replayed through `r247-lead/rerun247.py`. 21 of the 23 greens and both negative controls exited 1 in
+  under 4 s, all at the same place: the recipes build their fixture checkout without `git init`, and
+  `ledger._metadata`'s `git rev-parse` fails before any coordinator code under test runs. The replay's inputs have
+  rotted (the shape fixture was regenerated, labels remapped, five recipes need a missing recipe index), and these
+  recipes replace the supervisor RPC with a stub, so they could not reach this change. (C) replaces them. One replay
+  left its daemon running with a compatibility lease on this checkout; it was stopped by a SIGTERM to its supervisor.
+
+### Static checks (`r2412/static_checks2412.py`, on the final tree)
+- every plugin `.py` compiles under Python 3.15 (83 files), and the 14 hook-run files under the system Python
+  3.9.6;
+- `coordinator/hooks.py --check`: exit 0, compatible, protocol `jsonl-v1`;
+- the shim parses under `sh -n`, `bash --posix -n` and zsh's sh emulation, and keeps mode 0755;
+- ruff (F821, F822, F823, F811, F841, F401): 35 findings against installed 2.4.11's 35, none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.12.
+
+### Known limits
+- **Unsettled writers:** a family whose writer is running, orphaned or not yet recovered stays; it is live custody.
+  A launch abandoned by a worker that died stays until the next start's sweep.
+- **A handle that never saw its exit code** and whose family has left reports none (`returncode` None).
+- **Journal size:** fixed when a journal is created. The user's 128 MiB journal from the 2.4.11 switch stays 128 MiB;
+  a new one defaults to 8 MiB.
+- **The switch from 2.4.11:** a graceful stop with writers in flight still waits on `NOT_QUIESCENT`, as before.
+- **The lead catalog replay** needs its inputs rebuilt before it measures anything again.
+- **2.4.11's known limits stand.** Those marked for 2.4.12 (review turn 93) and 2.4.9's move to 2.4.13.

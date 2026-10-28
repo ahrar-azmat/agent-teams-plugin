@@ -199,8 +199,9 @@ class Parking:
                     await daemon.history.observe(listener, actor, connection)
                 self.stage(listenerid, "stopping")
                 await finish(daemon.stop_listener(store.get(listenerid)))
-                receipt = await daemon.leases.call("owner/status")
-                family = next(f for f in receipt["families"] if f["listener"] == listenerid)
+                # The ledger's receipt: stopping saved it and let the owner forget the family (2.4.12), so the owner's
+                # status no longer lists it.
+                family = await daemon.family_receipt(store.get(listenerid))
                 if family["state"] != "GONE":
                     raise CoordinatorError("FAMILY_REAPING", "Park awaits the owner FAMILY_GONE receipt", operational=True)
                 self.stage(listenerid, "family_exit", owner_sequence=family["owner_sequence"])

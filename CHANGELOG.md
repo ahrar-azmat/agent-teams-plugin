@@ -3,6 +3,75 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.12] — 2026-10-28
+
+The owner journal no longer keeps every process family it has ever recorded. Its compaction now keeps only what can
+still be asked about: live families, a writer's finished family until the ledger holds its receipt, and other finished
+families for a retention window. Through 2.4.11 it rewrote every family, finished ones included, so the journal only
+grew; the user's 8 MiB journal filled in 9 days, refused new ownership (`RESOURCE_EXHAUSTED`) and blocked the switch
+to 2.4.11 until it was moved aside. One change, in the coordinator (`owner_journal.py`, `owners.py`, `daemon.py`,
+`dormancy.py`, `parking.py`, `owned.py`; coordinator/VERIFY.md, 2.4.12).
+
+### Fixed: the owner journal kept every family it had ever recorded
+- The journal's state kept the latest record of every family, `GONE` ones included, and compaction wrote a snapshot of
+  each, so finished writers, helpers and probes stayed forever. Compaction refuses when what it keeps exceeds half the
+  journal, and from then on new ownership is refused.
+- Now a family leaves the journal once nothing can still ask for its `FAMILY_GONE` receipt:
+  - **A writer's app-server family** leaves when the worker holds its receipt in the ledger. The worker sends
+    `forget` (worker channel only; the supervisor forgets only `GONE` families no request waits on) and the supervisor
+    records `FORGOTTEN`. The worker forgets when a writer stops, parks, dies, goes dormant or fails to start, and at
+    every start again for each listener record holding a receipt: a forget lost to a crash, and the receipts saved
+    before 2.4.12.
+  - **A writer launch abandoned before its listener record exists** leaves too. A launch cancelled after the
+    supervisor granted it forgets the family it ends, and every start forgets each `GONE` listener family that no
+    listener record names and an earlier worker was granted (a worker that died between the grant and the record).
+    The current worker's own launches are never swept.
+  - **Every other family** (admission, project and role app-servers, helpers, members, watcher probes, workers) is
+    asked about only by the handle that launched it, within seconds of its exit. Compaction keeps it for
+    `SOFTWARE_WORKFLOWS_OWNER_JOURNAL_RETENTION_S` seconds after its `FAMILY_GONE`, three days by default, read at
+    every start; one recorded before 2.4.12 has no exit time and goes at the first compaction.
+  - A receipt the ledger holds is answered from the ledger, so nothing asks the supervisor for a family it has
+    forgotten. Parking reads its receipt there too, instead of searching `owner/status`.
+  - `daemon/status` reports the supervisor's `forgotten` and `gone_retained`, the journal's `retention_s`, and the
+    worker each family was granted to.
+  - A process handle stays correct now that families leave. Its `end` is idempotent: once answered `GONE` it answers
+    again from what it holds, and an `end` after its family has left (`OWNER_UNREGISTERED`), with the root's exit
+    evidenced, is that finished end. A `poll` queued behind an `end` that finished the family returns that end's
+    outcome, and the supervisor answers a `poll` for a family it no longer holds with `OWNER_UNREGISTERED`, no longer
+    a bare lookup error. Admission's schema step, the watchdog and project discovery all end or poll a process after
+    it exits; under a short retention their late ask failed a writer's admission or discovery's cleanup. A family the
+    owner does not hold, with a live root, is still an error.
+- Measured:
+  - **The real journal and owner classes, real child processes, a 256 KiB journal, 600 lifecycles** (one helper per
+    two writers): the installed 2.4.11 refused new ownership at lifecycle 155, holding 155 `GONE` families
+    (198,219 bytes used; 15 compactions refused). This tree completed all 600 with 20 compactions and none refused,
+    never above 128,260 bytes, keeping 6 families. Ending a family took 14 ms at the median on both, 5.02 s at most
+    on both (the root's five-second grace).
+  - **A real daemon, supervisor and worker on a disposable state, with real writer app-servers against the loopback
+    fixture provider** (256 KiB journal, retention 0, writers parking after a second): the installed 2.4.11 refused
+    the fourth writer at admission (`RESOURCE_EXHAUSTED`, 197,736 bytes used, 116 families kept, 8 of them
+    writers'), and its restarted supervisor did not answer. This tree ran all 12 writers; it forgot all 24 writer
+    families, kept none of them, and held 6 families in 36,404 bytes before the restart, after which
+    the startup sweep found 24 receipts and nothing left to forget. An earlier run, before the handle
+    changes, refused its tenth writer: that is how the late ask was found.
+  - **A handle's late ask** (the real journal and owner, retention 0, the supervisor's own `end` and `poll`, calls
+    serialized as the worker's client does): with 2.4.11's handle, an end after a poll saw the exit, a second end, and
+    a poll queued behind discovery's `terminate` all failed (`OWNER_UNREGISTERED`, `OWNER_OPERATION`); with this
+    tree's, all three answer, and a family the owner does not hold, whose root lives, is still refused.
+  - **Abandoned launches:** a listener launch cancelled after its grant left a `GONE` family that 2.4.11's compaction
+    kept; this tree forgets it. On a real daemon, a `GONE` listener family that no record names, granted to an earlier
+    worker, survived two restarts of 2.4.11; this tree forgot it at the first start and it stayed gone.
+  - Codex review turn 94 found the abandoned launches and the queued poll; both are fixed above.
+
+### Known limits
+- A family whose writer is not settled (running, orphaned, or not yet recovered) stays: it is live custody. A launch
+  abandoned by a worker that died stays until the next start's sweep.
+- The size of an existing journal is fixed at its creation: the user's 128 MiB journal from the 2.4.11 switch stays
+  128 MiB, and a new one defaults to 8 MiB.
+- A handle whose family has left and that never saw its exit code reports none (`returncode` None).
+- The switch from 2.4.11 is the usual one: with writers in flight a graceful stop still waits on `NOT_QUIESCENT`.
+- Review turn 93's items for the push gate and 2.4.9's limits marked for 2.4.12 move to 2.4.13.
+
 ## [software-workflows 2.4.11] — 2026-10-28
 
 The push gate asks for an acknowledgement only for a Bash command whose structure puts a push or commit where the
