@@ -14507,3 +14507,60 @@ installed 2.4.12 as the red.
   pressure: 109 of the 1,752 in that hour.
 - **2.4.12's known limits stand.** Review turn 93's push-gate items, 2.4.9's limits and `restore_unknown` move to
   2.4.14.
+
+## 2.4.14
+
+One change: `recovery.py` reads operations through their partial indexes, never the whole history. Measured on 10-29
+between 01:52 and 01:55 on the user's Mac: the read comparison on the user's live ledger (read-only), and the restore
+on a real daemon with the installed 2.4.13 as the comparison.
+
+### What it changes
+- **`quarantined_operations(store)`** reads `SELECT * FROM records INDEXED BY blocker_quarantine WHERE` the ledger's
+  own `BLOCKERS["quarantine"]` predicate, `ORDER BY id`. Its callers: `restore_unknown` (the single-path operations
+  its restore resolves), `restore_checkout` (the same, checkout-wide) and `resolve_restored_parents`.
+- **`in_flight_operations(store)`** reads `INDEXED BY window_operation WHERE` `WINDOW_ACTIVE["operation"]` (prepared,
+  allowed or running), `ORDER BY id`. Its callers are startup recovery's two passes: cross-checkout operations
+  interrupted before their atomic receipt, and lead operations interrupted before verified completion.
+- Each caller keeps its own filter (state, parts, checkout, paths, kind) on the rows it gets; the order is that of
+  `store.all`. Both indexes are created by the store at open, in the same transaction as each record's change.
+- Not changed: `lead_calls.recover` (see Known limits), and actors, which `restore_unknown` still reads whole (a few
+  hundred records, 10 ms on the user's ledger).
+
+### (L) The reads on the user's live ledger (`r2414/scan_probe.py`, read-only)
+- **The setup.** A read-only connection to `ledger.sqlite` (a WAL reader never blocks the daemon) and one read
+  transaction for every read, since the live ledger changes while the old read runs. A first run outside one snapshot
+  saw 4 operations in flight by the old filter and 3 by the index, 20 s apart. Inside one snapshot the counts agree.
+  The query strings are the tree's own, from `store.BLOCKERS` and `store.WINDOW_ACTIVE`.
+- **The old read:** every one of 22,344 operations read and decoded in 14.4 s (`r2414/l-live.out`), then filtered as
+  recovery.py did. The first run, outside one snapshot, took 20.7 s over 22,342 (`r2414/l-live-first.out`, kept from
+  the session's transcript after review turn 96 found its output missing).
+- **Quarantined:** the indexed read returned the same 6 records in the same order in 1.3 ms (plan: `SCAN records USING
+  INDEX blocker_quarantine`, a temporary B-tree for the order).
+- **In flight:** the same 2 records in the same order in 0.3 ms (`SCAN records USING INDEX window_operation`).
+
+### (M) An UNKNOWN's restore on a real daemon (`r2414/restore_probe.py`)
+- **The setup.** A real daemon on a disposable state, its supervisor and worker started by the CLI's own client; a
+  registered git checkout and a lead session. With the daemon stopped, the plugin's own `Store` records what an
+  unattributed change leaves: the changed `a.txt`, its UNKNOWN, a quarantined operation on `a.txt` alone, and a
+  quarantined parent whose only part is resolved. Then a start, `unknown/restore` with revision `baseline` (as the
+  release settlement does), and a restart.
+- **The installed 2.4.13 and this tree, alike:** the restore answered `resolved`, resolution `baseline`, in 0.1 s. The
+  file was back at its baseline. Both open UNKNOWNs on the path were resolved (the start's own scan had recorded a
+  second one). The single-path operation was `resolved` with `restored_by`, and the parent was `resolved` with its
+  `restoration`. The restart was ready, and no process was left.
+
+### Static checks (`r2414/static_checks2414.py`, on the final tree)
+- every plugin `.py` file compiles under 3.15 (83 files), and the hook-run files under `/usr/bin/python3` (3.9.6 14 files);
+- `hooks.py --check` compatible, protocol `jsonl-v1`;
+- the git shim parses under `sh -n`, `bash --posix -n` and zsh's sh emulation, and is executable;
+- ruff's F821/F822/F823/F811/F841/F401: 35 findings here, 35 in 2.4.13; none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.14.
+
+### Known limits
+- **`lead_calls.recover`** still reads and decodes every operation once per start, to keep the lead-edit ones (14 to
+  21 s on the user's ledger). It uses that map after the records change, so its indexed form needs a check of its own.
+- **The stop's quiescence check** (`daemon.stop_pending`) still reads every lead hook, actor, run and message record
+  at each refused stop, about 0.7 s on the user's ledger.
+- **2.4.13's known limits stand.** Review turn 93's push-gate items, 2.4.9's limits and fenced park refusals remain
+  for later.

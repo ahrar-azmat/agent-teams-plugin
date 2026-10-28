@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.13 / P1
+# Writer coordinator — software-workflows 2.4.14 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can

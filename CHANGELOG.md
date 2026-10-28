@@ -3,6 +3,35 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.14] — 2026-10-29
+
+The coordinator no longer reads every operation it has ever recorded to answer a question about a few of them. Through
+2.4.13 each restore of an UNKNOWN read the whole history twice on the event loop, and each start three times. On the
+user's ledger that is 22,344 operations and 1.7 GB, at 14 to 21 s per read. Now a restore reads none of it and a start
+reads it once (Known limits). One change, in the coordinator (`recovery.py`; coordinator/VERIFY.md, 2.4.14).
+
+### Fixed: restores and starts read the whole operation history
+- An operation record keeps its tool output. A restore asks for the quarantined operations it resolves: those on its
+  path alone, and the parents whose parts are all resolved. Startup recovery asks for the operations interrupted in
+  flight. Each question was answered by decoding every operation ever recorded, on the event loop, so the coordinator
+  answered nothing else meanwhile: about 30 to 40 s per restore on the user's ledger, as much again per start. On
+  10-23 a settlement of 43 paths stalled it until one status call took 94 s.
+- Now each reads through the partial index the ledger already keeps for that question, in the same id order:
+  `blocker_quarantine` for the quarantined operations, `window_operation` for those prepared, allowed or running.
+- Measured on the user's live ledger, read-only and in one snapshot: reading and decoding every operation took 14.4 s
+  (20.7 s in a first run). The indexed reads returned the same records in the same order: the 6 quarantined in 1.3 ms
+  and the 2 in flight in 0.3 ms.
+- On a real daemon on a disposable state, an UNKNOWN's restore behaved the same on the installed 2.4.13 and on this
+  tree, with a quarantined operation on its path and a quarantined parent whose part was resolved. In both, the file was
+  restored to its baseline, the UNKNOWN and both operations were resolved, and the restart was clean.
+
+### Known limits
+- `lead_calls.recover` still reads and decodes every operation once per start, to keep the lead-edit ones: 14 to 21 s
+  on the user's ledger. It uses that map after the records change, so its indexed form needs a check of its own.
+- The stop's quiescence check still reads every lead hook, actor, run and message record at each refused stop (about
+  0.7 s on the user's ledger).
+- Still for later: review turn 93's push-gate items, the limits 2.4.9 carried, and fenced park refusals.
+
 ## [software-workflows 2.4.13] — 2026-10-29
 
 Two changes in the coordinator. A writer whose process family no owner journal holds no longer blocks the

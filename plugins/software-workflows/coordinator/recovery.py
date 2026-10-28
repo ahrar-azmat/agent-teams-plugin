@@ -13,7 +13,7 @@ import time
 from .locks import finish, finish_all, finish_thread
 from .client import CoordinatorError
 from . import native, processes, participants
-from .store import uid
+from .store import BLOCKERS, WINDOW_ACTIVE, uid
 
 # A quiet app-server's graceful exit after SIGTERM is bounded by Codex 0.163 itself: its threads' shutdown at
 # 10 s (shutdown_all_threads_bounded; a writer's MCP servers stop there) and each connection's RPC drain at 30 s
@@ -1047,7 +1047,7 @@ async def recover(daemon):
     # its pre-images, and one it may still be writing keeps its paths (`executing`).
     for listener in recoverable:
         await daemon.settle_native_log(listener["id"])
-    for operation in list(store.all("operation")):
+    for operation in in_flight_operations(store):
         if operation.get("parts") and operation["state"] in ("prepared", "allowed", "running"):
             await daemon.ledger.quarantine(operation, "cross-checkout operation interrupted before atomic receipt completion",
                                            executing=await may_execute(daemon, operation))
@@ -1062,7 +1062,7 @@ async def recover(daemon):
             discovery["state"] = "interrupted"
             store.save(discovery)
     # Lead operations have no native history to fill the crash gap: fenced before any lead call is admitted.
-    for operation in list(store.all("operation")):
+    for operation in in_flight_operations(store):
         if operation["kind"] in ("lead-edit", "restore", "lead-command") and operation["state"] in ("prepared", "allowed", "running"):
             await daemon.ledger.quarantine(operation, "lead operation interrupted before verified completion")
     from .publish import Publisher
@@ -1610,8 +1610,24 @@ async def settle_lead_command(daemon, reservation, resolve_quarantine=False):
                 return
 
 
+def in_flight_operations(store):
+    """The operations prepared, allowed or running, through their partial index (store.WINDOW_ACTIVE), in id order.
+    Never a decode of the whole history: operations hold their tool output, 1.7 GB in 22,344 records on the user's
+    ledger, 14 to 21 s to read and decode (10-29). Through 2.4.13 each start read it twice."""
+    return list(store.selected("SELECT * FROM records INDEXED BY window_operation WHERE " + WINDOW_ACTIVE["operation"] +
+                               " ORDER BY id"))
+
+
+def quarantined_operations(store):
+    """The quarantined operations, through their partial index (store.BLOCKERS), in id order. Through 2.4.13 each
+    restore read the whole history twice for these, on the event loop: 30 to 40 s of a stalled coordinator per UNKNOWN
+    on the user's ledger."""
+    return list(store.selected("SELECT * FROM records INDEXED BY blocker_quarantine WHERE " + BLOCKERS["quarantine"] +
+                               " ORDER BY id"))
+
+
 def resolve_restored_parents(store):
-    for operation in list(store.all("operation")):
+    for operation in quarantined_operations(store):
         if operation.get("parts") and operation["state"] == "quarantined" and all(
                 store.get(key)["state"] == "resolved" for key in operation["parts"]):
             operation.update(state="resolved", restoration={key: store.get(key).get("restored_by") for key in operation["parts"]})
@@ -1768,7 +1784,7 @@ async def restore_unknown(daemon, params):
     # It resolves what it found before its edit, by id: an UNKNOWN or a quarantined operation recorded later is an
     # effect it never saw.
     found = [unknown["id"] for unknown in store.unresolved(row["checkout"], [path]) if unknown["path"] == path]
-    replaced = [o["id"] for o in store.all("operation") if not o.get("parts") and o["checkout"] == row["checkout"]
+    replaced = [o["id"] for o in quarantined_operations(store) if not o.get("parts") and o["checkout"] == row["checkout"]
                 and o["state"] == "quarantined" and o["paths"] and set(o["paths"]) <= {path}]
     mark = uid("restore")  # carried by the claims its edit creates (release_taken)
     result = await daemon.lead_edit({"actor": actor["id"], "changes": {str(Path(checkout["root"]) / path): change}},
@@ -1866,7 +1882,7 @@ async def restore_checkout(daemon, actor, unknown, revisions):
     # As a path's restore: it resolves what it found before its edit, holds its claims until that commits, and is
     # resolved only while every head is still the one its read found.
     before = [item["id"] for item in store.unresolved(checkout["id"])]
-    replaced = [o["id"] for o in store.all("operation") if not o.get("parts") and o["checkout"] == checkout["id"]
+    replaced = [o["id"] for o in quarantined_operations(store) if not o.get("parts") and o["checkout"] == checkout["id"]
                 and o["state"] == "quarantined" and set(o["paths"]) <= paths]
     mark = uid("restore")
     result = await daemon.lead_edit({"actor": actor["id"], "changes": changes, "cwd": checkout["root"]}, restore=True, mark=mark)
