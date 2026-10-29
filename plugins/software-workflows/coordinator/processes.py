@@ -11,6 +11,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 
 from .client import CoordinatorError
 
@@ -194,6 +195,13 @@ def signal_identity(record, number):
     return True
 
 
+def unread_count(count):
+    """Whether a proc_listpids read, made with errno cleared, failed: Apple's libproc answers a failed read as an empty
+    one, 0 with the call's errno (libproc.c proc_listpids), never below 0 (review turn 126). A read that succeeds leaves
+    errno 0, even with nothing to list (measured 10-30: a process with no children, an absent PID)."""
+    return count < 0 or (count == 0 and ctypes.get_errno() != 0)
+
+
 def lineage(records, exclude=()):
     """Snapshot descendants while parent links exist; never infer ownership by a name."""
     retained = {r.get("kernel_id", r["birth"]): r for r in records}
@@ -203,6 +211,8 @@ def lineage(records, exclude=()):
         size = lib.proc_listpids(1, 0, None, 0)
         while True:
             buffer = (ctypes.c_int * (size // 4 + 128))()
+            # A failed read still reads as an empty one here (unread_count): raising it would end the owner during a
+            # family's cleanup, which does not retry a failed snapshot yet (review turn 127).
             count = lib.proc_listpids(1, 0, buffer, ctypes.sizeof(buffer))
             if count < 0:
                 raise _unreadable(0, ctypes.get_errno())
@@ -260,6 +270,38 @@ def arguments(pid):
     return (Path("/proc") / str(pid) / "cmdline").read_bytes().rstrip(b"\0").split(b"\0")
 
 
+def children(pid):
+    """The PIDs whose parent is `pid` now (zombies too), read from the kernel with no process scan: macOS
+    proc_listpids(PROC_PPID_ONLY), measured 10-30 to list exactly a process's children; Linux reads each /proc entry's
+    parent (not run on Linux). A read that fails raises (unread_count)."""
+    if sys.platform == "darwin":
+        lib = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        size = lib.proc_listpids(6, int(pid), None, 0)
+        while True:
+            buffer = (ctypes.c_int * (max(size, 0) // 4 + 64))()
+            ctypes.set_errno(0)
+            count = lib.proc_listpids(6, int(pid), buffer, ctypes.sizeof(buffer))
+            if unread_count(count):
+                raise _unreadable(pid, ctypes.get_errno())
+            if count < ctypes.sizeof(buffer):
+                return [p for p in buffer[:count // 4] if p > 0]
+            size = ctypes.sizeof(buffer) * 2
+    found = []
+    for path in Path("/proc").iterdir():
+        if path.name.isdigit():
+            try:
+                if int((path / "stat").read_text().rsplit(")", 1)[1].split()[1]) == int(pid):
+                    found.append(int(path.name))
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+    return found
+
+
+# Set by the coordinator in each stdio MCP server's launch environment, naming the server (roles.overlay); Codex starts
+# no command with it. It is what makes a server a writer's thread starts later its service (started_services).
+MCP_SERVER_ENV = "SOFTWARE_WORKFLOWS_MCP_SERVER"
+
+
 def markers(pid):
     if sys.platform == "darwin":
         lib = ctypes.CDLL("/usr/lib/libSystem.dylib", use_errno=True)
@@ -279,7 +321,7 @@ def markers(pid):
         values = rest[position + 1:].split(b"\0")[argc:]
     else:
         values = (Path("/proc") / str(pid) / "environ").read_bytes().split(b"\0")
-    wanted = {b"CODEX_THREAD_ID", b"CODEX_SESSION_ID", b"CODEX_TOOL_CALL_ID", b"SOFTWARE_WORKFLOWS_OPERATION"}
+    wanted = {b"CODEX_THREAD_ID", b"CODEX_SESSION_ID", b"CODEX_TOOL_CALL_ID", b"SOFTWARE_WORKFLOWS_OPERATION", MCP_SERVER_ENV.encode()}
     return {key.decode(): value.decode("utf-8", "strict") for item in values if b"=" in item
             for key, value in [item.split(b"=", 1)] if key in wanted}
 
@@ -345,6 +387,105 @@ def baseline(vanished=None):
                 # forked after enumeration; absence is not a complete inventory.
                 vanished.append({"pid": pid, "reason": "exited during enumeration"})
     return records
+
+
+def born_at(entry):
+    """Wall-clock seconds of an identity()'s birth: macOS records the start time, Linux counts clock ticks since boot."""
+    if sys.platform == "darwin":
+        seconds, micros = entry["birth"].split(":")
+        return int(seconds) + int(micros) / 1e6
+    with open("/proc/uptime") as stream:
+        uptime = float(stream.read().split()[0])
+    return time.time() - uptime + int(entry["birth"]) / os.sysconf("SC_CLK_TCK")
+
+
+def started_services(listener, bounds):
+    """The MCP servers of the listener's app-server, each with what it started for no call (mcp.survey): its direct
+    children whose environment names a server (MCP_SERVER_ENV) and holds no call's markers, each with its descendants
+    born by its bound, the admission of the first MCP call that could reach it once it was born (`bounds`: (pid, birth)
+    -> that time, recorded before the call ran: mcp.dispatching), or all of them while no such call was admitted. A
+    tool's work starts only once its call is admitted, so nothing a call started is taken (review turn 125): what a
+    server starts after its bound is passed over with all it starts, and held as before. Codex 0.163 starts a thread's
+    server with the thread, or, one whose tools it has cached, as it dispatches the thread's first call that needs it,
+    before that call's hook (order-1: born 3.11 s before the call's bound with each admission delayed 3 s; undelayed,
+    0.07 to 0.11 s before it). A command's process is never taken: neither Codex nor a command that
+    clears its environment gives it the name (review turn 124). Each server's whole tree is read every time, so what one
+    survey could not read a later one takes, under the same bound; each process is checked, as it is read, to be its
+    parent's child still, so a PID another process took meanwhile is not followed. Returns (found, complete): every
+    server and process taken, those taken before too, each server's with its bound; complete is False when a process
+    could not be read."""
+    app = identity(listener["pid"]) if listener.get("pid") else None
+    if not app or app["zombie"] or app["birth"] != listener["birth"]:
+        return [], True
+    found, complete = [], True
+    pending = [(pid, app, None, None) for pid in children(app["pid"])]
+    while pending:
+        pid, parent, server, until = pending.pop()
+        try:
+            entry = identity(pid)
+            if (not entry or entry["zombie"] or entry["ppid"] != parent["pid"]
+                    or entry.get("parent_kernel_id", parent.get("kernel_id")) != parent.get("kernel_id")):
+                continue  # gone, or no longer its parent's child: another process took the PID meanwhile
+            if until is not None and born_at(entry) > until:
+                continue  # started by its server once a call that could reach it was admitted: held as before
+            try:
+                env = markers(pid)
+            except (CoordinatorError, OSError, UnicodeDecodeError):
+                again = identity(pid)
+                if not again or again["zombie"] or again["birth"] != entry["birth"]:
+                    continue  # it ended as it was read: a command's or a hook's, most likely, and no service
+                raise
+            if env.get("CODEX_TOOL_CALL_ID") or env.get("SOFTWARE_WORKFLOWS_OPERATION"):
+                continue
+            bound = {}
+            if server is None:
+                server = env.get(MCP_SERVER_ENV)
+                if not server:
+                    continue  # Codex's own infrastructure, or a command
+                until = bounds.get((pid, entry["birth"]))
+                if until is not None:
+                    bound["until"] = until
+            below = children(pid)
+            if (identity(pid) or {}).get("birth") != entry["birth"]:
+                continue
+        except (CoordinatorError, OSError, UnicodeDecodeError):
+            complete = False
+            continue
+        found.append(dict({key: entry[key] for key in ("pid", "birth", "ppid", "kernel_id", "parent_kernel_id", "boot_session")
+                           if key in entry}, server=server, **bound))
+        pending.extend((child, entry, server, until) for child in below)
+    return found, complete
+
+
+def dispatch_bounds(listener, servers, bounded=()):
+    """What an MCP call that may reach `servers` (names; None: any) bounds before it is admitted (mcp.dispatching): the
+    listener's app-server's direct children that are those servers, and those whose environment cannot be read,
+    whatever they are, as [(identity, server or None)], none of them in `bounded` (pid, birth); with the (pid, birth)
+    of each of its direct children now. Each is checked, as it is read, to be the app-server's child still."""
+    app = identity(listener["pid"]) if listener.get("pid") else None
+    if not app or app["zombie"] or app["birth"] != listener["birth"]:
+        return [], set()
+    found, present = [], set()
+    for pid in children(app["pid"]):
+        entry = identity(pid)
+        if (not entry or entry["zombie"] or entry["ppid"] != app["pid"]
+                or entry.get("parent_kernel_id", app.get("kernel_id")) != app.get("kernel_id")):
+            continue
+        present.add((pid, entry["birth"]))
+        if (pid, entry["birth"]) in bounded:
+            continue
+        try:
+            env = markers(pid)
+        except (CoordinatorError, OSError, UnicodeDecodeError):
+            again = identity(pid)
+            if again and not again["zombie"] and again["birth"] == entry["birth"]:
+                found.append((entry, None))  # what it is cannot be read: bounded whatever it is
+            continue
+        server = env.get(MCP_SERVER_ENV)
+        if (server and not env.get("CODEX_TOOL_CALL_ID") and not env.get("SOFTWARE_WORKFLOWS_OPERATION")
+                and (servers is None or server in servers)):
+            found.append((entry, server))
+    return found, present
 
 
 def inventory(listener, root_thread, known=(), operation=None, services=(), ambiguous=(), baseline=None):

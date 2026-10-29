@@ -711,8 +711,14 @@ class Daemon:
             own = native.coordinator_hooks(listed, roots, command=command)
             if len(own) != 2 or any(h["trustStatus"] != "trusted" or not h["enabled"] for h in own):
                 raise CoordinatorError("HOOK_TRUST", "Precise native hook trust was not honored")
-            listener.update(hooks=own, config_digest=digest(effective), writer_profile=profile, profile_base_config=profile_base_config)
+            from .roles import servers, unmarked
+            missing = unmarked(effective_writer)  # servers Codex would start without their name (roles.overlay)
+            # Every server's name, matched against an MCP call's to tell the servers it may reach (mcp.dispatching).
+            listener.update(hooks=own, config_digest=digest(effective), writer_profile=profile, profile_base_config=profile_base_config,
+                            mcp_unmarked=missing, mcp_names=servers(effective_writer))
             self.store.save(listener)
+            if missing:
+                self.store.event("listener/mcp_unmarked", listener["id"], {"servers": missing})
             return listener
         except BaseException:
             # These listeners are still threadless; finish every owned retirement.
@@ -1469,10 +1475,16 @@ class Daemon:
         if profile_line:
             actor["writer_profile_context"] = profile_line
         self.store.save(actor)
-        listener = self.store.get(listener["id"])
-        listener["root_thread"] = actor["thread"]
-        listener["services"] = await telemetry.to_thread(processes.inventory, listener, None)
-        self.store.save(listener)
+        from .mcp import merged
+        # As every inventory of a writer's services: one at a time with its MCP surveys, saved on the record as it is
+        # by then, keeping what a survey recorded of each process (mcp.survey; review turn 125).
+        async with self.actor_locks.hold("services:" + listener["id"]):
+            listener = self.store.get(listener["id"])
+            listener["root_thread"] = actor["thread"]
+            services = await telemetry.to_thread(processes.inventory, listener, None)
+            listener = self.store.get(listener["id"])
+            listener.update(root_thread=actor["thread"], services=merged(listener.get("services", []), services))
+            self.store.save(listener)
         admitted = await admission.writer_gate(self, listener["id"], response, fixture=bool(fixture))
         listener = self.store.get(listener["id"])
         listener["recovery_state"] = "reconciled"
@@ -1632,7 +1644,8 @@ class Daemon:
         services = None if prior else await telemetry.to_thread(processes.inventory, listener, None)
         listener = self.store.get(listener["id"])
         if services is not None:
-            listener["services"] = services
+            from .mcp import merged
+            listener["services"] = merged(listener.get("services", []), services)  # what a survey recorded stays
         listener["service_boundary"] = {"time": time.time(), "generation": self.store.generation,
                                         "captured": services is not None, "prior_opaque_operations": prior}
         self.store.save(listener)
@@ -1747,6 +1760,10 @@ class Daemon:
                 # reconciliation and process identity supply the conservative context.
                 async with self.actor_locks.hold("services:" + listener["id"], cutoff):
                     await self.services_before_first_command(listener)
+                    if tool not in ("Bash", "exec_command"):
+                        # What the servers it may reach start once it is admitted can be its own (mcp.dispatching).
+                        from .mcp import dispatching
+                        await dispatching(self, listener["id"], tool)
                     operation = await self.ledger.prepare(actor, "command" if tool in ("Bash", "exec_command") else "mcp",
                                                           {"tool_input": payload.get("tool_input"), "tool": tool}, [], identity, cutoff)
                 try:
@@ -2185,11 +2202,12 @@ class Daemon:
     async def notification(self, listener, method, params):
         # `listener` was read before this notification waited its turn (native_worker): a reconcile may have saved it
         # since. Each update below is made on the record read again with no await before its save (review turn 101).
-        if method == "mcpServer/startupStatus":
-            snapshot = await self.leases.call("snapshot", payload={"listener": listener["id"]})
-            listener = self.store.get(listener["id"])
-            listener["owner_sequence"] = snapshot["family"]["owner_sequence"]
-            self.store.save(listener)
+        if method == "mcpServer/startupStatus/updated":
+            # Codex 0.163.0's name for it: 2.4.8 to 2.4.23 matched "mcpServer/startupStatus", which never arrives (mcp.py).
+            # The owner snapshot that branch took never ran, and stays off: the owner reads a family's members when it
+            # ends it.
+            from .mcp import status
+            status(self, listener, params)
             return
         if method == "thread/reverted":
             actor = await self.resolve_actor(listener, params["threadId"])
@@ -2423,6 +2441,12 @@ class Daemon:
 
     async def observe_processes(self, actor, reservation, resolve_quarantine=False, terminals=None, retry_helpers=True):
         listener = self.store.get(actor["listener"])
+        if listener.get("mcp_pending"):
+            # A survey of the writer's MCP servers that could not read every process is tried again before custody
+            # decides what it holds (mcp.retry).
+            from .mcp import retry
+            await retry(self, listener)
+            listener = self.store.get(listener["id"])
         try:
             operation = self.store.get(reservation["operation"])
             if terminals is None:

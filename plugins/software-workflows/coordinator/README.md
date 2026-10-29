@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.23 / P1
+# Writer coordinator — software-workflows 2.4.24 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -1117,6 +1117,38 @@ native infrastructure started lazily after thread creation. Later survivors do n
 become harmless services merely by executable name or longevity. A hook helper
 must be birth-verified through its native listener before it is excluded; an
 inventory racing that attestation retains custody while checking the evidence.
+
+An MCP server that a writer's thread starts later (a sub-agent's thread, a thread
+loaded again) is a service too. The coordinator names each stdio server in its
+launch environment (`SOFTWARE_WORKFLOWS_MCP_SERVER`, set with the writer's other
+launch overrides in `roles.overlay`); Codex gives no command that name, and a
+command that clears its environment has none. Before an MCP call is admitted, each
+server it may reach is bounded at that moment unless it already was
+(`mcp.dispatching`, under the listener's services lock): a tool's work starts only
+once its call is admitted. Codex hooks a call `mcp__<server>__<tool>`, the server's
+name with its trailing `_` trimmed and its characters outside `[A-Za-z0-9_]` made
+`_` (`foo` and `foo_` both hook `mcp__foo__spawn`), so a call may reach each server
+whose name's letters and digits, after `mcp` or not, begin the call's (`mcp.reached`);
+any server when none does, or while a configured name is long enough for Codex to
+cut. The app-server's children are read from the kernel, and a read that fails
+refuses the call and keeps every bound (`processes.unread_count`). A survey (`mcp.survey`) takes the app-server's direct
+children that carry a name and no call's markers, each with its descendants born
+by its bound, or all of them while none is set, into the listener's services
+(`listener/services_started`); what a server starts after its bound is held as a
+command's survivor, as before. A survey runs when `mcpServer/startupStatus/updated`
+reports how a start ended (`ready`, `failed`) and at each reconcile, which covers a
+report sent while no coordinator was connected. It reads every server's whole tree
+each time, so what one survey could not read a later one takes under the same
+bound, and a process is followed only while it is still its parent's child. An MCP
+service that has exited leaves at the next survey, and a survey that could not
+read every process is recorded on the listener (`mcp_pending`) and tried again
+before its custody inventories (after 5 s, doubling to 300 s). Surveys, call
+admissions and every inventory of a writer's services hold the listener's
+services lock, and each saves on the record as it is by then. Admission records a
+writer whose effective configuration lacks a server's name
+(`listener/mcp_unmarked`). Through 2.4.23 the report was matched under another
+name (`mcpServer/startupStatus`) and never applied, so such a server was held as
+a survivor for as long as it ran (VERIFY 2.4.24).
 
 C1 never passes a native terminal ID to `kill()`. An unreadable or ambiguous
 survivor retains quarantine. On macOS, kernel unique-process and original-parent

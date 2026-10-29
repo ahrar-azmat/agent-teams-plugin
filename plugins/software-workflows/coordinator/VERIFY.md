@@ -15892,3 +15892,268 @@ Each stopped gracefully.
 - **No bulk conversion of records written by earlier releases**: a listener drops its copy when it is admitted again
   (`writer_gate`), and a dead or stopped one, never admitted again, keeps it; an earlier custody's inline table goes at
   its release (`release_held`) or by `compact_history`, as before (review turn 122).
+
+## 2.4.24
+
+One change: an MCP server that a writer's thread starts after the writer's first command is the writer's service, not
+a command's survivor. Measured from 10-29 20:55 to 10-30 03:40 on the user's Mac (macOS 26.6.2, Python 3.15.2, SQLite
+3.54.1, Codex 0.163.0). (A) was read from the live ledger and process table, read-only. (C) runs a real daemon
+(supervisor, worker) with a real Codex writer and the loopback fixture provider on a disposable state: 2.4.23 from its
+installed copy, the tree from the checkout.
+
+### What it changes
+- **The report's name** (`daemon.py` `notification`): Codex 0.163.0 reports each start of a thread's MCP server as
+  `mcpServer/startupStatus/updated` {`name`, `status`, `threadId`, `error`, `failureReason`}: `starting`, then `ready`
+  or `failed`. 2.4.8 to 2.4.23 matched `mcpServer/startupStatus`, which never arrives; that branch (an owner snapshot)
+  never ran, and it is gone.
+- **The server's name** (`roles.py` `overlay`, `unmarked`; `daemon.py` `admit_listener`): every stdio server of the
+  writer's effective configuration (one with a `command`; a user server or a plugin's entry) gets
+  `env.SOFTWARE_WORKFLOWS_MCP_SERVER = <its name>` in the writer's launch overrides, the inline tables that already
+  gave the related servers `SOFTWARE_WORKFLOWS_ROLE` and merge only these leaves. Admission reads the writer's
+  effective configuration back and records the servers it shows without the name (`mcp_unmarked`,
+  `listener/mcp_unmarked`).
+- **A server's bound** (`mcp.py` `dispatching`, `reached`; `processes.py` `dispatch_bounds`, `children`; `daemon.py`
+  `admitted_hook`; `roles.py` `servers`): before an MCP call is admitted, under the listener's services lock, each of
+  the app-server's direct children that is a server the call may reach is bounded at that moment unless it already was:
+  `until` on its service record, or in `mcp_bounds` while no survey took it. Codex 0.163 hooks a call
+  `ensure_mcp_prefix(join_tool_name(namespace, tool))` (`core/src/tools/handlers/mcp.rs`): the namespace is the
+  server's name with each character outside `[A-Za-z0-9_]` made `_`, `mcp__` before it unless it begins so, and a
+  12-hex hash after it when two names would collide (`codex-mcp/src/tools.rs`); the join trims the namespace's trailing
+  `_`. So `foo` and `foo_` both hook `mcp__foo__spawn`, and only letters and digits tell a name: a call may reach each
+  configured server (`mcp_names`, recorded at admission) whose name's letters and digits, after `mcp` or not, begin the
+  call's (`reached`), and any server when none does, or while a configured name is over 95 bytes (Codex cuts a
+  namespace over 113 bytes, and a cut one is named by any other's start). A child whose environment cannot be read is
+  bounded whatever it is, and one whose identity cannot be read fails the call. A tool's work starts only once its call
+  is admitted. Children are read from the kernel (`proc_listpids(PROC_PPID_ONLY)`), with no process scan; a read that
+  fails (Apple's wrapper answers it 0 with errno set: `unread_count`) fails the call before anything is saved, so every
+  bound is kept. Through the third candidate (review turn 126) a call matched the servers whose name began its native
+  name, and a failed read was read as no children: the call was admitted with nothing bounded and the bounds recorded
+  so far dropped. The fourth candidate checked the owner's read of every process (`lineage`) the same way; review
+  turn 127 found that its raise would end the owner during a family's cleanup, which does not retry a failed snapshot,
+  so that read is as it was (Known limits).
+- **Services from a survey** (`mcp.py` `survey`, `status`; `processes.py` `started_services`, `born_at`,
+  `MCP_SERVER_ENV`): the app-server's direct children that carry a name and no call's markers (`CODEX_TOOL_CALL_ID`,
+  `SOFTWARE_WORKFLOWS_OPERATION`), each with its descendants born by its bound, or all of them while it has none, join
+  the listener's `services` with `service: "mcp"` and the server (`listener/services_started` names them), so
+  `processes.inventory` holds none of them (`service_birth`). What a server starts after its bound is held as before.
+  Every server's whole tree is read at every survey, those already among the services too, so what one survey could not
+  read a later one takes under the same bound. Each process is checked, as it is read, to be its parent's child still
+  (PID, and on macOS the kernel's original-parent identity), so a PID another process took is not followed. Each survey
+  first drops the `mcp` services and bounds whose process has exited (`exit_evidence`). A survey runs when a report of
+  how a start ended arrives (in the background, so the native intake never waits on the services lock) and at each
+  reconcile (`recovery.py`): a report sent while no coordinator was connected is never journaled. Through the first
+  candidate (review turn 124) any unmarked direct child born near a report was taken, a command that cleared its
+  environment too; through the second (review turn 125) a server's descendants were taken when born by its report's
+  journal time plus 2 s, and a server already among the services was passed over with all it started.
+- **Retry** (`mcp.py` `retry`; `daemon.py` `observe_processes`): a survey that could not read every process (or whose
+  read failed) is recorded on the listener (`mcp_pending` {`attempts`, `code`, `retry_at`}) with
+  `listener/services_unread`, and the listener is surveyed again before its next custody inventory once due: after 5 s,
+  doubling to 300 s. A survey records what it could not read and never raises for it; anything else that escapes one
+  (the ledger failing) is recorded as `background/failure` when a report started it (`Daemon.background`), and fails
+  the reconcile that ran it, which maintenance makes again (`reconcile_failed`).
+- **One writer of a listener's services at a time** (`daemon.py` `launch_writer`, `services_before_first_command`;
+  `recovery.py` the replacement's inventory; `mcp.py` `merged`): the inventories of the root thread's start, of the first
+  command's boundary and of a fresh replacement take the listener's services lock, as surveys and call admissions do,
+  and each saves on the record read after its inventory, keeping what a survey recorded of each process (its server and
+  bound) and the listener's `mcp_pending`. Through the second candidate a thread start's save could drop both.
+
+### (A) Live findings (read-only)
+- One writer's `MCP_DOCKER` server, started by one of its threads at 20:55, was held as a survivor by 71 command
+  custodies, 98 by 22:27, for as long as it ran; each maintenance pass inventoried each of them again. The event loop
+  stalled every few seconds, lead edits were refused (`LEAD_ADMISSION_BUSY`), a full `daemon/status` took 251.6 s and
+  810 native notifications waited. The switch to 2.4.23 at 22:28 found no quiet moment and was forced with 129
+  custodies held and 1,018 native applications queued.
+- On the user's writers, each command Codex runs carries its call's markers (`CODEX_TOOL_CALL_ID`) and an MCP server
+  carries none; each MCP server is a direct child of the app-server, started per thread; the reports' `ready` came
+  within 4 s of `starting`.
+- The hook's name of each of the 120 MCP calls completed in the 14 days to 10-30 began `mcp__<server>__` with its
+  item's own server (`MCP_DOCKER`, `openaiDeveloperDocs`), read through `writer_mcp_usage` in 0.08 s. A scan of one
+  unit's operations for its MCP calls took 1.7 s, too slow for a call's admission: a server's bound is recorded instead.
+- After that switch (23:00), the 130 custodies still unreleased belong to writers whose startup recovery failed
+  (23 `NATIVE_RPC`, permanent; 10 `EXCLUSIVE_WRITER`, retryable), with their app-servers gone. This release does not
+  change them.
+
+### (C) Real daemon
+Each command's end is its `item/completed` row; each release is its `custody/released` event. The stub MCP server
+(`r2424/f1_stub_mcp.py`, configured in the fixture's native home) answers `initialize` after the delay its argument
+gives.
+
+`r2424/f1_probe2.py <plugin> <dir> <label> 40`: one native run whose root turn runs `sleep 1`, spawns a sub-agent
+(`spawn_agent`; its thread starts its own MCP server), then runs `sleep 3`; the sub-agent runs `sleep 40`.
+
+| code | `sleep 1` | `sleep 40` (sub-agent) | `sleep 3` | services from reports | stop |
+|---|---|---|---|---|---|
+| 2.4.23 (`f2-2423-1`) | released 0.13 s after its end | ended at 70.2 s; its custody held the sub-agent's MCP server (`listener-domain`, no markers) and was quarantined at 113.8 s | waited, then refused `CUSTODY_WAIT`; never ran | none | refused `NOT_QUIESCENT`; the probe ended its daemon |
+| second candidate (`f2-v2-1`) | released 1.41 s after its end (the sub-agent's server was born as it settled) | released 0.37 s after its end | ran, released 0.18 s after its end | the root's server and the sub-agent's, each by its name | graceful |
+| third candidate (`f2-v3-1`) | released 0.14 s after its end | released 0.49 s after its end | ran, released 0.19 s after its end | the root's server and the sub-agent's, each by its name | graceful |
+| final (`f2-v5-1`) | released 0.13 s after its end | released 0.68 s after its end | ran, released 0.14 s after its end | the root's server and the sub-agent's, each by its name | graceful, no server left running |
+
+A first form of the probe on 2.4.23 (`f1-2423-1`) caught the sub-agent's server in the `sleep 1` custody instead, held
+to the end; both later commands waited 108 s and were refused `CUSTODY_WAIT`. Which custody catches it depends on when
+the server is born.
+
+`r2424/f3_probe.py <plugin> <dir> <label> 25` (review turn 124, HIGH): the root spawns the sub-agent first, whose server
+(delay 3 s) is reported ready while the root's first command runs: `exec /usr/bin/env -i /usr/bin/python3 -c '…'`, a
+command that clears its environment and leaves a child (`setsid`, 25 s) behind it.
+
+| code | the command's two processes | its custody | the child ended |
+|---|---|---|---|
+| first candidate (`f3-v1-3`) | taken as the sub-agent's MCP services by its report | released 0.25 s after the command ended (40.8 s) | 62.3 s, unheld for 21 s |
+| second candidate (`f3-v2-1`) | not taken | released at 60.6 s, as the child ended | 60.6 s |
+| third candidate (`f3-v3-1`) | not taken | released at 58.2 s, 0.46 s after the child ended | 57.7 s |
+| final (`f3-v4-1`) | not taken | released at 58.2 s, as the child ended | 58.2 s |
+
+Two earlier forms on the first candidate, where the report came before the command started, did not take them
+(`f3-v1-1`, whose background child Codex ended with the command; `f3-v1-2`, whose custody held the child until it
+ended, as the final does).
+
+`F1_FAIL_FOR_S=<s> r2424/f1_probe2.py …` (review turn 124, MEDIUM): `r2424/inject_f1/sitecustomize.py`, on the
+daemon's `PYTHONPATH` only, makes each survey's process scan (`processes.started_services`) raise `PROCESS_SCAN` for
+that many seconds after the process imports it.
+
+| fault | `sleep 1` | `sleep 40`, `sleep 3` | `listener/services_unread` | stop |
+|---|---|---|---|---|
+| 40 s, second candidate (`rt-v2-40`) | held 16.9 s after its end; released 0.09 s after the retry that found the sub-agent's server (the third survey of its report: 5 s, then 10 s) | ran, released 0.62 and 0.15 s after their ends | 3 (attempts 1, 1, 2) | graceful |
+| permanent, second candidate (`rt-v2-perm`) | released 0.15 s after its end | `sleep 40` held the sub-agent's server to the end; `sleep 3` refused `CUSTODY_WAIT` | 8 (attempts to 7, the next due in 300 s), its report kept in `mcp_pending` | refused `NOT_QUIESCENT` |
+| 40 s, third candidate (`rt-v3-40`) | released 0.14 s after its end | ran, released 0.55 and 0.14 s after their ends; both servers taken once the fault ended | 3 (attempts 1 to 3) | graceful |
+| 40 s, final (`rt-v4-40`) | released 0.14 s after its end | ran, released 0.69 and 0.14 s after their ends; both servers taken once the fault ended | 3 (attempts 1 to 3) | graceful |
+
+Every run completed with 0 UNKNOWN and no `native/reconcile_failure`; no admission recorded `listener/mcp_unmarked`.
+Runs of the first candidate on the tree before the rework (`f2-tree-1`, `f2-tree-2`) are superseded by these.
+
+#### Review turn 125: the second candidate
+`r2424/f456_probe.py <plugin> <dir> <label> <scenario>` runs the same real daemon with `r2424/f4_stub_mcp.py`, a stub
+whose tool `spawn` starts `/bin/sleep <seconds>` as the server's child and answers at once (it can also start a helper,
+`/bin/sleep <s>`, as it initializes). Its model provider (`r2424/probe_provider.py`) is the fixture's, with cells that
+call the tool. The writer runs as every gpt-6-astra writer does (`tool_mode` `code_mode_only`): Codex 0.163 offers it
+`exec` cells and no MCP tool, and answers a direct call `unsupported call: mcp__f4probe__spawn` (`f4-disc-1`). The root
+turn's first action is a cell calling the root's server, and a sub-agent thread then started a server of its own,
+born 0.08 s before the sub-agent's first call was admitted (`f4-disc-2`). Faults come from `r2424/inject_v3/sitecustomize.py`
+on the daemon's `PYTHONPATH`.
+
+`tool` (HIGH, a retry exempting a tool's work): the root spawns the sub-agent 4 s after its own call. The sub-agent's
+first cell calls `spawn` with 61 s. Every survey fails while a flag file exists, and the probe removes it 1 s after the
+tool's child appears, so a retry surveys the server after the call.
+
+| code | the tool's `sleep 61` (born 0.08 s after the server's `ready`) | the call's custody |
+|---|---|---|
+| second candidate (`f4-v2-4`) | taken as an MCP service by the retry after the fault cleared | released 5.6 s after the call ended (39.3 s), with `sleep 61` running to 94.8 s |
+| third candidate (`f4-v3-1`) | not taken: born after the server's bound, the call's admission | released 0.44 s after `sleep 61` ended (95.5 s) |
+| final (`f4-v4-1`) | not taken: born 0.03 s after the server's bound | released 0.9 s after `sleep 61` ended (96.1 s) |
+
+`partial` (MEDIUM, a partial scan): the sub-agent's server starts a helper, `/bin/sleep 90`, as it initializes (the
+root's starts none). The first survey's read of the helper's environment fails once. The root runs `/bin/sleep 12` from
+a cell after the spawn.
+
+| code | the helper | the root's first call's custody | `/bin/sleep 12` |
+|---|---|---|---|
+| second candidate (`f5-v2-3`) | never taken: the retry, which read every process, passed over the server taken before with all it started | released 90.7 s after the call ended, as the helper ended | waited 91.5 s for its custody; released 0.14 s after its end |
+| third candidate (`f5-v3-1`) | taken by the retry 5 s later | released 5.7 s after the call ended | waited 6.5 s; released 0.13 s after its end |
+| final (`f5-v4-1`) | taken by the retry 5 s later | released 5.6 s after the call ended | waited 5.4 s; released 0.14 s after its end |
+
+`lost` (MEDIUM, other writers of the services): the inventory of the root thread's start sleeps 8 s first, and every
+survey fails. The root's server's report is surveyed during that delay.
+
+| code | the listener once the run started | at its end |
+|---|---|---|
+| second candidate (`f6-v2-2`) | no `mcp_pending`: the thread start's save dropped the failure the survey recorded during its inventory (`listener/services_unread`: 1) | none; never tried again |
+| third candidate (`f6-v3-1`) | `mcp_pending` (attempts 1): the survey waited for the thread start's save | attempts 2: tried again before the `sleep 1` custody's inventory |
+| final (`f6-v4-1`) | `mcp_pending` (attempts 1) | attempts 2: tried again |
+
+On the third candidate and the final code both servers of `tool` and of `partial` carry the bound their first call set (`until`). Every run
+completed with 0 UNKNOWN and no `native/reconcile_failure`, and its daemon stopped gracefully. Not counted: earlier
+forms whose root ran a direct `sleep 1` first (`f4-v2-2`, `f5-v2-2`), which left Codex's code-mode host to start after
+the service boundary, held as a survivor by every custody (Known limits); and a `tool` form with no delay (`f4-v2-3`),
+whose sub-agent's server was born while the root's call custody was still open and, every survey failing, held it, so
+the sub-agent's call waited and was refused `CUSTODY_WAIT`.
+
+#### Review turn 126: the third candidate
+`r2424/reached_check.py <plugin>` ports Codex 0.163's naming of MCP tools, read at `rust-v0.163.0`
+(`codex-mcp/src/tools.rs` `normalize_tools_for_model_with_prefix`, `codex-mcp/src/mcp/mod.rs`
+`sanitize_responses_api_tool_name`, `core/src/tools/handlers/mcp.rs` `hook_tool_name`; an MCP tool's raw namespace is
+its server's name, `codex-mcp/src/rmcp_client.rs`). It names every tool of 200,009 server sets and matches each hook
+name against the set. The sets: random names of letters, digits, `_`, `-`, `.`, a space and `é`, some beginning `mcp`,
+some ending in `_`, some over 90 bytes; with and without the `mcp__` prefix, some servers unprefixed; and nine fixed
+sets (`foo`/`foo_`, `foo`/`foo-`, `a`/`a__b`, `foo-bar`/`foo_bar`, `MCP_DOCKER`/`brave-search`, `mcp__x`/`x`, `_`/`x`,
+a 96-byte name, `x` + 150 `_` + `y` beside `x`). Of 1,192,076 hook names, the third candidate's matching left the
+tool's own server out for 18,612 (`foo_` and `foo-` for `mcp__foo__spawn`, a cut namespace), this release's for none.
+A call of `MCP_DOCKER`'s or `brave-search`'s tool still reaches its own server alone.
+
+`r2424/listpids_check.py <plugin>`, in process: `proc_listpids` given a buffer the kernel cannot write fails `EFAULT`,
+and Apple's wrapper answers it 0 with errno 14. The third candidate's test (`count < 0`) passed it: under that fault its
+`children()` returned `[]` with the process's 4 children alive. This release's `children()` raises
+`PROCESS_UNREADABLE` (errno 14); `lineage()`, as it was (Known limits), returned its one record without the 4
+children. With no fault, `children()` listed exactly the 4 children, and none for a childless process or an absent
+PID.
+
+`r2424/f456_probe.py`, on the real daemon as above, with `inject_v3` faults:
+- `keys` (`keys-1`): with servers `fcol` and `fcol_`, the code-mode host names their tools `mcp__fcol__spawn` and
+  `mcp__fcol_spawn`; Codex hooks a call of either `mcp__fcol__spawn`.
+- `lazy` (`lazy-1`): a sub-agent running two cells with no MCP call started no server. Codex defers a thread's server
+  whose tools it has cached until a call needs it (`codex-mcp` `connection_manager.rs`, `defer_startup`); one with none
+  cached starts with the thread, as `f1_stub_mcp.py`, which lists no tool, does in `f2-*`.
+- `order` (`order-1`): with every admission delayed 3 s (`F9_DISPATCH_DELAY_S`), the sub-agent's server was born 3.11 s
+  before its first call's bound, so its start does not wait for the call's hook; undelayed it was born 0.07 to 0.11 s
+  before the call's admission (`f4-disc-2`, `col-new-2`, `col-v3-2`, `unr-new-2`, `unr-v3-2`, `f4-v4-1`, `f5-v4-1`).
+
+`collide` (HIGH, name matching): the root's cell calls `fcol_`'s tool (`sleep 40`, `fcol_`'s child), then spawns a
+sub-agent whose cell calls `fcol`'s, so its thread starts an `fcol` server whose report is surveyed while the root's
+sleep runs. `F7_V3_REACHED=1` injects the third candidate's matching.
+
+| code | `fcol_`'s bound | the root's `sleep 40` | the root call's custody |
+|---|---|---|---|
+| third candidate (`col-v3-2`) | none: the call bounded `fcol` alone | taken as `fcol_`'s MCP service by the survey | released 4.7 s after the call ended, 35.6 s before the sleep did |
+| final (`col-new-2`) | the call's admission | not taken | released as the sleep ended, 40.2 s after the call |
+
+`unread` (HIGH, a failed child enumeration): every `proc_listpids` read of an MCP call's admission fails, as above
+(`F8_LISTPIDS_FAIL_WHILE`), until one has. The root's cell calls the tool (`sleep 40`), spawns a sub-agent whose cell
+calls it (`sleep 3`; its server's report is surveyed), and calls it again 4 s later (`sleep 40`). `F8_V3_CHILDREN=1`
+injects the third candidate's enumeration.
+
+| code | the call during the fault | its `sleep 40` | the later call's `sleep 40` |
+|---|---|---|---|
+| third candidate (`unr-v3-2`) | admitted with nothing bounded | taken as an MCP service by the survey: its custody released 4.5 s after the call ended, 35.7 s before the sleep did | held to its end |
+| final (`unr-new-2`, `unr-new-3`) | refused `PROCESS_UNREADABLE` (errno 14), nothing saved | none | held to its end |
+
+The first forms of both (`col-new-1`, `col-v3-1`, `unr-new-1`, `unr-v3-1`) had sub-agents that answered with text and
+started no server, so nothing surveyed the root's sleep and both codes held it to its end. Every run completed with 0
+UNKNOWN, no `native/reconcile_failure` and no `background/failure`, and its daemon stopped gracefully.
+
+The final rows named `-v4-` above, `unr-new-2` and `col-new-2` ran on the fourth candidate, which differs from this
+release only in `lineage()`'s check of a failed read (review turn 127); no read failed in them. `f2-v5-1` and
+`unr-new-3` ran on this release's tree.
+
+### Static checks
+`r2424/static_checks2424.py`, as 2.4.23's, against the installed 2.4.23, on the final tree: 12 of 12.
+
+### Known limits
+- **A server whose launch drops its environment** (a wrapper that clears it) carries no name, and a plugin's server
+  whose configuration shows no `command` is not given one: either is held as before when a thread starts it after the
+  writer's first command. Admission records only the servers the configuration shows without it.
+- **A process an MCP server starts once a call that may reach it was admitted** is held by lineage as before, a
+  server's own background work too. The bound is per server, set by the first such call, and calls are matched to
+  servers by name, not thread: a call to a server of the same name on another thread (the root's, while a sub-agent's
+  starts) bounds the new one as well, and what that one starts after it is held.
+- **A server started only once a call to it was admitted** would be taken with what that call started before the
+  server's first survey: the bound is set by calls admitted after a server's birth. Codex 0.163 starts a server it
+  defers (one whose tools it has cached) as it dispatches the first call that needs it, before that call's hook: born
+  0.07 to 0.11 s before the call's admission in seven runs, and 3.11 s before its bound with every admission delayed
+  3 s (`order-1`). One it does not defer starts with its thread.
+- **A call may be matched to servers it does not reach**: each whose name's letters and digits begin the call's (a
+  server `brave` for a call of `brave-search`'s tool), and every server while a configured name is over 95 bytes. Each
+  is bounded, and what it starts afterwards is held as before.
+- **A command that clears its environment and sets `SOFTWARE_WORKFLOWS_MCP_SERVER` itself** is taken for a server: a
+  guardrail against accidents, not a boundary.
+- **A survey that keeps failing** is recorded on the listener and tried every 300 s at most; until one reads every
+  process, what it could not read is held as before.
+- **Codex's code-mode host, when it starts after the writer's first command** (a direct command before any cell, which
+  no gpt-6-astra writer runs), is held as a survivor by every later custody, as before (`f4-v2-2`, `f5-v2-2`).
+- **Servers started under an earlier release carry no name**: such a writer is refused at every hook by this release
+  (`HOOK_PROGRAM_CHANGED`) and replaced once its unit is quiet, and a custody already holding one of its servers is
+  released when that server exits.
+- **A command's custody still retains a domain survivor of a sibling command of the same listener** (unchanged).
+- **The owner's read of every process** (`processes.lineage`, when it snapshots a family's members) still takes a
+  failed read for one that found nothing, as through 2.4.23 (`listpids_check.py`: its one record, without the 4
+  children). Review turn 127 found that raising there ends the owner during a family's cleanup (`Owner.snapshot` from
+  `begin_end`, called by the supervisor's shutdown and its worker-death handling with no handler), which does not
+  retry a failed snapshot: that read is refused once the owner retries.

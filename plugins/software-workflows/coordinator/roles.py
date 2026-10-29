@@ -5,6 +5,7 @@ import re
 
 from .client import CoordinatorError
 from . import native
+from .processes import MCP_SERVER_ENV
 from .store import digest
 
 
@@ -22,22 +23,54 @@ def overlay(config):
     # Codex's dotted -c parser splits keys before TOML parsing; quoted dotted
     # segments are not portable. Inline TOML tables quote every key safely and
     # merge only these leaves, preserving unrelated servers and secret values.
+    # Every stdio server also names itself in its environment (MCP_SERVER_ENV): what makes a server that a writer's
+    # thread starts after the writer's first command its service, not a command's survivor (mcp.survey).
     overrides = {}
     def policy(settings):
         value = {"disabled_tools": sorted(set(settings.get("disabled_tools") or []) | LEAD_TOOLS)}
         if settings.get("command"):
             value["env"] = {"SOFTWARE_WORKFLOWS_ROLE": "writer"}
         return value
+    def mark(path, name, settings):
+        if isinstance(settings, dict) and settings.get("command"):
+            servers = overrides
+            for key in path:
+                servers = servers.setdefault(key, {})
+            servers.setdefault(name, {}).setdefault("env", {})[MCP_SERVER_ENV] = name
     for name, settings in (config.get("mcp_servers") or {}).items():
         if related(name, settings):
             overrides.setdefault("mcp_servers", {})[name] = policy(settings)
+        mark(("mcp_servers",), name, settings)
     for plugin, value in (config.get("plugins") or {}).items():
         if not isinstance(value, dict):
             continue
         for name, settings in (value.get("mcp_servers") or {}).items():
             if related(plugin + " " + name, settings):
                 overrides.setdefault("plugins", {}).setdefault(plugin, {}).setdefault("mcp_servers", {})[name] = policy(settings)
+            mark(("plugins", plugin, "mcp_servers"), name, settings)
     return overrides
+
+
+def unmarked(config):
+    """The stdio MCP servers of an effective configuration whose environment lacks the name overlay() set: Codex did not
+    honor it, so a thread that starts such a server after the writer's first command leaves it held as a command's
+    survivor, as through 2.4.23."""
+    servers = [(name, settings) for name, settings in (config.get("mcp_servers") or {}).items()]
+    for plugin, value in (config.get("plugins") or {}).items():
+        if isinstance(value, dict):
+            servers += [(plugin + " " + name, settings) for name, settings in (value.get("mcp_servers") or {}).items()]
+    return sorted(name for name, settings in servers if isinstance(settings, dict) and settings.get("command")
+                  and MCP_SERVER_ENV not in (settings.get("env") or {}))
+
+
+def servers(config):
+    """The name of each MCP server of an effective configuration, a plugin's by its own name too (the name overlay()
+    gives it): what an MCP call's native name is matched against for the servers it may reach (mcp.reached)."""
+    names = set(config.get("mcp_servers") or {})
+    for value in (config.get("plugins") or {}).values():
+        if isinstance(value, dict):
+            names |= set(value.get("mcp_servers") or {})
+    return sorted(names)
 
 
 def apply(config, restrictions):

@@ -888,10 +888,14 @@ async def _reconcile_listener(daemon, listener):
     if fresh:
         # A replacement has not executed a turn. Its own infrastructure is a
         # fresh service baseline; prior command survivors retain their separate
-        # birth-bound records, including those outside this listener's tree.
-        listener = store.get(listener["id"])
-        listener["services"] = await finish_thread(processes.inventory, listener, None)
-        store.save(listener)
+        # birth-bound records, including those outside this listener's tree. As every inventory of a writer's
+        # services: one at a time with its MCP surveys, saved on the record as it is by then (mcp.survey).
+        from .mcp import merged
+        async with daemon.actor_locks.hold("services:" + listener["id"]):
+            services = await finish_thread(processes.inventory, store.get(listener["id"]), None)
+            listener = store.get(listener["id"])
+            listener["services"] = merged(listener.get("services", []), services)
+            store.save(listener)
     if readmit and alive and stale:
         # It runs another release's hook program: hook() refuses every call it makes (HOOK_PROGRAM_CHANGED), so no
         # admission would let it run anything, and it is replaced once its unit is quiet (below, or by
@@ -911,6 +915,10 @@ async def _reconcile_listener(daemon, listener):
     # Failed results it wrote while no daemon read its log, judged with every item replayed above
     # (its log is not followed while it reconciles).
     await daemon.settle_native_log(listener["id"])
+    # Codex reports an MCP server's start to the connection open then: one sent while no coordinator was connected is
+    # never journaled. Each reconcile surveys the writer's servers once (mcp.survey).
+    from .mcp import survey
+    await survey(daemon, listener["id"])
     # Discover every loaded descendant before reconciling its items. Parent events
     # may have been missed; thread/read supplies the native ancestry.
     await daemon.discover_descendants(listener)

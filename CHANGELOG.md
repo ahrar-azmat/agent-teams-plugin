@@ -3,6 +3,118 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.24] — 2026-10-30
+
+One change: an MCP server that a writer's thread starts after the writer's first command is now its app-server's
+service, no longer a survivor held by commands. On 10-29 one writer's `MCP_DOCKER` server, started by one of its threads
+at 20:55, was held by 71 command custodies, 98 by 22:27, for as long as it ran. Every maintenance pass inventoried each
+of them again: the coordinator's event loop stalled every few seconds, lead edits were refused
+(`LEAD_ADMISSION_BUSY`), a full status took 252 s, 810 native notifications waited, and the switch to 2.4.23 found no
+quiet moment and had to be forced. (`mcp.py`, `processes.py`, `roles.py`, `daemon.py`, `recovery.py`;
+coordinator/VERIFY.md, 2.4.24.)
+
+### Fixed: a thread's MCP server held the custody of the commands that ran while it lived
+- Codex starts a thread's MCP servers (a sub-agent's, a resumed thread's) as the app-server's direct children: with
+  the thread, or, a server whose tools it has cached, as it dispatches the thread's first call that needs it, before
+  that call's hook. It reports each start with `mcpServer/startupStatus/updated`: `starting`, then how it ended.
+- The coordinator inventories a writer's services when its root thread starts and once more before its first command.
+  A process of the app-server that appears later is held, by kernel lineage, as a command's survivor.
+- 2.4.8 to 2.4.23 handled that report under the name `mcpServer/startupStatus`, which Codex 0.163.0 never sends. So a
+  later start's servers were never the writer's services.
+- Now the coordinator names each stdio server in its launch environment (`SOFTWARE_WORKFLOWS_MCP_SERVER`), with the
+  writer's other launch overrides. Codex gives no command that name, and a command that clears its environment has
+  none. Admission records a writer whose effective configuration lacks it (`listener/mcp_unmarked`).
+- Before an MCP call is admitted, each server it may reach is bounded at that moment, unless it already was. A tool's
+  work starts only once its call is admitted.
+  - Codex hooks a call `mcp__<server>__<tool>`, the server's name with its trailing `_` trimmed and its characters
+    outside `[A-Za-z0-9_]` made `_`: `foo` and `foo_` both hook `mcp__foo__spawn`.
+  - So a call may reach each server whose name's letters and digits, after `mcp` or not, begin the call's. It may
+    reach any server when none does, or while a configured name is over 95 bytes, which Codex may cut.
+  - The app-server's children are read from the kernel. A read that fails refuses the call and keeps every bound:
+    Apple's `proc_listpids` answers a failed read as an empty one, with errno set.
+- A survey takes into the listener's services (`listener/services_started`), so no custody holds them:
+  - the app-server's direct children that carry a name and no call's markers;
+  - each one's descendants born by its bound, or all of them while it has none.
+
+  What a server starts after its bound is held as a command's survivor, as before. A survey reads every server's
+  whole tree each time, so what one could not read a later one takes. A process is followed only while it is still its
+  parent's child. An MCP service that has exited leaves at the next survey.
+- A survey runs when a start's end is reported, and at each reconcile: a report sent while no coordinator was
+  connected is never journaled.
+- A survey that cannot read every process is recorded on the listener (`mcp_pending`, `listener/services_unread`)
+  and tried again before the listener's custody inventories: after 5 s, doubling to 300 s.
+- Surveys, call admissions and every inventory of a writer's services (its thread's start, its first command, a
+  replacement) hold the listener's services lock. Each saves on the record as it is by then, keeping what the others
+  recorded.
+- A survey records what it could not read and never raises for it. Anything else that escapes one (the ledger
+  failing) is recorded as `background/failure` when a report started it, and fails the reconcile that ran it, which
+  maintenance makes again.
+- The owner snapshot that 2.4.8's branch would have taken never ran, and it stays off: the owner reads a family's
+  members when it ends it.
+- Three reviews of earlier candidates shaped this.
+  - Turn 124 found that the first took any direct child without a call's markers born near a report, so a command that
+    cleared its environment escaped custody; that it could follow a reused PID; and that a failed survey was never
+    tried again.
+  - Turn 125 found that the second took a server's descendants born by its report's journal time plus 2 s, so a
+    retry could take a tool's work; that it passed over a server already taken with all it started, so what a partial
+    survey missed was never taken; and that the inventory of a thread's start could save over a survey.
+  - Turn 126 found that the third matched a call to servers by its native name's prefix, so of `foo` and `foo_` a call
+    to either bounded `foo` alone; and that it read a failed read of a process's children as none, so a call was
+    admitted with no server bounded and the bounds already recorded were dropped.
+
+  This release fixes all eight.
+- Measured on a real daemon with a real Codex writer (VERIFY 2.4.24). A root turn that spawns a sub-agent (its thread
+  starts its own MCP server) and runs `sleep 1` and `sleep 3`, the sub-agent `sleep 40`:
+
+  | | 2.4.23 | 2.4.24 |
+  |---|---|---|
+  | `sleep 40` (sub-agent) | its custody held the sub-agent's MCP server after the command ended, quarantined 44 s later | released 0.68 s after it ended |
+  | `sleep 3` (root) | waited for that custody, refused `CUSTODY_WAIT`, never ran | ran, released 0.14 s after it ended |
+  | graceful stop | refused `NOT_QUIESCENT` | stopped |
+
+  The review's cases, on the second candidate and on 2.4.24:
+
+  | case | second candidate | 2.4.24 |
+  |---|---|---|
+  | a sub-agent's tool starts `sleep 61` while surveys fail | the retry took it for a service: the call's custody was released with it running for 55.5 s more | held until it ended, released 0.9 s after |
+  | the first survey cannot read a server's helper (`sleep 90`) | never taken: the root's call custody held 90.7 s, its next command waited 91.5 s | taken by the retry 5 s later: released 5.6 s after the call |
+  | a survey fails during a thread start's slow inventory | its failure dropped by the start's save, never tried again | kept, and tried again |
+
+  Turn 126's cases, on the third candidate and on 2.4.24:
+
+  | case | third candidate | 2.4.24 |
+  |---|---|---|
+  | servers `fcol` and `fcol_`: the root calls `fcol_`'s tool (`sleep 40`), then a sub-agent's server is surveyed | `fcol_` never bounded: the survey took the sleep for its service, and the call's custody was released 35.6 s before the sleep ended | both bounded: held until the sleep ended |
+  | every child read of an admission fails until one has (a real `EFAULT`) | the call admitted with nothing bounded; a survey took its `sleep 40`, and its custody was released 35.7 s before the sleep ended | the call refused `PROCESS_UNREADABLE`; the next call's `sleep 40` held until it ended |
+
+  Codex 0.163's naming, ported, named 1,192,076 tools of random server sets: the third candidate's matching left the
+  tool's own server out for 18,612 of them, 2.4.24's for none.
+
+  A command that clears its environment and leaves a `setsid` child behind, while the sub-agent's server is reported
+  ready: the first candidate took both its processes for MCP services and released its custody 21 s before the child
+  ended; 2.4.24 held it until the child ended. A process scan failing for 40 s left every custody released within
+  0.69 s of its command's end. Every run completed with no UNKNOWN.
+
+### Known limits
+- A server whose launch drops its environment, or a plugin's server whose configuration shows no `command`, carries no
+  name and is held as before.
+- What a server starts once a call that may reach it was admitted is held by lineage, its own background work too.
+  Calls are matched to servers by name, not thread: a call to a same-named server on another thread bounds a new one.
+- A server Codex started only once a call to it was admitted would be taken with what that call started before its
+  first survey. Codex 0.163 starts a server it defers as it dispatches the first call that needs it, before that
+  call's hook: with every admission delayed 3 s, the server was born 3.11 s before its bound.
+- A call may be matched to servers it does not reach (a server `brave` for a call of `brave-search`'s tool, or every
+  server while a configured name is over 95 bytes). Each is bounded, and what it starts afterwards is held as before.
+- A command that clears its environment and sets `SOFTWARE_WORKFLOWS_MCP_SERVER` itself is taken for a server.
+- Servers started under an earlier release carry no name. Such a writer is refused at every hook by this release and
+  replaced once its unit is quiet; a custody already holding one of its servers is released when it exits.
+- Codex's code-mode host, when it starts after a writer's first command (a direct command before any cell, which no
+  gpt-6-astra writer runs), is held as a survivor by every later custody, as before.
+- A command's custody still retains a domain survivor of a sibling command of the same listener.
+- The owner's read of every process, when it snapshots a family's members (`processes.lineage`), still takes a failed
+  read for one that found nothing, as through 2.4.23. Refusing it there would end the owner during a family's cleanup,
+  which does not retry a failed snapshot yet (review turn 127).
+
 ## [software-workflows 2.4.23] — 2026-10-29
 
 One change: what a record saved often holds but never changes is kept in a record of its own, written once: a
