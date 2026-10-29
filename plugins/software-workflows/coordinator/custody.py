@@ -292,6 +292,12 @@ def path_effect(checkout, paths, operation=None):
             "keys": [normalize(checkout, path)["key"] for path in paths]}
 
 
+def baseline_id(group):
+    """The record of a custody group's process baseline: the process table its command is checked against while held
+    (Custody.process_baseline). Custody granted through 2.4.22 holds it in each member (process_baseline)."""
+    return "custody_baseline:" + group
+
+
 def interfering(store, checkout, paths, operation=None, since=None):
     effect = path_effect(checkout, paths, operation)
     # Only this checkout's custody can conflict: held, or released since `since`.
@@ -518,12 +524,17 @@ class Custody:
                     request["state"] = "granted"
                     self.store.save(request)
                     ids = []
+                    # The process table the command is checked against is its own record, written once for the group
+                    # (process_baseline). Kept in each member (89 KB on a probe), it was written again with each of
+                    # their saves while held: 5.8 of the 7.6 MB a run of ten commands wrote.
+                    self.store.put("custody_baseline", baseline_id(ident), {"group": ident, "processes": process_baseline},
+                                   actor["unit"])
                     for index, item in enumerate(proposed):
                         key = ident if index == 0 else uid("custody")
                         ids.append(key)
                         self.store.put("custody", key, dict(item, unit=actor["unit"], actor=actor["id"], command=command,
                                        group=ident, state="held", created=time.time(), terminals=[], processes=[],
-                                       process_baseline=process_baseline, generation=self.store.generation), actor["unit"])
+                                       generation=self.store.generation), actor["unit"])
                     root = self.store.get(ident)
                     root["members"] = ids
                     self.store.save(root)
@@ -550,4 +561,19 @@ class Custody:
         # (80 KB on a busy machine) is decoded again by each later custody scan.
         reservation.pop("process_baseline", None)
         self.store.save(reservation)
+        group = reservation.get("group", reservation["id"])
+        root = self.store.get(group, required=False) or reservation
+        if all(self.store.get(key)["state"] == "released" for key in root.get("members", [root["id"]])):
+            baseline = self.store.get(baseline_id(group), required=False)
+            if baseline and baseline["processes"]:
+                baseline["processes"] = []  # the group's last member released: no window is checked against it
+                self.store.save(baseline)
         self.store.event("custody/released", reservation["id"], {})
+
+    def process_baseline(self, reservation):
+        """The process table a held command is checked against: its group's record (baseline_id), or the member's own
+        process_baseline for custody granted through 2.4.22."""
+        if "process_baseline" in reservation:
+            return reservation["process_baseline"] or []
+        record = self.store.get(baseline_id(reservation.get("group", reservation["id"])), required=False)
+        return (record or {}).get("processes") or []

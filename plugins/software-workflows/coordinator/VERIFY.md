@@ -15825,3 +15825,70 @@ not written.
   (`SOFTWARE_WORKFLOWS_RECONCILE_RETRY_MAX_S`, 300 s by default; review turn 120).
 - **An unchanged save still encodes its record** before SQLite compares it (0.47 ms for a 231 KB run).
 - **The phases held by custody stay held**: this release stops their cost, not their cause.
+
+### (A'') This release, live
+Switched 10-29 20:20:33 (forced at the first attempt: only workflows' and writers' turns were in flight; their five
+phases ended `interrupted`), recovered by 20:26:15. `r2422/kind_writes.py` at 20:37 with seven actors running: runs
+5.0 saves a minute, none unchanged (2.4.21 at 20:14 with five workflows running: 349.7, all unchanged); listeners 126.1
+a minute, none unchanged, 11.0 MB a minute. `r2421/live_after.py` 20:27-20:38: 2.68 loop stalls a minute, settlement
+p50 / p90 / max 2.8 / 11.4 / 18.6 s, 14 lead admissions granted (decision p50 0.21 s).
+
+## 2.4.23
+
+One change: what a record saved often holds but never changes is kept in a record of its own, written once: a
+writer's admission evidence beside its listener, a command's process table beside its custody. Measured on 10-29
+between 20:30 and 20:45 on the user's Mac (macOS 26.6.2, Python 3.15.2, SQLite 3.54.1, Codex 0.163.0). (A) was read
+from the live ledger, read-only. (C) runs a real daemon (supervisor, worker) with a real Codex writer and the loopback
+fixture provider on a disposable state: 2.4.22 from its installed copy (`5c0849a`, 108 of 108 files identical), the
+tree from the checkout.
+
+### What it changes
+- **Admission evidence** (`admission.py` `Admission.writer_gate`, `evidence_id`): the fingerprint and observations of
+  a writer's admission are the record `admission_evidence:<listener>` (parent: the listener), written with the
+  listener in one transaction. The listener keeps `admission` (the binding), `admission_adapter` (the fingerprint's
+  adapter digest), `capabilities` and `capability_fallback`, and drops `admission_fingerprint` and
+  `admission_observations`. A reconcile compares `admission_adapter`, or for a listener admitted through 2.4.22 its
+  `admission_fingerprint.adapter_digest` (recovery.py).
+- **Process baseline** (`custody.py` `Custody.acquire`, `baseline_id`, `process_baseline`, `release_held`): the process
+  table a command is checked against is the record `custody_baseline:<group>` (parent: the unit), written at the grant
+  in its transaction; the members no longer hold `process_baseline`. When the group's last member is released its
+  processes are emptied. The process inventory reads it through `Custody.process_baseline` (daemon.py
+  `observe_processes`, recovery.py `settle_lead_command`), which reads a member's own `process_baseline` for custody
+  granted through 2.4.22, and none for the custody of an unmediated command, as before.
+
+### (A) Live findings (read-only)
+A live listener's record was 76,791 bytes: `admission_observations` 32,786, `admission_fingerprint` 32,340, `config`
+3,936, `writer_profile` 2,654. On 2.4.21 (20:14) listeners were saved 276 times a minute, 246 with a real change
+(`helpers` at each coordinator hook, the `park` fields, `state`), 22.6 MB a minute. Only `admission.py` (writes both)
+and `recovery.py` (reads the adapter digest) name the two fields.
+
+### (C) Real daemon
+`r2423/listener_probe.py <plugin> <dir> <label>` under `r2423/inject` (each `Store.put`, whether it wrote — 2.4.22's
+`Store.puts` moves only on a write — and the encoded bytes written, by kind): one native run whose turn adds a file
+with `apply_patch`, runs ten commands and answers.
+
+| code | written in all | custody | listener | process tables | admission evidence | listener record | outcome |
+|---|---|---|---|---|---|---|---|
+| 2.4.22 (`lst-2422-1`) | 7,584,404 B | 76 writes, 5,818,156 B (largest 89,342) | 46 writes, 1,453,762 B | | | 43,053 B | completed, 0 UNKNOWN |
+| tree (`lst-tree-1`) | 1,790,473 B | 78 writes, 61,512 B (largest 1,409) | 55 writes, 476,507 B | 20 writes, 905,543 B | 1 write, 32,886 B | 13,244 B | the same |
+
+`r2423/settle_probe.py` (r2422's settlement probe under `r2423/inject`): an Abraham workflow whose analysis turn leaves
+`sleep <hold>` running, so its custody is held and its settlement refused while it runs. The two ran at once, so their
+holds differ (150 and 152 s) for each to know its own process.
+
+| code | hold | written in all | custody | listener | process tables | settled after the sleep ended | outcome |
+|---|---|---|---|---|---|---|---|
+| 2.4.22 (`settle-2422-1`) | 150 s | 914,693 B | 414 saves, 7 writes, 562,383 B | 220 saves, 17 writes, 246,678 B | | 1.0 s | both phases complete, 0 UNKNOWN |
+| tree (`settle-tree-1`) | 152 s | 318,450 B | 422 saves, 7 writes, 4,557 B | 224 saves, 17 writes, 82,631 B | 2 writes, 92,855 B | 0.5 s | the same |
+
+Each stopped gracefully.
+
+### Static checks
+`r2423/static_checks2423.py`, as 2.4.22's, against the installed 2.4.22, on the final tree: 12 of 12.
+
+### Known limits
+- **Each command still writes its process table once** (about 90 KB on the probe's machine) and empties it at release.
+- **A listener still rewrites its other 12 KB at each coordinator hook** (its helper processes).
+- **No bulk conversion of records written by earlier releases**: a listener drops its copy when it is admitted again
+  (`writer_gate`), and a dead or stopped one, never admitted again, keeps it; an earlier custody's inline table goes at
+  its release (`release_held`) or by `compact_history`, as before (review turn 122).

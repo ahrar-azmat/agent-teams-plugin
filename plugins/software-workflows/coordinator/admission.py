@@ -201,6 +201,12 @@ def steps_router(steps):
     return router
 
 
+def evidence_id(listener):
+    """The record of a listener's admission evidence: its fingerprint and observations (Admission.writer_gate). A
+    listener admitted through 2.4.22 holds them itself (admission_fingerprint, admission_observations)."""
+    return "admission_evidence:" + listener
+
+
 class Admission:
     def __init__(self, store):
         self.store = store
@@ -334,11 +340,19 @@ class Admission:
             cached, capabilities = await self.calibrate_writer(binding, fingerprint, fixture)
         listener = self.store.get(listenerid)
         listener["admission"] = binding
-        listener["admission_fingerprint"] = fingerprint
+        listener["admission_adapter"] = fingerprint.get("adapter_digest")
         listener["capabilities"] = {name: value.get("capability") for name, value in capabilities.items()}
         listener["capability_fallback"] = {name: value["error"] for name, value in capabilities.items() if value.get("fallback")}
-        listener["admission_observations"] = {"endpoint": listener["endpoint"], "listener": listenerid, "cache_hit": cached, "writer_catalog": catalog}
-        self.store.save(listener)
+        # The admission's evidence is its own record, written once (admission_evidence). Kept in the listener (65 of its
+        # 77 KB on 10-29), it was encoded and written again with each of the listener's saves, about 250 a minute.
+        for key in ("admission_fingerprint", "admission_observations"):
+            listener.pop(key, None)
+        with self.store.transaction():
+            self.store.put("admission_evidence", evidence_id(listenerid), {
+                "listener": listenerid, "fingerprint": fingerprint,
+                "observations": {"endpoint": listener["endpoint"], "listener": listenerid, "cache_hit": cached, "writer_catalog": catalog}},
+                listenerid)
+            self.store.save(listener)
         self.store.event("admission/writer", listenerid, {"writer_profile": listener.get("writer_profile"), "fingerprint": binding, "fixture": fixture, "cache_hit": cached,
                                                           "capabilities": listener["capabilities"]})
         return {"admitted": True, "fingerprint": binding, "cache_hit": cached, "effective_modes": modes}

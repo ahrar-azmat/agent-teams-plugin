@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.22 / P1
+# Writer coordinator — software-workflows 2.4.23 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -2199,9 +2199,17 @@ leaves its revision as it was, so a record's revision counts its changes. A work
 (`Publisher.quiescent`) is tried each maintenance pass for its first minute of refusals; after that, at the next pass
 once a record of its unit or run is written, or at the writers' reconcile backoff for any other change (by default
 5 s, doubling to 300 s), and at once on a turn's end, a reconcile or a start. Through 2.4.21 a phase held by custody
-that could not clear was tried
-every second for hours, each try reading its writers' state from native and saving its run and listener unchanged
-(10-29: 96 of 103 run saves and 318 of 363 listener saves a minute changed nothing; VERIFY 2.4.22).
+that could not clear was tried every second for hours, each try reading its writers' state from native and saving its
+run and listener unchanged (10-29: 96 of 103 run saves and 318 of 363 listener saves a minute changed nothing; VERIFY
+2.4.22).
+
+What a record saved often holds but never changes is a record of its own, written once: a writer's admission evidence
+is `admission_evidence:<listener>` (its listener keeps `admission_adapter`, the digest a reconcile compares), and a
+held command's process table is `custody_baseline:<group>`, emptied when the group's last member is released
+(`Custody.process_baseline`). Through 2.4.22 each save of the listener or of a held member wrote them again: 65 of a
+listener's 77 KB, and 5.8 of the 7.6 MB a run of ten commands wrote (VERIFY 2.4.23). Listeners and custody written by
+an earlier release are read as before, and nothing converts them in bulk: a listener drops its copy when it is
+admitted again, and an earlier custody's inline table goes at its release or by `compact_history`, as before.
 
 Retain the state directory and scratch evidence when investigating a refusal.
 There is no garbage collector or destructive reset command in C1. Do not remove

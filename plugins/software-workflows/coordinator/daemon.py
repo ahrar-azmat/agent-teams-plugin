@@ -2461,7 +2461,7 @@ class Daemon:
                     separate += [p for p in other.get("observed_processes", []) if p.get("ownership") != "listener-domain"]
             found = await telemetry.to_thread(processes.inventory, listener, actor["session"],
                                             reservation.get("observed_processes", reservation.get("processes", [])),
-                                            operation, separate, reservation.get("ambiguous_processes", []), reservation.get("process_baseline", []))
+                                            operation, separate, reservation.get("ambiguous_processes", []), self.custody.process_baseline(reservation))
             reservation = self.store.get(reservation["id"])
             reservation["processes"] = found
             observed = {(p["pid"], p["birth"]): p for p in reservation.get("observed_processes", [])}

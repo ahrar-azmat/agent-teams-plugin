@@ -865,7 +865,9 @@ async def _reconcile_listener(daemon, listener):
             if silent(exc):
                 silence(daemon, listener, "no answer on its socket (" + code + ")")
             raise
-    readmit = fresh or listener.get("admission_fingerprint", {}).get("adapter_digest") != await finish_thread(native.adapter_digest)
+    # A listener admitted through 2.4.22 holds its fingerprint itself; since, the adapter digest alone (admission.py).
+    admitted = listener.get("admission_adapter", listener.get("admission_fingerprint", {}).get("adapter_digest"))
+    readmit = fresh or admitted != await finish_thread(native.adapter_digest)
     resuming = (not attached or readmit or bool(listener.get("recovery_error"))
                 or bool(listener.get("park_resume_required")) or bool(startup_obligation(store, listener["run"])))
     if resuming:
@@ -1624,7 +1626,7 @@ async def settle_lead_command(daemon, reservation, resolve_quarantine=False):
                 root = reservation.get("lead_root", {"pid": None, "birth": None})
                 services = [daemon.leases.controller] if daemon.leases.controller else []
                 survivors = await finish_thread(processes.inventory, root, operation["id"], reservation.get("processes", []),
-                                               None, services, reservation.get("ambiguous_processes", []), reservation.get("process_baseline", []))
+                                               None, services, reservation.get("ambiguous_processes", []), daemon.custody.process_baseline(reservation))
                 if not current():
                     store.event("custody/inventory_discarded", group, {"reason": "ownership changed during inventory"})
                     continue

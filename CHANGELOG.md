@@ -3,6 +3,44 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.23] — 2026-10-29
+
+One change: what a record saved often holds but never changes is kept in a record of its own, written once: a
+writer's admission evidence beside its listener, a command's process table beside its custody. (`admission.py`,
+`custody.py`, `daemon.py`, `recovery.py`; coordinator/VERIFY.md, 2.4.23.)
+
+### Fixed: each save of a listener or a held command's custody rewrote data that never changes
+- Found live on 10-29 (2.4.21 and 2.4.22, read-only): a listener's record is 77 KB, and 65 KB of it is its admission
+  evidence (`admission_fingerprint`, `admission_observations`), written once at admission and again with every save
+  after. Listeners were saved about 250 times a minute with real changes (each writer hook's helper process, the
+  parking fields), 22.6 MB a minute.
+- On a real daemon (2.4.22), a run of ten commands wrote 7.6 MB of records, 5.8 MB of it custody: each member of a
+  command's custody holds the machine's process table it is checked against (89 KB here) until it is released, and
+  each save while held wrote it again.
+- Now the admission evidence is the record `admission_evidence:<listener>`, and the listener keeps the adapter digest
+  a reconcile compares (`admission_adapter`). The process table is the record `custody_baseline:<group>`, written at
+  the grant and emptied when the group's last member is released (`Custody.process_baseline`). A listener admitted, or
+  custody granted, by an earlier release is read as before, and nothing converts them in bulk: after a switch each
+  live writer is admitted again (which drops its old fields) or replaced, since the adapter digest covers every
+  coordinator file, and an earlier custody's inline table goes at its release, as before.
+- Measured on a real daemon with a real Codex writer (VERIFY 2.4.23), 2.4.22 then this release:
+
+  | probe | 2.4.22 | 2.4.23 |
+  |---|---|---|
+  | ten commands: records written | 7.58 MB | 1.79 MB |
+  | the same: custody, listener | 5.82 MB, 1.45 MB | 0.06 MB, 0.48 MB (process tables 0.91 MB) |
+  | the same: the listener's record | 43 KB | 13 KB |
+  | a command held 150 s (152 s for 2.4.23): records written | 915 KB | 318 KB |
+
+  The runs came out the same, with no UNKNOWN; the held phase settled 1.0 s (2.4.22) and 0.5 s (2.4.23) after its
+  process ended.
+
+### Known limits
+- Each command still writes its process table once (about 90 KB on the probe's machine) and empties it at release.
+- A listener still rewrites its other 12 KB at each hook (its helper processes).
+- No bulk conversion: a listener admitted by an earlier release keeps its copy until it is admitted again or
+  replaced, and so does a dead or stopped one, which nothing admits again.
+
 ## [software-workflows 2.4.22] — 2026-10-29
 
 Two changes: a save that changes nothing writes nothing, and a workflow phase refused settlement is no longer tried
