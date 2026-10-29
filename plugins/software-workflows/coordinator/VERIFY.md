@@ -15475,3 +15475,110 @@ The calibration is why the retained form keeps an empty list rather than none.
 - **The live after the 2.4.18 switch** (read-only, 16:20 to 16:30): 14 app-servers, children of the supervisor, held
   1,163 MB resident together. 12 belong to the startup incidents' listeners, quarantined with recovery `failed`, and
   only 2 to connected writers. Queued with 2.4.21 (`RESTORE_CUSTODY`, `NATIVE_RPC`).
+
+## 2.4.20
+
+Two changes in the custody of a writer's commands (2.4.17's known limits). A process is matched against a record by
+pid and birth together. A local command whose app-server has exited is ended by that exit. Measured on 10-29 between
+17:05 and 17:40 on the user's Mac (macOS 26.6.2, Python 3.15.2, Codex 0.163.0), each against the installed 2.4.19.
+The tree's runs of (A), (B) and (C) were repeated on the final tree, after review turn 116 (17:37 to 17:40), with the
+same outcomes; the tables give the first runs, and the final ones where they differ.
+(A) runs `processes.inventory` on real processes; (B) runs a `Store` on a disposable state; (C) runs a real daemon
+(supervisor, worker) with a real Codex writer in `code_mode_only`, the loopback fixture provider, on a disposable
+state. The live findings behind both changes were read from the user's ledger, read-only (`r2420/stuck_now.py`,
+`closure_now.py`, `separate_cost.py`).
+
+### What it changes
+- **`processes.inventory`**: `known` is keyed by (pid, birth), with its pids kept apart for `inspect`'s refusal rule.
+  Services are a set of (pid, birth), and a process is a service when its own identity is in it. No identity is read
+  per service record, and a record naming a pid that another process now holds decides nothing. Through 2.4.19 both
+  maps were keyed by pid; the last record for a pid won.
+- **`Store.listener_processes()`**: the identities, `{pid, birth}`, of every listener's `services` and `helpers`, kept
+  per listener by `put` as each listener is written. The first call reads them from SQLite with `json_extract`, not
+  decoding the records, and so does the first call after a transaction that wrote a listener (`_listener_written`)
+  rolls back. `observe_processes` builds `separate` from it instead of `store.all("listener")`.
+- **`Daemon.native_end_lost(actor, operation)`**: the exit evidence of the app-server that ran a local command
+  (`kind` `command`; never an MCP call, whose server can outlive the app-server) when native's end of it can no longer
+  be read, else None. That app-server must not be the actor's listener now, must be `dead` or `stopped`, its exit
+  evidenced (`processes.exit_evidence`), and the call's turn record must show a closure read made with the evidence
+  `History.closure_evidence` computes now (`executor_ended` included) that did not find the end. After its last await
+  it reads again the operation (the same `_revision`), the actor's listener, the app-server's state and the turn record
+  through the history checkpoint, and `_settle_actor` ends the command with no await between (review turn 116).
+- **`Daemon.end_with_executor(operation, members, exited)`**: nothing for an operation that has a completed item or a
+  failed result by then. Otherwise, in one transaction, the completed item `{exitCode: None,
+  observedGone, missingNativeCompletion, executorExit}`, `end_execution`, and for each member's checkout without a
+  checkout-wide UNKNOWN naming that app-server since the member was created, one (`a command's app-server exited before
+  native's end of it was read`); event `custody/ended_with_listener`. `_settle_actor` calls it for a command not ended,
+  with no process or terminal left and its custody not quarantined, then releases the custody as for any ended command.
+
+### The live findings (read-only, 17:0x)
+- `separate_cost.py`: 3,686 listener records, 45.4 MB of JSON. Decoding them all, as 2.4.19's `observe_processes`
+  does at each inventory, took 142.5 ms (best of 5); `json_extract` of the two arrays 51.6 ms with their decoding,
+  44.9 ms without; reading the records' length alone 22.5 ms. 3,673 identities, all distinct by (pid, birth), 3,610
+  distinct pids.
+- `stuck_now.py`: the 2 held custody records (`83a293c0`, `139aac4d`, 8.5 h old) hold no process now (the 2.4.19
+  switch ended the app-server whose MCP server `83a293c0` held). Their commands are `running`, returned (`success`),
+  with no Post hook and no completed item. Each ran on an app-server now `dead` and `replaced` (`f89fd903`,
+  `1a2e4aa7`), whose death recorded a checkout-wide UNKNOWN at 08:40 (`fba684dd`, `69d550ff`).
+- `closure_now.py`: for both, the turn record's `closure_checked` equals the digest of the evidence with
+  `executor_ended` true: a closure read after the exit did not find the end. Turns `interrupted`, no pending item,
+  history epoch current.
+
+### (A) A stale service record of a live service's pid
+`r2418/service_probe.py <plugin>`: a stand-in app-server (this probe's child) starts two children, `service` (recorded
+as the listener's service, its true birth) and `survivor` (not recorded: the control). `services` lists the service,
+then a dead writer's record of the same pid with another birth, as `observe_processes` passes every listener's.
+
+| code | inventory |
+|---|---|
+| tree | [survivor] |
+| 2.4.19 | [service, survivor]: the stale record won the pid-keyed map |
+
+### (B) The store's identities
+`r2420/store_probe.py <plugin> <dir>`: 3,686 listener records shaped as the live ones (35.5 MB, one service each, a
+helper on every seventh, 38 lineage entries).
+
+| measure | value |
+|---|---|
+| 2.4.19's list (every record decoded), best of 5 | 153.0 ms (final tree's run: 152.0) |
+| `listener_processes()`, first call | 52.2 ms (49.8) |
+| `listener_processes()`, warm, best of 5 | 0.44 ms (0.50) |
+| the same identities, all three | yes (4,213) |
+
+Kept against what SQLite holds (`json_extract` of every record), each equal: after plain writes (services replaced, a
+new listener, helpers emptied), after a committed transaction, after a transaction that wrote a listener and rolled
+back (the kept identities dropped, then read again), and after one that rolled back without writing one (kept).
+
+### (C) A command whose app-server exited before its end was read
+`r2420/accept2420.py <plugin> <dir> <label> lostend|nodeath`, with `r2420/inject/sitecustomize.py` in the worker only.
+The writer's code-mode cell runs `exec_command`; its Post hook, its `item/completed` and its completion in history
+reads are dropped, as when its app-server is ended after the call returned and before either arrived (the live
+2.4.16 switch). The probe checks the call returned with no end and its custody held, kills the app-server (SIGKILL),
+waits until it is `dead`, then cancels the run (`run/interrupt`) and watches for 150 s. `nodeath` also drops every
+checkout-wide UNKNOWN naming a listener except this release's own, as after a stop by the coordinator.
+
+| code, scenario | cancel | custody, command | UNKNOWNs | after the cancel | stop |
+|---|---|---|---|---|---|
+| tree, lostend | `cancelled` at once | released; `reconciled`, `executorExit: pid_absent` | the death's, the notification gap | 2 reconciles, 3 scans; 1 `custody/ended_with_listener` | graceful |
+| tree, nodeath | `cancelled` at once | the same | one: `a command's app-server exited before native's end of it was read` (custody, listener, operation) | the same | graceful |
+| 2.4.19, lostend | `cancelling` after 150.6 s | held, no process; `running` | the death's, the notification gap | 69 reconciles, 69 scans | `NOT_QUIESCENT` (custody 1): supervisor signalled |
+
+Each tree run took 60 s whole; 2.4.19's, 304 s. The 2.4.16 run of the same probe on 10-29 at 13:30 (`r2418/o-lostend`)
+matched 2.4.19's. The tree's runs above predate the guard at the top of `end_with_executor` and review turn 116's two
+changes; a run with the guard (`acc-green2`) and the final tree's runs (`acc-final-lostend`, `acc-final-nodeath`,
+17:38) gave the same outcomes, the same counts and the same UNKNOWNs, in 59.2 to 59.8 s.
+
+### Static checks
+`r2420/static_checks2420.py`, as 2.4.19's against the installed 2.4.19, on the final tree: 12 of 12 pass (every
+plugin file compiles under 3.15 and the hook-run ones under 3.9, `hooks.py --check`, the shim under three shells, no
+ruff finding beyond 2.4.19's 35, `claude plugin validate --strict` for the plugin and the marketplace, `git diff
+--check`, the version in the README's title).
+
+### Known limits
+- **The first `listener_processes` read** after a start, and after a rolled-back transaction that wrote a listener,
+  reads every listener record's two fields on the event loop (52 ms at the live shape). Listener records are never
+  deleted, so the kept identities grow with them.
+- **A command whose writer has no connected app-server** is not settled by anyone: `_settle_actor` needs the actor's
+  current app-server connected, as before.
+- **An MCP call whose app-server exited before its end was read** keeps its custody until its own end or a lead's
+  `custody/reconcile`, as before: its server can outlive the app-server (review turn 116).

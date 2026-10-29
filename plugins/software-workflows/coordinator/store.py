@@ -83,6 +83,11 @@ def digest(value):
     return hashlib.sha256(encoded(value).encode()).hexdigest()
 
 
+def identities(*groups):
+    """The (pid, birth) of each process record in these lists; a list may be None."""
+    return frozenset((entry["pid"], entry["birth"]) for group in groups for entry in group or ())
+
+
 def fsync_dir(path):
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -97,6 +102,8 @@ class Store:
         # Writes per record kind in this process: a projection read from records of some kinds is computed again only
         # once one of them was written (Dormancy.status). A write rolled back still counts: one more computation.
         self.puts = Counter()
+        self._listener_processes = None  # listener id -> its services' and helpers' identities (listener_processes)
+        self._listener_written = False  # a listener was written in the open transaction
         self.root = validate_state(root, create=True)
         self._validated_blobs = {}
         self._path_blobs = {}  # advisory source stamps; never persisted across a restart
@@ -337,6 +344,7 @@ class Store:
                 self.db.execute("BEGIN IMMEDIATE")
         else:
             self.db.execute("BEGIN IMMEDIATE")
+        self._listener_written = False
         try:
             yield
             if measured:
@@ -345,6 +353,8 @@ class Store:
             else:
                 self.db.execute("COMMIT")
         except BaseException as exc:
+            if self._listener_written:
+                self._listener_processes = None  # what this transaction's listeners kept is read again
             # COMMIT can fail with the transaction still active (notably BUSY).
             # Other SQLite errors may already have rolled it back. Never leave
             # the next owner inside this transaction, or hide the original error.
@@ -369,6 +379,10 @@ class Store:
         self.db.execute("""INSERT INTO records(id,kind,parent,data) VALUES(?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET data=excluded.data,revision=records.revision+1""",
                         (ident, kind, parent, encoded(data)))
+        if kind == "listener":
+            self._listener_written = self._listener_written or self.db.in_transaction
+            if self._listener_processes is not None:
+                self._listener_processes[ident] = identities(data.get("services"), data.get("helpers"))
         return dict(data, id=ident)
 
     def get(self, ident, required=True):
@@ -412,6 +426,18 @@ class Store:
             with telemetry.span("json_materialization", False):
                 record = dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
             yield record  # no measurement context remains open across a yield
+
+    def listener_processes(self):
+        """The identities, {pid, birth}, of every listener's services and helpers. Kept per listener as each listener
+        is written; read from SQLite without decoding the records on the first call, and on the first call after a
+        transaction that wrote a listener rolled back. Each process inventory of a command reads them: built from every
+        listener record decoded, that cost 142 ms on the event loop (10-29: 3,686 records, 45 MB; this read, 45 ms)."""
+        if self._listener_processes is None:
+            self._listener_processes = {
+                row[0]: identities(json.loads(row[1] or "[]"), json.loads(row[2] or "[]"))
+                for row in self.db.execute("SELECT id, json_extract(data,'$.services'), json_extract(data,'$.helpers') "
+                                           "FROM records WHERE kind='listener'")}
+        return [{"pid": pid, "birth": birth} for pid, birth in frozenset().union(*self._listener_processes.values())]
 
     def live_operations(self, checkout):
         return self.selected("SELECT * FROM records WHERE " + LIVE_OPERATION +

@@ -377,7 +377,11 @@ def inventory(listener, root_thread, known=(), operation=None, services=(), ambi
                 return roots
             roots = extended
     listener_tree = descendants(listener_tree)
-    known_map = {entry["pid"]: entry for entry in known}
+    # Records are matched by identity, pid and birth together: the ledger keeps records of processes long gone, and a
+    # pid is reused (10-29: a dead writer's service record named a live MCP server's pid and won a pid-keyed map, and
+    # that server was held as a command's survivor for as long as its app-server ran).
+    known_map = {(entry["pid"], entry["birth"]): entry for entry in known}
+    known_pids = {entry["pid"] for entry in known}
     ambiguous_pids = {entry["pid"] for entry in ambiguous}
     for entry in ambiguous:
         if entry["pid"] not in candidates:
@@ -385,19 +389,14 @@ def inventory(listener, root_thread, known=(), operation=None, services=(), ambi
             if current and not current["zombie"] and current["birth"] == entry["birth"]:
                 raise CoordinatorError("PROCESS_AMBIGUOUS", "Retained ambiguous identity is alive outside the inventory",
                                        {"processes": [entry], "pids": [entry["pid"]]})
-    service_map = {entry["pid"]: entry for entry in services}
-    service_roots = set()
-    for pid, entry in service_map.items():
-        current = identity(pid)
-        if current and not current["zombie"] and current["birth"] == entry["birth"]:
-            service_roots.add(pid)
-    # A baseline service is only this birth identity, never its future children.
-    service_tree = service_roots
+    # A service is only this birth identity, never its future children. Each process is matched as it is inspected
+    # below: no identity read per record (3,673 of them on the user's ledger, 10-29).
+    service_births = {(entry["pid"], entry["birth"]) for entry in services}
     def inspect(pid):
         try:
             return identity(pid)
         except CoordinatorError:
-            if baseline is not None or pid in listener_tree or pid in known_map or pid in ambiguous_pids:
+            if baseline is not None or pid in listener_tree or pid in known_pids or pid in ambiguous_pids:
                 raise
             return None
     observed, roots = {}, set()
@@ -422,10 +421,9 @@ def inventory(listener, root_thread, known=(), operation=None, services=(), ambi
         before = identities[pid]
         if before is None or before["zombie"]:
             continue
-        old = known_map.get(pid)
-        known_birth = bool(old and old["birth"] == before["birth"])
-        service = service_map.get(pid)
-        service_birth = bool(service and service["birth"] == before["birth"] or pid in service_tree)
+        old = known_map.get((pid, before["birth"]))
+        known_birth = old is not None
+        service_birth = (pid, before["birth"]) in service_births
         domain = before.get("kernel_id") in domain_ids or pid in listener_tree
         # OWNERSHIP NEEDS EVIDENCE (2.3.0): a process is the writer's when it carries the writer's
         # Codex markers or its kernel lineage reaches the listener. One that appeared during a command

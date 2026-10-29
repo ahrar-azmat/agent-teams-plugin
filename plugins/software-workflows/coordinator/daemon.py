@@ -2448,14 +2448,13 @@ class Daemon:
                 self.store.save(other)
             reservation = self.store.get(reservation["id"])
             listener = self.store.get(listener["id"])
-            separate = listener.get("services", []) + listener.get("helpers", [])
+            # Every listener's services and helpers, this one's among them: an orphaned service keeps its lineage.
+            separate = self.store.listener_processes()
             # The descriptor channel attests this exact controller birth. A
             # replacement custodian is allowed; none of its future children
             # inherit that exemption.
             if self.leases.controller:
                 separate.append(self.leases.controller)
-            for service_listener in self.store.all("listener"):
-                separate += service_listener.get("services", []) + service_listener.get("helpers", [])
             for other in self.custody.unit_active(actor["unit"]):
                 if other["id"] != reservation["id"] and other.get("group", other["id"]) != reservation.get("group", reservation["id"]) and self.store.get(other["actor"]).get("listener") == listener["id"]:
                     separate += [p for p in other.get("observed_processes", []) if p.get("ownership") != "listener-domain"]
@@ -2539,6 +2538,58 @@ class Daemon:
                 except asyncio.TimeoutError:
                     pass
 
+    async def native_end_lost(self, actor, operation):
+        """The exit evidence of the app-server that ran this local command when native's end of it can no longer be
+        read, else None: that app-server is not the writer's now and was ended (dead or stopped: what it sent was
+        applied), it has exited, and a read of the call's turn in native's history made since then
+        (History.closure_evidence) did not find the end. 10-29: two commands whose app-servers a switch replaced
+        before their Post hooks held their custody 8 h, and the cancels of both runs waited for it, reconciling their
+        writers every 2 s. Never an MCP call: its server (an HTTP one) can go on with it after the app-server exits.
+        Everything is read again after the last await, and the caller ends the command with no await between."""
+        ident = operation["native"].get("listener")
+        if operation["kind"] != "command" or not ident or ident == actor.get("listener"):
+            return None
+        ran = self.store.get(ident, required=False)
+        if not ran or ran["state"] not in ("dead", "stopped") or not ran.get("pid"):
+            return None
+        exited = await telemetry.to_thread(processes.exit_evidence, ran)
+        expected = (await self.history.closure_evidence([operation])).get(operation["id"]) if exited else None
+        if not expected:
+            return None
+        # What was read before the awaits may have changed meanwhile: the operation, its writer's binding, the
+        # app-server's record, and the history checkpoint (a revert invalidates it, a fallback starts a new epoch).
+        if (self.store.get(operation["id"])["_revision"] != operation["_revision"]
+                or self.store.get(actor["id"]).get("listener") in (None, ident)
+                or self.store.get(ident)["state"] not in ("dead", "stopped")):
+            return None
+        read = (self.history.turn(actor, operation["native"].get("turn") or "") or {}).get("closure_checked") or {}
+        return exited if read.get(operation["id"]) == expected else None
+
+    def end_with_executor(self, operation, members, exited):
+        """End a command whose app-server has exited (native_end_lost) as gone, with that evidence. What it may have
+        done unobserved is that app-server's UNKNOWN: its death records one for the whole checkout of each command it
+        held (recovery._reconcile_listener); an app-server the coordinator stopped records none, and a checkout with
+        none recorded since the command began has one recorded here. A command native's end reached meanwhile is left
+        as it is."""
+        ran = operation["native"]["listener"]
+        with self.store.transaction():
+            operation = self.store.get(operation["id"])
+            if operation.get("completed_item") or returned_failure(operation):
+                return
+            operation["completed_item"] = {"exitCode": None, "observedGone": True, "missingNativeCompletion": True,
+                                           "executorExit": exited}
+            self.store.save(operation)
+            self.ledger.end_execution(operation, transaction=False)
+            for key in members:
+                member = self.store.get(key)
+                if not self.store.db.execute("SELECT 1 FROM unknowns WHERE checkout=? AND path='*' AND created>=? AND "
+                                             "json_extract(context,'$.listener')=? LIMIT 1",
+                                             (member["checkout"], member.get("created", 0), ran)).fetchone():
+                    self.store.unknown(member["checkout"], "*", "a command's app-server exited before native's end of it was read",
+                                       {"listener": ran, "custody": key, "operation": operation["id"]})
+            self.store.event("custody/ended_with_listener", members[0], {"operation": operation["id"], "listener": ran,
+                                                                         "exit_evidence": exited, "members": members})
+
     async def _settle_actor(self, actor, resolve_quarantine):
         self.check_native_stop()
         if not actor.get("listener"):
@@ -2589,6 +2640,11 @@ class Daemon:
                         self.store.unknown(self.store.get(key)["checkout"], "*", "lead reconciled absence of survivors without native completion", {"custody": key})
             if reservation["state"] == "quarantined" or reservation["processes"] or own_terminals:
                 continue
+            if not ended:
+                exited = await self.native_end_lost(actor, operation)
+                if exited:
+                    self.end_with_executor(operation, members, exited)
+                    operation, ended = self.store.get(operation["id"]), True
             if not ended:
                 # Nothing of it runs, and native's end of it is still to be read: its result, its Post hook or its
                 # completed item. A dispatch that ended without a result shows nothing more.

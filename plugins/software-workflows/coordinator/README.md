@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.19 / P1
+# Writer coordinator — software-workflows 2.4.20 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -1084,9 +1084,32 @@ with no process or terminal of it left, waits only for Codex's completed item, w
 can arrive after the patch's hook: the hook waits for it until its deadline. A command
 still running conflicts (`CLAIM_CONFLICT`).
 
+A local command whose app-server has exited is ended by that exit: no app-server can
+deliver its end then. That holds once nothing of it runs, the app-server that ran it is
+no longer its writer's and was ended (dead or stopped, so what it sent was applied), its
+exit is evidenced, and a read of the call's turn in Codex's history made since then
+(the closure read) did not find the end. All of it is read again after the last wait,
+and the command is ended with no wait between. Its completed item records `observedGone`,
+`missingNativeCompletion` and `executorExit` (the exit evidence), and its custody is
+released after the opaque-effects scan, as any command's (`custody/ended_with_listener`).
+An MCP call is never ended so: its server, an HTTP one, can go on with it after the
+app-server exits, so it keeps its custody until its own end or a lead's reconciliation.
+What it may have done unobserved is that app-server's UNKNOWN: a death records one for
+the whole checkout of each command it held; a checkout with none recorded since the
+command began, as after a stop by the coordinator, has one recorded then. Through
+2.4.19 such a command waited for an end that could not come, and a cancel of its run
+waited with it.
+
 Custody lasts beyond a completed turn. Command roots bind the listener, thread and
 tool-call identity to PID plus birth identity. Observed descendants remain recorded
-after reparenting. Only that operation's native terminals participate; native
+after reparenting. A process is matched against a record (a command's processes seen
+before, any listener's services and helpers) by PID and birth together: the ledger
+keeps records of processes long gone, and a record naming a PID that another process
+now holds never decides. Through 2.4.19 services and earlier sightings were keyed by
+PID alone, and one listener's stale service record could make another's live MCP
+server a command's survivor. The services and helpers of every listener are kept by the
+store as each listener is written (`Store.listener_processes`), not read from every
+listener record at each inventory. Only that operation's native terminals participate; native
 `processId` is opaque, while an available `osPid` requires ancestry and birth checks.
 Persistent services are inventoried separately before a turn and again, under a
 serialized boundary, before the listener's first command/MCP effect. This includes

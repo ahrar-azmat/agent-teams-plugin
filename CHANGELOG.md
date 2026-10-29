@@ -3,6 +3,75 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.20] — 2026-10-29
+
+Two changes, both in the custody of a writer's commands (2.4.17's known limits): a process is matched against a
+record by its identity, pid and birth together, and a local command whose app-server has exited is ended by that exit.
+(`processes.py`, `store.py`, `daemon.py`; coordinator/VERIFY.md, 2.4.20.)
+
+### Fixed: a writer's live MCP server held as a command's survivor
+- Found live on 10-29, read-only: custody `83a293c0` held `docker` and `docker-mcp`, the MCP server of its writer's
+  current app-server, as a command's survivors, for as long as that app-server ran.
+- `processes.inventory` leaves a listener's services and helpers alone, and `observe_processes` passes those of every
+  listener (3,673 on the user's ledger). The inventory keyed them by pid alone. A dead listener's record of another
+  process that had once held the same pid (5.7 days old) won the map, so the live server matched no service and was
+  taken as the command's. The processes a command was seen with before (`known`) were keyed the same way.
+- Now both are matched by pid and birth together. A record naming a pid that another process now holds never decides,
+  and no identity is read per service record any more.
+- Building that list decoded every listener record on the event loop at each command's process inventory: 142 ms on
+  the live ledger (3,686 records, 45 MB, read-only). The store now keeps each listener's service and helper identities
+  as the listener is written (`Store.listener_processes`). Its first call reads them from SQLite without decoding the
+  records, and so does the first call after a transaction that wrote a listener rolls back.
+- Measured (VERIFY 2.4.20 (A), (B)):
+  - on real processes, a stand-in app-server with a service and a genuine survivor, and a stale record of the
+    service's pid with another birth after it: 2.4.19 took the service as a survivor, this release only the survivor;
+  - at the live ledger's listener shape (3,686 records): 153 ms for 2.4.19's list, 52 ms for the first call, 0.44 ms
+    after, the same identities; and the kept identities equal what SQLite holds after plain writes, a commit, and
+    rollbacks with and without a listener written.
+
+### Fixed: a command whose app-server had exited held its custody for good
+- Found live on 10-29, read-only: custody `139aac4d` and `83a293c0`, of two commands run at 08:33 and 08:37 that had
+  returned to their code-mode cells. The app-servers that ran them were replaced at the 08:41 switch, before their
+  Post hooks or completed items were read. Settling waited for that end (its result, Post hook or completed item),
+  which no app-server can deliver once the one that ran the call has exited; a read of native's history after that
+  exit found none. So both stayed held for 8.5 hours.
+- The cancels of both runs waited for that custody since 09:34, and each cancel pass reconciled its writer with a full
+  scan of the checkout every few seconds. The startup incidents of the same checkout (`RESTORE_CUSTODY`) wait for it
+  too.
+- Now a local command whose call returned, with no process or terminal of it left, is ended by its app-server's exit
+  once native's end of it can no longer be read (`Daemon.native_end_lost`): the app-server that ran it is not its
+  writer's now and was ended (`dead` or `stopped`, so what it sent was applied), its exit is evidenced
+  (`processes.exit_evidence`), and a read of the call's turn in native's history made since then (history's closure
+  read) did not find the end. Each of those is read again after the last await, and the command is ended with no
+  await between (review turn 116). Its completed item records `observedGone`, `missingNativeCompletion` and
+  `executorExit` (the evidence), and its custody is released after the opaque-effects scan, as any command's
+  (`custody/ended_with_listener`).
+- An MCP call is never ended so: its server, an HTTP one, can go on with the call after the app-server exits. It keeps
+  its custody until its own end or a lead's reconciliation, as before (review turn 116).
+- What the command may have done unobserved is its app-server's UNKNOWN. An app-server's death records one for the
+  whole checkout of each command it held (`listener died with potentially escaped effects`). A checkout with no
+  checkout-wide UNKNOWN naming that app-server since the command began, as after a stop by the coordinator, has one
+  recorded then (`a command's app-server exited before native's end of it was read`).
+- Measured (VERIFY 2.4.20 (C)) on a real daemon and a real Codex writer, whose command's end was dropped and whose
+  app-server was then killed:
+  - this release ended the command, released its custody and reported the run cancelled at once, with 2 reconciles
+    and 3 scans after the cancel and no UNKNOWN beyond the app-server's own;
+  - 2.4.19 left the run cancelling and the custody held for the probe's 150 s, reconciling the writer and scanning
+    the checkout 69 times meanwhile, and refused the stop (`NOT_QUIESCENT`): its supervisor had to be signalled;
+  - with every checkout-wide UNKNOWN naming the app-server left out (as after a stop), this release recorded one, naming
+    the custody, the app-server and the operation.
+
+### Known limits
+- The first `Store.listener_processes` call after a start, and after a rolled-back transaction that wrote a listener,
+  reads every listener record's service and helper fields on the event loop (52 ms at the live shape). Listener
+  records are never deleted, so what the store keeps grows with them (4,213 identities at that shape).
+- An MCP call whose app-server exited before its end was read keeps its custody until its own end or a lead's
+  `custody/reconcile`, as before. A command whose writer has no connected app-server is settled by no one, as before.
+- The rest of the series stands: 2.4.21 `RESTORE_CUSTODY` waiting for custody, cancel passes and `NATIVE_RPC`, and the
+  startup incidents' listeners, quarantined with their app-servers still running; the whole-family replies of
+  2.4.18's known limits; then shared dependency evidence, native compaction and archive retention, reclaiming the
+  file's space, and parking and resource budgets.
+
 ## [software-workflows 2.4.19] — 2026-10-29
 
 One change: an append to the owner journal, and the supervisor's memory of it, no longer cost more as its history
