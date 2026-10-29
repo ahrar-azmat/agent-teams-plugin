@@ -412,8 +412,8 @@ class Client:
             return self.call("daemon/stop")
 
     def ensure(self, timeout=30, python=None, inherited_fds=None):
-        from .owner_journal import inspect
-        if inspect(self.state)["inhibited"]:
+        from .owner_journal import control_state
+        if control_state(self.state)["inhibited"]:
             raise CoordinatorError("AUTOSTART_INHIBITED", "Coordinator was explicitly stopped; run daemon start to resume",
                                    {"start": self.stop_command().rsplit("stop", 1)[0] + "start"}, True)
         try:
@@ -439,8 +439,8 @@ class Client:
 
     def resume(self):
         from .leases import control
-        from .owner_journal import inspect
-        owner = inspect(self.state)
+        from .owner_journal import control_state
+        owner = control_state(self.state)
         if owner["inhibited"]:
             try:
                 control(self.state, "owner/start")
@@ -473,8 +473,8 @@ class Client:
         environment = launch_environment()
         if inherited_fds:
             environment["CODEX_ORACLE_VENV_LOCK"] = str(inherited_fds[0])
-        from .owner_journal import inspect
-        owner = inspect(self.state)["custodian"]
+        from .owner_journal import control_state
+        owner = control_state(self.state)["custodian"]
         if owner and owner.get("agent"):
             from .leases import control
             control(self.state, "owner/status")  # socket activation, never a competing supervisor

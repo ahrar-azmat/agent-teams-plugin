@@ -45,7 +45,8 @@ class Owner:
         # In the opt-out model a surviving worker starts its replacement owner.
         # That independent authority and its families are never worker children
         # for cleanup purposes, despite the temporary kernel parent link.
-        members = processes.lineage(family["members"], exclude=(os.getpid(),))
+        # A GONE family compacted to its retained form keeps an empty member list (owner_journal.retained): its root.
+        members = processes.lineage(family.get("members") or [family["root"]], exclude=(os.getpid(),))
         family = dict(family, members=members)
         try:
             self.record("SNAPSHOT", family, cleanup=cleanup)
@@ -228,16 +229,22 @@ class Owner:
 
     def prune(self):
         """After a compaction: drop from memory the GONE families it left out (past the retention), with their
-        reaped child handles."""
+        reaped child handles, and keep the other GONE ones that are no listener's in the form it kept
+        (owner_journal.retained, 2.4.19). One an end still awaits stays whole."""
         kept = self.journal.state["families"]
-        for ident in [i for i, f in self.families.items() if f["state"] == "GONE" and i not in kept and i not in self.waiters]:
-            del self.families[ident]
-            self.children.pop(ident, None)
+        for ident, family in list(self.families.items()):
+            if family["state"] != "GONE" or ident in self.waiters:
+                continue
+            if ident not in kept:
+                del self.families[ident]
+                self.children.pop(ident, None)
+            elif family.get("kind") != "listener":
+                self.families[ident] = kept[ident]
 
     @staticmethod
     def entry(family):
         return {"listener": family["listener"], "state": family["state"], "kind": family["kind"],
-                "pid": family["root"]["pid"], "members": len(family["members"]),
+                "pid": family["root"]["pid"], "members": len(family.get("members") or ()),
                 "owner_sequence": family.get("owner_sequence"), "worker": (family.get("worker") or {}).get("kernel_id")}
 
     def page(self, chosen, after=None):

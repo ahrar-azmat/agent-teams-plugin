@@ -15378,3 +15378,100 @@ and the 14 hook-run ones under 3.9.6; `hooks.py --check`; the git shim under sh,
 - **The series moves by one:** 2.4.19 the owner journal's cost; 2.4.20 the custody of 2.4.17's known limits; 2.4.21
   `RESTORE_CUSTODY`, cancel passes and `NATIVE_RPC`; then shared dependency evidence, native compaction and archive
   retention, reclaiming the file's space, parking and resource budgets.
+
+## 2.4.19
+
+One change: an append to the owner journal, and the supervisor's memory of it, no longer cost more as its history
+grows; a start and a client's control read still scan every record (review turn 114). Measured on 10-29 between 16:40
+and 16:49 on the user's Mac (macOS 26.6.2, Python 3.15.2), each set against the installed 2.4.18. (A) uses disposable
+journals of the live one's size (128 MiB), written as frames the way the live one's are written: the control records,
+14 listener families, and hook-helper lifecycles of 7 records each (OWNED, SNAPSHOT, GRANTED, SNAPSHOT, SNAPSHOT,
+REAPING, FAMILY_GONE). Ids and identities are shaped as the live ones, and each step runs in a fresh process. (B) is
+a real daemon (supervisor and worker, no writer) started on such a journal and reached through the CLI. (C) is a
+journal compacted by one release and read by the other.
+
+### What it changes
+- **`owner_journal.replay(path, visit, events)`**: every intact record in order, given to `visit` as a row (its value,
+  sequence and boot session). Every record's frame, sequence and CRC are checked as `read` checked them. With
+  `events`, a payload naming none of them (an event as `frame` encodes it: a quoted name) is never decoded. Returns
+  (used, damaged, last sequence). **`read`** is `replay` into a list, as before.
+- **`fold(result, row)`**: one row applied to a state in place; **`state(records)`** folds them all, and
+  **`inspect(root)`** folds the journal as it is read, never holding its records.
+- **`control_state(root)`**: `inspect`'s custodian, worker and inhibited, with used and damaged and no families,
+  decoding only `CONTROL` (`CUSTODIAN`, `INHIBIT`, `WORKER`, `ADOPTED_WORKER`, `WORKER_GONE`). `Client.ensure`,
+  `Client.start`, `Client.resume`, `leases.control` and `Custodian.repair` read it in place of `inspect`. A record
+  whose payload passes its CRC but is no JSON (only a defective writer leaves one) is damage to `inspect`, but
+  `control_state` decodes no such payload.
+- **`Journal`**: no `records`. `__init__` folds the journal as `replay` reads it; `append` folds its own row; `compact`
+  folds the rows it wrote.
+- **`retained(family)`** (`RETAINED`): what a compaction writes of a `GONE` family that is no listener's: `listener`,
+  `kind`, `state`, `root`, `exit_evidence`, `returncode`, `gone_at`, and `members` left empty (2.4.18 and earlier read
+  one from every family they list or snapshot: (C)). A listener's, or any family not `GONE`, is written whole.
+- **`Owner.prune`**: after a compaction, a `GONE` family that is no listener's and that no `end` awaits takes the
+  journal's retained form in memory too. **`Owner.entry`** counts a missing member list as none, and
+  **`Owner.snapshot`** takes an empty one as the root alone.
+
+### (A) The journal's cost
+`r2419/journal_cost.py <plugin> <dir> <helpers>`: open is `Journal(root)` as a supervisor's start opens it; appends
+are 1,000 more through `Journal.append`, after which the state is compared with `state(read())` of the file; control
+compares `control_state` with `inspect` field by field (custodian, inhibited, worker, used, damaged) on the journal,
+on a copy with one payload byte flipped mid-journal, and on the user's live journal (read-only: neither opens it for
+writing); compact is an `Owner` over the journal, `Journal.compact`, `Owner.prune`.
+
+| code | helpers (records, MB) | open: s, ru_maxrss MB, records kept | append ms p50 / p99; 1,000 s | fold = replay | compaction: MB, bytes a family |
+|---|---|---|---|---|---|
+| tree | 10,000 (70,017; 69.5) | 0.531, 73.7, 0 | 0.03 / 0.07; 0.03 | yes | 4.59, 458 |
+| 2.4.18 | 10,000 (70,017; 69.5) | 0.598, 355.3, 70,017 | 20.48 / 102.71; 23.79 | yes | 11.39, 1,137 |
+| tree | 9,000 (63,017; 62.6) | 0.487, 68.7, 0 | 0.02 / 0.05; 0.03 | yes | under half: none |
+| 2.4.18 | 9,000 (63,017; 62.6) | 0.539, 322.3, 63,017 | 17.87 / 90.87; 20.23 | yes | under half: none |
+
+| journal | `inspect` s | `control_state` s | the same answer | damaged, used |
+|---|---|---|---|---|
+| seeded, 69.5 MB (tree) | 0.528 | 0.203 | yes | no, 69,537,565 |
+| a byte flipped mid-journal (tree) | 0.268 | 0.102 | yes | yes, 34,768,512 for both |
+| the user's live journal, 11.5 MB (tree) | 0.089 | 0.032 | yes | no |
+| seeded, 69.5 MB (2.4.18) | 0.651 | — | — | — |
+| seeded, 62.6 MB (2.4.18) | 0.573 | — | — | — |
+
+- After the compaction, a `GONE` helper held `exit_evidence`, `gone_at`, `kind`, `listener`, `members` (empty),
+  `owner_sequence`, `returncode`, `root` and `state`, in the journal and in the `Owner`'s memory; a listener kept
+  `supervisor`, `worker` and its members. On 2.4.18 both kept every key.
+- The 10,000 runs are the final code; the 9,000 runs, at 16:44, were before the retained form kept an empty member
+  list (13 bytes more a family).
+
+### (B) A real daemon on such a journal
+`r2419/journal_daemon.py <plugin> <work> <label> <helpers>` writes the same journal (pids from 400,000 up, which no
+process can have) into a fresh state, then `rpc daemon/status` brief (`Client.ensure` first) until ready, `ps` for the
+supervisor's and the worker's resident memory, the journal once the start's compaction ran, `rpc daemon/status` five
+times more, `daemon stop`.
+
+| code | first status (start included) s | supervisor MB | worker MB | journal after the start's compaction | later status s | stop |
+|---|---|---|---|---|---|---|
+| tree (final) | 1.53 | 104.8 | 52.9 | 4.62 MB, 10,003 families | 0.07 each | graceful, 0.04 s |
+| tree (16:45) | 1.58 | 100.6 | 53.2 | 4.49 MB | 0.07 to 0.08 | graceful |
+| 2.4.18 | 4.16 | 386.2 | 52.9 | 11.48 MB | 0.15 to 0.17 | graceful |
+
+### (C) A rollback
+`r2419/rollback.py <writer> <reader> <dir> <helpers> [no-members]`: 3,000 helper lifecycles written as frames, compacted
+by the writer, then the reader's `Owner` over that journal lists every family (`status` and `gone`, paged to the end,
+each frame checked against `MAX_FRAME`), snapshots a retained `GONE` helper and compacts again.
+
+| writer, reader | compaction | reader |
+|---|---|---|
+| tree, 2.4.18 | 1.38 MB; helpers retained | 3,001 families; 3,000 helpers paged, members 0; snapshot; compacts again |
+| tree, tree | 1.38 MB | the same; its snapshot takes the root as the member |
+| 2.4.18, tree | 3.44 MB; whole | the same, members 1 |
+| calibration: tree writes helpers with no member list at all, no compaction; 2.4.18 reads | — | fails: `KeyError: 'members'` in `Owner.entry` (owner/gone) |
+
+The calibration is why the retained form keeps an empty list rather than none.
+
+### Static checks
+`r2419/static_checks2419.py`, as 2.4.18's against the installed 2.4.18: 12 of 12 pass.
+
+### Known limits
+- **A start still reads the whole journal** (0.53 s at 69.5 MB), and the journal still grows to half its size between
+  compactions. The supervisor's memory holds one dict per family the journal holds (105 MB at 10,014).
+- **Whole-family replies** (2.4.18's known limits): not bounded yet. Queued.
+- **The live after the 2.4.18 switch** (read-only, 16:20 to 16:30): 14 app-servers, children of the supervisor, held
+  1,163 MB resident together. 12 belong to the startup incidents' listeners, quarantined with recovery `failed`, and
+  only 2 to connected writers. Queued with 2.4.21 (`RESTORE_CUSTODY`, `NATIVE_RPC`).

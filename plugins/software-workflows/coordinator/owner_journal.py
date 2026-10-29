@@ -57,12 +57,18 @@ def frame(sequence, value, boot=None):
     return HEADER.pack(MAGIC, len(data), sequence, boot, zlib.crc32(prefix + data)) + data
 
 
-def read(path):
-    records, offset, previous, damaged = [], 0, 0, False
+def replay(path, visit, events=None):
+    """Give `visit` every intact record of the journal at `path` in order, as a row: its value with its sequence and
+    boot session. With `events`, only the rows of those events: every record's frame, sequence and CRC are still
+    checked, but a payload naming none of them (as frame encodes an event, a quoted name) is never decoded. Returns
+    (used, damaged, the last sequence). Through 2.4.18 every reader decoded the whole journal into a list first: 309 MB
+    resident for the user's 55,932 records (60.5 MB), 0.77 s for the two control values a client asks."""
+    markers = None if events is None else tuple(json.dumps(event).encode() for event in events)
+    offset, previous, damaged = 0, 0, False
     try:
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     except FileNotFoundError:
-        return records, offset, damaged
+        return offset, damaged, previous
     try:
         size = os.fstat(fd).st_size
         while offset + HEADER.size <= size:
@@ -80,42 +86,90 @@ def read(path):
             if zlib.crc32(struct.pack("!IQ16s", length, sequence, boot) + data) != crc:
                 damaged = True
                 break
-            try:
-                value = json.loads(data)
-            except (ValueError, UnicodeError):
-                damaged = True
-                break
-            records.append(dict(value, sequence=sequence, boot_session=str(uuid.UUID(bytes=boot))))
+            if markers is None or any(marker in data for marker in markers):
+                try:
+                    value = json.loads(data)
+                except (ValueError, UnicodeError):
+                    damaged = True
+                    break
+                if events is None or value.get("event") in events:
+                    visit(dict(value, sequence=sequence, boot_session=str(uuid.UUID(bytes=boot))))
             previous = sequence
             offset += HEADER.size + length
     finally:
         os.close(fd)
-    return records, offset, damaged
+    return offset, damaged, previous
 
 
-def state(records):
-    result = {"families": {}, "worker": None, "custodian": None, "inhibited": False}
-    for row in records:
-        kind = row["event"]
-        if "family" in row:
-            result["families"][row["family"]["listener"]] = dict(row["family"], owner_sequence=row["sequence"])
-        if kind in ("WORKER", "ADOPTED_WORKER"):
-            result["worker"] = row["worker"]
-        elif kind == "WORKER_GONE":
-            result["worker"] = None
-        elif kind == "CUSTODIAN":
-            result["custodian"] = row
-        elif kind == "INHIBIT":
-            result["inhibited"] = row["value"]
-        elif kind == "FORGOTTEN":
-            for ident in row["listeners"]:
-                result["families"].pop(ident, None)
+def read(path):
+    records = []
+    used, damaged, _ = replay(path, records.append)
+    return records, used, damaged
+
+
+def empty():
+    return {"families": {}, "worker": None, "custodian": None, "inhibited": False}
+
+
+def fold(result, row):
+    """Apply one row to a journal state, in place: `state` is every row folded in order."""
+    kind = row["event"]
+    if "family" in row:
+        result["families"][row["family"]["listener"]] = dict(row["family"], owner_sequence=row["sequence"])
+    if kind in ("WORKER", "ADOPTED_WORKER"):
+        result["worker"] = row["worker"]
+    elif kind == "WORKER_GONE":
+        result["worker"] = None
+    elif kind == "CUSTODIAN":
+        result["custodian"] = row
+    elif kind == "INHIBIT":
+        result["inhibited"] = row["value"]
+    elif kind == "FORGOTTEN":
+        for ident in row["listeners"]:
+            result["families"].pop(ident, None)
     return result
 
 
+def state(records):
+    result = empty()
+    for row in records:
+        fold(result, row)
+    return result
+
+
+# What a GONE family that is no listener's keeps once compacted: what the handle that launched it still reads (its
+# root, state, exit evidence and return code; owned.Process) and what the retention needs (gone_at). Its member
+# identities and the supervisor's and worker's go: 712 of the 1,161 bytes a GONE helper took on the user's journal on
+# 10-29, kept for the three-day retention at ~500 helpers an hour (2.4.19).
+RETAINED = ("listener", "kind", "state", "root", "exit_evidence", "returncode", "gone_at")
+
+
+def retained(family):
+    """The form of `family` a compaction writes: whole, unless it is GONE and no listener's. Its member list is left
+    empty, not out: 2.4.18 and earlier read one from every family they list or snapshot."""
+    if family["state"] != "GONE" or family.get("kind") == "listener":
+        return family
+    return dict({key: family[key] for key in RETAINED if key in family}, members=[])
+
+
 def inspect(root):
-    records, used, damaged = read(Path(root) / "owner.journal")
-    return dict(state(records), used=used, damaged=damaged)
+    result = empty()
+    used, damaged, _ = replay(Path(root) / "owner.journal", lambda row: fold(result, row))
+    return dict(result, used=used, damaged=damaged)
+
+
+CONTROL = ("CUSTODIAN", "INHIBIT", "WORKER", "ADOPTED_WORKER", "WORKER_GONE")
+
+
+def control_state(root):
+    """inspect's custodian, worker and inhibited, with used and damaged, decoding only the control rows (CONTROL):
+    what a client reads before it starts, finds or resumes a supervisor. No families. Measured on the user's journal
+    on 10-29: the same answer as inspect in 0.15 s instead of 0.77. A record whose payload passes its CRC but is no
+    JSON, which only a defective writer leaves, is damage to inspect and to the supervisor's own read, unseen here."""
+    result = empty()
+    used, damaged, _ = replay(Path(root) / "owner.journal", lambda row: fold(result, row), events=CONTROL)
+    del result["families"]
+    return dict(result, used=used, damaged=damaged)
 
 
 class Journal:
@@ -128,9 +182,9 @@ class Journal:
             self.allocate(self.path, size)
         self.fd = os.open(self.path, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
         self.size = os.fstat(self.fd).st_size
-        self.records, self.used, self.damaged = read(self.path)
-        self.sequence = self.records[-1]["sequence"] if self.records else 0
-        self.state = state(self.records)
+        # The state, folded as the journal is read; its records are not kept (2.4.19).
+        self.state = empty()
+        self.used, self.damaged, self.sequence = replay(self.path, lambda row: fold(self.state, row))
         self.emergency = self.damaged
         self.retention = retention_seconds()
 
@@ -191,9 +245,8 @@ class Journal:
             raise exhausted("Owner journal append could not be made durable", errno=exc.errno) from exc
         self.used += len(packet)
         self.sequence += 1
-        row = dict(value, sequence=self.sequence, boot_session=boot_session())
-        self.records.append(row)
-        self.state = state(self.records)
+        # One row applied, not the whole log folded again: 17 to 20 ms an append at the user's 55,932 records (2.4.18).
+        fold(self.state, dict(value, sequence=self.sequence, boot_session=boot_session()))
         return self.sequence
 
     def compact(self, normal):
@@ -210,7 +263,8 @@ class Journal:
         # the worker, holding it durably in its ledger, forgets the family (FORGOTTEN: absent from `current`); a GONE
         # family of any other kind, which only in-memory handles ask about, stays for the retention (2.4.12).
         now = time.time()
-        rows += [{"event": "SNAPSHOT", "family": f} for f in current["families"].values() if not self.expired(f, now)]
+        rows += [{"event": "SNAPSHOT", "family": retained(f)} for f in current["families"].values()
+                 if not self.expired(f, now)]
         packets = [frame(self.sequence + i + 1, row) for i, row in enumerate(rows)]
         if sum(map(len, packets)) + HEADER.size > self.size // 2:
             return False  # retain the source and refuse new ownership before invading cleanup space
@@ -233,9 +287,10 @@ class Journal:
             # inode. Never acknowledge another append against the unlinked one.
             old, self.fd, fd = self.fd, fd, None
             os.close(old)
-            self.records = [dict(row, sequence=self.sequence + i + 1, boot_session=boot_session()) for i, row in enumerate(rows)]
+            self.state = state(dict(row, sequence=self.sequence + i + 1, boot_session=boot_session())
+                               for i, row in enumerate(rows))
             self.sequence += len(rows)
-            self.used, self.state = position, state(self.records)
+            self.used = position
             try:
                 directory = os.open(self.path.parent, os.O_RDONLY)
                 try:

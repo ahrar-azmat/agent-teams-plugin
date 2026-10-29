@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.18 / P1
+# Writer coordinator — software-workflows 2.4.19 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -128,8 +128,18 @@ holds. Any other `GONE` family (admission, project and role
 app-servers, helpers, members, watcher probes, workers) is asked about only by the
 handle that launched it, within seconds of its exit: compaction keeps it for
 `SOFTWARE_WORKFLOWS_OWNER_JOURNAL_RETENTION_S` seconds after its `FAMILY_GONE`
-(default three days; read at every start). Through 2.4.11 compaction kept every
-family ever recorded, and an 8 MiB journal filled in 9 days. Status alarms at
+(default three days; read at every start), in a retained form: its root, state,
+exit evidence, return code and `gone_at`, with an empty member list (2.4.18 and
+earlier read one), its member, supervisor and worker identities dropped: 458
+bytes a helper instead of 1,137. Through 2.4.11 compaction kept every
+family ever recorded, and an 8 MiB journal filled in 9 days. The supervisor
+keeps the journal's state, not its records: each append applies its own record
+(0.03 ms, where refolding all 70,017 of a 69.5 MB journal took 20 ms), and a
+start reads the journal record by record (74 MB at its peak where 2.4.18 held
+355 MB). A client that only asks whether autostart is inhibited or where the
+custodian listens (`Client.ensure`, `start` and `resume`, `leases.control`,
+`Custodian.repair`) reads `control_state`, which checks every record's CRC but
+decodes only the control records. Status alarms at
 60% and reports `retention_s`, `gone_retained` and `forgotten`. It counts every
 family by kind and state (`counts`) and lists those not `GONE` a page at a time,
 half the owner channel's 1 MiB frame each, `next` naming where the following

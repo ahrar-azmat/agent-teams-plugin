@@ -24,8 +24,8 @@ CURRENT = None
 
 
 def control(root, action, payload=None, timeout=20):
-    from .owner_journal import inspect
-    record = inspect(root)["custodian"]
+    from .owner_journal import control_state
+    record = control_state(root)["custodian"]
     if not record:
         raise FileNotFoundError("No owner endpoint")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
@@ -132,8 +132,8 @@ class Leases:
             self.connection.close()
         manifest = None
         try:
-            from .owner_journal import inspect
-            manifest = inspect(self.root)["custodian"]
+            from .owner_journal import control_state
+            manifest = control_state(self.root)["custodian"]
             if manifest is None:
                 manifest = runtime.private_json(Path(self.root) / "custodian.json")
             current = processes.identity(manifest["process"]["pid"])

@@ -3,6 +3,52 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.19] — 2026-10-29
+
+One change: an append to the owner journal, and the supervisor's memory of it, no longer cost more as its history
+grows. A start and a client's control read still scan every record, the control read decoding only the control
+ones. (`owner_journal.py`, `owners.py`, `client.py`, `leases.py`; coordinator/VERIFY.md, 2.4.19.)
+
+### Fixed: the supervisor's journal cost grew with every record
+- Measured on the user's live journal on 10-29, read-only, at 55,932 records (60.5 MB of 128 MiB):
+  - every append refolded the journal's state from every record kept: 17 to 20 ms an append;
+  - every record stayed decoded in the supervisor until a compaction (past 64 MiB): reading them took a process from
+    24 to 309 MB resident, and the live supervisor held 227 MB after its start;
+  - `Client.ensure` (every CLI `rpc`, every MCP server call that starts the coordinator), `Client.start` and
+    `Client.resume`, `leases.control` and `Custodian.repair` read and decoded the whole journal for two control
+    values: 0.77 s each time.
+- A hook helper's `GONE` family is kept for the journal's three-day retention, and the user's sessions finish about
+  500 helpers an hour. Each took 1,137 to 1,161 bytes in a compaction, its member, supervisor and worker identities
+  included, though only the handle that launched it asks about it, and only for its root, state, exit evidence and
+  return code.
+- Now:
+  - the journal keeps its state, not its records: an append applies its own record (`fold`), and a start reads the
+    journal record by record (`replay`);
+  - those clients read `control_state`, which checks every record's frame, sequence and CRC but decodes only the
+    control records (`CUSTODIAN`, `INHIBIT`, `WORKER`, `ADOPTED_WORKER`, `WORKER_GONE`);
+  - a compaction keeps a `GONE` family that is no listener's in a retained form: its root, state, exit evidence,
+    return code and `gone_at`, with an empty member list, its member, supervisor and worker identities dropped
+    (`retained`). The supervisor's memory takes that form too after the compaction (`Owner.prune`). A listener's
+    family stays whole.
+- Measured (VERIFY 2.4.19) against the installed 2.4.18, on journals written as the live one is (helper lifecycles of
+  7 records):
+  - at 70,017 records (69.5 MB): an append 0.03 ms (p99 0.07) instead of 20.5 (p99 103); opening the journal 74 MB
+    at its peak instead of 355; `control_state` 0.20 s where `inspect` takes 0.53; a compaction 4.59 MB, 458 bytes a
+    family, instead of 11.39 MB, 1,137 bytes;
+  - a real daemon started on that journal: its supervisor 105 MB resident instead of 386, its first status (the start
+    included) 1.53 s instead of 4.16, a status after 0.07 s instead of 0.15;
+  - on the user's live journal (read-only): `control_state` and `inspect` answer the same, in 0.032 s and 0.089 s.
+
+### Known limits
+- A journal is still read whole at a supervisor's start (0.53 s at 69.5 MB), and between compactions it grows to half
+  its size. The supervisor's memory then holds every family the journal does, one dict per family (105 MB at 10,014).
+- The whole-family replies of 2.4.18's known limits (`spawn`, `adopt`, `snapshot`, `end`, `end-member`) are not
+  bounded yet. Queued.
+- The rest of the series stands: 2.4.20 the custody of 2.4.17's known limits; 2.4.21 `RESTORE_CUSTODY`, cancel passes
+  and `NATIVE_RPC`, and the 12 startup incidents' listeners, quarantined with their app-servers still running (12 of
+  the 14 app-servers after the 2.4.18 switch, which held 1,163 MB resident together); then shared dependency evidence,
+  native compaction and archive retention, reclaiming the file's space, and parking and resource budgets.
+
 ## [software-workflows 2.4.18] — 2026-10-29
 
 One change: the supervisor lists the families its journal keeps a page at a time, instead of all at once in a status
