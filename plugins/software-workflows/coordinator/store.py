@@ -3,6 +3,7 @@
 Only the daemon event-loop thread accesses SQLite. Expensive work is done before
 calling these methods. Historical events and UNKNOWN records are append-only.
 """
+from collections import Counter
 from contextlib import contextmanager
 import hashlib
 import io
@@ -93,6 +94,9 @@ def fsync_dir(path):
 class Store:
     def __init__(self, root):
         self.status_epoch = 0
+        # Writes per record kind in this process: a projection read from records of some kinds is computed again only
+        # once one of them was written (Dormancy.status). A write rolled back still counts: one more computation.
+        self.puts = Counter()
         self.root = validate_state(root, create=True)
         self._validated_blobs = {}
         self._path_blobs = {}  # advisory source stamps; never persisted across a restart
@@ -209,6 +213,9 @@ class Store:
                 ("unfinished_unit", "id", "kind='unit' AND json_extract(data,'$.publication_state') IN ('prepared','partially_published')"),
                 ("unfinished_unit_v2", "id", "kind='unit' AND json_extract(data,'$.publication_state') IN ('prepared','publishing','partially_published')"),
                 ("message_unit", "json_extract(data,'$.unit'),id", "kind='message'"),
+                # run/list counts each unit's unread mail: through message_unit alone it read every message of the
+                # unit (10-29: 374 ms of one 0.82 s listing, 91 units).
+                ("message_unread", "json_extract(data,'$.unit'),id", "kind='message' AND json_extract(data,'$.state')!='acknowledged'"),
                 ("message_recipient", "json_extract(data,'$.recipient'),id", "kind='message'"),
                 ("mailbox_session", "json_extract(data,'$.session_id'),id", "kind='lead_mailbox'"),
                 # A lead's inbox reads mail to lead actors and the sessions they belong to; PostToolBatch finds a
@@ -237,6 +244,15 @@ class Store:
             ):
                 self.db.execute("CREATE INDEX IF NOT EXISTS " + name + " ON records(" + expression + ") WHERE " + condition)
             self.db.execute("CREATE INDEX IF NOT EXISTS unknown_checkout ON unknowns(checkout)")
+            # participants.surface sums the revisions of a unit's claims and custody for pollers, and every command
+            # leaves a custody record. `revision` follows `data` in a row: without this covering index each sum read
+            # all of those records whole (10-29: 17,792 custody records; 0.73-1.85 s for the 91 units of one run/list,
+            # 41.5 ms with it; built in 4.8 s on a copy of the 15 GiB ledger). Partial, because each save changes the
+            # revision, so an index over all records is updated at every save (on the copy, 2,000 custody saves wrote
+            # 1.3 more WAL pages each with it), and 80% of the copy's 15.4 M saves were of other kinds (listeners alone
+            # 10.3 M).
+            self.db.execute("CREATE INDEX IF NOT EXISTS claim_custody_revision ON records(parent,kind,revision) "
+                            "WHERE kind IN ('claim','custody')")
         # Exclusion epochs detect even a lead admission that starts and ends
         # during a scan. Heads detect byte transitions separately. The trigger
         # changes no epoch for ordinary native journal/progress saves.
@@ -349,6 +365,7 @@ class Store:
         if kind in {"run", "unit", "actor", "listener", "checkout", "claim", "custody", "message", "claim_request",
                     "release_request", "custody_request", "participant", "publication", "publication_group", "project_revision", "resolution"}:
             self.status_epoch += 1
+        self.puts[kind] += 1
         self.db.execute("""INSERT INTO records(id,kind,parent,data) VALUES(?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET data=excluded.data,revision=records.revision+1""",
                         (ident, kind, parent, encoded(data)))
@@ -566,3 +583,8 @@ class Store:
         rows = self.db.execute("SELECT u.*,s.restore,s.edit FROM unknowns u LEFT JOIN resolutions s "
                                "ON s.unknown_id=u.id WHERE u.checkout=? AND s.edit IS NULL", (checkout,))
         return [dict(row) for row in rows if paths is None or row["path"] in paths or row["path"] == "*"]
+
+    def unresolved_count(self, checkout):
+        """len(unresolved(checkout)), without reading each UNKNOWN's context."""
+        return self.db.execute("SELECT count(*) FROM unknowns u LEFT JOIN resolutions s ON s.unknown_id=u.id "
+                               "WHERE u.checkout=? AND s.edit IS NULL", (checkout,)).fetchone()[0]

@@ -2904,7 +2904,7 @@ class Daemon:
             reported = dict(zip(("state", "turns"), self.runs.reported(run))) if run.get("_kind") == "run" else {}
             return dict(run, **reported, **participants.surface(self, run["unit"]))
         if method == "run/list":
-            return self.runs.listing(params["cwd"], params.get("limit", 50))
+            return await self.runs.listing(params["cwd"], params.get("limit", 50))
         if method == "run/result":
             self.runs.get(params["run"], params.get("cwd"))
             return self.writer.result(params["run"], params.get("cursor", 0), params.get("limit", 50000))

@@ -19,6 +19,7 @@ class Dormancy:
         self.daemon, self.store = daemon, daemon.store
         self.tasks = {}
         self.cold = []
+        self.counts = None  # (the record writes it was read at, the counts): status()
 
     def demand(self, runid):
         return self.store.get("writer_start:" + runid, required=False)
@@ -328,13 +329,22 @@ class Dormancy:
         daemon.parking.touch(record["listener"])
 
     def status(self):
-        listeners = [l for l in self.store.all("listener") if l.get("root_thread")
-                     and self.store.get(l["actor"]).get("listener") == l["id"]]
-        starts = list(self.store.all("writer_start"))
-        values = sorted(self.cold)
-        return {**self.daemon.parking.status(), "dormant": sum(l["state"] == "dormant" for l in listeners),
-                "running": sum(l["state"] == "connected" for l in listeners),
+        """Brief daemon/status, which the Office asks for every 2 s. Each writer's current listener is found through
+        its actor, and the counts are read again only after a listener, actor, writer start or history gap was
+        written: through 2.4.14 every call decoded every listener record (10-29: 3,417, 40 MB; 0.18-0.41 s of the
+        event loop per call, 13.5 ms this way)."""
+        key = tuple(self.store.puts[kind] for kind in ("listener", "actor", "writer_start", "history_gap"))
+        if self.counts is None or self.counts[0] != key:
+            states = dict(self.store.db.execute(
+                "SELECT json_extract(l.data,'$.state'), count(*) FROM records a JOIN records l "
+                "ON l.id=json_extract(a.data,'$.listener') WHERE a.kind='actor' AND l.kind='listener' AND "
+                "json_extract(l.data,'$.actor')=a.id AND coalesce(json_extract(l.data,'$.root_thread'),'')!='' GROUP BY 1"))
+            starts = list(self.store.all("writer_start"))
+            self.counts = (key, {
+                "dormant": states.get("dormant", 0), "running": states.get("connected", 0),
                 "history_gaps": self.store.db.execute("SELECT count(*) FROM records WHERE kind='history_gap'").fetchone()[0],
                 "demand_starts": sum(r["attempts"] for r in starts),
-                "start_failures": sum(r.get("failures", int(r["state"] == "failed")) for r in starts),
+                "start_failures": sum(r.get("failures", int(r["state"] == "failed")) for r in starts)})
+        values = sorted(self.cold)
+        return {**self.daemon.parking.status(), **self.counts[1],
                 "cold_start_p50": values[len(values) // 2] if values else None, "cold_start_max": max(values, default=None)}

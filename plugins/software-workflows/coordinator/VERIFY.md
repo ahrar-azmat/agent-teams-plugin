@@ -14564,3 +14564,122 @@ on a real daemon with the installed 2.4.13 as the comparison.
   at each refused stop, about 0.7 s on the user's ledger.
 - **2.4.13's known limits stand.** Review turn 93's push-gate items, 2.4.9's limits and fenced park refusals remain
   for later.
+
+## 2.4.15
+
+Two changes: the coordinator opts out of `turn/diff/updated` on every app-server connection that can run a turn, and
+the Codex Office's poll (`run/list`, brief `daemon/status`) reads what it reports through indexes and frees the event
+loop between runs. Measured on 10-29 between 07:32 and 08:20 on the user's Mac. (A) is a real codex 0.163.0
+app-server. (B) uses the plugin's own code on a copy of the user's live ledger. (C) is a real daemon. Each compares with
+the installed 2.4.14. Codex's code review of 10-29 08:08 found that `run/list` read every eligible run before its limit,
+that the first form of (C) never listed its run, and that the opt-out's scope was overstated. All three are fixed and
+measured below.
+
+### What it changes
+- **`native.OPTED_OUT`** (`["turn/diff/updated"]`) goes in `initialize`'s `capabilities.optOutNotificationMethods`
+  on every connection the coordinator opens through `native.Connection`: writers, admission probes and history
+  readers. The outbound validator already allowed the field. The project-discovery and catalog-preflight clients
+  (`projects.py`, `roles.py`) initialize their own stdio connections without it. They start no turn, so nothing sends
+  them the notification.
+- **`claim_custody_revision`**, a covering index on `records(parent,kind,revision)` for claim and custody records
+  only, answers `participants.surface`'s per-unit sum of claim and custody revisions. It is partial because every save
+  changes a record's revision (B2). **`message_unread`**, a partial index on the unit for unacknowledged messages,
+  answers `run/list`'s unread count. The store creates both at open, in its index transaction.
+- **`Store.unresolved_count(checkout)`** counts the open UNKNOWNs without reading their context. `participants.surface`
+  uses it, and `Runs.summary` takes the run's own checkout's count from the surface it already computed.
+- **`Runs.listing`** is a coroutine. It chooses the runs from `id`, `unit`, `dispatch_cwd` and `target_cwd` read in
+  SQL, newest first through `visible_run`, which the query names, and reads no further than the last run it lists. The
+  order and the visibility rule are unchanged. It then reads and summarises each run after an `asyncio.sleep(0)`, so
+  each summary is consistent as of its own step. A listed run's `listener` is `Runs.listed_listener`: `dormancy.view`
+  without `writer_profile`, read with `json_extract`. Other callers of `summary` (cancel, resume, unit status) keep the
+  full view.
+- **`Dormancy.status`** counts dormant and running writers through each actor's current listener, in one join with
+  the same meaning as before: the listener's actor names it, and it has a root thread. It caches the counts with the
+  store's per-kind write counters (`Store.puts`) for listener, actor, writer_start and history_gap. A write that
+  rolls back only causes one extra count.
+
+### (A) The opt-out on a real app-server (`r2415/optout_probe.py`)
+- **The setup.** The plugin's own admission helpers: the loopback fixture provider, a disposable `CODEX_HOME` and
+  repository, the coordinator's own Unix-socket WebSocket client. One turn adds `probe.txt` with apply_patch, runs a
+  command and answers. Red empties `native.OPTED_OUT` before the connection initializes, which is 2.4.14's
+  `initialize`.
+- **Red:** 4 `turn/diff/updated`.
+- **Green:** none. Every other method arrived the same number of times: `item/started` 4, `item/completed` 4,
+  `turn/started` 1, `turn/completed` 1, `thread/tokenUsage/updated` 3, `account/rateLimits/updated` 3 and the
+  thread/remote-control states. The `fileChange` item carried its diff, and the file was written.
+
+### (B) The Office's poll on a copy of the user's ledger (`r2415/bench2415.py`)
+- **The setup.** `VACUUM INTO` of the live ledger through a read-only connection: 160.6 s, 15.24 GiB to a 15.10 GiB
+  copy, `quick_check` ok. Then the plugin's own `Store`, `Runs` and `Dormancy` on the copy, with only the custody
+  helper beside them. Five `run/list` ("/", limit 100) and five brief-status dormancy counts each. A 1 ms ticker task
+  measured the longest stretch without a yield. The new indexes were dropped before each run.
+- **Installed 2.4.14:** `run/list` took 2.947, 0.642, 0.368, 0.580 and 0.654 s, each held without a yield, with a
+  420 KiB answer over 91 runs. The dormancy count took 0.357 s, then 0.143 to 0.147 s.
+- **This tree:** opening the store, which built both indexes, took 3.07 s. `run/list` took 0.233, 0.334, 0.220, 0.180
+  and 0.174 s, with the longest hold 0.025, 0.088, 0.015, 0.011 and 0.011 s. Its answer was 288 KiB over the same 91
+  runs. The dormancy count took 0.023 s, then 0.000 s. Both versions counted 55 dormant and 5 running writers.
+- **Where `run/list`'s time went on the copy:**
+  - without the revision index, the revision sums took 0.73 to 1.85 s for the 91 units; with it, all 101 units' sums
+    took 1.7 ms;
+  - the unread-mail count took 374 ms of one 0.82 s listing.
+
+### (B2) The revision index's cost, and the listing's bound (`r2415/index_cost.py`, `partial_index.py`, `listing_limit.py`)
+- **The setup.** The same copy, through the tree's own `Store` (WAL, `synchronous=FULL`). 2,000 saves cycling over 50
+  existing records of one kind, from a truncated WAL with automatic checkpoints off, so the WAL's frame count is the
+  pages they wrote.
+- **What the copy's records have cost.** Its 213,797 records had been saved 15.4 M times in all: listeners 10.3 M,
+  custody 3.0 M, operations 0.57 M.
+- **The index over all records** (this release's first form): custody saves took 0.197 ms and 3.3 WAL frames each,
+  against 0.170 ms and 2.0 frames without it. It was 11.4 MiB.
+- **Over claim and custody records only:** built in 3.11 s, 2.23 MiB. Custody saves took 0.124 ms and 3.13 frames
+  (0.092 ms and 2.0 without it). Operation saves took 0.310 ms and 2.0 frames, as without it (0.304 ms, 2.0). The
+  surface's plan is `SEARCH records USING COVERING INDEX claim_custody_revision (parent=? AND kind=?)`.
+- **The listing's selection.** Unnamed, SQLite's plan for it was `SEARCH records USING INDEX record_kind (kind=?)`,
+  then `USE TEMP B-TREE FOR ORDER BY`: every run was read and sorted before the first was listed. 2.4.14's query has
+  the same plan. Named, it is `SCAN records USING INDEX visible_run`. With limits 1, 10 and 100 the selection read 1,
+  10 and 91 rows, and the listings took 0.030, 0.029 and 0.223 s.
+
+### (C) A real daemon under the Office's poll (`r2415/daemon_probe2.py`)
+- **The first form** (`r2415/daemon_probe.py`, 07:55) started a plain native run. That run has no workflow and no
+  project revision, so `run/list` never listed it, and its polls read an empty listing. Its opt-out results agree with
+  the second form's.
+- **The setup.** A real daemon on a disposable state: supervisor, worker and a real writer app-server, against the
+  loopback fixture provider. One Abraham workflow run, with the descriptor the MCP server sends and fixture prompts,
+  so `run/list` lists it from its creation. Its analysis turn answers a brief. Its implementation turn adds
+  `probe.txt` with apply_patch, runs a command and answers. Meanwhile a poller makes the Office's two calls every
+  0.5 s, four times its rate, and records each listing. Then a graceful stop.
+- **Installed 2.4.14:** completed its implementation in 33.2 s, and the file was written. The run's listener journaled
+  4 `turn/diff/updated` rows (1,600 bytes). Of 63 listings, 62 held the run (the first came before `run/start`). They
+  showed it admitting, then running its implementation, then completed.
+- **This tree:** completed its implementation in 35.1 s, and the file was written. It journaled the same rows as the
+  installed 2.4.14, method for method and count for count, except no `turn/diff/updated`. That includes the
+  `fileChange` `item/completed`. Of 61 listings, 60 held the run. They showed it admitting, settling its analysis,
+  running its implementation, then completed.
+- **Both:** no poll errors and 0 watchdog signals. The graceful stop completed and the daemon exited.
+- **Poll answers:**
+  - this tree: `run/list` p50 1.4 ms (max 6.2 ms), brief status p50 1.2 ms (max 53 ms);
+  - installed 2.4.14: `run/list` p50 1.4 ms (max 7.5 ms), brief status p50 1.3 ms (max 41.9 ms).
+  - The state is small here, so (B) is the measure of the user's.
+
+### Static checks (`r2415/static_checks2415.py`, on the final tree)
+- every plugin `.py` file compiles under 3.15 (83 files), and the hook-run files under `/usr/bin/python3` (3.9.6 14 files);
+- `hooks.py --check` compatible, protocol `jsonl-v1`;
+- the git shim parses under `sh -n`, `bash --posix -n` and zsh's sh emulation, and is executable;
+- ruff's F821/F822/F823/F811/F841/F401: 35 findings here, 35 in 2.4.14; none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.15.
+
+### Known limits
+- **What the ledger holds stays.** 16.3 GB, 2.53 GiB of it old `turn/diff/updated`. Codex's architect review of
+  10-29 orders the rest:
+  - 2.4.16: one retry policy for every caller, and the hook-inventory failure that two writers retry every 5 min;
+  - 2.4.17: bounded tool paging and stored tool responses;
+  - 2.4.18: shared dependency evidence;
+  - 2.4.19: native compaction and archive retention;
+  - 2.4.20: reclaiming the file's space;
+  - 2.4.21: parking and resource budgets.
+- **Streaming deltas stay journaled.** Codex's research of 10-29: history keeps their final text, but not command
+  output beyond what history keeps.
+- **2.4.14's known limits stand:** `lead_calls.recover` and the stop's quiescence check.
+- **Writer records are rewritten whole at each save.** On the copy, 10.3 M listener saves, some of records of
+  1 to 2 MB (B2). Measured here, queued for a later release.

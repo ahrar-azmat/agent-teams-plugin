@@ -109,7 +109,7 @@ def surface(daemon, unit, publication_only=False):
         data.append(dict(root=member["root"], checkout=member["checkout"], branch=member["branch"], base=member["base"],
                          **({} if publication_only else dict(
                              claims=daemon.custody.claims(member["checkout"], unit["id"]),
-                             unknown_count=len(store.unresolved(member["checkout"])))), phase=journal["phase"] if journal else "",
+                             unknown_count=store.unresolved_count(member["checkout"]))), phase=journal["phase"] if journal else "",
                          **({"commit": journal["commit"]} if journal and journal.get("commit") else {})))
     state = group["publication_state"] if group else unit.get("publication_state", "")
     if not state and journals:

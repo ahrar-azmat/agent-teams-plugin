@@ -24,6 +24,13 @@ DECODE_METRICS = {"json_bytes": 0, "history_json_bytes": 0, "messages": 0,
                   "history_responses": 0, "max_json_bytes": 0, "max_decode_seconds": 0}
 HISTORY_METHODS = {"thread/turns/list", "thread/items/list"}
 
+# Notifications no reader of the coordinator needs, which the app-server then never sends on the connection
+# (InitializeCapabilities.optOutNotificationMethods, codex 0.163.0, exact method names). turn/diff/updated repeats the
+# turn's whole unified diff at every change: on the user's ledger it was 87% of the native bytes journaled in the 6.5 h
+# to 10-29 07:32 (895 rows, 535 MiB; ~2 GiB a day) and 2.53 GiB of the 6.97 GiB journaled since 10-19. Application
+# ignores it (Daemon.notification has no case for it), and run/events keeps each file's diff in its fileChange item.
+OPTED_OUT = ["turn/diff/updated"]
+
 # Threat: a live native peer stops reading, so flushing a close frame never ends.
 # Round 12's 100 real 0.163.0 peer close round trips took at most 0.000431 s
 # (local flush/close: 0.000218 s). One second gives over 2,300x headroom and
@@ -775,7 +782,8 @@ class Connection:
 
     async def initialize(self, experimental=True):
         result = await self.call("initialize", {"clientInfo": {"name": "software-workflows-coordinator", "version": "2.0.0"},
-                                                "capabilities": {"experimentalApi": experimental}})
+                                                "capabilities": {"experimentalApi": experimental,
+                                                                 "optOutNotificationMethods": list(OPTED_OUT)}})
         await self.send({"method": "initialized"})
         return result
 

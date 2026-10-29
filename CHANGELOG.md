@@ -3,6 +3,61 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.15] — 2026-10-29
+
+Two changes in the coordinator, both to load it made for itself. Writers' app-servers no longer send it
+`turn/diff/updated`, which repeated each turn's whole diff at every change: 87% of what the user's ledger grew by,
+about 2 GiB a day. And the Codex Office's poll no longer holds its event loop for seconds at a time. (`native.py`,
+`store.py`, `runs.py`, `participants.py`, `dormancy.py`, `daemon.py`; coordinator/VERIFY.md, 2.4.15.)
+
+### Fixed: the ledger grew about 2 GiB a day from a notification nothing read
+- The coordinator journals every notification a writer's app-server sends before applying it. `turn/diff/updated`
+  carries the turn's whole unified diff and comes again at every change. Nothing applies it, and the run log keeps
+  each file's diff in its `fileChange` item. In the 6.5 h to 10-29 07:32 it was 895 rows and 535 MiB, 87.3% of the
+  native bytes journaled; since 10-19, 2.53 of the 6.97 GiB.
+- The coordinator now opts out of it when it initializes a connection that can run a turn: writers, admission probes
+  and history readers (`optOutNotificationMethods`, codex 0.163.0). The app-server never sends it.
+- On a real codex 0.163.0 app-server, one turn that adds a file: with 2.4.14's initialize, 4 `turn/diff/updated`
+  arrived; with the opt-out none, and every other notification the same number of times, the `fileChange` item with
+  its diff included. On a real daemon the installed 2.4.14 journaled those 4 rows for the same turn; this tree none.
+
+### Fixed: the Codex Office's poll held the coordinator for seconds at a time
+- While its page is open the Office asks for `run/list` (up to 100 runs) and a brief `daemon/status` every 2 s, and
+  gives up after 2 s. On the user's coordinator `run/list` took 7 to 30 s and the brief status 0.2 to 7 s. Neither
+  freed the event loop until it was done. The loop stalled 0.75 s or more about every 3.5 s, 4,641 times in 6 h, and
+  every writer's and lead's hooks, native intake and replies waited behind it.
+- `run/list`:
+  - each unit's sum of claim and custody revisions comes from a covering index of those two kinds, not the records
+    (every command leaves a custody record, and `revision` follows `data` in a row);
+  - the unread-mail count comes from a partial index;
+  - UNKNOWNs are counted, not read;
+  - the listener of each listed run is read in SQL, without its writer profile (`run/events` and full
+    `daemon/status` keep it; the profiles were 130 of the 420 KiB of one answer);
+  - the runs are chosen newest first through their index, which the query names, reading no further than the last
+    one listed (unnamed, SQLite read and sorted every run first, in 2.4.14 too);
+  - the runs are summarised one at a time, with the event loop free between them.
+- Brief status: the dormancy counts are found through each actor's current listener in one query, and read again
+  only after a listener, actor, writer start or history gap was written. Through 2.4.14 every call decoded every
+  listener record: 3,417 of them, 40 MB.
+- Measured with the plugin's own code on a copy of the user's 15 GiB ledger:
+  - `run/list` went from 0.37 to 2.95 s, all of it without a yield, to 0.17 to 0.33 s, at most 11 to 88 ms without one;
+  - its answer went from 420 to 288 KiB;
+  - the dormancy part of the brief status went from 143 to 357 ms to 25 ms once, then nothing until a relevant write.
+- The two new indexes are built at the first start, 3.1 s on that copy. The revision index holds claim and custody
+  records only because every save changes a record's revision, so an index over all records is updated at every
+  save: on the copy, 2,000 custody saves wrote 1.3 more WAL pages each with it, and 80% of its 15.4 M saves were of
+  other kinds.
+
+### Known limits
+- What the ledger already holds stays: 16.3 GB, of which 2.53 GiB is old `turn/diff/updated`. Codex's architect
+  review of 10-29 set the order of the rest: 2.4.16 one retry policy for every caller (and the hook-inventory
+  failure), 2.4.17 bounded tool paging and stored tool responses, 2.4.18 shared dependency evidence, 2.4.19 native
+  compaction and archive retention, 2.4.20 reclaiming the file's space, 2.4.21 parking and resource budgets.
+- Streaming deltas stay journaled. History keeps their final text, but not command output beyond what history keeps.
+- The Office still polls every 2 s; each poll now costs a few hundred milliseconds of the coordinator, in small steps.
+- Writer records are rewritten whole at each save: on the copy, 10.3 M listener saves, some of records of 1 to 2 MB.
+  Measured here, queued for a later release.
+
 ## [software-workflows 2.4.14] — 2026-10-29
 
 The coordinator no longer reads every operation it has ever recorded to answer a question about a few of them. Through

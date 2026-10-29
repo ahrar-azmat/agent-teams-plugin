@@ -1,7 +1,7 @@
 {
   "name": "software-workflows",
   "description": "Agent-teams orchestration with Codex as the cross-model advisor and writer: the Codex Oracle MCP server (architect_review, code_review, research, codex_query, abraham and its run tools) and the hooks that gate plan mode and git push on a Codex review.",
-  "version": "2.4.14",
+  "version": "2.4.15",
   "author": {
     "name": "Ahrar Ahmad"
   },

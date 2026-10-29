@@ -66,40 +66,69 @@ class Runs:
                                     "json_extract(d.data,'$.result.turn.id')=? LIMIT 1", (run["unit"], turn)).fetchone()
         return {"message": row[0]} if row else {}
 
-    def summary(self, run):
+    def summary(self, run, listed=False):
         unit = self.store.get(run["unit"])
         surface = participants.surface(self.daemon, unit)
         state, turns = self.reported(run)
-        listener = self.store.get((self.store.get(run.get("root_actor") or "", required=False) or {}).get("listener") or "", required=False) or {}
-        from .dormancy import view
+        ident = (self.store.get(run.get("root_actor") or "", required=False) or {}).get("listener") or ""
+        if listed:
+            listener = self.listed_listener(ident)
+        else:
+            from .dormancy import view
+            listener = view(self.store.get(ident, required=False) or {})
+        own = next((p["unknown_count"] for p in surface["participants"] if p["checkout"] == run["checkout"]), None)
         return {"run": run["id"], "revision": run.get("_revision", 0) + surface["participant_revision"], "backend": "native", "unit": unit["id"], "unit_state": unit["state"],
-                "phase": run.get("phase"), "state": state, "listener": view(listener), "turns": turns, "created": run.get("created", 0),
+                "phase": run.get("phase"), "state": state, "listener": listener, "turns": turns, "created": run.get("created", 0),
                 "dispatch_cwd": run.get("dispatch_cwd"), "target_cwd": run.get("target_cwd"),
                 "claims": [c for p in surface["participants"] if p["checkout"] == run["checkout"] for c in p["claims"]],
                 "custody": [{k: v for k, v in c.items() if k != "process_baseline"}
                             for c in self.daemon.custody.unit_active(run["unit"]) if c["unit"] == unit["id"]],
                 "unread_messages": self.store.db.execute("SELECT count(*) FROM records WHERE kind='message' AND "
                     "json_extract(data,'$.unit')=? AND json_extract(data,'$.state')!='acknowledged'", (unit["id"],)).fetchone()[0],
-                "unknown_count": len(self.store.unresolved(run["checkout"])),
+                "unknown_count": own if own is not None else self.store.unresolved_count(run["checkout"]),
                 **surface,
                 "actors": [{k: a.get(k) for k in ("id", "kind", "thread", "active_turn", "state")} for a in self.store.all("actor", unit["id"])]}
 
-    def listing(self, cwd, limit=50):
+    def listed_listener(self, ident):
+        """A listed run's listener: dormancy.view without the writer profile, which run/events and full daemon/status
+        keep, read in SQL rather than decoded whole. A dormant listener's record is ~100 KB; the profiles were 130 of
+        the 420 KiB of one run/list answer (10-29, 91 runs)."""
+        row = self.store.db.execute("SELECT json_extract(data,'$.state'), json_extract(data,'$.dormant_at'), "
+                                    "json_extract(data,'$.dormant_reason'), json_extract(data,'$.history_gaps') "
+                                    "FROM records WHERE id=?", (ident,)).fetchone()
+        state, dormant_at, reason, gaps = row if row else (None, None, None, None)
+        return {"state": state, "dormant_at": dormant_at, "dormant_reason": reason,
+                "history_gaps": json.loads(gaps) if gaps is not None else None}
+
+    async def listing(self, cwd, limit=50):
+        """run/list, which the Codex Office asks for every 2 s and gives up on after 2 s (office.py NATIVE_TIMEOUT_S).
+        The runs are chosen from a few fields read in SQL, newest first through visible_run, reading no further than the
+        last one listed. The index is named: without statistics SQLite chose record_kind and sorted every run first.
+        Then they are summarised one at a time, each as of its own turn of the event loop: through 2.4.14 one listing
+        held the loop for all of its 7-30 s on the user's coordinator (10-29, 91 runs), while hooks, native intake and
+        every other reply waited."""
         from .observations import checkout_at
         checkout, changed = checkout_at(self.store, cwd)
         workspace = os.path.realpath(cwd)
-        runs = []
-        for run in self.store.selected("SELECT * FROM records WHERE kind='run' AND "
+        chosen = []
+        for ident, unit, dispatched, target in self.store.db.execute(
+                "SELECT id, json_extract(data,'$.unit'), json_extract(data,'$.dispatch_cwd'), json_extract(data,'$.target_cwd') "
+                "FROM records INDEXED BY visible_run WHERE kind='run' AND "
                 "(json_extract(data,'$.workflow') IS NOT NULL OR json_extract(data,'$.project_revision') IS NOT NULL) "
                 "ORDER BY json_extract(data,'$.created') DESC,id DESC"):
-            if (checkout and not changed and participants.contains(self.store, run["unit"], checkout["id"]) or
+            if (checkout and not changed and participants.contains(self.store, unit, checkout["id"]) or
                     any(path and os.path.commonpath((workspace, os.path.realpath(path))) == workspace
-                        for path in (run.get("dispatch_cwd"), run.get("target_cwd")))):
-                runs.append(run)
-                if len(runs) >= max(1, min(limit, 100)):
+                        for path in (dispatched, target))):
+                chosen.append(ident)
+                if len(chosen) >= max(1, min(limit, 100)):
                     break
-        return {"data": [self.summary(r) for r in reversed(runs)],
-                "generation": self.store.generation}
+        data = []
+        for ident in reversed(chosen):
+            await asyncio.sleep(0)
+            run = self.store.get(ident, required=False)
+            if run is not None:
+                data.append(self.summary(run, listed=True))
+        return {"data": data, "generation": self.store.generation}
 
     def events(self, run, cursor=0, limit=100):
         if type(cursor) is not int or cursor < 0 or type(limit) is not int or not 1 <= limit <= 400:

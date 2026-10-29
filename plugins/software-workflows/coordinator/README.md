@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.14 / P1
+# Writer coordinator — software-workflows 2.4.15 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -1221,9 +1221,13 @@ eligible for parking again after its next idle interval.
 
 `daemon/status.dormancy` reports current dormant/running families, history gaps,
 persisted demand attempts, durable failure counters and this generation's cold-start
-p50/max seconds. Run listings and logs include the listener state, dormant time,
-reason, gap IDs and applied profile. Every transition is an event. Status reads
-the small writer-start records; it does not count failures by scanning events.
+p50/max seconds. Run logs include the listener state, dormant time, reason, gap IDs
+and applied profile; run listings the same without the profile (2.4.15: the profiles
+were 130 of the 420 KiB of one `run/list` answer). Every transition is an event.
+Status reads the small writer-start records; it does not count failures by scanning
+events. It counts families through each actor's current listener, and again only
+after a listener, actor, writer start or history gap was written (2.4.15: through
+2.4.14 each brief status decoded every listener record).
 
 ### Verified live parking and native retention
 
