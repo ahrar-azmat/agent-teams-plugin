@@ -63,6 +63,10 @@ def call_source(operation):
 NATIVE_APPLIED_FLUSH_S = 0.1
 NATIVE_APPLIED_BATCH = 256
 FORGET_BATCH = 500  # listener ids per startup forget: one owner round trip and at most one FORGOTTEN record each
+# daemon/status's supervision_after: a family id, the longest a member's (listener id, ":member:", kernel id: ~70
+# characters), with headroom. A longer string would only make the owner channel's request frame refuse, which
+# Lease.call answers by repairing the custodian.
+SUPERVISION_CURSOR_CHARS = 256
 
 
 class NativeBacklog:
@@ -1104,11 +1108,17 @@ class Daemon:
         abandoned = []
         mine = (processes.identity(os.getpid()) or {}).get("kernel_id")
         if mine is not None:
+            families, after = [], None
             try:
-                families = (await self.leases.call("owner/status"))["families"]
+                while True:  # a page at a time: GONE families are bounded by the journal's retention alone (2.4.18)
+                    page = await self.leases.call("owner/gone", payload={"kind": "listener", "after": after})
+                    families += page["families"]
+                    if page["next"] is None:
+                        break
+                    after = page["next"]
             except (CoordinatorError, OSError) as exc:
                 self.store.event("owner/forget_failed", None, {"code": getattr(exc, "code", type(exc).__name__),
-                                                                "listeners": 0, "stage": "status"})
+                                                                "listeners": 0, "stage": "gone"})
                 families = []
             abandoned = [f["listener"] for f in families if f["kind"] == "listener" and f["state"] == "GONE"
                          and f.get("worker") != mine and self.store.get(f["listener"], required=False) is None]
@@ -2876,8 +2886,18 @@ class Daemon:
     async def dispatch_admitted(self, method, params):
         self.check_native_stop()
         if method == "daemon/status":
+            after = params.get("supervision_after")
+            if after is not None and (not isinstance(after, str) or len(after) > SUPERVISION_CURSOR_CHARS):
+                raise CoordinatorError("PAGE_CURSOR", "supervision_after is the `next` of the supervision page before",
+                                       {"limit_chars": SUPERVISION_CURSOR_CHARS})
             result = self.status(params.get("checkout"), bool(params.get("brief")))
-            result["supervision"] = await self.leases.call("owner/status")
+            try:
+                # A page of the families not GONE; `supervision_after` continues from its `next` (2.4.18).
+                result["supervision"] = await self.leases.call("owner/status", payload={"after": after})
+            except CoordinatorError as exc:
+                # The supervisor's report is not this daemon's state: a failure to get it is shown, never raised.
+                # Through 2.4.17 it failed the whole status, and so Client.ensure and every CLI call (10-29).
+                result["supervision"] = {"error": {"code": exc.code, "details": exc.details}}
             return result
         if method == "checkout/query":
             from .observations import query

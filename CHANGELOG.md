@@ -3,6 +3,75 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.18] — 2026-10-29
+
+One change: the supervisor lists the families its journal keeps a page at a time, instead of all at once in a status
+that could not be sent. `daemon/status` answers again, and with it `Client.ensure`, every CLI `rpc`, the MCP
+server's calls that start the coordinator, and `daemon stop`. (`owners.py`, `daemon.py`; coordinator/VERIFY.md,
+2.4.18.)
+
+### Fixed: every daemon/status failed once the owner journal kept ~6,400 finished families
+- `daemon/status` includes the supervisor's `owner/status`, which comes over the owner channel, whose frame is 1 MiB
+  (`leases.MAX_FRAME`). Through 2.4.17 that status listed every family the journal holds, `GONE` ones too.
+- A `GONE` family that is not a listener's stays for the journal's retention, three days by default (2.4.12), and the
+  user's sessions finish about 500 hook helpers an hour. On 10-29 at 15:30 the live journal held 6,652 `GONE`
+  families, the oldest 13.2 hours old.
+- At 15:07 the list held 6,463 families (6,446 `GONE`, 6,437 of them helpers) and encoded to 1,064,936 bytes. The
+  supervisor's `send` refused the frame (`ValueError`), so `owner/status` answered `OWNER_OPERATION`, and every
+  `daemon/status` failed with it:
+  - `Client.ensure` asks `daemon/status` first, so every CLI `rpc` and every MCP server call that starts the
+    coordinator failed;
+  - `Client.stop` asks it before stopping, so `daemon stop` failed and the switch to 2.4.17 could not begin (2.4.17 is
+    installed; the live daemon is still 2.4.16);
+  - the start's sweep of abandoned launches read the same list and recorded `owner/forget_failed` (stage `status`).
+  The lead hooks call their RPCs directly and kept working.
+- Now `owner/status` counts every family by kind and state (`counts`) and lists those not `GONE` a page at a time.
+  A page holds up to 512 KiB of entries (`PAGE_BYTES`, half the frame), in listener order, and `next` names where the
+  following page starts. `daemon/status` shows the first page; `supervision_after`, the `next` of the page before,
+  continues. A cursor that is not a string of at most 256 characters (`SUPERVISION_CURSOR_CHARS`) is refused
+  `PAGE_CURSOR`: a longer one would only pass the owner channel's request frame. Not `GONE` is no live process: a
+  family whose every member has exited stays `REAPING` while its `FAMILY_GONE` cannot be written (a journal past its
+  cleanup reserve), so that list too is bounded by the journal alone (Codex review turn 111).
+- The `GONE` families of one kind are read with `owner/gone`, a page at a time in the same way. The start's sweep
+  reads listeners that way.
+- `daemon/status` no longer fails when it cannot get the supervisor's report. `supervision` then holds `error`
+  (`code`, `details`), and the rest of the status answers.
+- A reply the supervisor sends once a family has ended (to an `end` that waited for it) and cannot send, as a family
+  past the frame, is answered `OWNER_OPERATION` as a failed request is. Through 2.4.17 that `ValueError` was raised
+  out of the supervisor's loop, and ended the supervisor (review turn 111).
+- Measured (VERIFY 2.4.18):
+  - on a journal seeded with 7,000 helpers shaped as the live ones and 4,000 abandoned listener launches, 2.4.17
+    failed every status and the stop `OWNER_OPERATION`, and its supervisor had to be signalled. This release answered
+    with a supervision report of 999 bytes, forgot the 4,000 launches across pages and stopped gracefully; the whole
+    run took 20.2 s, 17.7 s of it seeding the journal;
+  - on a real `Owner` holding 7,000 each of `GONE` listeners, `GONE` helpers and `REAPING` helpers whose members had
+    all exited, 2.4.17's one status reply was 3,482,471 bytes. This release's took 3 pages, the largest frame
+    524,921 bytes, each family listed once.
+
+### Known limits
+- The owner journal's own cost grows with what it holds. Measured on the live journal, read-only, at 15:45 (by the
+  2.4.16 code; this release's journal code is the same), at 55,932 records and 60.5 MB:
+  - an append rebuilds the journal's state from every record: 17 to 20 ms;
+  - every record stays in memory until a compaction, which runs only past half the journal (64 MiB of the live
+    128 MiB). Reading them took a process from 24 to 309 MB resident, and the live supervisor held 173 MB;
+  - `Client.ensure`, `Client.start`, `Client.resume`, `leases.control` and `Custodian.repair` each read the whole
+    journal for its control records: 0.77 s and those 309 MB each time;
+  - a helper's `GONE` family stays three days, though only the handle that launched it asks about it, within seconds.
+  Queued for 2.4.19.
+- `spawn`, `adopt`, `adopt-legacy`, `snapshot`, `end` and `end-member` still answer with the whole family, every
+  member it ever recorded (`processes.lineage` keeps each identity it saw). A family past the frame is answered
+  `OWNER_OPERATION` now, no longer ending the supervisor, but its stop then cannot complete. The largest such reply
+  the user's journal could give is 9,014 bytes, 1/116 of the frame: a listener's `FAMILY_GONE` with 30 members
+  (sequence 16776; review turn 112). Bounded receipts, with the member list read in pages where it is needed
+  (parking), are queued with 2.4.19 (review turn 111).
+- The series moves by one:
+  - 2.4.19: the owner journal's cost;
+  - 2.4.20: the custody in 2.4.17's known limits (services matched by birth; a call whose app-server exited ended by
+    that exit);
+  - 2.4.21: `RESTORE_CUSTODY` waiting for custody, cancel passes and `NATIVE_RPC`;
+  - then shared dependency evidence, native compaction and archive retention, reclaiming the file's space, and
+    parking and resource budgets.
+
 ## [software-workflows 2.4.17] — 2026-10-29
 
 Two changes. Every coordinator tool result now fits what a writer's model is shown whole, and a completed call's

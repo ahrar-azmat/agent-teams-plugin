@@ -13,11 +13,15 @@ import time
 
 from . import processes
 from .client import CoordinatorError, launch_environment, validate_state, venv_fds
-from .leases import Custodian, RecoveryEndpoint, receive, send
+from .leases import MAX_FRAME, Custodian, RecoveryEndpoint, receive, send
 from .owner_journal import Journal
 
 TERM_SECONDS = 5.0  # Codex's 2 s MCP escalation plus measured idle shutdown and headroom.
 KILL_SECONDS = 2.0
+# owner/status and owner/gone: one page's families, encoded as send encodes them. Half the owner channel's frame: the
+# rest of a reply is under 2 KB (an identity, the journal's status, a count per kind and state), and a page still holds
+# ~3,140 of the 167-byte listener entries (measured, 2.4.18).
+PAGE_BYTES = MAX_FRAME // 2
 
 
 class Owner:
@@ -230,16 +234,56 @@ class Owner:
             del self.families[ident]
             self.children.pop(ident, None)
 
-    def status(self):
+    @staticmethod
+    def entry(family):
+        return {"listener": family["listener"], "state": family["state"], "kind": family["kind"],
+                "pid": family["root"]["pid"], "members": len(family["members"]),
+                "owner_sequence": family.get("owner_sequence"), "worker": (family.get("worker") or {}).get("kernel_id")}
+
+    def page(self, chosen, after=None):
+        """The families `chosen` accepts in listener order after `after`, as many as PAGE_BYTES holds as send encodes
+        them, and the last one listed when more follow (else None)."""
+        page, size = [], 0
+        for ident in sorted(i for i, f in self.families.items() if chosen(f) and (after is None or i > after)):
+            entry = self.entry(self.families[ident])
+            size += len(json.dumps(entry)) + 2
+            if page and size > PAGE_BYTES:
+                return page, page[-1]["listener"]
+            page.append(entry)
+        return page, None
+
+    def status(self, after=None):
+        """Every family counted by kind and state (`counts`), and those not GONE listed a page at a time after `after`
+        (`next` continues). Not GONE is no live process: a family whose every member has exited stays REAPING while
+        its FAMILY_GONE cannot be written (service), so that list is bounded by the journal alone too (review turn
+        111). The GONE ones, kept for the journal's retention (2.4.12), are read with owner/gone. Through 2.4.17 every
+        family was listed at once: on the user's journal on 10-29, 6,446 GONE of 6,463 families, 6,437 of them hook
+        helpers, encoded to 1,064,936 bytes, past the owner channel's frame (leases.MAX_FRAME, 1 MiB). Every
+        daemon/status then failed OWNER_OPERATION (send's ValueError), and every Client.ensure with it."""
+        counts = {}
+        for family in self.families.values():
+            key = family["kind"] + ":" + family["state"]
+            counts[key] = counts.get(key, 0) + 1
+        families, following = self.page(lambda f: f["state"] != "GONE", after)
         return {"custodian": self.identity, "journal": self.journal.status(),
                 "inhibited": self.journal.state["inhibited"],
                 "cleanup": "launchd restart" if os.environ.get("SOFTWARE_WORKFLOWS_LAUNCH_AGENT") else
                            "crash cleanup on next start only",
                 "gone_retained": sum(f["state"] == "GONE" for f in self.families.values()), "forgotten": self.forgotten,
-                "families": [{"listener": f["listener"], "state": f["state"], "kind": f["kind"],
-                              "pid": f["root"]["pid"], "members": len(f["members"]),
-                              "owner_sequence": f.get("owner_sequence"),
-                              "worker": (f.get("worker") or {}).get("kernel_id")} for f in self.families.values()]}
+                "counts": counts, "families": families, "next": following}
+
+    def gone(self, kind, after=None):
+        """The GONE families of `kind` a page at a time after `after`, `next` continuing (the abandoned-launch sweep
+        asks for listeners)."""
+        families, following = self.page(lambda f: f["state"] == "GONE" and f["kind"] == kind, after)
+        return {"families": families, "next": following}
+
+
+def failure(exc):
+    """The answer to an owner operation that failed: its CoordinatorError, any other exception as OWNER_OPERATION."""
+    error = exc if isinstance(exc, CoordinatorError) else CoordinatorError("OWNER_OPERATION", "Owner operation could not complete",
+        {"cause": type(exc).__name__, "errno": getattr(exc, "errno", None), "retryable": True}, True)
+    return {"ok": False, "error": error.envelope()}
 
 
 def activated_socket():
@@ -371,6 +415,13 @@ def _supervise(root, control):
                                 send(connection, {"ok": True, "family": owner.families[ident]})
                             except OSError:
                                 pass
+                            except Exception as exc:
+                                # As a request's failure is answered (failure): send's ValueError for a family past the
+                                # frame, raised here, ended the supervisor (review turn 111).
+                                try:
+                                    send(connection, failure(exc))
+                                except OSError:
+                                    pass
                         del owner.waiters[ident]
                 if worker and processes.exit_evidence(worker):
                     if child:
@@ -478,7 +529,9 @@ def _supervise(root, control):
                                 detached()
                             channel = connection
                         elif action == "owner/status":
-                            send(connection, {"ok": True, **owner.status()})
+                            send(connection, {"ok": True, **owner.status(request.get("after"))})
+                        elif action == "owner/gone":
+                            send(connection, {"ok": True, **owner.gone(request["kind"], request.get("after"))})
                         elif action == "owner/diagnostic":
                             # A watchdog uses a separate connection while the
                             # worker's event loop is stalled. It may only ask for
@@ -584,10 +637,8 @@ def _supervise(root, control):
                             selector.unregister(connection)
                             connection.close()
                     except Exception as exc:
-                        error = exc if isinstance(exc, CoordinatorError) else CoordinatorError("OWNER_OPERATION", "Owner operation could not complete",
-                            {"cause": type(exc).__name__, "errno": getattr(exc, "errno", None), "retryable": True}, True)
                         try:
-                            send(connection, {"ok": False, "error": error.envelope()})
+                            send(connection, failure(exc))
                         except OSError:
                             pass
                     finally:

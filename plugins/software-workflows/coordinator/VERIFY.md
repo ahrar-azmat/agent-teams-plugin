@@ -15263,3 +15263,118 @@ its findings were fixed.
   exit); 2.4.19 `RESTORE_CUSTODY` due only when custody settles, cancel passes that reconcile only on a change, and the
   `NATIVE_RPC` incidents' cause; then shared dependency evidence, native compaction and archive retention, reclaiming
   the file's space, parking and resource budgets.
+
+## 2.4.18
+
+One change: the supervisor lists the families its journal keeps a page at a time, `GONE` or not, and `daemon/status`
+shows a supervisor report it cannot get instead of failing. Measured on 10-29 between 15:20 and 15:57 on the user's
+Mac (macOS 26.6.2, Python 3.15.2). (A) is a real daemon (supervisor and worker, no writer) on disposable states,
+reached through the CLI as a lead or the MCP server reaches it; (B) calls a real `Owner` over a real journal. Both
+compare with the installed 2.4.17. Codex's review turn 111 refuted the first version's claim that the families not
+`GONE` are bounded by the process limit; (A)'s cursor rows and (B) are the evidence for what it asked.
+
+### What it changes
+- **`Owner.entry(family)`**: one family as a page lists it (listener, state, kind, root pid, member count, owner
+  sequence, worker kernel id).
+- **`Owner.page(chosen, after)`**: the families `chosen` accepts in listener order after `after`, as many as
+  `PAGE_BYTES` (`MAX_FRAME // 2`, 524,288) holds as `send` encodes them, and the last one listed when more follow,
+  else None.
+- **`Owner.status(after)`**, `owner/status` with `after`: `counts`, every family by `kind:state`, and `families`, a
+  page of those not `GONE`, with `next`; the rest as before (`custodian`, `journal`, `inhibited`, `cleanup`,
+  `gone_retained`, `forgotten`).
+- **`Owner.gone(kind, after)`**, the supervisor's `owner/gone`: a page of the `GONE` families of `kind`, with `next`.
+  Any connection may ask, as for `owner/status`.
+- **`Daemon.forget_consumed_families`** reads the `GONE` listener families through `owner/gone`, page after page. A
+  failure records `owner/forget_failed` with stage `gone`, and no abandoned launch is forgotten, as before.
+- **`daemon/status`**: `supervision_after` is passed to `owner/status` as `after`; one that is not a string of at most
+  `SUPERVISION_CURSOR_CHARS` (256) characters is refused `PAGE_CURSOR` before anything is asked. A `CoordinatorError`
+  from `owner/status` (the lease channel raises every failure as one, `CUSTODIAN_LOST` or `LEASE_UNCERTAIN` for a
+  lost channel) is shown as `supervision: {"error": {"code", "details"}}`.
+- **`owners.failure(exc)`**: the answer to a failed owner operation, its `CoordinatorError` or `OWNER_OPERATION` with
+  `cause` and `errno`. The request handler answers with it, as before, and now so does the reply sent to an `end`
+  that waited for its family to end, when `send` refuses it (`ValueError`, a family past the frame). Through 2.4.17
+  that error was raised out of `_supervise`'s loop.
+
+### (A) A journal past the frame, through the CLI
+`r2418/owner_status_probe.py <plugin> <work> <label> <helpers> <listeners>` seeds a disposable state's owner journal
+(32 MiB) before its first start:
+- `<helpers>` `GONE` helper families shaped as the live ones: the same keys, ids as long as the live
+  `helper-<32 hex>`, and no `gone_at`, as 723 of the live ones;
+- `<listeners>` `GONE` listener families that no ledger record names, granted to an earlier worker (abandoned
+  launches).
+
+Then `rpc daemon/status` brief (`Client.ensure` first) until ready, and full; on the tree, brief again with
+`supervision_after` set to `""`, `"~"` (past any family id), 300 characters, and the number 7; the sweep's events;
+`daemon stop`; a supervisor still running 90 s later is sent SIGTERM. The last column is the whole run, seeding
+included (17.7 s of t-final2's).
+
+| run | code | helpers | listeners | status | supervision | sweep | stop | run s |
+|---|---|---|---|---|---|---|---|---|
+| t-final2 | tree, 2.4.18 | 7,000 | 4,000 | ok, brief and full | 999 bytes; 2 listed, `next` null; `helper:GONE` 7,000 | `owner/forgotten`: abandoned 4,000, forgotten 4,000 | graceful | 20.2 |
+| o-owner | 2.4.17 | 7,000 | 4,000 | `OWNER_OPERATION` (`ValueError`), brief and full | — | `owner/forget_failed`, stage `status`; abandoned 0 | `OWNER_OPERATION`; SIGTERM | 151.3 |
+| o-helpers | 2.4.17 | 7,000 | 2 | `OWNER_OPERATION` (`ValueError`), brief and full | — | `owner/forget_failed`, stage `status`; abandoned 0 | `OWNER_OPERATION`; SIGTERM | 151.4 |
+
+- t-final2's cursors: `""` listed the 2 families, `next` null; `"~"` listed none; 300 characters and 7 were refused
+  `PAGE_CURSOR`. (t-final, at 15:35 before the review, had the same results without the cursors, in 19.5 s.)
+- The calibration first came back green. With 7,000 helpers whose ids were 19 characters, 2.4.17's list encoded to
+  1,000,936 bytes, under the frame. With ids as long as the live ones it failed, as the user's journal did.
+- t-final2's sweep forgot 4,000 abandoned listeners, more than one page holds (B), across pages. Its journal then held
+  7,003 families: the helpers, kept for their retention, and the daemon's own.
+- This probe's daemon keeps no families not `GONE` to page through: its journal is healthy, so at its start every
+  family of an earlier worker is ended, and those of its invented, exited identities are `GONE` at once. A journal
+  whose completion records fail keeps them `REAPING`, and when a worker survives its supervisor's restart, the
+  families granted to it stay `ORPHANED` until it adopts them. (B) pages them on a real `Owner`.
+
+### (B) The pages
+`r2418/pages.py <plugin> <dir> <n>`: a disposable journal holding `<n>` each of `GONE` listener families, `GONE`
+helpers and `REAPING` helpers (every member exited, none recorded `GONE`), read by a real `Owner`. `Owner.status` and
+`Owner.gone("listener")` are paged through to the end, each reply encoded as `send` encodes it. On 2.4.17, which
+has no pages, its one status reply is measured.
+
+| code | n | status: pages (families each), largest frame | gone: pages (families each), largest frame | listed once, in order |
+|---|---|---|---|---|
+| tree | 1 | 1 (1), 813 | 1 (1), 204 | yes, yes |
+| tree | 7,000 | 3 (3,139, 3,139, 722), 524,921 | 3 (3,146, 3,139, 715), 524,354 | yes, yes; status only `REAPING`, gone only listeners |
+| 2.4.17 | 1 | one reply: 3 families, 1,052 | — | — |
+| 2.4.17 | 7,000 | one reply: 21,000 families, 3,482,471: past the frame | — | — |
+
+- Every tree frame stays half the frame below `MAX_FRAME`: a page passes `PAGE_BYTES` by its envelope alone, under
+  1 KB (the status reply's identity, journal status and counts; a gone page's `next`).
+- The same run sends a `REAPING` family given 5,000 members (1,175,868 bytes) on a socket pair: `send` raises
+  `ValueError` before writing, and `failure` answers in 188 bytes, `OWNER_OPERATION` with cause `ValueError`, which
+  `receive` reads on the other end. That is the answer the deferred `end` reply now sends; through 2.4.17 the same
+  `ValueError` left `_supervise`.
+- Earlier, `r2418/gone_pages.py` (`Owner.gone` alone) gave 4 pages for 11,000 listeners (3,146, 3,139, 3,139, 1,576;
+  largest frame 524,354) at 15:28 and 15:35. pages.py ran at 15:56.
+
+### Static checks
+`r2418/static_checks2418.py`, as 2.4.17's against the installed 2.4.17: 12 of 12 pass (83 files compile under 3.15
+and the 14 hook-run ones under 3.9.6; `hooks.py --check`; the git shim under sh, bash and zsh; ruff 35 findings, as
+2.4.17; `claude plugin validate --strict` for the plugin and the marketplace; `git diff --check`; the version), at
+15:34 and again at 15:58 after the review's fixes.
+
+### Known limits
+- **The owner journal's own cost grows with what it holds.** Measured on the live journal, read-only, at 15:45, by
+  the 2.4.16 code (this release's `owner_journal.py` is the same), at 55,932 records and 60.5 MB, twice:
+  - `Journal.append` rebuilds `state` from every record: 17.0 to 20.1 ms over five rebuilds each;
+  - `Journal.records` keeps every record until a compaction, which runs only past half the journal (64 MiB of the
+    live 128 MiB). `read` took 0.51 s and a process from 24 to 309 MB resident (`ru_maxrss`); the live supervisor
+    held 173 MB;
+  - `Client.ensure`, `Client.start` and `Client.resume`, `leases.control` and `Custodian.repair` each read the whole
+    journal (`inspect`) for its control records: 0.77 s. A scan that checks every record's CRC but decodes only the
+    11 control records gave the same answer in 0.15 s;
+  - a helper's `GONE` family stays for the three-day retention, though only the handle that launched it asks about it,
+    within seconds: at 15:30, 5,922 of the 6,652 `GONE` families were helpers with a `gone_at`, the oldest 13.2 hours
+    old.
+  An earlier measurement under tracemalloc (39 ms, 2.65 s) was slowed by the tracing itself. Queued for 2.4.19.
+- **Whole-family replies.** `spawn`, `adopt`, `adopt-legacy`, `snapshot`, `end` and `end-member` still answer with
+  the whole family, every member it recorded (`processes.lineage` keeps every identity it saw). A family past the
+  frame is answered `OWNER_OPERATION` (now also when an `end` waited for it), and its stop cannot complete. Measured
+  on the live journal, read-only, at 16:10 over its 56,828 records: the largest such reply would be 9,014 bytes (the
+  family 8,990), 1/116 of the frame, a listener's `FAMILY_GONE` with 30 members at sequence 16776, found by Codex's
+  review turn 112. A first count at 15:50 took the first 30-member record instead (8,510 bytes, before its exit
+  evidence). Bounded receipts, with the member list read in pages where it is needed (parking reads a snapshot's
+  `members`), are queued with 2.4.19 (review turn 111). Not measured on a real family past the frame.
+- **The series moves by one:** 2.4.19 the owner journal's cost; 2.4.20 the custody of 2.4.17's known limits; 2.4.21
+  `RESTORE_CUSTODY`, cancel passes and `NATIVE_RPC`; then shared dependency evidence, native compaction and archive
+  retention, reclaiming the file's space, parking and resource budgets.

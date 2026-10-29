@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.17 / P1
+# Writer coordinator — software-workflows 2.4.18 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -130,7 +130,17 @@ handle that launched it, within seconds of its exit: compaction keeps it for
 `SOFTWARE_WORKFLOWS_OWNER_JOURNAL_RETENTION_S` seconds after its `FAMILY_GONE`
 (default three days; read at every start). Through 2.4.11 compaction kept every
 family ever recorded, and an 8 MiB journal filled in 9 days. Status alarms at
-60% and reports `retention_s`, `gone_retained` and `forgotten`. An exhausted or
+60% and reports `retention_s`, `gone_retained` and `forgotten`. It counts every
+family by kind and state (`counts`) and lists those not `GONE` a page at a time,
+half the owner channel's 1 MiB frame each, `next` naming where the following
+page starts (`daemon/status` takes it as `supervision_after`). Not `GONE` is no
+live process: a family whose members have all exited stays `REAPING` while its
+`FAMILY_GONE` cannot be written. `owner/gone` pages through the `GONE` ones of
+one kind the same way, and the start's sweep reads listeners that way. Through
+2.4.17 the status listed every family at once: 6,463 on the user's journal on
+10-29 passed the frame, and every `daemon/status` failed `OWNER_OPERATION`.
+`daemon/status` now shows a supervisor report it cannot get as
+`supervision.error` and answers the rest. An exhausted or
 damaged journal refuses new ownership with retryable `RESOURCE_EXHAUSTED`; it
 never opens an unregistered payload's gate. A listener whose family the
 supervisor does not hold at all (its journal was replaced, as when one is moved
