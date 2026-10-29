@@ -62,27 +62,40 @@ class Memory:
         except ValueError:
             self.error = "Invalid memory thresholds: require 0 < hysteresis < warning < critical < 1"
 
-    def check(self):
-        if self.error:
-            raise CoordinatorError("RESOURCE_PAUSED", self.error, {"retryable": True}, True)
-        try:
-            sample = reading()
-        except (OSError, ZeroDivisionError) as exc:
-            raise CoordinatorError("RESOURCE_PAUSED", "Memory pressure could not be read; launch deferred",
-                                   {"retryable": True, "cause": type(exc).__name__}, True) from exc
+    def classify(self, sample):
+        """The launch level a sample sets, with hysteresis from the current one, and the input that decided it."""
         previous = self.level
-        level = "normal"
-        deciding = "below thresholds"
         if sample["supported"]:
             ratio, pressure = sample["compressor_ratio"], sample["pressure"]
             critical = self.critical - (self.hysteresis if previous == "critical" else 0)
             warning = self.warn - (self.hysteresis if previous != "normal" else 0)
             if pressure >= 4 or ratio >= critical:
-                level = "critical"
-                deciding = "kernel critical" if pressure >= 4 else "compressor critical"
-            elif ratio >= warning:
-                level = "warning"
-                deciding = "compressor warning"
+                return "critical", "kernel critical" if pressure >= 4 else "compressor critical"
+            if ratio >= warning:
+                return "warning", "compressor warning"
+        return "normal", "below thresholds"
+
+    def admits(self):
+        """Whether check would admit a launch now, read without recording, requesting or raising anything: a start this
+        gate refused is due again once it would (recovery.gate_reopened)."""
+        if self.error:
+            return False
+        try:
+            return self.classify(reading())[0] == "normal"
+        except (OSError, ZeroDivisionError):
+            return False
+
+    def check(self):
+        # Its refusals name the gate (resource): the retry policy asks admits before their backoff has passed.
+        if self.error:
+            raise CoordinatorError("RESOURCE_PAUSED", self.error, {"retryable": True, "resource": "memory"}, True)
+        try:
+            sample = reading()
+        except (OSError, ZeroDivisionError) as exc:
+            raise CoordinatorError("RESOURCE_PAUSED", "Memory pressure could not be read; launch deferred",
+                                   {"retryable": True, "cause": type(exc).__name__, "resource": "memory"}, True) from exc
+        previous = self.level
+        level, deciding = self.classify(sample)
         self.level, self.sample = level, dict(sample, observed=time.time(), deciding_input=deciding)
         if self.daemon and previous != level:
             self.daemon.store.event("resource/memory", None, self.status())
@@ -96,7 +109,7 @@ class Memory:
         if level != "normal":
             code = "RESOURCE_EXHAUSTED" if level == "critical" else "RESOURCE_PAUSED"
             raise CoordinatorError(code, "Native launch deferred by kernel memory pressure",
-                                   dict(self.status(), retryable=True), True)
+                                   dict(self.status(), retryable=True, resource="memory"), True)
         return self.sample
 
     def status(self):

@@ -27,6 +27,28 @@ class Dormancy:
     def pending(self, runid):
         return (self.demand(runid) or {}).get("state") in ("pending", "starting", "failed")
 
+    def start_due(self, runid):
+        """Whether a caller on its own schedule (a waking message, a workflow's advance, startup recovery) may start the
+        run's writer now: no failed demand start, or one due by the policy of recovery.retry_due: its backoff has passed,
+        and its cause can heal or this release has not tried it. A resume starts it regardless. Through 2.4.15 a failed
+        start was tried again at each message delivery pass, each with a new app-server: on the user's ledger four runs'
+        starts were tried 1,072 to 2,788 times, failing OWNER_UNREGISTERED or HOOK_DEFINITIONS every time."""
+        from .recovery import gate_reopened
+        record = self.demand(runid)
+        if not record or record.get("state") != "failed":
+            return True
+        if record.get("retry_at", 0) > time.time() and not gate_reopened(self.daemon, record):
+            return False
+        return not self.start_held(runid)
+
+    def start_held(self, runid):
+        """A failed demand start whose cause cannot heal, which this release has tried (start_due): no schedule starts it
+        again, only a resume or the next release."""
+        from .runtime import plugin_version
+        record = self.demand(runid)
+        return (bool(record) and record.get("state") == "failed" and not record.get("retryable", True)
+                and record.get("version") == plugin_version())
+
     def require_quiet(self, listener):
         """A dormant state is not itself proof that its family is quiescent."""
         proof = listener.get("dormant_proof") or {}
@@ -195,7 +217,7 @@ class Dormancy:
                             dormant_proof={"exit": {"pid": listener.get("pid"), "birth": listener.get("birth"),
                                                    "observed": time.time()}, "read_only": True,
                                            "descendants_enumerated": True, "actors": [a["id"] for a in actors]})
-            for key in ("recovery_error", "recovery_error_details", "recovery_retryable", "recovery_retries", "retry_at"):
+            for key in ("recovery_error", "recovery_error_details", "recovery_retryable", "recovery_version", "recovery_retries", "retry_at"):
                 listener.pop(key, None)
             store.save(listener)
             store.event("listener/dormant", listener["id"], {"run": listener["run"], "when": listener["dormant_at"],
@@ -240,6 +262,11 @@ class Dormancy:
             raise CoordinatorError("RUN_CANCELLED", "A cancelled demand does not start a writer")
         if store.get(run["unit"])["state"] != "open":
             raise CoordinatorError("UNIT_FROZEN", "Reopen a sealed unit before resuming; published units cannot resume")
+        if reason != "resume" and self.tasks.get(runid) is None and not self.start_due(runid):
+            # Refused before any write: callers on a schedule ask again each pass (start_due).
+            raise CoordinatorError("WRITER_START_FAILED", "The writer's last start failed; it is tried again when its retry is due",
+                                   {"retryable": bool(record.get("retryable", True)), "run": runid, "cause": record.get("error"),
+                                    "retry_at": record.get("retry_at")}, True)
         record = record or {"id": "writer_start:" + runid, "state": "pending", "reasons": [], "attempts": 0}
         if reason not in record["reasons"]:
             record["reasons"].append(reason)
@@ -284,12 +311,28 @@ class Dormancy:
                 raise CoordinatorError("RUN_CANCELLED", "The run was cancelled during its demand start")
             ensure_running(daemon)
         except Exception as exc:
+            from .recovery import failure_info, memory_gated, retryable_failure, retry_delay
+            from .runtime import plugin_version
             record = self.demand(runid)
-            record.update(state="cancelled" if getattr(exc, "code", None) in ("RUN_CANCELLED", "UNIT_FROZEN") else "failed",
-                          error=getattr(exc, "code", type(exc).__name__), failed=time.time(),
-                          failures=record.get("failures", 0) + 1)
+            code = getattr(exc, "code", type(exc).__name__)
+            if code == "DAEMON_DRAINING":
+                # A stop's own refusal fails nothing, as for a reconcile (recovery.reconcile_failed): the start stays
+                # pending for the next daemon's recovery. Classified, it would hold the start until a resume.
+                record.update(state="pending")
+            else:
+                record.update(state="cancelled" if code in ("RUN_CANCELLED", "UNIT_FROZEN") else "failed", error=code,
+                              failed=time.time(), failures=record.get("failures", 0) + 1)
+            if record["state"] == "failed":
+                # The one retry policy (start_due), backing off over consecutive failures, a resource refusal too: one
+                # the memory gate made is due again once the gate would admit it (recovery.gate_reopened).
+                streak, info = record.get("failure_streak", 0) + 1, failure_info(exc)
+                record.update(failure_streak=streak, retryable=retryable_failure(info), version=plugin_version(),
+                              resource="memory" if memory_gated(info) else info.get("resource"),
+                              retry_at=time.time() + retry_delay(streak))
             store.save(record)
-            store.event("writer/start_failed", runid, {"code": record["error"], "demand": record["id"], "retryable": record["state"] == "failed"})
+            store.event("writer/start_failed", runid, {"code": code, "demand": record["id"], "retryable":
+                                                       record["state"] == "pending" or record["state"] == "failed" and record["retryable"],
+                                                       "retry_at": record.get("retry_at")})
             # Only this attempt's unsubmitted replacement can be retired here.
             current = store.get(store.get(run["root_actor"])["listener"])
             owned = (current["id"] != original["id"] and current.get("replaces") == original["id"]
@@ -312,15 +355,13 @@ class Dormancy:
                                recovery_state="reconciled")
                     old.pop("replaced_by", None)
                     store.save(old)
-            if record["state"] == "cancelled":
-                raise
-            if record["error"] in ("RESOURCE_PAUSED", "RESOURCE_EXHAUSTED"):
+            if record["state"] != "failed" or code in ("RESOURCE_PAUSED", "RESOURCE_EXHAUSTED"):
                 raise
             raise CoordinatorError("WRITER_START_FAILED", "Writer start failed; the dormant demand is retained for retry",
-                                   {"retryable": True, "run": runid, "cause": record["error"]}, True) from exc
+                                   {"retryable": record["retryable"], "run": runid, "cause": record["error"]}, True) from exc
         record = self.demand(runid)
         seconds = time.monotonic() - began
-        record.update(state="complete", completed=time.time(), seconds=seconds,
+        record.update(state="complete", completed=time.time(), seconds=seconds, failure_streak=0,
                       listener=store.get(run["root_actor"])["listener"])
         with store.transaction():
             store.save(record)

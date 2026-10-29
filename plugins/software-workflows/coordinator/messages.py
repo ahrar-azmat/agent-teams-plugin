@@ -170,6 +170,8 @@ class Messages:
                 return
             listener = self.store.get(actor["listener"])
             if (listener["state"] in ("dormant", "parking") or listener.get("park_resume_required")) and self.daemon.delivery_owed(message):
+                if not self.daemon.dormancy.start_due(actor["run"]):
+                    return  # its writer's last start failed: this pass starts none (dormancy.start_due)
                 await self.daemon.dormancy.start(actor["run"], "waking message")
                 message = self.store.get(ident)
                 if self.cancel_pending(message):

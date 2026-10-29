@@ -91,6 +91,8 @@ class Writer:
             await self.daemon.ensure_lease(key)
         listener = self.store.get(actor["listener"])
         if listener["state"] in ("dormant", "parking") or listener.get("park_resume_required"):
+            if not self.daemon.dormancy.start_due(runid):
+                return  # its last start failed: the input stays prepared until its retry is due (dormancy.start_due)
             await self.daemon.dormancy.start(runid, "workflow advance")
             listener = self.store.get(self.store.get(actor["id"])["listener"])
         if self.daemon.hook_stale(listener) and not self.unbound(listener):
@@ -99,7 +101,7 @@ class Writer:
             if not self.daemon.unit_quiet(run["unit"]):
                 return
             from .recovery import reconcile_listener
-            await reconcile_listener(self.daemon, listener, advance=False)
+            await reconcile_listener(self.daemon, listener, advance=False, scheduled=True)
         from .writer_profile import deliver_context
         await deliver_context(self.daemon, self.store.get(run["root_actor"]), preparing_input=True)
         await self.daemon.messages.deliver_held(runid)

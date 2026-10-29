@@ -3,6 +3,106 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.16] — 2026-10-29
+
+Two changes. A writer readmitted again after a release change no longer runs the hooks of the release that first
+admitted it, and is no longer refused `HOOK_DEFINITIONS` for it. And every caller that retries a writer on its own
+schedule follows one retry policy, so a failure that cannot heal no longer starts app-servers again and again, fills
+the ledger with refusals, or holds a stop. (`daemon.py`, `recovery.py`, `dormancy.py`, `memory.py`, `runs.py`,
+`messages.py`, `writer.py`; coordinator/VERIFY.md, 2.4.16.)
+
+### Fixed: a writer's second readmission ran the first release's hooks, and was refused
+- On the user's coordinator, two writers first admitted by 2.4.11 were refused `HOOK_DEFINITIONS` at every readmission
+  from 10-29 02:22. Their runs stayed cancelling, with 121 failed readmissions in 6.3 h, each with a new app-server.
+- The cause:
+  - a first admission sets the coordinator's hooks as dotted `hooks.PreToolUse` and `hooks.PostToolUse` keys;
+  - a readmission added a `hooks` table naming its own release, and kept the dotted keys;
+  - the store sorts keys, so at the next readmission the dotted keys came after the table in its `-c` overrides;
+  - the app-server applies overrides in order, so the dotted keys won and named the first release's `hooks.py`;
+  - admission found none of its own hooks, and refused.
+- Measured on a real codex 0.163.0 app-server: with the table first and then the dotted keys, hooks/list listed the
+  dotted keys' hooks. With the table alone, the dotted keys alone, or the dotted keys first, it listed the table's.
+- A readmission now sets the hooks once, in the table, and drops the dotted keys. The refusal records how many session
+  hooks were listed and how many run this release's `hooks.py`.
+- On a real daemon, a writer admitted by the installed 2.4.14 was readmitted by the installed 2.4.15:
+  - its first readmission passed and its second was refused `HOOK_DEFINITIONS`;
+  - this tree then readmitted that same writer, healing the state 2.4.15 left;
+  - readmitted twice by this tree from 2.4.14 instead, it passed both times.
+
+### Fixed: writers that could not start were started again without end
+- Each failure is classified retryable or not (`retryable_failure`), but the callers did not apply it:
+  - a cancel's settlement checked only the backoff;
+  - a demand start (a waking message, a workflow's advance) was made again at every pass.
+- On the user's ledger:
+  - four runs' demand starts were made 1,072, 2,012, 2,774 and 2,788 times, each failing `OWNER_UNREGISTERED` or
+    `HOOK_DEFINITIONS`, each with a new app-server;
+  - the two cancelling runs' turns were refused 3,734 interrupts in 5.6 h.
+- One policy now, for every caller on its own schedule: startup recovery, maintenance, a cancel's settlement, a
+  transport gap, a workflow's submission, and demand starts:
+  - a failure that can heal is retried after the backoff, counted over consecutive failures;
+  - one that cannot heal is tried once by each new release, since its cause may have been the coordinator's own
+    (`HOOK_DEFINITIONS` was);
+  - after that, only a resume tries it;
+  - a resource refusal backs off too, and one the memory gate made, directly or in every failed case of a
+    calibration, is also due as soon as the gate would admit a launch (`Memory.admits`, read without side effects);
+  - a stop's own refusal (`DAEMON_DRAINING`) fails no demand start: it stays pending for the next daemon.
+- The policy is decided under the run's reconcile lock, on the incarnation current by then, so a pass queued behind
+  one that failed (a cancel's behind a transport gap's) is not made.
+- A writer whose reconcile failed keeps that failure across a restart and a transport gap until the policy makes it
+  due: neither marks it reconciling nor tries it before then. A gap is applied to the writer's record as it is when
+  the gap is handled, so a gap that waited behind a failing reconcile keeps that failure too. A startup incident
+  rebuilt from an earlier release's quarantine keeps that failure's release (none before 2.4.16), so this release
+  still tries it once.
+- A cancel interrupts a turn only through a live connection. A turn whose writer is not connected is interrupted after
+  the writer reconnects, with no event at each pass.
+- A stop no longer waits for a held writer's workflow or its mail not yet sent, nor for its turn once its app-server
+  has exited with no live connection. A live app-server's turn is still waited for: a hold does not show that a turn
+  ended. Custody, operations and calls in flight are still waited for, and the next daemon takes the rest up. Through
+  2.4.15 such a writer refused every graceful stop.
+- On a real daemon, each case was run under both releases with an injected readmission failure that both classify
+  permanent (a third coordinator hook):
+  - a cancelled run whose writer died mid-turn: in the cancel's 30 s and the 60 s after, 2.4.15 made 24 app-servers,
+    each a failed readmission, and recorded 44 refused interrupts; this tree made none of either;
+  - a waking message to a parked writer: in 60 s, 2.4.15 made 46 starts, each with an app-server; this tree made one;
+  - stopping afterwards: 2.4.15 refused `NOT_QUIESCENT` both times; this tree stopped gracefully both times.
+- And the cases Codex's first review of the tree asked for, once its four findings were fixed:
+  - a run cancelled during its writer's first readmission: in the 40 s after, 2.4.15 made 20 failed readmissions;
+    this tree made one;
+  - a permanent failure after the replacement was bound: 2.4.15 tried 4 more times in 15 s and once more at the next
+    start; this tree tried none until a resume, and a resume without the fault reconciled the writer;
+  - an Abraham workflow whose writer is held: 2.4.15 refused the stop `NOT_QUIESCENT`; this tree stopped gracefully;
+  - a rebuilt pre-2.4.16 quarantine: this tree tried it once, and zero times when this release had already tried it;
+  - a memory refusal: the retry began 0.5 s after the gate reopened (2.4.15: 57 s later, at its backoff); a waking
+    message under the shut gate: one start in 20 s (2.4.15: 20), and the next began 0.2 s after the gate reopened.
+- And the cases Codex's second review asked for:
+  - a live writer mid-turn whose reconcile failed permanently, then lost its connection: this tree refused the stop
+    `NOT_QUIESCENT` and left its app-server running; with that turn counted gone without exit evidence, as the
+    reviewed tree did, the stop ended the app-server mid-turn;
+  - a failure that can heal, then a gap or a restart before its deadline: this tree made no attempt; 2.4.15 made one
+    at the gap, and at the restart launched two app-servers;
+  - a memory refusal inside calibration (`ADMISSION_FAILED`): the retry began 0.5 s after the gate reopened, with
+    59.9 s of backoff left (2.4.15: at its deadline).
+- And the case its third review asked for: a gap read before a failing reconcile saved its failure, and applied
+  after. This tree kept that failure (its retries and deadline) and made no attempt. With the gap applied to the
+  record read before, as the reviewed tree did, and in 2.4.15: one more attempt 0.2 s after the gap.
+
+### Known limits
+- On the user's coordinator, 2.4.16 tries each of the 12 permanent startup incidents once. Two are the
+  `HOOK_DEFINITIONS` writers, which this release fixes. Ten are `OWNER_UNREGISTERED`, from the owner journal moved aside
+  at the forced 2.4.11 switch. 2.4.13's reading of unheld families may now pass them; any that fail again wait for a
+  resume.
+- A cancelled run whose writer is held stays cancelling until a resume or a new release: nothing can read whether its
+  turn ended.
+- A writer held after its replacement was bound keeps that app-server alive, idle and refused by every hook, until a
+  resume or the next release; after a restart it is not reconnected. Ending idle app-servers is 2.4.21's parking work.
+- A stop still waits for mail owed to a writer whose failure can heal, while its backoff runs: it is refused
+  `NOT_QUIESCENT` until a retry passes, as in 2.4.15. Queued.
+- Writer records keep `process_lineage` inline: on the user's ledger one record holds 7,656 processes (2.2 MB), and
+  is rewritten at each command's process inventory. Queued.
+- Codex's architect review of 10-29 sets the order of the rest: 2.4.17 bounded tool paging and stored tool responses,
+  2.4.18 shared dependency evidence, 2.4.19 native compaction and archive retention, 2.4.20 reclaiming the file's
+  space, 2.4.21 parking and resource budgets.
+
 ## [software-workflows 2.4.15] — 2026-10-29
 
 Two changes in the coordinator, both to load it made for itself. Writers' app-servers no longer send it

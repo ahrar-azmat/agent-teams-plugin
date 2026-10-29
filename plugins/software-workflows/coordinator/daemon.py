@@ -633,7 +633,7 @@ class Daemon:
                             self.store.event("listener/startup_retry", listener["id"],
                                 {"run": runid, "incident": incident["id"], "retry_at": listener.get("retry_at"),
                                  "retries": listener.get("recovery_retries", 0)})
-                        await reconcile_listener(self, listener, advance=False)
+                        await reconcile_listener(self, listener, advance=False, scheduled=True)
                         advance = bool(incident and run.get("workflow") and not startup_obligation(self.store, runid))
                 # Writer.advance takes this same non-reentrant writer lock. Match successful startup after releasing it.
                 if advance and not self.draining:
@@ -646,8 +646,14 @@ class Daemon:
 
     def readmission_config(self, config):
         """A listener's stored config with this release's coordinator hooks in place of those it was admitted with.
-        Its trust entries for them stay keyed by position: admit_listener replaces their hashes."""
+        Its trust entries for them stay keyed by position: admit_listener replaces their hashes.
+        The hooks are set once, in the `hooks` table. A first admission sets them as hook_config's dotted keys, and a
+        readmitted listener's stored config kept those beside the table its readmission added. The app-server applies
+        `-c` overrides in order and the store sorts keys, so the dotted keys came after the table and won: they named
+        the release that first admitted the writer, and its next readmission was refused HOOK_DEFINITIONS (codex
+        0.163.0, measured 10-29: two writers retried 121 times in 6 h, one app-server each)."""
         _, hooks = self.hook_config()
+        config = {key: value for key, value in config.items() if key not in ("hooks.PreToolUse", "hooks.PostToolUse")}
         return dict(config, thread_unload_delay_secs=0, features=dict(config.get("features") or {}, hooks=True),
                     hooks=dict(config.get("hooks") or {}, PreToolUse=hooks["hooks.PreToolUse"], PostToolUse=hooks["hooks.PostToolUse"]))
 
@@ -663,15 +669,18 @@ class Daemon:
             spawned.append(listener["id"])
             connection = self.connections[listener["id"]]
             listed = await connection.call("hooks/list", {"cwds": roots})
-            trust = {}
+            trust, session = {}, 0
             for entry in listed["data"]:
                 if entry.get("errors"):
                     raise CoordinatorError("HOOK_CONFIG", "Native hooks/list reports errors")
                 for hook in entry["hooks"]:
+                    session += hook.get("source") == "sessionFlags"
                     if hook.get("source") == "sessionFlags" and hook.get("command") == command:
                         trust[hook["key"]] = {"trusted_hash": hook["currentHash"]}
             if len(trust) != 2:
-                raise CoordinatorError("HOOK_DEFINITIONS", "Cannot identify exactly the coordinator's pre/post hook definitions")
+                # Counts only: which of the session's hooks run this release's hooks.py (failure_info keeps them).
+                raise CoordinatorError("HOOK_DEFINITIONS", "Cannot identify exactly the coordinator's pre/post hook definitions",
+                                       {"session_hooks": session, "current_hooks": len(trust)})
             # Restart only the idle, threadless discovery listener. Unrelated hook state is
             # merged from the native config API, never read from CODEX_HOME files.
             effective = await connection.call("config/read", {"cwd": cwd, "includeLayers": False})
@@ -2151,8 +2160,11 @@ class Daemon:
             self.store.save(obligation)
 
     async def notification(self, listener, method, params):
+        # `listener` was read before this notification waited its turn (native_worker): a reconcile may have saved it
+        # since. Each update below is made on the record read again with no await before its save (review turn 101).
         if method == "mcpServer/startupStatus":
             snapshot = await self.leases.call("snapshot", payload={"listener": listener["id"]})
+            listener = self.store.get(listener["id"])
             listener["owner_sequence"] = snapshot["family"]["owner_sequence"]
             self.store.save(listener)
             return
@@ -2161,11 +2173,19 @@ class Daemon:
             self.history.invalidate(actor, "thread_reverted")
             return
         if method == "coordinator/transportGap":
+            listener = self.store.get(listener["id"])
             if listener["state"] not in ("stopping", "stopped"):
-                listener.update(state="disconnected", recovery_state="reconciling")
+                from .recovery import retry_due, reconcile_listener
+                # A writer whose reconcile failed keeps that failure, and is reconciled for the gap only when the one
+                # retry policy makes it due: otherwise maintenance does once it is, or a resume, which reads the gap
+                # back. Marked reconciling, it lost the failure, and its pass was one more attempt before its backoff.
+                held = listener.get("recovery_state") == "failed" and not retry_due(self, listener)
+                listener.update(state="disconnected", **({} if held else {"recovery_state": "reconciling"}))
                 self.store.save(listener)
                 for key in participants.checkout_ids(self.store, listener["unit"]):
                     self.store.unknown(key, "*", "native notification gap", {"listener": listener["id"]})
+                if held:
+                    return
                 if self.draining:
                     # A replacement started now could outlive the stop, which lists the app-servers it ends. Left failed,
                     # as a reconcile that could not run: the next daemon's recovery reconciles it, or, if this stop is
@@ -2173,8 +2193,7 @@ class Daemon:
                     listener.update(recovery_state="failed", recovery_error="DAEMON_DRAINING", retry_at=time.time())
                     self.store.save(listener)
                     return
-                from .recovery import reconcile_listener
-                task = self.background(reconcile_listener(self, listener))
+                task = self.background(reconcile_listener(self, listener, scheduled=True))
                 self.gap_reconciles.add(task)
                 task.add_done_callback(self.gap_reconciles.discard)
             return
@@ -2722,14 +2741,18 @@ class Daemon:
             "history": self.history.active + len(self.history.scheduled),
             "observations": len(self.ledger.scans.live) + sum(p.task is not None for p in self.ledger.scans.producers.values()),
             "preimage_readers": sum(len(readers) for readers in getattr(self, "admission_reads", {}).values()),
-            # One waiting only for the lead's decision on an unproven input runs nothing (Runs.awaiting_lead).
+            # One waiting only for the lead's decision on an unproven input runs nothing (Runs.awaiting_lead), nor one
+            # whose writer the retry policy holds (held_by_retry).
             "workflows": sum(r["state"] not in TERMINAL | {"idle"} and not self.settling_on_outcomes(r) and not self.runs.awaiting_lead(r)
-                             for r in self.store.all("run") if r.get("workflow") or r["state"] == "admitting"),
-            "writers": sum(bool(a.get("active_turn")) for a in self.store.all("actor")),
+                             and not self.held_by_retry(r["id"]) for r in self.store.all("run") if r.get("workflow") or r["state"] == "admitting"),
+            # A held writer's turn is not waited for only once nothing can still run it (held_turn_gone).
+            "writers": sum(bool(a.get("active_turn")) and not self.held_turn_gone(a) for a in self.store.all("actor")),
             "custody": self.store.db.execute("SELECT count(*) FROM records INDEXED BY window_custody WHERE " + WINDOW_ACTIVE["custody"]).fetchone()[0],
             # A lead reads its mail through its inbox, so no native turn starts for it: unread lead mail is no
-            # delivery in flight, and a stop never waits for it.
-            "deliveries": sum(self.delivery_owed(m) for m in self.store.all("message")),
+            # delivery in flight, and a stop never waits for it. Nor for mail not yet sent to a writer the retry
+            # policy holds (held_by_retry).
+            "deliveries": sum(self.delivery_owed(m) and not (m["delivery"] == "pending" and self.held_by_retry(
+                (self.store.get(m["recipient"], required=False) or {}).get("run"))) for m in self.store.all("message")),
             "lead_hooks": len(hooks), "lead_operations": len(lead_operations),
             "external_editors": len(pending_executors(self.store)),
             "other_operations": len(operations) - len(lead_operations),
@@ -2737,6 +2760,32 @@ class Daemon:
             "mutating_rpcs": sum(m not in READ_RPC and m != "daemon/stop" for m in methods),
         }
         return {key: value for key, value in counts.items() if value}
+
+    def held_by_retry(self, runid):
+        """Whether the one retry policy holds a run's writer until a resume or the next release: its demand start failed
+        with a cause that cannot heal (dormancy.start_held), or its reconcile did (recovery.permanently_failed).
+        Nothing is admitted for it meanwhile (hook(), deliveries and submissions refuse a failed writer), so a stop does
+        not wait for its workflow or its unsent mail; its turn only once nothing can still run it (held_turn_gone).
+        Custody, operations and calls in flight are each still waited for. The next daemon takes them up. Through
+        2.4.15 such a writer refused every graceful stop NOT_QUIESCENT for as long as it stayed."""
+        if not runid:
+            return False
+        if self.dormancy.start_held(runid):
+            return True
+        from .recovery import permanently_failed
+        actor = self.store.get((self.store.get(runid, required=False) or {}).get("root_actor") or "", required=False) or {}
+        listener = self.store.get(actor.get("listener") or "", required=False)
+        return bool(listener) and permanently_failed(self, listener)
+
+    def held_turn_gone(self, actor):
+        """A held writer's recorded turn that nothing can still run: no live connection shows it, and its app-server has
+        exited. A hold says the next admission waits, not that a turn ended: a live app-server whose reconcile failed and
+        whose connection then closed may still be running its turn, which a stop's end of its family would cut (review
+        turn 100)."""
+        if not self.held_by_retry(actor.get("run")) or self.runs.connected(actor.get("listener")):
+            return False
+        listener = self.store.get(actor.get("listener") or "", required=False) or {}
+        return bool(listener.get("pid")) and bool(processes.exit_evidence(listener))
 
     def pending_lead_edits(self):
         from .lead_calls import blockers

@@ -14683,3 +14683,228 @@ measured below.
 - **2.4.14's known limits stand:** `lead_calls.recover` and the stop's quiescence check.
 - **Writer records are rewritten whole at each save.** On the copy, 10.3 M listener saves, some of records of
   1 to 2 MB (B2). Measured here, queued for a later release.
+
+## 2.4.16
+
+Two changes: a readmission sets the coordinator's hooks once, and one retry policy holds every caller that retries a
+writer on its own schedule, including a stop's wait. Measured on 10-29 between 08:42 and 10:53 on the user's Mac. (A) is
+a real codex 0.163.0 app-server. (B) to (F) are real daemons on disposable states with the loopback fixture provider;
+(D), (E) and (F) are the evidence Codex's reviews of the tree (turns 99 to 101) asked for, after their findings were
+fixed. Each compares with the installed 2.4.15.
+
+### What it changes
+- **`Daemon.readmission_config`** drops the dotted `hooks.PreToolUse` and `hooks.PostToolUse` keys before setting
+  the `hooks` table. **`admit_listener`**'s `HOOK_DEFINITIONS` carries `session_hooks` and `current_hooks`, and
+  `failure_info` keeps them.
+- **`recovery.retry_due`** honours the classification for every caller: the incident's, else the listener's
+  `recovery_retryable`. A failure that cannot heal is due once per release: `reconcile_failed` and
+  `quarantine_failed` record `recovery_version` (and the incident's `version`), and one recorded under another
+  release, or none, is due. **`recovery.permanently_failed`** is the opposite case: failed, cannot heal, tried by
+  this release. **`recovery.gate_reopened`**: a refusal only the memory gate made is also due before its backoff once
+  `Memory.admits`. **`recovery.memory_gated`** decides "only the memory gate": the refusal names `resource: "memory"`
+  (which `failure_info` keeps), or it is an `ADMISSION_FAILED` whose failed cases all are (a calibration's probes
+  launch their own app-servers).
+- **`reconcile_listener(scheduled=True)`**, from startup recovery, `Daemon.readmit`, `Runs._settle_cancel`, a
+  transport gap and `Writer.submit`: under the run's reconcile lock, an incarnation whose reconcile failed and is not
+  `retry_due` is not passed. A resume is not scheduled.
+- **`recovery.recover`** leaves out every run whose bound writer failed and is not `retry_due` (one that cannot heal,
+  or one whose backoff has not passed), as it does a permanent startup incident, with `recovery/writer_held`
+  (`permanent`, `retry_at`). A transport gap on such a writer keeps `recovery_state: failed` and reconciles nothing.
+- **`quarantine_failed(reconstructed=True)`** keeps the listener's `recovery_version` (none before 2.4.16) for the
+  incident and the listener; only an attempt stamps this release. A replacement copies `recovery_version`, and a pass
+  that succeeds drops it.
+- **`Runs._settle_cancel`** reconciles a failed writer only when `retry_due`. It interrupts an active turn only
+  through a live connection.
+- **`Dormancy`**:
+  - a failed demand start records `retryable`, `version`, `resource` (`memory` when `memory_gated`),
+    `failure_streak` and `retry_at`, which follows the reconcile backoff for every cause;
+  - `DAEMON_DRAINING` puts the start back to `pending`, unclassified;
+  - `start_due` (with `gate_reopened`) and `start_held` read those fields;
+  - `start` refuses `WRITER_START_FAILED` before any write for any reason but a resume, while the start is not due;
+  - `Messages.deliver` and `Writer.submit` ask `start_due` first, and return quietly.
+- **`Memory.classify`** holds the level rule `check` applied; **`Memory.admits`** reads a sample through it without
+  recording, requesting parking or raising. Every `Memory.check` refusal names `resource: "memory"`.
+- **`Daemon.held_by_retry(runid)`**: a demand start held (`start_held`), or a bound writer `permanently_failed`.
+  `stop_pending` counts neither such a run's workflow nor its mail still `pending`. **`Daemon.held_turn_gone`**: an
+  active turn of it is not counted only when no live connection shows it (`Runs.connected`) and its app-server has
+  exited (`processes.exit_evidence`).
+- **`Daemon.notification`** applies a transport gap, and an MCP server's startup status, to the listener record read
+  again with no await before its save, not to the one `native_worker` read before the notification's turn: a
+  reconcile can save its failure in between (review turn 101).
+
+### (A) Which hooks a real app-server lists (`res/hook_override_probe.py`)
+- **The setup.** The plugin's own admission helpers, a disposable `CODEX_HOME`, and two commands, OLD and NEW. Each
+  shape is given as `-c` overrides in this order on its own app-server, then hooks/list.
+- **The shapes and what was listed:**
+  - `hooks={NEW}` then `hooks.PostToolUse=[OLD]`, `hooks.PreToolUse=[OLD]`, the order the failing writers' stored
+    config emits: OLD for both;
+  - the dotted OLD keys first, then the table: NEW;
+  - the table alone: NEW;
+  - the dotted keys alone: NEW.
+- **The failing writers' stored config** (`res/hookcfg_probe.py`, read-only on the live ledger, key names and hook
+  releases only):
+  - `profile_base_config` holds a `hooks` table at position 7 and dotted `hooks.PostToolUse` and `hooks.PreToolUse`
+    at 8 and 9, all naming 2.4.11's `hooks.py`;
+  - 2.4.15's `readmission_config` put this release's commands in the table and left the dotted keys naming 2.4.11;
+  - `override_args` emitted them in that order.
+
+### (B) A writer readmitted across releases on a real daemon (`r2416/hook_e2e.py`)
+- **The setup.** A real daemon (supervisor, worker, real writer app-servers) on a disposable state. The installed
+  2.4.14 admits the writer with one plain run, which completes and parks (`WRITER_PARK_IDLE_SECONDS=1`); then a
+  graceful stop. Each later `run/resume` starts the parked writer, which readmits it. A graceful stop alone does not:
+  the next daemon adopts the live app-server (this probe's first form). After each step: the writer's trusted hooks,
+  and the releases its stored hook keys name.
+- **Red, the installed 2.4.15:**
+  - readmission one passed; the stored config then held the table naming 2.4.15 and dotted keys naming 2.4.14;
+  - readmission two was refused `WRITER_START_FAILED`, cause `HOOK_DEFINITIONS`.
+- **This tree, on that same state:** its readmission passed. The stored config then held only the table, naming
+  this tree.
+- **This tree from 2.4.14:** both readmissions passed, and the stored config held only the table, naming this tree
+  (run again on the final tree, after the review's fixes: the same, 91 s in all).
+
+### (C) A writer that can never be readmitted (`r2416/retry_e2e2.py`)
+- **The setup.** A real daemon on a disposable state, backoff shortened for both releases alike
+  (`RECONCILE_RETRY_FIRST_S=1`, `RECONCILE_RETRY_MAX_S=4`). The injected failure is a third coordinator hook
+  (PermissionRequest, the release's own `hooks.py`) in the writer's stored `profile_base_config` table. Both releases
+  keep it, so admission lists three coordinator hooks and refuses `HOOK_DEFINITIONS`, which both classify permanent.
+  The history reader checks no hooks. Counted for the run: listener records (one per app-server spawn) and events.
+- **A cancelled run whose writer died mid-turn.** The turn waits on the model (fixture delay); inject; `SIGKILL` to
+  the writer's process group; its readmission fails; `run/interrupt`; 60 s; one explicit resume.
+  - Installed 2.4.15, in the cancel's 30 s and the 60 s after: 24 app-servers (24 failed readmissions) and 44
+    `run/turn_interrupt_refused`. The run stayed cancelling, and the stop was refused `NOT_QUIESCENT`.
+  - This tree: its one readmission failed `HOOK_DEFINITIONS` with `session_hooks: 3, current_hooks: 3`, recorded
+    permanent under 2.4.16. The cancel's settlement and the 60 s after made no app-server and recorded no event. The
+    explicit resume made one readmission, which failed the same way. The stop then completed gracefully: the writer
+    was held (`held_by_retry`).
+- **A waking message to a parked writer.** Park; stop; inject; start; `message/send` with wake start; 60 s.
+  - Installed 2.4.15: 46 demand starts, 45 failed, 46 app-servers. The stop was refused `NOT_QUIESCENT`, and its
+    daemon went on starting writers until it was signalled.
+  - This tree: one demand start, failed `HOOK_DEFINITIONS`, recorded `retryable: false` under 2.4.16, then none. It
+    stopped gracefully.
+- **Both run again on the final tree**, after the review's fixes (`f2-stuck-green`, `f2-demand-green`): the same. The
+  stuck cancel made one readmission, none in its window, and one at the explicit resume, then stopped gracefully; the
+  waking message made one start, then none.
+- **First form** (`r2416/retry_e2e.py`): a `sandbox_mode` the app-server refuses, which made it exit 1 at start
+  (`r2416/fault_probe.py`).
+  - Waking message: 2.4.15 made 54 demand starts in 60 s; this tree made one (`LISTENER_START`, permanent).
+  - Its cancel case had no active turn and settled at once under both releases. The fault also fails the history
+    reader, which is classified retryable. Hence the second form.
+
+### (D) The closing evidence Codex's review of the tree asked for (`r2416/retry_e2e3.py`)
+- **The setup.** As (C), from 09:46 to 10:02: the fixture's model call waits 240 s, and the backoff is 1 s doubling
+  to 4 s unless named. The faults are (C)'s third hook, or one made in the worker by `r2416/inject3/sitecustomize.py`
+  while a marker file exists:
+  - `projects.verify_thread` refusing `PROJECT_THREAD_MISMATCH`, classified permanent, which `_reconcile_listener`
+    asks after the replacement is bound and its thread resumed;
+  - the memory gate reading a critical compressor ratio.
+  Each case ran on the tree and on the installed 2.4.15.
+- **A cancel during the first readmission** (race). `SIGKILL` to the writer's process group, then `run/interrupt` at
+  once. The cancel was recorded 0.3 s before the transport gap's readmission failed, so its settlement queued behind it.
+  - 2.4.15, in the 40 s after: 20 failed readmissions (20 app-servers), 7 refused cancel reconciles, 34 refused
+    interrupts. Its stop was refused `NOT_QUIESCENT` (`writers: 1`).
+  - This tree: one failed readmission and one app-server, then nothing. The stop completed gracefully.
+- **A permanent failure after binding, then a restart** (restart). The replacement was bound and alive, then refused
+  at its thread check.
+  - 2.4.15: 4 more failed passes in 15 s, then one more at the next start.
+  - This tree: none in 15 s. The next start recorded `recovery/writer_held` and tried nothing. A resume with the
+    fault tried once and was refused the same way. A resume without it reconciled the writer (it then refused
+    `RECOVERY_UNKNOWN` for the gap's UNKNOWNs, as 2.4.15 did).
+- **An Abraham workflow whose writer is held** (workflow): kill; the readmission fails; cancel; 30 s; stop.
+  - 2.4.15: 17 failed readmissions and 30 refused interrupts. The stop was refused `NOT_QUIESCENT`
+    (`workflows: 1, writers: 1`).
+  - This tree: one failed readmission. The stop completed gracefully, leaving the run cancelling for the next daemon.
+- **A rebuilt pre-2.4.16 quarantine** (legacy). After the readmission failed and a stop, the writer's record was edited
+  to a quarantine with no `recovery_version` and no startup incident; then a start.
+  - This tree rebuilt the incident with no release, and maintenance tried it once (one app-server,
+    `listener/startup_retry`), which recorded 2.4.16.
+  - The calibration kept `recovery_version: 2.4.16` (legacy-held): rebuilt under 2.4.16, tried zero times.
+- **A memory refusal** (resource; backoff 60 s doubling to 120 s). Kill under a shut gate: the readmission was refused
+  `RESOURCE_EXHAUSTED`. The gate reopened 3.2 s later.
+  - 2.4.15 waited for the backoff: its retry began 57 s after the gate reopened, and the readmission completed 84.2 s
+    after (its calibration takes about 25 s).
+  - This tree's retry began 0.5 s after the gate reopened; the readmission completed 27.4 s after.
+- **A waking message under a shut gate** (resource-demand). A parked writer; 20 s shut; then reopened.
+  - 2.4.15: 20 demand starts in those 20 s, one a second, each refused.
+  - This tree: one, then none until the gate reopened. The next start began 0.2 s after it did, 40 s before its
+    backoff, and completed 27.1 s after (26.8 s starting).
+  - A stop made as that start completed was refused `NOT_QUIESCENT` (`deliveries: 2`): the waking message and the
+    writer's notice were still being submitted. A stop a minute later completed for both releases.
+
+### (E) The closing evidence Codex's review at turn 100 asked for (`r2416/retry_e2e4.py`)
+- **The setup.** As (D), from 10:22 to 10:28, with faults made in the worker by `r2416/inject4/sitecustomize.py`:
+  - (D)'s thread check, refusing `PROJECT_THREAD_MISMATCH` (cannot heal) or `WRITER_HISTORY_READ_FAILED` (can heal);
+  - a transport gap: the worker aborts one listener's connection while its app-server lives;
+  - a memory gate that lets a set number of launches through, then shuts.
+  Each case ran on the tree and on the installed 2.4.15.
+- **A live writer's turn, then a stop** (stopsafety). A slow turn; a gap. Its reconcile attaches again and fails
+  permanently, with the app-server alive and the turn running. A second gap; then `daemon/stop`.
+  - This tree: refused `NOT_QUIESCENT` (`writers: 1`). The app-server was alive 5 s later; no signal reached it.
+  - The calibration (`exitlie`) counted such a turn gone without exit evidence, as the tree reviewed at turn 100 did:
+    the stop completed and ended the app-server mid-turn. The probe sees that red.
+  - 2.4.15: refused `NOT_QUIESCENT` (`writers: 1`), the app-server alive; its second gap was reconciled again (three
+    failed passes in all).
+- **A failure that can heal, then a gap** (backoff-gap; backoff 60 s). A completed run's idle writer; a gap; its
+  reconcile fails `WRITER_HISTORY_READ_FAILED`; another gap 5 s later; 20 s.
+  - This tree: no attempt. The writer stayed failed, disconnected, with 35 s of its backoff left.
+  - 2.4.15: one more attempt at the second gap, before the deadline.
+- **A failure that can heal, then a restart** (backoff-restart). As above to the failure; a graceful stop; a start
+  of the same release; 20 s.
+  - This tree: `recovery/writer_held` (`permanent: false`), and no app-server started; 38 s of backoff left.
+  - 2.4.15: its start launched two app-servers and recovered the writer read-only (dormant), before the deadline.
+- **A memory refusal inside calibration** (calib-memory; backoff 60 s). A slow turn. The gate lets two more launches
+  through (the readmission's discovery and writer app-servers) and shuts for its calibration's probes. Kill: the
+  readmission fails `ADMISSION_FAILED`, each failed case `RESOURCE_EXHAUSTED` from the memory gate. Then the gate
+  reopens.
+  - This tree: the retry began 0.5 s after the gate reopened, and the readmission completed 26.7 s after; its
+    `retry_at` was 59.9 s after.
+  - 2.4.15: the retry began 60.7 s after, at its deadline, and completed 86.9 s after.
+- **(D)'s race and workflow cases and (C)'s stuck cancel, run again on the final tree** (`f3-race`, `f3-workflow`,
+  `f3-stuck-green`): the same. One failed readmission each (the stuck cancel one more at its explicit resume), the
+  cancel in the race recorded 0.3 s before the readmission failed, and every stop graceful.
+
+### (F) The closing evidence Codex's review at turn 101 asked for (`r2416/retry_e2e4.py`, overlap)
+- **The setup.** As (E), from 10:44 to 10:53, with two more faults in `r2416/inject4/sitecustomize.py`:
+  - a transport gap's notification waits 6 s after `native_worker` has read the record (`gapdelay`);
+  - the thread check's refusal aborts that pass's own connection, and reaches the failure's save 2 s later (`overlap`).
+  A pass that attaches again ends the old connection's worker, and any gap that worker holds (this probe's first form,
+  a gap on the old connection while a resume attached again: that gap was never applied). So the gap that can overlap
+  a failure's save is on the connection the failing pass itself uses.
+- **A gap overlapping a failing reconcile's save** (backoff 60 s doubling to 120 s). A completed run's idle writer. A
+  gap; its reconcile (R1) attaches again and fails `WRITER_HISTORY_READ_FAILED` (retries 1, 60 s). An explicit resume
+  reconciles again (R2) through that connection, which is aborted as R2 fails. R2's failure is saved 2.0 s later
+  (retries 2, 120 s). The gap's notification held the record read before that save (retries 1, R1's deadline) and was
+  applied 4.0 s after it. Then a message made work owed; counted until 20 s past R1's deadline.
+  - This tree: R2's failure survived the gap (retries 2, its deadline, release 2.4.16), and the writer was marked
+    disconnected. No attempt to the end, 42 s before R2's deadline.
+  - The calibration (`stale`): the handler's read answers the record read before the wait, as the tree reviewed at
+    turn 101 used it. One more attempt 0.2 s after the gap was applied, 116 s before R2's deadline.
+  - 2.4.15: one more attempt 0.2 s after the gap was applied.
+  - Every stop was refused `NOT_QUIESCENT` (`deliveries: 1`): mail owed to a writer whose failure can heal (Known
+    limits). Each daemon was then signalled.
+
+### Static checks (`r2416/static_checks2416.py`, on the final tree)
+- every plugin `.py` file compiles under 3.15 (83 files), and the hook-run files under `/usr/bin/python3` (3.9.6 14 files);
+- `hooks.py --check` compatible, protocol `jsonl-v1`;
+- the git shim parses under `sh -n`, `bash --posix -n` and zsh's sh emulation, and is executable;
+- ruff's F821/F822/F823/F811/F841/F401: 35 findings here, 35 in 2.4.15; none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.16.
+
+### Known limits
+- **The user's 12 permanent startup incidents** are each tried once by 2.4.16: two `HOOK_DEFINITIONS`, which this
+  release fixes, and ten `OWNER_UNREGISTERED` from the owner journal moved aside at the forced 2.4.11 switch. Any that
+  fail again wait for a resume.
+- **A cancelled run whose writer is held stays cancelling** until a resume or a new release: nothing reads whether its
+  turn ended.
+- **A writer held after its replacement was bound keeps that app-server alive**, idle and refused by every hook, until
+  a resume or the next release; after a restart it is not reconnected (D, restart). Ending idle app-servers is 2.4.21's.
+- **A stop still waits for mail owed to a writer whose failure can heal**, while its backoff runs: refused
+  `NOT_QUIESCENT` (`deliveries`) until a retry passes (F; 2.4.15 the same). Queued.
+- **Writer records keep `process_lineage` inline**: on the user's ledger one record holds 7,656 processes (2.2 MB),
+  rewritten at each command's process inventory. Queued.
+- **Codex's architect review of 10-29 orders the rest:**
+  - 2.4.17: bounded tool paging and stored tool responses;
+  - 2.4.18: shared dependency evidence;
+  - 2.4.19: native compaction and archive retention;
+  - 2.4.20: reclaiming the file's space;
+  - 2.4.21: parking and resource budgets.

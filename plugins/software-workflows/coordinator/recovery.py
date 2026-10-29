@@ -13,6 +13,7 @@ import time
 from .locks import finish, finish_all, finish_thread
 from .client import CoordinatorError
 from . import native, processes, participants
+from .runtime import plugin_version
 from .store import BLOCKERS, WINDOW_ACTIVE, uid
 
 # A quiet app-server's graceful exit after SIGTERM is bounded by Codex 0.163 itself: its threads' shutdown at
@@ -114,12 +115,16 @@ async def may_execute(daemon, operation):
     return bool(current and current["birth"] == listener["birth"] and not current["zombie"])
 
 
-async def reconcile_listener(daemon, listener, advance=True, *, demand=False):
+async def reconcile_listener(daemon, listener, advance=True, *, demand=False, scheduled=False):
     """Reconcile a run's writer app-server: reconnect, replace or re-admit it, and read back what native did
     meanwhile.
     - One caller at a time for each run (a recovery, a resume, a message's or a workflow's re-admission, a cancel, a
       transport gap, a startup incident's retry). Each takes the run's lock, then reconciles the incarnation
       current by then, so two callers never replace the same app-server.
+    - A caller on its own schedule (scheduled: startup recovery, maintenance's re-admission, a cancel's settlement, a
+      transport gap, a workflow's submission) is held to the one retry policy there, on that incarnation: one whose
+      reconcile failed is passed only when retry_due. A pass queued behind one that failed waits for its backoff, and
+      for a resume once the failure cannot heal. A resume is not scheduled: it always tries.
     - A failure marks that incarnation failed, so its unit's work waits, and maintenance reconciles it again.
     - Every call is a stop's to wait for. It is counted in daemon.listener_reconciles before its first await,
       a caller still waiting for the run's lock included. Once a stop is closing, every call is refused
@@ -133,18 +138,22 @@ async def reconcile_listener(daemon, listener, advance=True, *, demand=False):
     daemon.listener_reconciles[token] = invocation
     try:
         # Cancellation cannot release the stop fence while this pass's native or filesystem work still runs.
-        return await finish(_registered_reconcile(daemon, listener, advance, invocation, demand))
+        return await finish(_registered_reconcile(daemon, listener, advance, invocation, demand, scheduled))
     finally:
         daemon.listener_reconciles.pop(token, None)
 
 
-async def _registered_reconcile(daemon, listener, advance, invocation, demand):
+async def _registered_reconcile(daemon, listener, advance, invocation, demand, scheduled):
     store = daemon.store
     async with daemon.reconcile_locks.hold(listener["run"]):
         listener = store.get(listener["id"])
         bound = store.get(listener["actor"]).get("listener")
         if listener.get("root_thread") and listener["state"] in ("dead", "stopped", "dormant") and bound and bound != listener["id"]:
             listener = store.get(bound)
+        if scheduled and listener.get("recovery_state") == "failed" and not retry_due(daemon, listener):
+            # Decided here, under the run's lock, on the incarnation current by then: a pass queued behind one that
+            # failed (a cancel's behind maintenance's) ran too, even after a failure that cannot heal.
+            return
         if listener["state"] == "dormant" and not demand:
             if not listener.get("dormant_proof"):
                 async with capacity(daemon):
@@ -355,7 +364,7 @@ def reconcile_failed(daemon, listener, exc):
     - The backoff starts at RECONCILE_RETRY_FIRST_S and doubles up to RECONCILE_RETRY_MAX_S. It is carried across
       replacements, so a replacement does not restart it.
     - The failure is recorded as a code with structured details, never native log text, and classified as
-      retryable or not (retryable_failure).
+      retryable or not (retryable_failure), with the release that classified it (retry_due).
     - A stop's own refusal (DAEMON_DRAINING) marks nothing."""
     daemon.check_native_stop()
     if isinstance(exc, native.Retired) or not listener.get("root_thread") or getattr(exc, "code", None) == "DAEMON_DRAINING":
@@ -366,7 +375,8 @@ def reconcile_failed(daemon, listener, exc):
     info = failure_info(exc)
     retryable, delay = retryable_failure(info), retry_delay(retries)
     current.update(recovery_state="failed", recovery_error=info["code"], recovery_error_details=info,
-                   recovery_retryable=retryable, recovery_retries=retries, retry_at=time.time() + delay)
+                   recovery_retryable=retryable, recovery_version=plugin_version(), recovery_retries=retries,
+                   retry_at=time.time() + delay)
     store.save(current)
     store.event("listener/reconcile_failed", current["id"], dict(info, retryable=retryable, retries=retries,
                 retry_at=current["retry_at"], delay_seconds=delay, max_seconds=RECONCILE_RETRY_MAX_S))
@@ -376,7 +386,7 @@ def failure_info(exc):
     """Persist codes and structured diagnostics, never native log text or configuration."""
     details = getattr(exc, "details", {}) or {}
     info = {"code": getattr(exc, "code", type(exc).__name__)}
-    for key in ("method", "native_code", "exit_code", "errno"):
+    for key in ("method", "native_code", "exit_code", "errno", "session_hooks", "current_hooks", "resource"):
         if key in details:
             info[key] = details[key]
     if isinstance(exc, OSError):
@@ -428,9 +438,49 @@ def startup_obligation(store, runid):
 
 
 def retry_due(daemon, listener):
+    """Whether a writer whose reconcile failed is reconciled again now by a caller on its own schedule (maintenance, a
+    cancel's settlement): its backoff has passed, and its failure can heal (the incident's classification, else the
+    listener's) or this release has not tried it yet. A failure that cannot heal may have been the coordinator's own
+    (HOOK_DEFINITIONS was, through 2.4.15), so each release tries it once; then only a resume does. Through 2.4.15 a
+    cancel's settlement checked only the backoff, and two writers whose readmission could not pass were tried 121
+    times in 6 h, each with a new app-server."""
+    if listener.get("recovery_state") != "failed":
+        return False
+    if listener.get("retry_at", 0) > time.time() and not gate_reopened(daemon, listener.get("recovery_error_details")):
+        return False
+    return not permanently_failed(daemon, listener)
+
+
+def gate_reopened(daemon, failure):
+    """A launch the memory gate refused is backed off like any failure that can heal, which bounds what is tried and
+    recorded while the gate stays shut, and is due before its backoff once the gate would admit it (Memory.admits): the
+    next pass retries it. Other resource refusals (the owner journal's, the lease bridge's) wait for their backoff."""
+    return memory_gated(failure or {}) and daemon.memory.admits()
+
+
+def memory_gated(info):
+    """Whether only the memory gate refused (failure_info's form): the refusal itself names it, or each failed case of
+    an admission does. A calibration's probes launch their own app-servers, and admission reports their refusals as
+    cases of ADMISSION_FAILED (review turn 100)."""
+    if info.get("resource") == "memory":
+        return True
+    cases = info.get("cases") or []
+    return info.get("code") == "ADMISSION_FAILED" and bool(cases) and all(memory_gated(case["error"]) for case in cases)
+
+
+def permanently_failed(daemon, listener):
+    """A writer whose reconcile failed with a failure that cannot heal, which this release has tried (retry_due): no
+    schedule reconciles it again, only a resume or the next release. Startup recovery keeps it as it is (recover), and
+    so does a transport gap."""
+    if listener.get("recovery_state") != "failed":
+        return False
     incident = startup_obligation(daemon.store, listener["run"])
-    return (listener.get("recovery_state") == "failed" and listener.get("retry_at", 0) <= time.time()
-            and (incident["retryable"] if incident else listener["state"] != "quarantined"))
+    if incident:
+        retryable, version = incident["retryable"], incident.get("version")
+    else:
+        retryable = listener.get("recovery_retryable", listener["state"] != "quarantined")
+        version = listener.get("recovery_version")
+    return not retryable and version == plugin_version()
 
 
 def startup_counts(store):
@@ -771,7 +821,7 @@ async def _reconcile_listener(daemon, listener):
         # The notice its first full pass sends: why the coordinator ended it, when it did (end_wedged, runs.end_writer).
         replacement["initializing"] = "dormant" if was_dormant else "ended" if listener.get("ended") else "readmitted" if readmitted else "died"
         # A replacement attempt does not restart the run's backoff.
-        for key in ("recovery_retries", "retry_at", "recovery_error", "recovery_error_details", "recovery_retryable"):
+        for key in ("recovery_retries", "retry_at", "recovery_error", "recovery_error_details", "recovery_retryable", "recovery_version"):
             if key in listener:
                 replacement[key] = listener[key]
         with store.transaction():
@@ -923,7 +973,7 @@ async def _reconcile_listener(daemon, listener):
     listener = store.get(listener["id"])
     listener.update(recovery_state="reconciled", state="connected")
     listener.pop("park_resume_required", None)
-    for key in ("recovery_error", "recovery_error_details", "recovery_retryable", "recovery_retries", "retry_at"):
+    for key in ("recovery_error", "recovery_error_details", "recovery_retryable", "recovery_version", "recovery_retries", "retry_at"):
         listener.pop(key, None)
     initialized = listener.pop("initializing", None)
     with store.transaction():
@@ -1025,6 +1075,17 @@ async def recover(daemon):
     # daemon ran) fails only its own writers' recovery: each reconcile takes its leases again before it reconnects, and
     # is quarantined with an UNKNOWN when refused. Every other checkout recovers.
     permanent = {i["run"] for i in store.all("startup_recovery") if i["state"] == "pending" and not i["retryable"]}
+    # A writer whose reconcile failed keeps that failure until the one retry policy makes it due (retry_due): not marked
+    # reconciling below, nor tried by this start. Maintenance tries it once it is due; one that cannot heal
+    # (permanently_failed) waits for a resume or the next release. Through 2.4.15 every start tried each once more,
+    # before its backoff.
+    for listener in list(store.selected("SELECT * FROM records WHERE kind='listener' AND "
+                                        "json_extract(data,'$.recovery_state')='failed'")):
+        if (listener["run"] not in permanent and store.get(listener["actor"]).get("listener") == listener["id"]
+                and not retry_due(daemon, listener)):
+            permanent.add(listener["run"])
+            store.event("recovery/writer_held", listener["run"], {"listener": listener["id"], "code": listener.get("recovery_error"),
+                        "permanent": permanently_failed(daemon, listener), "retry_at": listener.get("retry_at")})
     recoverable = [l for l in store.all("listener") if l["run"] not in permanent and
                    (recoverable_listener(l) or l.get("root_thread") and
                     store.get(l["actor"]).get("listener") == l["id"] and
@@ -1135,6 +1196,9 @@ def quarantine_failed(daemon, listener, exc, unknowns=None, reconstructed=False)
     info = failure_info(exc)
     retryable = retryable_failure(info)
     incident = startup_obligation(store, run["id"])
+    # Stamped only after an attempt: a reconstructed incident keeps the release of the failure it adopts (none before
+    # 2.4.16), so this release still tries it once (retry_due).
+    version = current.get("recovery_version") if reconstructed else plugin_version()
     with store.transaction():
         if not incident:
             ident = uid("startup_recovery")
@@ -1149,10 +1213,10 @@ def quarantine_failed(daemon, listener, exc, unknowns=None, reconstructed=False)
             run["startup_recovery"] = ident
             store.save(run)
             incident = store.get(ident)
-        incident.update(error=info, retryable=retryable, listener=current["id"], last_failed=time.time())
+        incident.update(error=info, retryable=retryable, version=version, listener=current["id"], last_failed=time.time())
         store.save(incident)
         current.update(state="quarantined", recovery_state="failed", recovery_error=info["code"],
-                       recovery_error_details=info, recovery_retryable=retryable)
+                       recovery_error_details=info, recovery_retryable=retryable, recovery_version=version)
         current.setdefault("retry_at", time.time() + RECONCILE_RETRY_FIRST_S)
         store.save(current)
         store.event("listener/startup_quarantined", current["id"],
@@ -1204,7 +1268,7 @@ async def recover_writers(daemon, plan):
                     if daemon.dormancy.pending(runid):
                         await daemon.dormancy.start(runid, "recovery")
                     else:
-                        await reconcile_listener(daemon, listener, advance=False)
+                        await reconcile_listener(daemon, listener, advance=False, scheduled=True)
                 except Exception as exc:
                     if getattr(exc, "code", "").startswith("WRITER_") or getattr(exc, "code", None) in ("UNIT_FROZEN", "RUN_CANCELLED"):
                         store.event("writer/recovery_deferred", runid, {"code": exc.code})

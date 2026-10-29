@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.15 / P1
+# Writer coordinator — software-workflows 2.4.16 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -1206,7 +1206,17 @@ is checked again afterwards. The existing replacement path resumes the same
 thread with `excludeTurns:true`, current hooks and the current writer profile.
 Callers join the owned operation within the existing recovery wait bound. A
 failure returns retryable `WRITER_START_FAILED`, retains the demand and dormant
-binding, and can be retried. `WRITER_START_PENDING` means the operation is still
+binding, and can be retried. Callers on a schedule (a waking message, a
+workflow's advance, startup recovery) start it again only when its retry is due:
+after the reconcile backoff below, counted over consecutive failures, and only if
+its cause can heal or the running release has not tried it yet. A resume starts
+it regardless. A resource refusal (`RESOURCE_PAUSED`, `RESOURCE_EXHAUSTED`) backs
+off the same way, so while the gate stays shut it is tried only as each backoff
+passes; one the memory gate made is also due as soon as the gate would admit a
+launch (`Memory.admits`). A stop's own refusal (`DAEMON_DRAINING`) fails nothing: the
+start stays pending for the next daemon. Through 2.4.15 every message delivery
+pass started it again: four runs on the user's ledger were started 1,072 to 2,788
+times, each with a new app-server. `WRITER_START_PENDING` means the operation is still
 owned. These temporary outcomes are not cached as completed idempotent RPCs.
 Startup recovers a persisted demand; existing input-settlement rules still
 prohibit blindly resending an uncertain input after a crash.
@@ -1836,7 +1846,27 @@ project, schema, configuration and missing-history refusals remain quarantined;
 an operational error alone is not evidence that retrying can help.
 
 Retries run in the background, even for terminal runs, after 5 s, doubling to
-300 s, with no attempt limit. `SOFTWARE_WORKFLOWS_RECONCILE_RETRY_FIRST_S` and
+300 s, with no attempt limit. Every caller that retries on its own schedule
+(startup recovery, maintenance, a cancel's settlement, a transport gap, a
+workflow's submission) applies this classification (`recovery.retry_due`; through
+2.4.15 a cancel's settlement checked only the backoff), and decides it under the
+run's reconcile lock, on the incarnation current by then: a pass queued behind one
+that failed is not made until it is due. A failure classified permanent is tried
+once by each new release, since its cause may have been the coordinator's own
+(`HOOK_DEFINITIONS` was, through 2.4.15), then only by a resume. A writer whose
+reconcile failed keeps that failure across a restart and a transport gap until
+the policy makes it due: neither marks it reconciling nor tries it before then
+(`recovery/writer_held` at startup). An incident rebuilt from an earlier
+release's quarantine keeps that failure's release (none before 2.4.16), so this
+release still tries it once. A memory-gate refusal, made directly or in every
+failed case of a calibration, is also due before its backoff once the gate would
+admit a launch. A stop does not wait for a held writer's workflow or its mail not
+yet sent, nor for its turn once its app-server has exited with no live
+connection; a live app-server's turn is still waited for, as are custody,
+operations and calls in flight.
+A cancel interrupts a turn only through a live connection; a turn whose writer is
+not connected is interrupted after it reconnects, without an event at each pass.
+`SOFTWARE_WORKFLOWS_RECONCILE_RETRY_FIRST_S` and
 `SOFTWARE_WORKFLOWS_RECONCILE_RETRY_MAX_S` configure these existing delays; both
 must be positive finite seconds and the maximum must be at least the first delay.
 `listener/reconcile_failed` records the code, classification, attempt count and
@@ -1847,7 +1877,13 @@ and their UNKNOWNs, including those already narrowed by a lead.
 
 Each retry completes the same history, admission and replacement checks as a
 successful startup. An attached connection is resumed again when its earlier
-attempt failed; stale hooks are replaced once the unit is quiet. After native
+attempt failed; stale hooks are replaced once the unit is quiet. A readmission
+sets the coordinator's hooks once, in the `hooks` table, and drops the dotted
+`hooks.PreToolUse`/`hooks.PostToolUse` keys a first admission writes: kept beside
+the table, they came after it in the sorted stored config and won, so a writer's
+second readmission ran its first release's `hooks.py` and was refused
+`HOOK_DEFINITIONS` (through 2.4.15). That refusal records how many session hooks
+were listed and how many run this release's `hooks.py`. After native
 history is complete, each participant's bytes are read under its ledger lock,
 with custody and executing-write safeguards. A `recovery_resolution` record and
 `unknown/recovery_resolved` event name the history evidence, scan and exact startup

@@ -320,21 +320,24 @@ class Runs:
         due = time.monotonic() - self.cancel_reconciled.get(runid, float("-inf")) > 2
         if due:
             self.cancel_reconciled[runid] = time.monotonic()
-            from .recovery import reconcile_listener
+            from .recovery import reconcile_listener, retry_due
             for ident in {a["listener"] for a in self.store.all("actor", run["unit"]) if a.get("listener")}:
                 listener = self.store.get(ident)
                 if listener.get("recovery_error") == "ENDED" or listener["state"] == "dormant":
                     continue  # ended to settle an input (end_writer): nothing runs there, and a cancel needs no replacement
-                if listener.get("recovery_state") == "failed" and listener.get("retry_at", 0) > time.time():
-                    continue  # its retry is not due yet: a start that keeps failing is not tried every 2 s
+                if listener.get("recovery_state") == "failed" and not retry_due(self.daemon, listener):
+                    continue  # the one retry policy: not before its backoff, and one that cannot heal waits for a resume
                 try:
-                    await reconcile_listener(self.daemon, listener, advance=False)
+                    await reconcile_listener(self.daemon, listener, advance=False, scheduled=True)
                 except (CoordinatorError, OSError) as exc:
                     self.store.event("run/cancel_reconcile_refused", runid, {"code": getattr(exc, "code", type(exc).__name__)})
             # Every turn still active is interrupted again: one the cancel's pass could not see, and one whose
-            # interrupt was lost with its app-server.
+            # interrupt was lost with its app-server. Only through a live connection: one without is interrupted on a
+            # pass after it reconnects, by this generation, as read then. Through 2.4.15 each pass recorded its refusal
+            # (10-29: 3,734 events in 5.6 h for two writers whose readmission could not pass).
             for actor in list(self.store.all("actor", run["unit"])):
-                if actor.get("active_turn"):
+                connection = self.daemon.connections.get(actor.get("listener"))
+                if actor.get("active_turn") and connection and not connection.closed:
                     await self.interrupt_turn(actor, actor["active_turn"], generation)
         for actor in list(self.store.all("actor", run["unit"])):
             await self.daemon.settle_actor(actor)
