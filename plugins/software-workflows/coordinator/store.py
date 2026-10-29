@@ -115,6 +115,9 @@ class Store:
         # Writes per record kind in this process: a projection read from records of some kinds is computed again only
         # once one of them was written (Dormancy.status). A write rolled back still counts: one more computation.
         self.puts = Counter()
+        # parent -> writes of the records under it since a backoff began to watch it (a key here): a workflow phase's
+        # settlement refused is tried again once a record of its unit or its run changes (Writer.settle_due).
+        self.watched = {}
         self._listener_processes = None  # listener id -> its services' and helpers' identities (listener_processes)
         self._listener_written = False  # a listener was written in the open transaction
         self.root = validate_state(root, create=True)
@@ -394,13 +397,19 @@ class Store:
 
     @telemetry.measured("sql_work", False)
     def put(self, kind, ident, data, parent=None):
-        if kind in {"run", "unit", "actor", "listener", "checkout", "claim", "custody", "message", "claim_request",
-                    "release_request", "custody_request", "participant", "publication", "publication_group", "project_revision", "resolution"}:
-            self.status_epoch += 1
-        self.puts[kind] += 1
-        self.db.execute("""INSERT INTO records(id,kind,parent,data) VALUES(?,?,?,?)
-            ON CONFLICT(id) DO UPDATE SET data=excluded.data,revision=records.revision+1""",
-                        (ident, kind, parent, encoded(data)))
+        # A save of the bytes a record already holds writes nothing: no WAL frames, no new revision, and the caches
+        # kept until a write (status_epoch, puts, watched) stay. Through 2.4.21 each was written (10-29, the user's
+        # ledger: 318 of 363 listener saves a minute and 96 of 103 run saves changed nothing).
+        written = self.db.execute("""INSERT INTO records(id,kind,parent,data) VALUES(?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET data=excluded.data,revision=records.revision+1
+            WHERE records.data IS NOT excluded.data RETURNING parent""", (ident, kind, parent, encoded(data))).fetchall()
+        if written:
+            if written[0][0] in self.watched:
+                self.watched[written[0][0]] += 1
+            if kind in {"run", "unit", "actor", "listener", "checkout", "claim", "custody", "message", "claim_request",
+                        "release_request", "custody_request", "participant", "publication", "publication_group", "project_revision", "resolution"}:
+                self.status_epoch += 1
+            self.puts[kind] += 1
         if kind == "listener":
             self._listener_written = self._listener_written or self.db.in_transaction
             if self._listener_processes is not None:

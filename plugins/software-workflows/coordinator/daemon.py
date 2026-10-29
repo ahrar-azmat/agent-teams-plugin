@@ -3461,10 +3461,13 @@ class Daemon:
                 await self.ledger.scans.retry()
                 # Only runs this loop can act on: every finished run is history. A plain run's prepared continuation
                 # (transition_pending) is submitted again too: its writer was being replaced when run/resume prepared it.
-                for run in list(self.store.selected("SELECT * FROM records WHERE kind='run' AND ((json_extract(data,'$.cancel_requested') "
+                runs = list(self.store.selected("SELECT * FROM records WHERE kind='run' AND ((json_extract(data,'$.cancel_requested') "
                         "AND json_extract(data,'$.state')!='cancelled') OR json_extract(data,'$.state') IN ('transition_pending','submission_uncertain') OR "
                         "(json_extract(data,'$.workflow') IS NOT NULL AND "
-                        "json_extract(data,'$.state') NOT IN ('completed','failed','interrupted','blocked','refused','cancelled'))) ORDER BY id")):
+                        "json_extract(data,'$.state') NOT IN ('completed','failed','interrupted','blocked','refused','cancelled'))) ORDER BY id"))
+                for runid in set(self.writer.refused) - {run["id"] for run in runs}:
+                    self.writer.forget(runid)  # its settlement backoff, for a run this loop no longer acts on
+                for run in runs:
                     if ("run", run["id"]) in recovering:
                         continue
                     if run.get("cancel_requested") and run["state"] != "cancelled":
@@ -3477,7 +3480,9 @@ class Daemon:
                         continue
                     # A workflow whose turn/start result was lost (submission_uncertain) is advanced too: the advance settles
                     # that input, reading native at most each 2 s (writer.py); one nothing shows waits for the lead's resume.
-                    if run.get("workflow") and run["state"] in ("settling", "transition_pending", "submission_uncertain"):
+                    # A phase refused settlement for a minute is tried at a backoff (Writer.settle_due).
+                    if (run.get("workflow") and run["state"] in ("settling", "transition_pending", "submission_uncertain")
+                            and self.writer.settle_due(run)):
                         try:
                             await self.writer.advance(run["id"])
                         except CoordinatorError as exc:

@@ -17,6 +17,10 @@ from .store import uid, digest
 
 
 TERMINAL = {"completed", "failed", "interrupted", "blocked", "refused", "cancelled"}
+# A workflow phase refused settlement is tried each maintenance pass for this long, then at a backoff
+# (Writer.settle_due). Above the time a command's custody takes to clear: on 10-29 a command's settlement took 64 s
+# at most on the saturated 2.4.20 loop (p90 25.7 s), and 15.8 s on 2.4.21 (p90 8.9 s).
+SETTLE_EACH_PASS_S = 60
 IMAGES_NUDGE = "Images are attached to this turn. Look at each one, then continue from where you left off with them in mind."
 
 
@@ -59,6 +63,7 @@ class Writer:
         self.advancing = 0  # advances under way: a drain waits for them
         self.resubmitting = set()  # plain runs whose prepared continuation is being submitted again
         self.starting = set()  # input ids whose turn/start is in flight in this daemon
+        self.refused = {}  # run -> its phase's last settlement refusal: maintenance's backoff (settle_due)
 
     def prepare(self, runid, phase):
         run = self.store.get(runid)
@@ -200,8 +205,14 @@ class Writer:
             await self.daemon.runs.settle_inputs(runid, "resume")
 
     def observe(self, actor, method, params):
+        # Only a root writer's turns are its run's phases, so no other actor's notification decodes the run, and the
+        # run is saved only when this changed it. Through 2.4.21 each notification of a phase's turn encoded and saved
+        # the whole run (a workflow's, 50-400 KB), changed or not: a resumed turn of 30 notifications saved it 45 times,
+        # now 6-7 (VERIFY 2.4.22).
+        if actor["kind"] != "root":
+            return
         run = self.store.get(actor["run"])
-        if not run.get("phases") or actor["kind"] != "root":
+        if not run.get("phases"):
             return
         turn = params.get("turnId") or params.get("turn", {}).get("id")
         item = params.get("item", {})
@@ -213,6 +224,7 @@ class Writer:
                 phase = candidate
         if phase is None:
             return
+        before = dict(phase), dict(phase.get("messages") or {}), run.get("state")
         phase["turn"] = turn
         if item.get("type") == "userMessage" and item.get("clientId") == phase["input_id"]:
             self.daemon.messages.entered(actor["id"], phase["input_id"], {"turn": turn, "item": item.get("id")})
@@ -235,7 +247,43 @@ class Writer:
                 run["state"] = params["turn"]["status"]
             else:
                 run["state"] = "settling"
-        self.store.save(run)
+        if (dict(phase), dict(phase.get("messages") or {}), run.get("state")) != before:
+            self.store.save(run)
+
+    def settle_due(self, run):
+        """Whether maintenance tries now to settle a workflow phase it was refused (Publisher.quiescent): at once when a
+        record of its unit (actors, custody, claims, operations) or of its run (listeners) was written since; else each
+        pass for its first SETTLE_EACH_PASS_S of refusals, then at the writers' reconcile backoff (recovery.retry_delay:
+        by default 5 s, doubling to 300 s), for any change not watched: native's, or a lead edit of another unit in the
+        checkout. A turn's end, a reconcile and a start try it at once.
+        Through 2.4.21 each pass tried it, and a phase whose command custody stayed held was refused for hours: each try
+        read its writers' threads and terminals from native, inspected their processes, and saved its run and listener
+        (10-29: three such runs, each tried every second; one listener saved 256 times a minute)."""
+        held = self.refused.get(run["id"])
+        return (held is None or held["input"] != (run.get("phases") or {}).get(run.get("phase"), {}).get("input_id")
+                or time.monotonic() >= held["due"] or held["writes"] != self.writes(run))
+
+    def writes(self, run):
+        return self.store.watched.get(run["unit"]), self.store.watched.get(run["id"])
+
+    def backoff(self, run, input_id):
+        """Record a refusal of the phase's settlement (settle_due), as of what its unit and run hold now."""
+        from .recovery import retry_delay
+        for parent in (run["unit"], run["id"]):
+            self.store.watched.setdefault(parent, 0)
+        now = time.monotonic()
+        held = self.refused.get(run["id"])
+        first, tries = (held["first"], held["tries"]) if held and held["input"] == input_id else (now, 0)
+        delay = 0 if now - first < SETTLE_EACH_PASS_S else retry_delay(tries + 1)
+        self.refused[run["id"]] = {"input": input_id, "unit": run["unit"], "first": first, "due": now + delay,
+                                   "tries": tries + bool(delay), "writes": self.writes(run)}
+
+    def forget(self, runid):
+        """A run whose settlement is not backed off: its phase completed, or maintenance no longer acts on it."""
+        held = self.refused.pop(runid, None)
+        if held:
+            for parent in (held["unit"], runid):
+                self.store.watched.pop(parent, None)
 
     def signature(self, run, status):
         unit = self.store.get(run["unit"])
@@ -279,8 +327,10 @@ class Writer:
                 await Publisher(self.daemon).quiescent(self.store.get(run["unit"]))
             except CoordinatorError as exc:
                 run = self.store.get(runid)  # read after the await: a cancel since then is not overwritten
-                run["settlement_refusal"] = exc.envelope()
-                self.store.save(run)
+                if run.get("settlement_refusal") != exc.envelope():
+                    run["settlement_refusal"] = exc.envelope()
+                    self.store.save(run)
+                self.backoff(run, phase.get("input_id"))
                 return
             await finish_all(*(self.daemon.ledger.reconcile(self.store.get(key)) for key in participants.checkout_ids(self.store, run["unit"])))
             if self.daemon.draining:
@@ -298,6 +348,7 @@ class Writer:
                 return
             new_unknown = [u for u in [u for key in participants.checkout_ids(self.store, run["unit"]) for u in self.store.unresolved(key)] if u["id"] not in phase["unknown_baseline"]]
             success = phase.get("status") == "completed" and phase.get("input_observed") and bool(phase.get("answer", "").strip()) and not new_unknown
+            self.forget(runid)
             phase.update(state="complete", completed=time.time(), success=success)
             phase["signed_result"] = self.signature(run, "ok" if success else "error") + "\n" + phase.get("answer", "")
             run.pop("settlement_refusal", None)

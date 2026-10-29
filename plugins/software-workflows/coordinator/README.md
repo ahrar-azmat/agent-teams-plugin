@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.21 / P1
+# Writer coordinator — software-workflows 2.4.22 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -2193,6 +2193,15 @@ user's ledger; the loop stalled 12 times a minute and a lead's edits were refuse
 that adds an index builds it at its first start (2.4.21: six, 4.6 s on a copy of the user's ledger). Maintenance's
 runs to act on, the mail pass's lead-actor filter and some reads at a start still read every record of their kind
 (VERIFY 2.4.21, known limits).
+
+A save writes a record only when its bytes change (`Store.put`): an unchanged save writes nothing to the ledger and
+leaves its revision as it was, so a record's revision counts its changes. A workflow phase refused settlement
+(`Publisher.quiescent`) is tried each maintenance pass for its first minute of refusals; after that, at the next pass
+once a record of its unit or run is written, or at the writers' reconcile backoff for any other change (by default
+5 s, doubling to 300 s), and at once on a turn's end, a reconcile or a start. Through 2.4.21 a phase held by custody
+that could not clear was tried
+every second for hours, each try reading its writers' state from native and saving its run and listener unchanged
+(10-29: 96 of 103 run saves and 318 of 363 listener saves a minute changed nothing; VERIFY 2.4.22).
 
 Retain the state directory and scratch evidence when investigating a refusal.
 There is no garbage collector or destructive reset command in C1. Do not remove

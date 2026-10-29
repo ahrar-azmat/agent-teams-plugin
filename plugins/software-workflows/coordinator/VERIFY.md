@@ -15715,3 +15715,113 @@ The rest, unchanged, read kinds of at most 184 records or run once at a start.
 - **The new partial indexes' upkeep**: each save of a listener, message, run or operation evaluates their
   conditions. That cost was not measured apart; the live measurement after the switch gives the net (review turn
   118).
+
+## 2.4.22
+
+Two changes: a save that changes nothing writes nothing, and a workflow phase refused settlement is no longer tried
+every second while nothing it waits for changes. Measured on 10-29 between 19:45 and 20:06 on the user's Mac (macOS
+26.6.2, Python 3.15.2, SQLite 3.54.1, Codex 0.163.0). (A) was read from the live 2.4.21 daemon and ledger, read-only.
+(B) runs SQLite alone on a scratch database. (C) runs a real daemon (supervisor, worker) with a real Codex writer and
+the loopback fixture provider, on a disposable state: 2.4.21 from its installed copy (`a496ef9`, 108 of 108 files
+identical), the tree from the checkout.
+
+### What it changes
+- **`Store.put`**: the upsert's `DO UPDATE` has `WHERE records.data IS NOT excluded.data` and `RETURNING parent`. A
+  save of the bytes already stored changes no row: no WAL frames, no new revision. `status_epoch`, `puts` and a
+  watched parent's count (`Store.watched`) move only on a write.
+- **`Writer.observe`** returns before reading the run for a notification of an actor that is not a root writer, and
+  saves the run only when its phase or state changed (the phase and its messages compared before and after).
+- **Settlement backoff** (`Writer.settle_due`, `backoff`, `forget`; daemon maintenance). When `Publisher.quiescent`
+  refuses a phase, its refusal is saved only when it differs from the last, and the run is recorded with the writes
+  under its unit (actors, custody, claims, custody requests, dynamic requests, operations, the run) and under its run
+  (listeners). Maintenance tries it again at the next pass when either moved; else each pass for the first
+  `SETTLE_EACH_PASS_S` (60 s) of refusals, then after `recovery.retry_delay` (the writers' reconcile backoff and its
+  settings: by default 5 s, doubling to 300 s), which covers every change not watched. A turn's end, a reconcile and a
+  start advance the run directly, as before. The record is dropped when the phase completes or maintenance no longer
+  selects the run.
+
+### (A) Live findings (2.4.21, read-only)
+`r2422/kind_writes.py <kind> 60`: every record of a kind read each 0.5-1 s for 60 s; a write whose data is
+byte-identical to the previous read is unchanged.
+
+| kind | records | saves a minute | unchanged | MB a minute | most saved |
+|---|---|---|---|---|---|
+| run | 110 | 102.6 | 95.6 | 20.6 | three runs, 32 a minute each |
+| listener | 3,850 | 362.8 | 318.1 | 25.8 | one, 256 a minute; one, 64 |
+| actor | 190 | 5.0 | 2.0 | 0.005 | |
+
+The three runs were workflow phases `settling`, refused `CUSTODY_HELD` or `UNVERIFIED_OPERATION`; the two most saved
+listeners were their writers'. Watched for 5 s, one run's revision rose from 4,989 to 4,993 with nothing changed.
+Thirteen runs held a refusal, with revisions from 829 to 13,359. Decoding the 231 KB run took 0.22 ms and encoding it
+0.47 ms; the 76 KB listener, 0.18 ms each.
+
+### (B) The upsert on SQLite 3.54.1
+`r2422/upsert_probe.py` (WAL, `synchronous=FULL`, autocommit, checkpoints off) on a 231,066-byte record, 200 saves
+each, and `r2422/returning_probe.py`:
+
+| save | rows | revision | WAL a save | time a save |
+|---|---|---|---|---|
+| unchanged, 2.4.21's statement | 1 | +1 each | 6.4 KiB | 0.058 ms |
+| unchanged, this release's | 0 | unchanged | 0 | 0.017 ms |
+| changed, this release's | 1 | +1 each | 237.4 KiB | 0.494 ms |
+
+`RETURNING parent` returns the record's parent for an insert and for a changed save (also when `put` is given no
+parent), and nothing for an unchanged save, in a transaction or out of one; after `fetchall()` an autocommit save
+leaves no transaction open.
+
+### (C) Real daemon
+`r2422/observe_probe.py <plugin> <dir> <label>`: one native run (a patch, six commands, an answer), then a
+`run/resume` whose turn runs six commands and answers. Its continuation is a phase, so `Writer.observe` acts on it.
+
+| code | first turn: run revision | continuation: notifications, run saves | outcome | UNKNOWNs | stop |
+|---|---|---|---|---|---|
+| 2.4.21 (`obs-2421-2`) | 5 | 30, 45 | completed, `continued` | 0 | graceful |
+| tree (`obs-tree-1`, `obs-tree-2`) | 5 | 30, 7 and 6 | the same | 0 | graceful |
+
+The run's outcome with ids and times left out (state, phase, each phase's state, status, answer, messages, input seen,
+fields) and its actors were the same.
+
+`r2422/settle_probe.py <plugin> <dir> <label> <hold>` under `r2422/inject` (each `Publisher.quiescent` call, each
+`Store.put` by kind): an Abraham workflow whose analysis turn starts `sleep <hold>` through `exec_command` with a 1 s
+yield, then answers; the implementation turn answers. The phase is refused `BACKGROUND_TERMINAL` while the process
+runs.
+
+| code | tries | refused | try times (s from the first) | settled after the sleep ended | run revision / saves | writer's listener revision / all listener saves | outcome |
+|---|---|---|---|---|---|---|---|
+| 2.4.21 (`settle-2421-1`, 150 s) | 136 | 134 | each 1.1 s to 149.2 | 0.5 s | 171 / 171 | 282 / 289 | both phases complete, success |
+| tree, no wake on writes (`settle-tree-1`, 152 s) | 62 | 60 | each pass to 60.4, then 65.7, 76.3, 96.5, 136.7, 217.7 | 67 s | 17 / 18 | 10 / 221 | the same |
+| tree (`settle-tree-2`, 150 s) | 62 | 60 | each pass to 60.1, then 65.4, 76.0, 96.3, 136.4, 149.1 | 0.5 s | 17 / 18 | 10 / 219 | the same |
+
+`settle-tree-1` ran an earlier form of the change, without the wake on writes: the phase waited for its 80 s backoff
+after the process ended. In `settle-tree-2` the custody release that followed the process's exit was a write in the
+unit, and the next pass settled the phase. No UNKNOWN in any; each stopped gracefully. A record's revision counts its
+writes (an insert is revision 1). The tree's listener saves left, about one a second, were almost all unchanged, so
+not written.
+
+### (A') The release before, live
+`r2421/live_after.py`, 2.4.21 from 19:46 to 20:06 (20.3 min, 8 minutes after its forced switch), against 2.4.20 from
+18:37 to 19:07 (30 min):
+
+| | 2.4.20 | 2.4.21 |
+|---|---|---|
+| loop stalls a minute | 12.1 | 1.97 |
+| native messages a minute | 1,096 | 708 |
+| settlement p50 / p90 / max | 10.4 / 25.7 / 64.1 s | 2.5 / 8.9 / 15.8 s |
+| lead admissions | 18 granted, 15 expired, 1 refused | 24 granted |
+| admission decision p50 / p90 | 1.5 / 2.6 s | 0.25 / 0.55 s |
+| worker CPU | 98.7-144% | 56.5% |
+
+### Static checks
+`r2422/static_checks2422.py`, as 2.4.21's, against the installed 2.4.21, on the final tree: 12 of 12.
+
+### Known limits
+- **Maintenance's custody pass**: each second it settles every actor that holds command custody, reading its
+  background terminals from native and inspecting the machine's processes. Custody that cannot clear is inspected
+  each second (the stuck phases' units). Watching the held processes for their exit is queued, with research and a
+  design review first.
+- **A refusal that clears with nothing written in the unit or the run** waits for its backoff: one that clears in
+  native alone, or by a lead edit of another unit in the same checkout (`Publisher.quiescent` refuses the checkout's
+  unverified lead edits, publish.py 63). At most the writers' reconcile retry maximum
+  (`SOFTWARE_WORKFLOWS_RECONCILE_RETRY_MAX_S`, 300 s by default; review turn 120).
+- **An unchanged save still encodes its record** before SQLite compares it (0.47 ms for a 231 KB run).
+- **The phases held by custody stay held**: this release stops their cost, not their cause.

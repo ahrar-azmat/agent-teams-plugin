@@ -3,6 +3,51 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.22] — 2026-10-29
+
+Two changes: a save that changes nothing writes nothing, and a workflow phase refused settlement is no longer tried
+every second while nothing it waits for changes. (`store.py`, `writer.py`, `daemon.py`; coordinator/VERIFY.md,
+2.4.22.)
+
+### Fixed: records saved unchanged, and settlements tried every second for hours
+- Found live on 10-29 (2.4.21, read-only, 60 s each): 103 run saves a minute, 96 of them of the bytes already stored
+  (20.6 MB a minute of run records), and 363 listener saves a minute, 318 of them unchanged (25.8 MB). One listener's
+  record (76 KB) was saved 256 times a minute.
+- Most came from three workflow phases whose settlement was refused (`CUSTODY_HELD`, `UNVERIFIED_OPERATION`).
+  Maintenance tried each every second, and each try read its writers' threads, sub-agents and background terminals
+  from native, inspected their processes, and saved its run (up to 231 KB) and its listener, unchanged. Runs refused
+  that way had been saved 2,683 to 13,359 times. The rest came from `Writer.observe`, which saved the whole run at each
+  notification of a phase's turn, changed or not.
+- Now:
+  - `Store.put` writes a record only when its bytes change. An unchanged save writes no WAL frames, and its revision
+    and the caches kept until a write stay as they were. On a scratch database an unchanged save of a 231 KB record
+    wrote 6.4 KiB of WAL through 2.4.21, and none now.
+  - `Writer.observe` reads the run only for a root writer's notification, and saves it only when it changed it.
+  - Maintenance tries a refused phase each pass for its first minute of refusals, then at the next pass after a record
+    of its unit or run is written, or at the writers' reconcile backoff (by default 5 s, doubling to 300 s). A turn's
+    end, a reconcile and a start try it at once, as before. Its refusal is saved only when it differs from the last.
+- Measured on a real daemon with a real Codex writer (VERIFY 2.4.22 (C)), 2.4.21 then this release:
+
+  | probe | 2.4.21 | 2.4.22 |
+  |---|---|---|
+  | a resumed turn of 30 notifications: run saves | 45 | 6-7 |
+  | a workflow phase held 150 s by a background process: settlement tries | 136 | 62 |
+  | the same phase: run writes, listener writes | 171, 282 | 17, 10 |
+  | the same phase: settled after the process ended | 0.5 s | 0.5 s |
+
+  The runs, phases and answers came out the same, with no UNKNOWN.
+
+### Known limits
+- Each second, maintenance still settles every actor that holds command custody: it reads the actor's background
+  terminals from native and inspects the machine's processes. Custody that cannot clear is inspected each second, so
+  the units of the stuck phases keep that cost. Watching the held processes for their exit instead is queued, with
+  research and a design review first.
+- A phase whose refusal clears with nothing written in its unit or run (in native alone, or by a lead edit of
+  another unit in the same checkout) waits for its backoff: at most the writers' reconcile retry maximum
+  (`SOFTWARE_WORKFLOWS_RECONCILE_RETRY_MAX_S`, 300 s by default).
+- An unchanged save still encodes its record before SQLite compares it (0.47 ms for a 231 KB run).
+- The phases held by custody stay held. This release stops their cost, not their cause (the custody queue).
+
 ## [software-workflows 2.4.21] — 2026-10-29
 
 One change: the reads the worker's event loop made for each writer hook, each second, each reconcile and each start
