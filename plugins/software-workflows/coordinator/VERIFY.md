@@ -14908,3 +14908,358 @@ fixed. Each compares with the installed 2.4.15.
   - 2.4.19: native compaction and archive retention;
   - 2.4.20: reclaiming the file's space;
   - 2.4.21: parking and resource budgets.
+
+## 2.4.17
+
+Two changes: every coordinator tool result fits what a writer's model is shown whole, and a completed call's record
+keeps a bounded form of its answer; and a stop no longer waits for a writer whose retry the policy holds back. Measured
+on 10-29 between 11:04 and 14:56 on the user's Mac. (A) to (G) are real daemons (supervisor, worker, real codex
+0.163.0 writer app-servers, gpt-6-astra in `code_mode_only`) on disposable states, with the loopback fixture provider
+playing each run's cells; (H) calls the tool's function over a real store. (B) to (H) each compare with the installed
+2.4.16 or a calibration; (F) to (H) are the evidence Codex's review of the tree (turns 103 to 108) asked for, after
+its findings were fixed.
+
+### What it changes
+- **`tools.RESULT_BYTES`**: the budget for a result's encoded JSON, 32,000 bytes. `SOFTWARE_WORKFLOWS_TOOL_RESULT_BYTES`
+  sets it from 4,096 to `RESULT_CEILING` (40,000); any other value raises `CONFIG` at import, as recovery.py's settings
+  do. The derivation is recorded next to the constant: (A).
+- **`tools.result(value, success, name)`** counts every result into `METRICS`, which **`tools.metrics()`** reports as
+  `daemon/status` `tool_results`. **`tools.limited(name, ...)`** names a page or list cut to the budget, and counts it.
+- **`tools.invoke`** returns the response sent and the form its record keeps (**`tools.stored`**):
+  - `receipt_range` for a `read_file` page: its value without the bytes, the receipt, offset and length;
+  - `deflate` for any other response over `STORED_PLAIN_BYTES` (2,048);
+  - else the response itself.
+  **`tools.replayed`** rebuilds the exact response from any of them, and refuses an unknown form
+  `DYNAMIC_STORED_FORM`. `Daemon._native_request` stores the kept form and answers a repeated request through
+  `replayed`, off the loop (`finish_thread`).
+- **`tools.bounded_error`**: every error answer within the budget. Details that would not fit (a caller's own path,
+  `PATH_ESCAPE`'s among them) are left out, their size named (`details_omitted_bytes`). **`tools.echoed`** cuts a
+  caller's own string an error echoes (`REVISION_CHANGED`'s `continued`, `MESSAGE_NOT_FOUND`'s `message`) to
+  `ECHO_BYTES` (120) as encoded, naming its length (`<name>_chars`).
+- **`tools.read_page`**:
+  - checks the range and the pinned `revision` before routing, reconciling or reading;
+  - computes the page from the budget less the encoded envelope at its widest (23,601 bytes);
+  - refuses a pinned revision that is no longer the path's head `REVISION_CHANGED` (`path`, `revision`, `continued`);
+  - reads only the page through **`Store.read_blob_range`**;
+  - sets `limited` when it returns fewer bytes than asked and the file holds.
+- **`Store.read_blob_range(name, offset, length)`** validates the id, verifies a receipt whose stamp is not the verified
+  one (**`Store.verify_blob`**, sha256 in 1 MiB chunks, its stamp checked before and after), then reads the range and
+  refuses `BLOB_CORRUPT` if the stamp changed meanwhile. An offset at or past the receipt's end reads nothing and
+  never seeks: buffered `seek` refuses an offset from 2**63 on with `ValueError`, which no caller answered (review turn
+  103). **`Store.blob`** verifies a reused receipt with `verify_blob` instead of reading it whole.
+- **`tools.writer_status`** and **`tools.brief`**: the caller's own run within half the budget, then the other runs on
+  its checkout in run id order, paged by `cursor`. A run is shortened only when it alone exceeds a page: its task and
+  each custody command to `TASK_BYTES` (400) and `COMMAND_BYTES` (200) as encoded, naming their lengths
+  (`task_chars`, `command_chars`); its lists halved with `<list>_total`; then its task further. The open UNKNOWNs per
+  checkout take at most a quarter of the budget (`unknowns_checkouts`, `unknowns_total` for the rest). Unacknowledged
+  message counts come from one grouped query.
+- **`tools.writer_inbox`**, **`tools.message_view`**, **`tools.text_page`** and **`tools.message_text`**: a page of
+  bounded message views (`MESSAGE_FIELDS`, each string field cut by `echoed` to `ECHO_BYTES` with `<field>_chars`, the
+  text, `delivery_attempts` counted), loaded `INBOX_SLICE` (16) at a time until full or `limit`; a first message too
+  long for the page cut by characters, never refused; the rest of one message read by `message` and `text_offset`,
+  for its recipient only (`Messages.recipient`).
+- **`tools.conforms(value, schema)`** checks a value against the JSON Schema subset `CONTRACTS` uses (`anyOf`, `enum`
+  by type and value, `string`, `integer` with `minimum` and never a bool, `array` with `items`, `object` with
+  `properties`, `required` and `additionalProperties`). **`tools.dispatch`** checks every argument with it before
+  `effect()` or any read, and refuses `TOOL_ARGUMENTS` with `invalid` and `missing` (the tool's own names) and
+  `unknown` (a count). Native forwards the arguments unchecked (codex 0.163.0 `core/src/tools/handlers/dynamic.rs:141`,
+  `parse_arguments` to a JSON `Value`, then `request_dynamic_tool`).
+- **`routing.normalized`**: `ledger.normalize` for a caller's path, where an `OSError` in
+  **`routing.ACCESS_REFUSALS`** (`EACCES`, `EPERM`, `ELOOP`, `ENAMETOOLONG`: a name past `NAME_MAX`, a folder that
+  cannot be searched) is refused `PATH_INVALID` with its `errno`. **`tools.read_page`** refuses those from its
+  reconcile or read `READ_FAILED`. Any other `OSError` propagates as before: a local resource failure while a
+  receipt is written (`native.local_resource_failure`: `ENOSPC`, `EDQUOT`, `EFBIG`, `EMFILE`, `ENFILE`, `ENOMEM`)
+  reaches `apply_native_request`, which stops native intake (review turn 105: the first form answered them all).
+  **`services.declaration`** refuses a `kind` that is not a string `SERVICE_SPEC` (a list raised `TypeError` at the
+  `PORTS` lookup).
+- **`Store.read_blob`**, **`Store.verify_blob`** and **`Store.read_blob_range`** raise a local resource failure opening
+  or reading a receipt as it is (`native.local_resource_failure`), and any other `OSError` `BLOB_MISSING` as before.
+  Review turn 106: a receipt that could not be opened for want of a descriptor (`EMFILE`, `ENFILE`) was taken for a
+  missing one. The call was answered `BLOB_MISSING`, and when the check came from `Ledger.reconcile` (a scan) or
+  `Publisher.verify_working`, the operations that wrote the receipt were quarantined.
+- **`Ledger._complete_patch`**, **`operations.complete_patch`** and **`Ledger.settle_unapplied`** let a local resource
+  failure checking a writer's patch go on without quarantining the patch, and **`Daemon.maybe_verify`** lets it go on
+  whatever the patch's state. It reaches `check_native_resource` from the notification's application: native intake
+  stops, the notification stays unapplied, and it is applied again. A project writer's patch
+  (`operations.complete_patch`: it has parts even when it touches one checkout) is left unfinished the same way, but
+  the next start fences every operation with parts whose atomic completion did not commit (`recovery.recover`), so it
+  is still quarantined there (Known limits). Review turn 107: the patch was
+  quarantined, its paths made UNKNOWN, and `maybe_verify` then let the failure go because the patch was quarantined,
+  so intake went on. **`recovery.reconcile_effects`** and **`recovery._reconcile_listener`** passed over every
+  `CoordinatorError` from `complete_patch`, as for a patch it had quarantined; one carrying a local resource failure (a
+  cause or context) now fails the reconcile, which the retry policy tries again (not reached by a probe: it needs a
+  wrapped resource failure in a reconcile). A lead's own edits and commands (`Daemon.lead_edit`, `operation/complete`,
+  `recovery.lead_command`) keep their quarantine: the coordinator itself writes there, and a failure partway leaves
+  what it wrote unknown.
+- **`Daemon.settle_logged(listener, operation)`**: `settle_returned` for a receipt read from a listener's log, in a task
+  of its own (`tail_native_log`, and `runs` reading a log to tell what became of a delivery). A local resource failure
+  goes to `check_native_resource`, as one where the log is read does, and the next worker settles the call from its
+  receipt again (`settle_native_log` at its start). Review turn 108: it ended in `background/failure` alone, with the
+  log read past the receipt.
+- **`list_paths`**' project cursor: each decoded part must encode as UTF-8 (a JSON escape can decode to a lone
+  surrogate, which SQLite cannot bind), and `RecursionError` joins `TypeError` and `ValueError` as `PAGE_CURSOR`.
+- **`tools.as_text(value)`**: a stored field as text (a string as it is, `None` as "", anything else as its JSON),
+  used for a run's task and a custody command in `brief`, every message field and its text in `message_view`, and
+  the text in `message_text`; `message_view` cuts any field whose encoded size passes `ECHO_BYTES`. At ingestion,
+  **`Daemon.create_run`** refuses a task that is not a string `RUN_FIELDS`, and **`Messages.send`** a sender that is
+  not a nonempty string `MESSAGE_ARGUMENTS` (review turn 105: a numeric task made `brief` raise, and every writer's
+  `status` go unanswered; a list sender went uncut).
+- **`tools.fitted_chars`**: the longest prefix that encodes within a room, found by binary search (never splitting a
+  code point).
+- **`list_paths`** reads at most `PAGE_ROWS` (budget / 64) rows and one more, so a `limit` past what SQLite binds
+  (2**63) never reaches it; shows a row only with room left for its own cursor; and shows a row no page can hold alone,
+  over the budget, `limited` reason `ENTRY_OVER_BUDGET`.
+- **`send`** answers `id`, `recipient`, `state`, `delivery` and `wake`.
+- **`CONTRACTS`**: `inbox` gains `message` and `text_offset`, `status` gains `cursor`, and `read_file` gains `revision`;
+  all optional; the descriptions name the paging.
+- **`Daemon.held_by_retry(runid)`**: a demand start failed and not `start_due`, or a bound writer whose reconcile
+  failed and is not `retry_due` (through 2.4.16: `start_held`, or `permanently_failed`).
+
+### (A) What the model is shown of a cell's output (`r2417/ceiling_probe.py`, 11:04)
+- **The setup.** One writer; its cells print n characters by themselves, or a `read_file` page whole; one direct (not
+  code-mode) call. The router records the tool output each next model request carries.
+- **What reached the model:**
+  - a cell's output whole up to 32,047 characters (32,000 printed plus its header);
+  - from 64,000 on, about 40,150 characters, with `Warning: truncated output (original token count: N)` and the
+    middle left out. That is codex's `truncate_code_mode_result` with `TruncationPolicy::Tokens` at
+    `DEFAULT_MAX_OUTPUT_TOKENS` (10,000, `unified_exec/mod.rs:74`) in the installed 0.163.0 source;
+  - a direct call, accepted in `code_mode_only`, cut in the middle at about 48,000;
+  - the cell's JavaScript saw all 1,398,444 characters of a 1 MiB `read_file` page;
+  - 2.4.16's default `read_file` page (65,536 bytes) encoded to 87,720 characters, of which the model saw 40,150; a
+    16 KiB page (22,184) arrived whole; `status` on an almost empty state was 6,817.
+
+### (B) Every tool, whole and walked (`r2417/accept2417.py tools`, 11:55)
+- **The setup.** One writer; 41 messages to it, one of 100,000 characters; files of 64 KiB, 256 KiB, 1 MiB and 128 MiB;
+  1,200 paths of 98 characters. Each tool's answer is printed whole once, then walked to its end inside one cell.
+  Every message is steered into the turn before the first measured cell: codex 0.163.0 yields a running cell whenever a
+  steer is pending (`core/src/session/input_queue.rs`, `watch_user_input`), as this probe's first form found (every
+  `read_file` cell answered "Script running with cell ID N"). In the worker (`r2417/inject5/sitecustomize.py`): each
+  answer logged, then the request applied once more with the answer kept from native; and each `read_file` call's peak
+  Python allocation (tracemalloc).
+- **What the model was shown, this tree, then 2.4.16:**
+  - the default `read_file` page: 31,855 characters, whole; 2.4.16: 40,150 of 87,720, cut;
+  - every page of the 1 MiB file: 45 pages, 1,048,576 bytes, FNV-1a 840270039 as the file's, the largest page 31,810;
+    2.4.16: 16 pages, the same bytes, the largest 87,725;
+  - `length: 1000000`: 23,601 bytes with `limited` (`requested` 1,000,000, `returned` 23,601); 2.4.16: 1,000,000
+    bytes in 1,333,678 characters;
+  - a second page of a 256 KiB file after a line was appended, pinned to the first page's revision:
+    `REVISION_CHANGED`, naming both revisions; 2.4.16: a page of the changed file (size 262,173), with nothing to say
+    so;
+  - one page of the 128 MiB file: 31,809 characters, 1.6 MB peak allocation; 2.4.16: 87,721, 134.41 MB;
+  - `status`: 452 characters, whole (its own run, 41 unacknowledged); 2.4.16: cut, from 60,844 tokens;
+  - `inbox`: 29,363 characters, whole; 2.4.16: cut, from 59,151 tokens;
+  - `inbox` walked: 7 pages, 41 messages, 220,030 characters (all), the long one read in parts, the largest answer
+    31,999; 2.4.16: one answer of 236,601;
+  - `list_paths` whole: 31,942; walked: 14 pages, 1,205 rows (all), the largest 31,989; 2.4.16: 36,181, and 13 pages
+    up to 36,228;
+  - `send`: 166 characters; 2.4.16: 416.
+- **Records:** this tree 78, 91,200 bytes, the largest 3,660; 2.4.16: 39, 4,311,244 bytes, the largest 1,333,852. Each
+  answer applied a second time was identical to the one sent (78 of 78; 2.4.16: 39 of 39). After the stop, each record
+  rebuilt from the state's files (a fresh `Store` over the same root) matched the sha256 of the answer sent: 78 of 78,
+  49 `receipt_range`, 26 `deflate`, 3 as sent.
+- Both daemons stopped gracefully. Run at 11:55 on the tree before review turn 103's fixes, at 12:35 after them
+  (`g-tools`), at 13:02 after turn 104's (`h-tools`), after turn 105's, and at 14:10 on the final tree, after turn
+  106's (`i-tools`, the run after turn 105's under the same name before it); the figures are the final tree's. The runs
+  differ only where the order of the random message ids sets where an inbox page ends (7, 6, 7, 6 and 7 pages), and
+  so in the count of records.
+
+### (C) The smallest budget, three writers (`r2417/accept2417.py pages`, 12:00 and 12:03)
+- **The setup.** `SOFTWARE_WORKFLOWS_TOOL_RESULT_BYTES=4096`; three runs on one checkout; the walker claims 60 paths;
+  five messages of 3,000 characters. Run twice on the tree, once on 2.4.16 (which ignores the variable).
+- **This tree** (the three final runs, `h-pages1` to `h-pages3`, as the earlier ones): `status` walked in one page of
+  2,113 characters, both other runs shown and its own run's 60 claims shortened with `claims_total: 60`; `inbox` in 5
+  pages, all 15,000 characters, the largest 3,404; `list_paths` in 5 pages, all 64 rows, the largest 3,998. Records:
+  12, the largest 1,867. Each was identical when applied again and when rebuilt from disk (12 of 12, all `deflate`).
+- **2.4.16:** `status` 79,886 characters in one answer, every message on the checkout in it; `inbox` 17,055; `list_paths`
+  17,612; records 4, 124,861 bytes, the largest 85,888.
+- **The stops:** the second tree run and 2.4.16 stopped gracefully. In the first tree run a history read never settled:
+  after run A's turn ended, the catch-up's native call got no answer, and failed `NATIVE_UNCERTAIN` 58.7 s later
+  (`background/failure`). Every stop in the next 150 s was refused `NOT_QUIESCENT` (`history: 2`), and the daemon was
+  signalled. Its ledger and native logs are kept in `r2417/evidence-stuck-history/`.
+- **Most likely this probe's own capture** (review turn 103). Its replay of each answer replaced the connection's
+  `send` with a collector that forwarded nothing. 2.4.17's replay awaits a thread (`finish_thread(tools.replayed)`),
+  so a history read's request could go out meanwhile, into the collector. Its second form forwarded everything but a
+  payload with the replayed request's id; review turn 104 found that still too wide, since the coordinator's own
+  requests to native count their ids separately and one can share it. Its third form keeps only a response (no
+  `method`) with that id and forwards every request. Three runs in parallel with the second form (12:33, `f-pages1` to
+  `f-pages3`) and three with the third, on the final tree (`h-pages1` to `h-pages3`), each settled every history read
+  and stopped gracefully, in 88 to 90 s. That the first run's stuck read was the capture alone is supported by these
+  six runs, not proven.
+
+### (D) A worker that ends while a page's record is saved (`r2417/accept2417.py crash-before`, `crash-after`, 11:56)
+- **The setup.** One `read_file` call of a 16 KiB file. The worker ends itself (`os._exit(9)`) just before, or just
+  after, saving that call's completed record; the supervisor starts it again.
+- **Before the save:** the call's record stays at stage `effect` and is retired `DYNAMIC_PEER_ENDED`, its obligation
+  `peer_ended`; this tree and 2.4.16 alike.
+- **After the save:** the record is complete, `receipt_range` in this tree (as sent in 2.4.16), and its obligation
+  completed with `replay: response`. The page rebuilt from the record matches the file's 16,384 bytes at its head
+  revision, in both. Every daemon then stopped gracefully.
+
+### (E) A stop while a writer's retry backs off (`r2416/retry_e2e4.py overlap`, 11:55)
+- **The setup.** VERIFY 2.4.16 (F)'s overlap case, unchanged: a failure that can heal (R2: retries 2, its deadline 120 s
+  on), a transport gap overlapping its save, then a message that makes work owed; 20 s past R1's deadline; a stop.
+- **This tree:** the failure survived the gap (retries 2, R2's deadline), no attempt was made, and the stop completed
+  gracefully.
+- **2.4.16:** the same up to the stop, which was refused `NOT_QUIESCENT` (`deliveries: 1`); its daemon was signalled.
+
+### (F) The cases Codex's review asked for, turns 103 to 105 (`r2417/accept2417.py edges`, 12:32 to 13:45)
+- **The setup.** As (C), the 4,096-byte budget: a writer (A) whose task is "R2417 accept edges A " and 400 emoji (each
+  12 bytes as encoded), five messages of 3,000 characters, one from a 5,000-character sender (a lead's `message/send`
+  took any) and one whose sender the probe then rewrote in the disposable ledger as a list holding a 5,000-character
+  string, each shown with 150 more delivery attempts (the worker's `Messages.inbox` adds them,
+  `r2417/inject5/sitecustomize.py` `attempts`); run B's task rewritten there as the number 1, as a lead's `run/start`
+  could store it before this release. Code-mode cells for the strings, and direct calls for the integers past 2^63,
+  which serde passes as a u64; whether a cell can send one was not measured. Turn 104's argument cases run one per
+  writer (B to F), since a call nothing answers holds its turn: a list as `list_paths`' cursor, a 100,000-character
+  relative path for `read_file`, a file of mode 000 (made after every run started: `run/start` reads the whole
+  checkout and refuses an unreadable file, `OPERATIONAL_FAILURE` `PermissionError`, 2.4.16 too), a claim of a
+  100,000-character path, a `services_private` kind that is a list.
+- **This tree** (`i-edges`, final; `h-edges`, `g-edges` and `f-edges` after the earlier rounds showed the same for
+  their cases):
+  - `run/start` with `task: 1`: `RUN_FIELDS`; `message/send` with a list sender: `MESSAGE_ARGUMENTS`;
+  - a list cursor: `TOOL_ARGUMENTS`, `invalid: ["cursor"]`, 197 characters;
+  - the long relative path and the long claim: `PATH_INVALID`, `errno: ENAMETOOLONG`, 130 characters each;
+  - the unreadable file: `READ_FAILED`, `errno: EACCES`, 134 characters; the list kind: `SERVICE_SPEC`, 129;
+  - `status`: 1,966 characters with five other writers shown, B's stored task 1 among them, its own task 83
+    characters of 421 (`task_chars`); with one writer (`g-edges`) 794; the review's tree: over 4,096;
+  - `inbox` walked: 5 pages, all 7 messages and 15,036 characters, the largest 3,800, each with
+    `delivery_attempts: 151`; the long sender shown as 120 characters with `sender_chars: 5000`, the list sender as its
+    JSON cut to 120 with `sender_chars: 5004`; turn 103's tree: the first message refused `PAGE_SIZE`, with no way
+    past it;
+  - `read_file` pinned to a 100,000-character revision: `REVISION_CHANGED` in 384 characters, `continued` 120 of them
+    with `continued_chars: 100000`;
+  - `read_file` of a 100,000-character path: `PATH_ESCAPE` in 145 characters, its details left out with
+    `details_omitted_bytes`;
+  - `inbox` of a 100,000-character message id: `MESSAGE_NOT_FOUND` in 258 characters, `message_chars: 100000`;
+  - direct `read_file` at offset 10^19: an empty page, `next_offset: null`; the review's tree: no answer (`seek` raised
+    `ValueError`);
+  - direct `list_paths` and `inbox` with `limit` 10^19: a page each (1,112 and 3,422 characters);
+  - every answer identical when applied again and rebuilt from disk (22 of 22); the stop graceful.
+- **The calibrations**, this tree with one function put back as it was (`sitecustomize.py`):
+  - `c-edges`, `message_view` before turn 104 (`oldview`): the inbox walk's largest page 5,456 characters, over the
+    budget, both senders shown whole (5,002 and the list, 5,004);
+  - `c2-edges`, `as_text` returning a stored value as it is, as before turn 105 (`oldtext`): `status` never answered
+    (its record `pending` at stage `effect`; the cell yielded at 31 s with no result), B's numeric task reaching
+    `fitted_chars`. Everything else as above.
+- **2.4.16** (`p-edges`, 13:45; `o-edges` at 12:38 with one writer): `run/start` with `task: 1` refused
+  `OPERATIONAL_FAILURE`; the list sender accepted and stored; `status` 54,091 characters with six writers (28,574
+  with one), and the inbox one answer of 86,044; `PATH_ESCAPE` echoed the whole path, 100,279 characters; the
+  revision and message-id cases refused `TOOL_ARGUMENTS` (2.4.16 has no such arguments); the huge offset an empty
+  page, as here. Never answered: the list cursor, the long relative path, the unreadable file, the long claim and the
+  list kind (each cell yielded at 31 s with no result, `Script running with cell ID 1`), and the direct `list_paths`
+  with `limit` 10^19 (its record `pending` at stage `effect`, its obligation `failed`: SQLite refused the bound
+  integer). The stop was refused `NOT_QUIESCENT` (`writers: 1`) both times, and the daemon signalled.
+- **A worker ending after a page's record is saved, or before** (`i-crash-after`, `h-crash-before`, final tree): as
+  (D).
+
+### (G) Local resource failures while a receipt is written or read, or a patch is checked (`r2417/accept2417.py enospc`, `emfile`, `emfile-verify`, `emfile-patch`, `emfile-settle`, 13:45 to 14:56)
+- **In every case on this tree**, native intake closed, as every local resource failure does
+  (`native.local_resource_failure`): `native/journal_failure`, then `daemon/native_intake_closed`. The worker ended, and
+  the supervisor started the next one (recovery generation 2), which served `daemon/status`. Each daemon then stopped
+  gracefully. In each calibration intake went on, in one worker.
+- **Written** (review turn 105). One writer reads a file changed after the first scan, so the read writes a new
+  receipt; the worker's `Store.blob` raises `OSError(ENOSPC)` once (`sitecustomize.py` `enospc`), reached through
+  `read_path` in the read's own thread (its logged callers).
+  - This tree (`i-enospc`, 14:10, the final tree): no answer; native intake closed.
+  - The calibration (`c-enospc`, 13:45, `read_page` answering every `OSError` `READ_FAILED`, as turn 104's tree did,
+    `oldread`): answered `READ_FAILED` with `errno: ENOSPC`, and intake went on.
+- **Read** (review turn 106). One writer reads an unchanged file whose receipt the first scan wrote. Opening an existing
+  receipt (`<state>/blobs/<name>`, `rb`) raises `OSError(EMFILE)` once, as with no descriptor left (`sitecustomize.py`
+  `emfile`, wrapping `pathlib.Path.open`):
+  - from the read's own page (`emfile`): the logged caller `Store.read_blob_range`, in the read's thread;
+  - from the scan that reads the file again once its stat and its receipt's have both changed (`emfile-verify`,
+    `os.utime` on each): the logged callers `scans.read`, `read_path`, `Store.blob` and `Store.verify_blob`.
+  - This tree (`i-emfile`, `i-emfile-verify`, 14:09): no answer; native intake closed; the checkout not quarantined and
+    no UNKNOWN recorded.
+  - The calibration (`c-emfile`, `c-emfile-verify`, 14:09: the receipt readers before this fix, every `OSError`
+    `BLOB_MISSING`, `oldblob`): both answered `BLOB_MISSING` (168 characters), and intake went on. Through the scan,
+    `Ledger.reconcile` also quarantined the checkout `BLOB_MISSING`: a false quarantine, from a descriptor
+    shortage.
+- **A patch checked** (review turn 107). A writer updates `p.txt` (`apply_patch`, a direct call). The same injection
+  fails the first receipt opened after its Pre hook: the verification's read of the pre-image (the logged callers
+  `Daemon.maybe_verify`, `Ledger._complete_patch`, `Store.read_blob`). Then the daemon is stopped and started again.
+  - This tree (`i-emfile-patch`, 14:41, the final tree): the patch was not quarantined. The next worker's startup
+    recovery applied the notification again and verified the patch 0.51 s after intake closed (`operation/verified`,
+    attribution `exact`), `p.txt`'s head the patched bytes, no UNKNOWN; the same after the restart.
+  - The calibration (`c-emfile-patch`, 14:40; the verification before this fix, which quarantined for any failure, the
+    failure then let go by `maybe_verify`, `oldpatch`): quarantined `OSError`, `p.txt`'s head attributed `UNKNOWN`,
+    two UNKNOWNs on it (`OSError`), and intake went on; the same after the restart.
+  - The control (`i-patch-plain`, 14:40, no fault): verified `exact`, nothing closed.
+  - The first runs of these three were the same, but their final stops came while the restarted daemon still
+    recovered its writer and were refused `NOT_QUIESCENT` (`recovery: 3`), the control's too. The probe's stop now
+    waits for recovery as it waits for history reads. So run at 14:34, and at 14:40 on the final tree (after the
+    `recovery.py` change), both the same; the figures are the final tree's. Run once more at 14:56, after the
+    `settle_logged` change: the same.
+- **A refused patch settled from its log** (review turn 108). A writer's patch whose context is not in `p.txt`, which
+  native refuses in its handler (a failed result in its log, no Post hook). The model's next answer is held 8 s, so
+  the log tail settles the call first, in a task of its own. That settlement's first endpoint read raises
+  `OSError(EMFILE)` once (`sitecustomize.py` `emfile-settle`, armed inside `Ledger.settle_unapplied`; logged from
+  `Daemon.settle_logged` and `settle_returned`, then `read_path` of `p.txt`).
+  - This tree (`i-emfile-settle`, 14:56): `native/journal_failure` (`OSError`), native intake closed, and the next
+    worker (generation 2) settled the patch from its receipt 5.5 s later: `denied`, `NATIVE_CALL_FAILED`,
+    `no_effect`, no UNKNOWN.
+  - The calibration (`c-emfile-settle`, 14:55; `settle_logged` as `settle_returned` alone, as before this fix,
+    `oldsettle`): `background/failure` (`OSError`) and intake went on. The call was settled in the same instant by
+    its second receipt's settlement, 1 ms later: codex 0.163.0 logs `codex.tool_result` and `codex.tool_result_ready`
+    for it, and `read_native_log` gives the call once for each. This run shows the missing intake stop, not a call
+    left unsettled; with both settlements failing, it waits for the next settlement of the listener's log (its
+    turn's end, a claim's, or a restart's).
+
+### (H) Project cursors at the function (`r2417/cursor_probe.py`, 13:36)
+- **The setup.** The real `tools.dispatch` over a real `Store` on a disposable state: two checkout records with three
+  heads each, one unit with both as participants. A project cursor needs a multi-root unit, which takes a Codex project
+  on a real daemon; this calls the same code with the same SQLite binding.
+- **This tree:** a cursor whose JSON decodes to a lone surrogate, `not-json`, and a 200,000-deep nesting: each
+  `PAGE_CURSOR`. A walk with `limit: 2`: 3 pages of 2 rows, across both checkouts.
+- **2.4.16:** the lone surrogate raised `UnicodeEncodeError` at the binding, the nesting `RecursionError`: neither
+  would be answered. The walk as here.
+
+### Static checks (`r2417/static_checks2417.py`, on the final tree)
+- every plugin `.py` file compiles under 3.15 (83 files), and the hook-run files under `/usr/bin/python3` (3.9.6 14 files);
+- `hooks.py --check` compatible, protocol `jsonl-v1`;
+- the git shim parses under `sh -n`, `bash --posix -n` and zsh's sh emulation, and is executable;
+- ruff's F821/F822/F823/F811/F841/F401: 35 findings here, 35 in 2.4.16; none new;
+- `claude plugin validate --strict`: passed for the plugin and for the marketplace;
+- `git diff --check`: clean; `plugin.json` and the coordinator README's title both at 2.4.17.
+
+### Known limits
+- **A 2.4.17 record cannot be replayed by 2.4.16**, which would send its stored form as the answer: roll back only with no
+  call in flight.
+- **The answers already stored stay as they are**: 3.93 GB on the user's ledger. Compaction and reclaiming the file's
+  space, later in this series, take them up.
+- **A thread begun before 2.4.17 keeps its tool schemas** (Codex keeps a thread's dynamic tools from its start): its
+  model is not told about `status`'s `cursor` or `inbox`'s `message` and `text_offset`, which the coordinator accepts
+  from any thread.
+- **The lead's `daemon/status` is not bounded**: it is the lead's RPC, not a model's tool result.
+- **`run/start` refuses an unreadable file in the checkout** (`OPERATIONAL_FAILURE`, `PermissionError`, no path
+  named), as 2.4.16 does: (F)'s first form at 13:2x, where the file existed before the runs started. Queued.
+- **A project writer's patch, checked while a local resource ran out, is still quarantined at the next start** (review
+  turns 108 and 109). It has parts even when it touches one checkout (`operations.prepare`, through
+  `prepare_patch` for a unit with a project revision). `operations.complete_patch` stops native intake as above, but
+  `recovery.recover` fences every operation with parts whose atomic completion did not commit, its paths UNKNOWN: the
+  outcome 2.4.16 reached at once. Verifying one there from its durable completion evidence, with every part checked
+  together, is queued. Not measured: it needs a Codex project writer.
+- **Found live after the 2.4.16 switch, for 2.4.18** (read-only, 12:40 to 12:55; `r2418/custody_holders.py`,
+  `custody_detail.py`, `inventory_now.py`, `ownership_why.py`):
+  - 7 of the 12 startup incidents became `NATIVE_RPC` (`thread/resume` -32600) and are held; 4 wait as
+    `RESTORE_CUSTODY`, which `resolve_startup` refuses while any custody is active in the checkout, each retry a full
+    readmission and calibration refused at its last step (22 admissions and 242 probes in 32 minutes);
+  - all of them are on one checkout, which holds two custody records about 4.2 hours old, of two runs cancelling since
+    09:34. One's `processes` are pids 15158 (`docker`) and 15185 (`docker-mcp`), born at 11:12:53: the MCP server of
+    its writer's current app-server (pid 15122, spawned at the switch), which lists both as its own `services`, with
+    the same births. 2.4.16's `processes.inventory`, run on those live records, still returns both as survivors:
+    `service_map` is keyed by pid alone, and `observe_processes` passes every listener's services (3,598 records,
+    3,657 entries); pid 15158 is also in a dead listener's services (born ~5.7 days earlier), which wins the dict, so
+    the live server is not a service and becomes the command's root;
+  - both custody records wait for the end of a code-mode `exec_command` whose result returned (`returned` success,
+    no completed item, no Post hook) and whose app-server was replaced before that end was read (the 08:41 and 11:12
+    switches): no app-server can now deliver it, and `_settle_actor` waits for it while nothing of the call runs;
+  - so the two runs stay cancelling, and each cancel pass (`runs._settle_cancel`, every 2 s at most) reconciles its
+    writer, with a history read and a full scan of the checkout (4,830 heads), every ~5.3 s: 889 scans and 208 loop
+    stalls of ~0.8 s in 32 minutes. Building `separate` decodes all 3,598 listener records (44 MB, 0.14 to 0.2 s) on
+    the event loop at each observation.
+- **Writer records keep `process_lineage` inline.** Queued.
+- **The series:** 2.4.18 the custody above (services matched by birth; a call whose app-server exited ended by that
+  exit); 2.4.19 `RESTORE_CUSTODY` due only when custody settles, cancel passes that reconcile only on a change, and the
+  `NATIVE_RPC` incidents' cause; then shared dependency evidence, native compaction and archive retention, reclaiming
+  the file's space, parking and resource budgets.

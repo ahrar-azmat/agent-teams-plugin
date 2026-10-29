@@ -1,10 +1,30 @@
 """One physical-checkout router for native, lead and dynamic tool paths."""
+import errno
 import os
 from pathlib import Path
 
 from .client import CoordinatorError
 from .ledger import normalize
 from .participants import members
+
+
+# What the filesystem answers about a path itself: the caller's to be told. Any other OSError keeps its own handling: a
+# local resource failure (ENOSPC, EMFILE, ...) stops native intake (native.local_resource_failure), so it is never
+# answered as a refusal (review turn 105).
+ACCESS_REFUSALS = (errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENAMETOOLONG)
+
+
+def normalized(checkout, value):
+    """A caller's path normalized (ledger.normalize). A component the filesystem refuses - a name past its length
+    limit, a folder the coordinator cannot search - makes the path invalid, refused PATH_INVALID: through 2.4.17's
+    review its OSError reached no handler, and a read_file call's answer never went (review turn 104)."""
+    try:
+        return normalize(checkout, value)
+    except OSError as exc:
+        if exc.errno not in ACCESS_REFUSALS:
+            raise
+        raise CoordinatorError("PATH_INVALID", "The filesystem refuses this path",
+                               {"errno": errno.errorcode.get(exc.errno, exc.errno)}) from exc
 
 
 def route(store, actor, value, cwd=None, directory=False):
@@ -19,7 +39,7 @@ def route(store, actor, value, cwd=None, directory=False):
         if checkout["_kind"] != "checkout" or not isinstance(value, str) or os.path.isabs(value):
             raise CoordinatorError("PATH_FIELDS", "root_id must name a checkout and path must be repository-relative")
         # Reject escape before selecting the actual inner boundary.
-        normalize(checkout, value)
+        normalized(checkout, value)
         cwd = checkout["root"]
     if not isinstance(value, str) or not value:
         raise CoordinatorError("PATH_ENCODING", "Path must be a nonempty string or a qualified path")
@@ -51,8 +71,8 @@ def route(store, actor, value, cwd=None, directory=False):
     if owner["id"] not in allowed:
         raise CoordinatorError("PATH_ESCAPE", "Path belongs to a registered checkout outside this unit",
                                {"root": owner["root"], "checkout": owner["id"], "participants": [p["root"] for p in participants]})
-    normalized = {"path": "", "key": ""} if directory and target == Path(owner["root"]) else normalize(owner, str(target))
-    return dict(normalized, checkout=owner["id"], root=owner["root"])
+    found = {"path": "", "key": ""} if directory and target == Path(owner["root"]) else normalized(owner, str(target))
+    return dict(found, checkout=owner["id"], root=owner["root"])
 
 
 def grouped(store, actor, paths, cwd=None):

@@ -5,6 +5,7 @@ import time
 
 from .locks import finish_all, finish_thread
 from .client import CoordinatorError
+from . import native
 from .ledger import patch_scope, unified_post
 from .routing import route, qualified
 
@@ -118,6 +119,8 @@ async def complete_patch(ledger, operation, item):
         terminal = ledger.terminal(operation, item)
         if terminal:
             return terminal
+        if native.local_resource_failure(exc):
+            raise  # descriptors, memory, storage: no evidence about the patch (review turn 107; Ledger._complete_patch)
         await finish(ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__)))
         raise
 

@@ -767,8 +767,11 @@ async def _reconcile_listener(daemon, listener):
                     and operation.get("hook_valid") and operation.get("post_hook")):
                 try:
                     await daemon.ledger.complete_patch(operation, operation["completed_item"])
-                except CoordinatorError:
-                    pass  # the receipt owner durably records insufficient evidence
+                except CoordinatorError as exc:
+                    # The receipt owner durably records insufficient evidence. A local resource failure is none: it
+                    # quarantined nothing (review turn 107), and fails this reconcile, which is tried again.
+                    if native.local_resource_failure(exc):
+                        raise
                 continue
             await daemon.ledger.quarantine(operation, "cross-checkout operation interrupted by native reconnect",
                                            executing=await may_execute(daemon, operation))
@@ -1016,8 +1019,11 @@ async def reconcile_effects(daemon, listener, actor):
             if operation["kind"] == "patch" and operation.get("hook_valid") and operation.get("post_hook") and operation.get("completed_item"):
                 try:
                     await daemon.ledger.complete_patch(operation, operation["completed_item"])
-                except CoordinatorError:
-                    pass  # complete_patch durably quarantines insufficient evidence
+                except CoordinatorError as exc:
+                    # complete_patch durably quarantines insufficient evidence. A local resource failure is none: it
+                    # quarantined nothing (review turn 107), and fails this reconcile, which is tried again.
+                    if native.local_resource_failure(exc):
+                        raise
             elif operation["kind"] in ("command", "mcp"):
                 if not operation.get("custody"):
                     await daemon.ledger.quarantine(operation, "crash gap before a durable custody decision")

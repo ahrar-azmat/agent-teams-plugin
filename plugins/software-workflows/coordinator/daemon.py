@@ -12,7 +12,7 @@ import stat
 import sys
 import time
 
-from .locks import KeyedLocks, finish_all
+from .locks import KeyedLocks, finish_all, finish_thread
 from .client import CoordinatorError, validate_state
 from . import telemetry
 from .store import Store, uid, digest, encoded, WINDOW_ACTIVE, BLOCKERS
@@ -374,7 +374,7 @@ class Daemon:
                 "lead_edits": self.pending_lead_edits(),
                 "lead_edit_legacy_limit": legacy_status(self.store),
                 "ended": dict(self.ended), "silent": len(self.silent), "dormancy": self.dormancy.status(), "writer_mcp_profile": self.writer_profile,
-                "retention": self.retention.status(),
+                "retention": self.retention.status(), "tool_results": tools.metrics(),
                 "sqlite": sqlite3.sqlite_version, "version": VERSION, **({} if brief else {"writers": writers})}
 
     def intake_status(self):
@@ -399,6 +399,9 @@ class Daemon:
     async def create_run(self, params, revision=None):
         if set(params) - {"checkout", "project", "cwd", "dispatch_cwd", "mode", "task", "paths", "model", "fixture", "workflow"} or params.get("mode", "native") not in ("lead", "native"):
             raise CoordinatorError("RUN_FIELDS", "run/start accepts checkout or project, cwd, dispatch_cwd, mode (lead or native), task, paths, model, fixture and workflow")
+        if not isinstance(params.get("task", ""), str):
+            # Every writer's status shows it (review turn 105: a numeric task was stored, and broke them).
+            raise CoordinatorError("RUN_FIELDS", "A run's task is a string")
         if params.get("mode", "native") == "native":
             # Refuse before allocating a run or its claims. The launch boundary
             # checks again in case pressure changes during preparation.
@@ -970,6 +973,17 @@ class Daemon:
                                                   " AND json_extract(data,'$.native.listener')=? ORDER BY id", (listenerid,))):
             await self.settle_returned(operation)
 
+    async def settle_logged(self, listenerid, operation):
+        """settle_returned for a receipt read from a listener's log, in a task of its own. A local resource failure
+        stops native intake, as it does where the log is read (check_native_resource), and the next worker settles the
+        call from its receipt again (settle_native_log at its start). Before, the failure ended in background/failure
+        alone, with the log read past the receipt (review turn 108)."""
+        try:
+            await self.settle_returned(operation)
+        except Exception as exc:
+            self.check_native_resource(listenerid, exc, "native log")
+            raise
+
     async def settle_returned(self, operation):
         """Native wrote a failed result for this call (Codex 0.163 `codex.tool_result`, success=false), direct or
         nested in a code-mode cell: its handler returned, refusing it (`tty` on a TTY-disabled runtime, an unusable
@@ -1217,7 +1231,7 @@ class Daemon:
                     continue
                 await self.native_turn()
                 for ident in self.read_native_log(listenerid):
-                    self.background(self.settle_returned(self.store.get(ident)))
+                    self.background(self.settle_logged(listenerid, self.store.get(ident)))
                 failure = None
             except Exception as exc:
                 self.check_native_resource(listenerid, exc, "native log")
@@ -2122,7 +2136,8 @@ class Daemon:
         existing = self.store.get(ident, required=False)
         if existing and existing.get("response"):
             self.complete_dynamic_obligations(ident)
-            await connection.send({"id": message["id"], "result": existing["response"]})
+            # Rebuilt exactly from what the record keeps (tools.stored): a stored page reads its receipt, off the loop.
+            await connection.send({"id": message["id"], "result": await finish_thread(tools.replayed, self.store, existing["response"])})
             return
         if existing and existing.get("stage") != "preparing":
             # A completed effect may precede its durable response. Never execute
@@ -2144,12 +2159,9 @@ class Daemon:
             invocation = self.store.get(ident)
             invocation.update(stage="effect")
             self.store.save(invocation)
-        try:
-            response = tools.result(await tools.dispatch(self, actor, params["tool"], params["arguments"], effect=effect))
-        except CoordinatorError as exc:
-            response = tools.result({"error": exc.envelope()}, False)
+        response, kept = await tools.invoke(self, actor, params["tool"], params["arguments"], effect=effect)
         self.check_native_stop()
-        self.store.put("dynamic", ident, {"actor": actor["id"], "state": "completed", "response": response})
+        self.store.put("dynamic", ident, {"actor": actor["id"], "state": "completed", "response": kept})
         self.complete_dynamic_obligations(ident)
         await connection.send({"id": message["id"], "result": response})
 
@@ -2384,8 +2396,10 @@ class Daemon:
                 (operation.get("post_hook") or operation["completed_item"].get("status") != "completed")):
             try:
                 await self.ledger.complete_patch(operation, operation["completed_item"])
-            except Exception:
-                if self.store.get(operation["id"])["state"] != "quarantined":
+            except Exception as exc:
+                # A local resource failure goes on whatever the operation's state: it stops native intake
+                # (check_native_resource), and the notification is applied again after (review turn 107).
+                if native.local_resource_failure(exc) or self.store.get(operation["id"])["state"] != "quarantined":
                     raise
                 # Recorded: its quarantine made each of its paths UNKNOWN, and the notification goes on (2.4.0-2.4.3
                 # failed it, recording a checkout-wide UNKNOWN too and skipping the rest of a turn's end).
@@ -2762,20 +2776,22 @@ class Daemon:
         return {key: value for key, value in counts.items() if value}
 
     def held_by_retry(self, runid):
-        """Whether the one retry policy holds a run's writer until a resume or the next release: its demand start failed
-        with a cause that cannot heal (dormancy.start_held), or its reconcile did (recovery.permanently_failed).
-        Nothing is admitted for it meanwhile (hook(), deliveries and submissions refuse a failed writer), so a stop does
-        not wait for its workflow or its unsent mail; its turn only once nothing can still run it (held_turn_gone).
-        Custody, operations and calls in flight are each still waited for. The next daemon takes them up. Through
-        2.4.15 such a writer refused every graceful stop NOT_QUIESCENT for as long as it stayed."""
+        """Whether the one retry policy holds a run's writer now: its demand start failed and is not due
+        (dormancy.start_due), or its reconcile failed and is not (recovery.retry_due): its backoff has not passed, or
+        its cause cannot heal and this release has tried it. Nothing is admitted for it meanwhile (hook(), deliveries
+        and submissions refuse a failed writer), so a stop does not wait for its workflow or its unsent mail; its turn
+        only once nothing can still run it (held_turn_gone). Custody, operations and calls in flight are each still
+        waited for. The next daemon keeps the failure until it is due and takes the rest up. Through 2.4.15 such a
+        writer refused every graceful stop NOT_QUIESCENT for as long as it stayed; through 2.4.16 one whose failure
+        could heal still did, until a retry passed (VERIFY 2.4.16 (F))."""
         if not runid:
             return False
-        if self.dormancy.start_held(runid):
+        if not self.dormancy.start_due(runid):
             return True
-        from .recovery import permanently_failed
+        from .recovery import retry_due
         actor = self.store.get((self.store.get(runid, required=False) or {}).get("root_actor") or "", required=False) or {}
         listener = self.store.get(actor.get("listener") or "", required=False)
-        return bool(listener) and permanently_failed(self, listener)
+        return bool(listener) and listener.get("recovery_state") == "failed" and not retry_due(self, listener)
 
     def held_turn_gone(self, actor):
         """A held writer's recorded turn that nothing can still run: no live connection shows it, and its app-server has

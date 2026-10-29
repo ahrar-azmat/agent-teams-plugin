@@ -35,7 +35,8 @@ def declaration(value):
     for name, spec in value["services"].items():
         if not NAME.fullmatch(name) or not isinstance(spec, dict) or set(spec) - {"kind", "image", "config", "environment"}:
             raise CoordinatorError("SERVICE_SPEC", "Service names and fields are invalid")
-        if spec.get("kind") not in PORTS or not isinstance(spec.get("image"), str) or not spec["image"]:
+        # A kind of another type (a list cannot be looked up) is refused like an unknown one, never raised.
+        if not isinstance(spec.get("kind"), str) or spec["kind"] not in PORTS or not isinstance(spec.get("image"), str) or not spec["image"]:
             raise CoordinatorError("SERVICE_SPEC", "Each service needs a supported kind and a local image")
         config = spec.get("config", {})
         if not isinstance(config, dict) or set(config) - {"migration_version", "migrations", "startup_seconds"}:

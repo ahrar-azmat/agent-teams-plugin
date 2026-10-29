@@ -3,6 +3,182 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.17] — 2026-10-29
+
+Two changes. Every coordinator tool result now fits what a writer's model is shown whole, and a completed call's
+record keeps a bounded form of its answer instead of the answer itself. And a stop no longer waits for a writer whose
+retry the policy is holding back. (`tools.py`, `store.py`, `daemon.py`, `routing.py`, `services.py`, `messages.py`,
+`ledger.py`, `operations.py`, `recovery.py`, `runs.py`; coordinator/VERIFY.md, 2.4.17.)
+
+### Fixed: tool results longer than a writer's model is shown
+- Writers run gpt-6-astra in `code_mode_only`, so each coordinator tool returns into a code-mode cell. Codex 0.163.0
+  shows the model a cell's output whole only up to a ceiling. Measured 10-29: whole up to 32,047 characters; from
+  64,000 on, cut to about 40,150 with its middle left out (10,000 tokens, `unified_exec`'s
+  `DEFAULT_MAX_OUTPUT_TOKENS`). A direct call was cut at about 48,000. The cell's own JavaScript sees all of a result.
+- Through 2.4.16 nothing bounded a result:
+  - `read_file`'s default page (65,536 bytes) encoded to 87,720 characters, and the model saw 40,150 of them;
+  - `status` listed every unacknowledged message on the checkout, other writers' too, and every custody record whole:
+    on the user's ledger one answer was 19.5 MB;
+  - `inbox` returned up to 100 messages whatever their length.
+- Now one budget for a result's encoded JSON: 32,000 bytes, 80 % of the ceiling, so a cell that prints one result
+  keeps room for its own text. `SOFTWARE_WORKFLOWS_TOOL_RESULT_BYTES` sets it from 4,096 to 40,000; any other value
+  refuses the daemon's start (`CONFIG`).
+  - `read_file` checks its range before anything is reconciled or read. A page holds what the budget leaves after its
+    fields (23,601 bytes). A larger `length` gets that page, with `next_offset` and a `limited` record (requested,
+    returned, `page_bytes`, reason `TOOL_RESULT_BUDGET`), never a silent cut.
+  - A later page passes `revision`, the one the first page returned. A file changed since is refused
+    `REVISION_CHANGED`, naming its current revision. Through 2.4.16 the later page came from the changed file, with
+    nothing to say so.
+  - Only a page's bytes are read from its receipt, off the event loop. A receipt not verified since its file last
+    changed is hashed first, 1 MiB at a time. Through 2.4.16 each page read the whole receipt, on the loop.
+  - `status` shows the caller's own run first, then the other runs on its checkout in run id order, a page at a time
+    (`cursor`). Each run shows its task (its first 400 bytes as encoded, the full length named), its state and its
+    writer's, its claims, active custody (each command's first 200 bytes, the full length named) and pending requests
+    in brief, and how many of its unit's messages are unacknowledged. A list too long for a page is cut, with its total
+    named. The open UNKNOWNs per checkout take at most a quarter of the budget. Mail is read with `inbox`.
+  - `inbox` and `list_paths` keep `limit` and end a page at the budget: `next_cursor` points after the last entry
+    shown, and `limited` is set when fewer than asked were shown. Neither loads more than a page can show.
+  - `inbox` shows each message's id, sender, recipient, state, delivery, wake, created time, notice and text, with its
+    delivery attempts counted. Through 2.4.16 it showed the record whole, every attempt listed. Each field but the
+    text is cut as an error's echo is (120 bytes, its full length named), whatever its type. A lead's `message/send`
+    took any sender, and now refuses one that is not a nonempty string (`MESSAGE_ARGUMENTS`); a record stored before
+    shows its sender as its JSON, cut. A message longer than a page shows the part of its text that fits
+    (`text_chars`, `text_offset`, `text_next_offset`); `inbox` with `message` and `text_offset` reads the rest, for a
+    message to the caller only.
+  - A path no page can hold is shown alone, over the budget and named (`ENTRY_OVER_BUDGET`), so a walk never stops.
+  - An error answer stays within the budget too. A caller's own string it echoes is cut to 120 bytes, its length
+    named; details too large are left out, their size named. Through 2.4.16 `PATH_ESCAPE` echoed the whole path given.
+  - A `read_file` offset or a `limit` past 2^63 is answered: an empty page, or a page. Measured by direct calls, which
+    carry such a number; whether a code-mode cell can send one was not measured. Through 2.4.16 such a `limit` raised
+    an error that nothing answered, so the call waited.
+  - Every argument is checked against the tool's declared schema before anything is marked or read. Codex passes a
+    dynamic call's arguments on as the model wrote them, unchecked (codex 0.163.0
+    `core/src/tools/handlers/dynamic.rs:141`). A value of another type is refused `TOOL_ARGUMENTS`, naming the tool's
+    own argument names (`invalid`, `missing`) and counting unknown ones. A project cursor is checked once decoded too:
+    one whose JSON decodes to a lone surrogate, or nests too deep, is refused `PAGE_CURSOR`. A path the filesystem
+    refuses (a name past its length limit, a folder that cannot be searched) is refused `PATH_INVALID`, and a file
+    the coordinator cannot open `READ_FAILED`. Through 2.4.16 each of these raised an error that nothing answered, so
+    the call waited: a list as `list_paths`' cursor, a 100,000-character relative path, an unreadable file, a claim of
+    such a path, a service `kind` that is a list, a lone surrogate or a 200,000-deep nesting in a project cursor. A
+    local resource failure while a receipt is written or read, or while a writer's patch is checked (`ENOSPC`,
+    `EMFILE`, ...), is neither a refusal nor evidence: it stops native intake, as every local resource failure does,
+    and what native sent is applied again after. A receipt that cannot be opened for want of a descriptor is no
+    longer taken for a missing one (`BLOB_MISSING`), which answered the call and, from a scan or a publication's
+    check, quarantined the checkout or the operations that wrote it. A patch of a writer outside a Codex project,
+    checked then, is no longer quarantined for it, its paths left UNKNOWN, nor is a patch native refused settled from
+    its logged receipt left to `background/failure` alone. A project writer's patch, which has parts even when it
+    touches one checkout, is still fenced at the next start (Known limits).
+  - `run/start` refuses a task that is not a string (`RUN_FIELDS`): every writer's `status` shows it. A run stored
+    before with another type shows its task as its JSON, cut.
+  - `send` answers the message's id, recipient, state, delivery and wake; through 2.4.16 it echoed the whole record,
+    text included.
+  - New arguments are optional, and none was removed or renamed.
+  - `daemon/status` shows `tool_results`: results since the daemon started, the largest, how many came within 80 % of
+    the budget, and per tool how many were limited to it or went over it.
+- On a real daemon with real codex 0.163.0 writers (the fixture provider), each tool's whole answer and then a walk
+  of every page, under 2.4.16 and this release:
+  - a default `read_file` page: 31,855 characters, shown whole (2.4.16: cut to 40,150 of 87,720);
+  - every page of a 1 MiB file: 45 pages, all 1,048,576 bytes, matching the file's FNV-1a; the largest 31,810
+    characters (2.4.16: 16 pages, up to 87,725);
+  - one page of a 128 MiB file: 1.6 MB of Python allocation (2.4.16: 134 MB);
+  - a second page after its file changed: `REVISION_CHANGED` (2.4.16: the changed file's bytes);
+  - `status` with 41 messages waiting: 452 characters (2.4.16: cut, from 60,844 tokens);
+  - `inbox` (41 messages, one of 100,000 characters): 7 pages and one message read in parts, all 220,030 characters,
+    the largest page 31,999 (2.4.16: one answer of 236,601, cut);
+  - `list_paths` over 1,205 paths: 14 pages, the largest 31,989 (2.4.16: up to 36,228);
+  - `send`: 166 characters (2.4.16: 416).
+- At the smallest budget (4,096 bytes), with three writers on one checkout, every page of `status`, `inbox` and
+  `list_paths` stayed within it and the walks reached every entry. 2.4.16's `status` there was 79,886 characters.
+- And the cases Codex's review of the tree asked for, at that budget, each answered within it:
+  - a task of 400 emoji, each 12 bytes as encoded: `status` 794 characters (the review's tree: over 4,096);
+  - messages carrying 150 more delivery attempts each: every message walked, the largest page 3,405 (the review's
+    tree: refused `PAGE_SIZE`, with no way past);
+  - a 100,000-character revision, message id or path: 384, 258 and 145 characters;
+  - by direct call, an offset of 10^19: an empty page (the review's tree: no answer at all); a `limit` of 10^19 for
+    `list_paths` and `inbox`: a page each (2.4.16: no answer at all);
+  - a list as `list_paths`' cursor, a 100,000-character relative path, a file of mode 000, a claim of a long path, a
+    service `kind` that is a list: `TOOL_ARGUMENTS`, `PATH_INVALID` (`ENAMETOOLONG`), `READ_FAILED` (`EACCES`),
+    `PATH_INVALID` and `SERVICE_SPEC`, each within 200 characters (2.4.16: none answered, each cell still waiting at
+    31 s);
+  - a message from a 5,000-character sender, and one whose stored sender is a list: shown as 120 characters with
+    `sender_chars`, the largest page 3,800 (with the message view before this fix: 5,456, over the budget);
+  - a run whose stored task is a number: every `status` answered, 1,966 characters (with the projection before this
+    fix: never answered);
+  - a project cursor decoding to a lone surrogate or nesting 200,000 deep: `PAGE_CURSOR` (2.4.16: no answer);
+  - the receipt volume full while a page's receipt is written: native intake closed, as for every local resource
+    failure (with the read before this fix: answered `READ_FAILED`, intake going on);
+  - no descriptor left as an existing receipt is opened, by a read's page or by a scan checking it: native intake
+    closed, nothing quarantined (with the receipt readers before this fix: answered `BLOB_MISSING`, intake going on,
+    and through the scan the checkout quarantined);
+  - no descriptor left as a writer's patch is verified: native intake closed, and the next worker applied the
+    notification again and verified the patch 0.5 s later, its path's revision exact (with the verification before
+    this fix: quarantined, two UNKNOWNs on its path, intake going on);
+  - no descriptor left as a patch native refused is settled from its logged receipt: native intake closed, and the
+    next worker settled it from its receipt 5.5 s later, no effect, no UNKNOWN (with the settlement before this fix:
+    `background/failure` alone, intake going on).
+
+### Fixed: each completed call's record kept its answer whole
+- On the user's ledger, 34,874 call records held 3.93 GB, 66 % of all record bytes. `status`'s 702 answers held
+  3.30 GB and `read_file`'s 9,455 held 573 MB; the largest record was 19.5 MB.
+- A record now keeps what rebuilds the answer exactly when a native server repeats the request:
+  - a `read_file` page, as its fields without the bytes plus the receipt range they came from (receipts are immutable,
+    and nothing deletes one);
+  - any other answer over 2,048 bytes, compressed;
+  - a smaller one as sent, as every record kept it before.
+  A repeated request is answered from the record, off the event loop, without running the tool again.
+- On the probe above: 78 records, 91 KB, the largest 3.7 KB (2.4.16: 39 records, 4.3 MB, the largest 1.33 MB). Each
+  answer, applied once more as a repeated request, was identical to the one sent (78 of 78). Each record, rebuilt from
+  the state's files after the daemon stopped, matched the answer sent (78 of 78: 49 pages, 26 compressed, 3 as sent).
+- A worker that ended just after saving a page's record left it complete, and the page rebuilt from it after the
+  restart matched the file. One that ended just before left the call to be retired, as in 2.4.16.
+
+### Fixed: a stop waited for a writer whose retry was backing off
+- 2.4.16 stopped waiting for a writer the retry policy holds, but counted only a failure that cannot heal. A writer
+  whose failure can heal, with mail owed to it, refused every graceful stop `NOT_QUIESCENT` until its backoff passed
+  and a retry succeeded.
+- Now a writer counts as held while its reconcile failed and is not due (`recovery.retry_due`), and while its demand
+  start failed and is not due (`dormancy.start_due`). The next daemon keeps the failure until it is due, as in
+  2.4.16, and then retries it.
+- 2.4.16's overlap case (VERIFY 2.4.16 (F)): this release stopped gracefully, and the installed 2.4.16 refused the
+  stop `NOT_QUIESCENT` (`deliveries: 1`). In both, the failure survived the overlapping gap and nothing was attempted
+  before its deadline.
+
+### Known limits
+- A record this release writes cannot be replayed by 2.4.16, which would send the stored form as the answer. Roll back
+  only with no call in flight.
+- The 3.93 GB of answers already in the user's ledger stay as they are. Native compaction and reclaiming the file's
+  space, later in this series, take them up.
+- A thread begun before 2.4.17 keeps the tool schemas it started with, because Codex keeps a thread's dynamic tools
+  from its start. Its model is not told about `status`'s `cursor` or `inbox`'s `message` and `text_offset`. The
+  coordinator accepts them from any thread, checked against this release's schemas, and Codex passes a call's
+  arguments on unchecked (codex 0.163.0 `core/src/tools/handlers/dynamic.rs:141`, read in the installed source; not
+  measured with a thread begun before 2.4.17).
+- Codex yields a running cell whenever a message is steered into its turn (`watch_user_input`, codex 0.163.0), and
+  the cell's output then arrives by `wait`. That is Codex's own behavior: the probe above delivers every message
+  before its first measured cell.
+- The lead's own `daemon/status` is not bounded; it is the lead's RPC, not a model's tool result.
+- `run/start` refuses `OPERATIONAL_FAILURE` (`PermissionError`, no path named) while the checkout holds a file the
+  coordinator cannot read, as 2.4.16 does (found by this release's probe). Queued.
+- A project writer's patch, checked while a local resource ran out, stops native intake as above, but the next start
+  still quarantines it, its paths UNKNOWN, as 2.4.16 did at once. Such a patch has parts even when it touches one
+  checkout (`operations.prepare`), and startup fences every operation with parts whose atomic completion did not
+  commit (`recovery.recover`). Verifying one there from its durable completion evidence is queued (Codex review turns
+  108 and 109; not measured: it needs a Codex project writer).
+- Found live after the 2.4.16 switch, read-only, for 2.4.18:
+  - of the 12 startup incidents, 7 became `NATIVE_RPC` (`thread/resume` refused, -32600) and are held;
+  - 4 wait as `RESTORE_CUSTODY`, retried at each backoff, each retry a full readmission with every calibration probe
+    before it is refused at its last step: 22 admissions in 32 minutes;
+  - all of them are on one checkout, whose two custody records can never be released. One holds its writer's own
+    MCP server (`docker mcp`) as a command's survivor, because a dead writer's service record with the same pid
+    shadows the live one: the inventory matches services by pid alone. Both wait for the end of a call whose
+    app-server was replaced before that end was read, and which no app-server can now deliver;
+  - so their two runs stay cancelling, and each cancel pass reconciles its writer, with a full scan of the
+    checkout, every ~5.3 s: 889 scans in 32 minutes.
+- Writer records keep `process_lineage` inline. Queued.
+- With 2.4.18 (the custody above) and 2.4.19 (`RESTORE_CUSTODY` waiting for custody, cancel passes, `NATIVE_RPC`)
+  inserted, the rest of the series moves by two: 2.4.20 shared dependency evidence; 2.4.21 native compaction and
+  archive retention; 2.4.22 reclaiming the file's space; 2.4.23 parking and resource budgets.
+
 ## [software-workflows 2.4.16] — 2026-10-29
 
 Two changes. A writer readmitted again after a release change no longer runs the hooks of the release that first

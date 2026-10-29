@@ -17,7 +17,7 @@ import time
 import uuid
 
 from .client import CoordinatorError, validate_state
-from . import telemetry
+from . import native, telemetry
 
 
 # Unreconciled operations: admission and custody look only at these, per checkout.
@@ -504,7 +504,7 @@ class Store:
                 stamp = None
             if stamp is not None:
                 if self._validated_blobs.get(name) != stamp:
-                    self.read_blob(name)
+                    self.verify_blob(name)
                 return name
             content.seek(position)
             fd, pending = tempfile.mkstemp(prefix="pending-", dir=target.parent)
@@ -537,6 +537,8 @@ class Store:
                 data = stream.read()
                 after = self._blob_stamp(os.fstat(stream.fileno()))
         except OSError as exc:
+            if native.local_resource_failure(exc):
+                raise  # descriptors, memory, storage: stops native intake (review turn 106), not a missing receipt
             raise CoordinatorError("BLOB_MISSING", "Receipt bytes are unavailable", {"blob": name}, True) from exc
         with telemetry.span("hashing", False):
             observed = hashlib.sha256(data).hexdigest()
@@ -545,6 +547,60 @@ class Store:
             raise CoordinatorError("BLOB_CORRUPT", "Receipt hash does not match", {"blob": name}, True)
         self._validated_blobs[name] = after
         return data
+
+    def verify_blob(self, name):
+        """Check a receipt's bytes against its name and record its stamp as verified, as read_blob does, hashing it
+        in 1 MiB chunks: memory one chunk, not the receipt (through 2.4.16 the first use of a receipt in a daemon,
+        a publication's reuse included, read it whole)."""
+        if not name or len(name) != 64 or any(c not in "0123456789abcdef" for c in name):
+            raise CoordinatorError("BLOB_ID", "Invalid receipt identifier")
+        observed = hashlib.sha256()
+        try:
+            with (self.root / "blobs" / name).open("rb") as stream:
+                before = self._blob_stamp(os.fstat(stream.fileno()))
+                with telemetry.span("hashing", False):
+                    for chunk in iter(lambda: stream.read(1 << 20), b""):
+                        observed.update(chunk)
+                after = self._blob_stamp(os.fstat(stream.fileno()))
+        except OSError as exc:
+            if native.local_resource_failure(exc):
+                raise  # descriptors, memory, storage: stops native intake (review turn 106), not a missing receipt
+            raise CoordinatorError("BLOB_MISSING", "Receipt bytes are unavailable", {"blob": name}, True) from exc
+        if before != after or observed.hexdigest() != name:
+            self._validated_blobs.pop(name, None)
+            raise CoordinatorError("BLOB_CORRUPT", "Receipt hash does not match", {"blob": name}, True)
+        self._validated_blobs[name] = after
+
+    def read_blob_range(self, name, offset, length):
+        """Bytes [offset, offset + length) of a receipt, and its size, in memory bounded by the range (a read_file
+        page): a receipt not verified since its file last changed (its stamp) is verified first (verify_blob), then
+        only the range is read. Through 2.4.16 every page read the whole receipt, on the loop."""
+        if not name or len(name) != 64 or any(c not in "0123456789abcdef" for c in name):
+            raise CoordinatorError("BLOB_ID", "Invalid receipt identifier")
+        try:
+            stamp = self._blob_stamp((self.root / "blobs" / name).stat())
+        except OSError as exc:
+            if native.local_resource_failure(exc):
+                raise  # descriptors, memory, storage: stops native intake (review turn 106), not a missing receipt
+            raise CoordinatorError("BLOB_MISSING", "Receipt bytes are unavailable", {"blob": name}, True) from exc
+        if self._validated_blobs.get(name) != stamp:
+            self.verify_blob(name)
+        try:
+            with (self.root / "blobs" / name).open("rb") as stream:
+                before = self._blob_stamp(os.fstat(stream.fileno()))
+                data = b""
+                if offset < before[2]:  # at or past the end reads nothing: seek refuses an offset from 2**63 on
+                    stream.seek(offset)
+                    data = stream.read(length)
+                after = os.fstat(stream.fileno())
+        except OSError as exc:
+            if native.local_resource_failure(exc):
+                raise  # descriptors, memory, storage: stops native intake (review turn 106), not a missing receipt
+            raise CoordinatorError("BLOB_MISSING", "Receipt bytes are unavailable", {"blob": name}, True) from exc
+        if before != self._validated_blobs.get(name) or self._blob_stamp(after) != before:
+            self._validated_blobs.pop(name, None)
+            raise CoordinatorError("BLOB_CORRUPT", "Receipt changed while read", {"blob": name}, True)
+        return data, after.st_size
 
     @telemetry.measured("heads_fetch_materialization")
     def heads(self, checkout):

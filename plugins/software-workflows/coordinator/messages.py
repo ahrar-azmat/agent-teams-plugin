@@ -69,6 +69,9 @@ class Messages:
     async def send(self, sender, recipient, text, wake, cwd="", notice=False, ident=None):
         if wake not in ("none", "queue", "start") or not isinstance(text, str) or not text:
             raise CoordinatorError("MESSAGE_ARGUMENTS", "Message needs text and explicit wake policy: none, queue or start")
+        if not isinstance(sender, str) or not sender:
+            # A lead's message/send names any sender; a writer's inbox shows it (review turn 105: a list was stored).
+            raise CoordinatorError("MESSAGE_ARGUMENTS", "A message's sender is a nonempty string")
         origin = None
         if recipient == "lead" and sender != "lead":
             origin = self.store.get(sender, required=False)

@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.16 / P1
+# Writer coordinator — software-workflows 2.4.17 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -732,6 +732,96 @@ cursor, ordered by checkout ID and then path. Indexed SQL applies the cursor and
 limit in each repository, materializing at most the page size plus one row across
 the participants. Checkout metadata is read at most once per root per call.
 Singleton cursors remain plain paths; malformed project cursors refuse `PAGE_CURSOR`.
+
+Every tool result encodes within one budget, 32,000 bytes of JSON by default.
+`SOFTWARE_WORKFLOWS_TOOL_RESULT_BYTES` sets it from 4,096 to 40,000; any other
+value refuses the daemon's start `CONFIG`. Writers run gpt-6-astra in
+`code_mode_only`, so each call returns into a code-mode cell. Codex 0.163.0 showed
+the model a cell's output whole up to 32,047 characters, and cut it to about 40,150
+from 64,000 on, leaving its middle out (10,000 tokens, `unified_exec`'s
+`DEFAULT_MAX_OUTPUT_TOKENS`; measured 10-29). The budget is 80 % of that ceiling,
+which leaves a cell that prints one result room for its own text.
+- `read_file` checks `offset`, `length` and `revision` before it reconciles or
+  reads anything. A page holds what the budget leaves after its fields (23,601
+  bytes). A larger `length` returns that page, with `next_offset` and `limited`
+  (requested, returned, `page_bytes`, reason `TOOL_RESULT_BUDGET`). A later page
+  passes the `revision` its first page returned, and a file changed since is
+  refused `REVISION_CHANGED` with its current revision. Only the page's bytes are
+  read from the receipt, off the event loop; a receipt not verified since its file
+  last changed is hashed first, 1 MiB at a time. An offset at or past the file's
+  end returns no bytes (`next_offset: null`), whatever its size.
+- `status` shows the caller's own run first, within half the budget, then the
+  other runs on its checkout in run id order, a page at a time (`cursor`,
+  `next_cursor`, `writers_total`, `limited`). A run is shortened only when it alone
+  exceeds a page; otherwise it waits for the next page. Each run shows its task (the
+  first 400 bytes of it as encoded, with `task_chars` when longer), its state and its
+  writer's, its claims, active custody (each command's first 200 bytes, with
+  `command_chars` when longer) and pending requests in brief, and how many of its
+  unit's messages are unacknowledged. A list too long for the run's room is halved
+  until it fits, its `<list>_total` named; then the task is shortened further. The
+  open UNKNOWNs per checkout take at most a quarter of the budget, the rest counted
+  (`unknowns_checkouts`, `unknowns_total`). Mail is read with `inbox`.
+- `inbox` and `list_paths` keep `limit` and end a page at the budget, with
+  `next_cursor` after the last entry shown and `limited` when fewer than asked were
+  shown. Neither loads more than a page can show: `list_paths` reads at most
+  budget / 64 rows and one more, and `inbox` reads 16 messages at a time until its
+  page is full.
+- `inbox` shows each message's id, sender, recipient, state, delivery, wake,
+  created time, notice and text, and its delivery attempts as a count
+  (`delivery_attempts`); through 2.4.16 it showed the record whole, its attempts
+  listed. Each field but the text shows at most 120 bytes as encoded, its full
+  length named (`sender_chars`), whatever its type: a lead's `message/send` refuses
+  a sender that is not a nonempty string (`MESSAGE_ARGUMENTS`), and a record stored
+  before shows its sender as its JSON, cut. A message too long for one page shows
+  the part of its text that fits, with
+  `text_chars`, `text_offset` and `text_next_offset`. `inbox` with `message` and
+  `text_offset` reads the rest, for a message to the caller only.
+- A path and root that no page can hold are shown alone, over the budget, with
+  `limited` reason `ENTRY_OVER_BUDGET`; refusing one would stop a walk at it.
+- An error echoes at most 120 bytes of a caller's own string (a revision, a message
+  id), naming its full length (`continued_chars`, `message_chars`). An error whose
+  details would not fit the budget leaves them out and names their size
+  (`details_omitted_bytes`); its code, message and kind stay.
+- `send` answers the message's id, recipient, state, delivery and wake.
+- Every call's arguments are checked against the tool's declared schema before
+  anything is marked or read: Codex passes them on as the model wrote them,
+  unchecked (codex 0.163.0 `core/src/tools/handlers/dynamic.rs:141`). A value of
+  another type, a value below an integer's minimum, an unknown argument or a missing
+  one is refused `TOOL_ARGUMENTS`, with the tool's own argument names (`invalid`,
+  `missing`) and a count of unknown ones. A project cursor is checked once decoded:
+  a lone surrogate or too deep a nesting is refused `PAGE_CURSOR`. A path the
+  filesystem refuses (`EACCES`, `EPERM`, `ELOOP`, `ENAMETOOLONG`) is refused
+  `PATH_INVALID` with its `errno`, and a file the coordinator cannot open for those
+  reasons is refused `READ_FAILED`. Any other `OSError` keeps its handling: a local
+  resource failure (`ENOSPC`, `EMFILE`, ...) stops native intake, a receipt's read
+  included: a receipt that cannot be opened for want of a descriptor is not taken
+  for a missing one (`BLOB_MISSING`), which answered the call and could quarantine
+  the operations that wrote it. Nor is a patch of a writer outside a Codex project
+  checked then quarantined for it: the notification is applied again (a project
+  writer's patch has parts even in one checkout, and is still fenced at the next
+  start). An offset or a
+  `limit` of any size is answered (measured by direct call with 10^19). Through
+  2.4.16 each of these could raise an error nothing answered, and the call waited.
+- `run/start` refuses a task that is not a string (`RUN_FIELDS`); `status` shows a
+  task or a custody command stored with another type as its JSON, cut.
+- New arguments are optional, and none was removed or renamed. A thread keeps the
+  tool schemas it started with, since `dynamicTools` is sent only at `thread/start`.
+  The coordinator accepts the new arguments from any thread.
+- `daemon/status` reports `tool_results`: results since the daemon started, the
+  largest, how many came within 80 % of the budget, and per tool how many were
+  `limited` to it or went over it. Only an effect's own answer, or a path shown
+  alone, can go over: every reading tool otherwise pages within the budget.
+
+A completed call's record keeps what rebuilds its answer exactly when a native
+server repeats the request:
+- a `read_file` page, as its fields without the bytes plus the receipt range they
+  came from (`receipt_range`). Receipts are immutable and nothing deletes one; a
+  reclamation that does must keep every receipt a stored page names;
+- any other answer over 2,048 bytes, compressed (`deflate`);
+- a smaller one as sent, as every record before 2.4.17 kept it.
+A repeated request is answered from the record, off the event loop, without
+running the tool again. 2.4.16 cannot replay a 2.4.17 record: it would send the
+stored form itself.
 
 The fixed Python hook command contains only its program and state-root path.
 Session, child, turn and tool-use identity come from the native payload. C1 calls
@@ -1860,10 +1950,14 @@ the policy makes it due: neither marks it reconciling nor tries it before then
 release's quarantine keeps that failure's release (none before 2.4.16), so this
 release still tries it once. A memory-gate refusal, made directly or in every
 failed case of a calibration, is also due before its backoff once the gate would
-admit a launch. A stop does not wait for a held writer's workflow or its mail not
+admit a launch. A writer is held while its reconcile failed and is not
+`retry_due` (its backoff has not passed, or its cause cannot heal and this
+release has tried it), and while its demand start failed and is not
+`start_due`. A stop does not wait for a held writer's workflow or its mail not
 yet sent, nor for its turn once its app-server has exited with no live
 connection; a live app-server's turn is still waited for, as are custody,
-operations and calls in flight.
+operations and calls in flight. Through 2.4.16 only a failure that cannot heal
+held a writer, so mail owed to one backing off refused the stop.
 A cancel interrupts a turn only through a live connection; a turn whose writer is
 not connected is interrupted after it reconnects, without an event at each pass.
 `SOFTWARE_WORKFLOWS_RECONCILE_RETRY_FIRST_S` and

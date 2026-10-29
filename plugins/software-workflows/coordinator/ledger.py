@@ -21,7 +21,7 @@ from .locks import KeyedLocks, finish_all
 from .client import CoordinatorError
 from . import gitio
 from .store import uid, digest
-from . import runtime, telemetry
+from . import native, runtime, telemetry
 
 
 def case_sensitive(root):
@@ -1124,6 +1124,10 @@ class Ledger:
             terminal = self.terminal(operation, item)
             if terminal:
                 return terminal
+            if native.local_resource_failure(exc):
+                # Descriptors, memory or storage ran out while the patch was checked: no evidence about it. Native
+                # intake stops, and the notification is applied again after (review turn 107: it was quarantined).
+                raise
             await self.quarantine(operation, getattr(exc, "code", type(exc).__name__))
             raise
 
@@ -1293,10 +1297,14 @@ class Ledger:
         except CoordinatorError as exc:
             if exc.code == "OPERATION_STATE" or not current():
                 return
+            if native.local_resource_failure(exc):
+                raise  # descriptors, memory, storage: no evidence about the patch (review turn 107)
             await self.quarantine(operation, reason + ": " + exc.code)
         except OSError as exc:
             if not current():
                 return
+            if native.local_resource_failure(exc):
+                raise  # as above: native intake stops, and the notification is applied again after
             await self.quarantine(operation, reason + ": " + type(exc).__name__)
 
     async def quarantine(self, operation, reason, executing=False):

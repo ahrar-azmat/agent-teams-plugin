@@ -661,7 +661,7 @@ class Runs:
                 continue
             # What it wrote that this daemon has not read yet (it is read to its end before a stop deletes it).
             for operation in self.daemon.read_native_log(host):
-                self.daemon.background(self.daemon.settle_returned(self.store.get(operation)))
+                self.daemon.background(self.daemon.settle_logged(host, self.store.get(operation)))
             marks = self.daemon.native_log(self.store.get(host))
             failed = marks.get("failed")
             if sent is not None and failed and failed["time"] >= sent - rollout.MARGIN_S:
