@@ -3,6 +3,67 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.21] — 2026-10-29
+
+One change: the reads the worker's event loop made for each writer hook, each second, each reconcile and each start
+by testing or decoding every record of a kind now go through an index and read only the records they act on.
+(`store.py`, `recovery.py`, `daemon.py`, `messages.py`, `runs.py`, `lead_calls.py`; coordinator/VERIFY.md, 2.4.21.)
+
+### Fixed: the event loop was held by reads of whole record kinds
+- Found live on 10-29 (2.4.20, read-only): the worker used 144% CPU and its event loop stalled 12 times a minute (368
+  stalls of at least 0.75 s in 30 minutes). A settlement waited 4.4 s of its 10.6 s for the loop. A lead's Write or
+  Edit was refused `LEAD_ADMISSION_BUSY` whenever its 2 s decision came late: 48 of 300 admissions in 6 hours, and
+  about half of another project's lead's edits while its writers started.
+- A 10 s stack sample of the worker: its main thread ran tasks 80% of the time, 54% inside SQLite, most of it waiting
+  on disk reads of table rows reached through an index, and 11.5% decoding JSON.
+- What held it, measured on the live ledger:
+  - each writer hook decoded every listener record ever written to find its session's app-server (`writer_ready`):
+    3,783 records, 47.3 MB, 278-483 ms a hook, about 1.3 hooks a second;
+  - each second, maintenance read every listener's record for the connected ones (47-58 ms) and again for the failed
+    ones (52 ms), every message for the writers' undelivered mail (19-21 ms), and decoded every run for a leased
+    checkout (110 runs, 11.4 MB, 17-65 ms);
+  - `Store.all(kind, parent)`: with no statistics SQLite chose `record_kind` (kind, id), whose order needs no sort, and
+    tested every record of the kind for its parent. A unit's operations, custody or dynamic calls took 1.0-1.7 s cold
+    (6-40 ms through a parent index), and a command's preparation read every read and declaration record;
+  - a reconcile decoded every operation of its unit to settle those in flight, and `runs.quiet_but_inputs` did so to
+    ask whether one was (0.3-1.1 s for a unit of 3,077);
+  - each start decoded every operation (23,283, 1,772 MB) to find its 341 lead-edit records (9.3-10.7 s).
+- Now each reads only what it acts on, through an index, and gets the same records in the same order. The indexes are
+  `live_listener` (connected and disconnected listeners, by session), `failed_listener`, `writer_mail`,
+  `unfinished_run`, `lead_edit_operation`, `record_children` (parent, kind, id), and `quiet_operation`, which already
+  existed, for a unit's operations in flight.
+- Measured on a copy of the user's ledger (VERIFY 2.4.21 (B)), 2.4.20 then this release:
+
+  | read | 2.4.20 | 2.4.21 |
+  |---|---|---|
+  | writer hook | 167-206 ms | 0.26-0.51 ms |
+  | connected listeners | 39-40 ms | 2.4-2.5 ms |
+  | failed listeners | 44 ms | 6.8-7.4 ms |
+  | undelivered mail | 14-467 ms | 0.6-1.8 ms |
+  | a leased checkout's runs | 15-62 ms | 1 ms |
+  | a reconcile's operations in flight | 347-1,098 ms | under 0.2 ms |
+  | every unit's quiet check | 13.4 s | 0.5 ms |
+  | a start's lead edits | 9.3 s | 38 ms |
+  | a unit's 3,077 operations | 396-3,075 ms | 226-228 ms, now their decoding |
+- The first start of this release builds the six indexes: 4.6 s on the copy; a later start, 0.002 s.
+- A real daemon with a real Codex writer (patch, two commands, an answer) settled the same as 2.4.20, with no
+  UNKNOWN. The statements that read every record of a large kind on each hook and each second are gone from its SQL
+  (VERIFY 2.4.21 (C)).
+
+### Known limits
+- A caller that asks for all of a unit's operations still decodes them: publication's mutation scope, a workflow
+  phase's report, a claim's release, a writer's first command's service inventory. That is about 0.2 s for a unit of
+  3,000 operations.
+- Each second, maintenance still evaluates its runs-to-act-on filter over every run (110), and the mail pass its
+  lead-actor filter over every actor (184).
+- A start still decodes every listener record a few times (0.35 s each on the copy) and every lead hook record twice
+  (0.6 s each).
+- The lead admission's 2 s decision bound is unchanged. Whether it holds once the loop is free is measured live after
+  the switch.
+- A workflow run's record (up to 400 KB) is written again at each notification of its phase's turn.
+- The new partial indexes are kept at each save of a listener, message, run or operation. Their cost was not
+  measured apart from the live result after the switch.
+
 ## [software-workflows 2.4.20] — 2026-10-29
 
 Two changes, both in the custody of a writer's commands (2.4.17's known limits): a process is matched against a

@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.20 / P1
+# Writer coordinator — software-workflows 2.4.21 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -2179,6 +2179,20 @@ Each probe step has its own bound;
 | `supervisor-wait.json` | A supervisor waiting for `upgrade.lock` to restart its worker, its leases held: since when, how many leases, and `until` once it restarted it. |
 | Canonical `/tmp/c1-<uid>/s*/` | Owned per-incarnation RPC/native/probe endpoint allocations. |
 | Canonical `/tmp/c1-<uid>/<identity>.owner` | Cross-state checkout ownership anchor; never remove to steal ownership. |
+
+The ledger keeps every record it was given (10-29, the user's: 222,906 records, 16 GB), so the reads the event loop
+makes for each writer hook, each second, each reconcile and each start go through an index and read only the
+records they act on. A writer's hook finds its app-server by
+session among the connected and disconnected listeners (`live_listener`). Each second, maintenance reads the
+connected and the failed listeners (`failed_listener`), the writers' undelivered mail (`writer_mail`) and a leased
+checkout's unfinished runs (`unfinished_run`). A reconcile reads its unit's operations in flight (`quiet_operation`),
+a parent's records of one kind are read through `record_children` (parent, kind, id), and a start reads the lead's
+file edits (`lead_edit_operation`). Through 2.4.20 each of these decoded or tested every record of its kind on the
+event loop: 278-483 ms a writer hook, 135-200 ms of every second for maintenance, 9.3-10.7 s at a start, on the
+user's ledger; the loop stalled 12 times a minute and a lead's edits were refused `LEAD_ADMISSION_BUSY`. A release
+that adds an index builds it at its first start (2.4.21: six, 4.6 s on a copy of the user's ledger). Maintenance's
+runs to act on, the mail pass's lead-actor filter and some reads at a start still read every record of their kind
+(VERIFY 2.4.21, known limits).
 
 Retain the state directory and scratch evidence when investigating a refusal.
 There is no garbage collector or destructive reset command in C1. Do not remove

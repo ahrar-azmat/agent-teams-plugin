@@ -223,7 +223,8 @@ class Daemon:
             return  # A stop cannot end the user's Claude host or waive its file-call exclusion.
         if not checkout.get("compatibility_lease"):
             return
-        runs = [r for r in self.store.all("run") if participants.contains(self.store, r["unit"], checkoutid) and r["mode"] == "native"]
+        # Asked each second while the lease is held: a finished run holds none (TERMINAL), and is not read.
+        runs = [r for r in self.store.unfinished_runs() if participants.contains(self.store, r["unit"], checkoutid) and r["mode"] == "native"]
         from .writer import TERMINAL
         if not stopping and any(r["state"] not in TERMINAL | {"idle"} and not self.runs.awaiting_lead(r) for r in runs):
             return
@@ -234,7 +235,7 @@ class Daemon:
             # Native may still write for it (a project's parts included): legacy writers stay excluded until it
             # ends. A stop releases after every app-server has exited.
             return
-        for message in self.store.all("message"):
+        for message in self.store.writer_mail():  # every message delivery_owed can hold
             if self.delivery_owed(message) and participants.contains(self.store, self.store.get(message["recipient"])["unit"], checkoutid):
                 return  # A queued or uncertain native turn can start without another RPC.
         await self.leases.call("release", checkout["root"])
@@ -3449,8 +3450,7 @@ class Daemon:
                 #   (recovery.end_wedged: its replacement is due now).
                 # Otherwise its next resume reconciles it. Its backoff is no work under way, so it holds no stop; an
                 # attempt it starts enters reconcile_listener's stop fence like any other.
-                for listener in list(self.store.selected("SELECT * FROM records WHERE kind='listener' AND "
-                                                         "json_extract(data,'$.recovery_state')='failed'")):
+                for listener in list(self.store.failed_listeners()):
                     if (retry_due(self, listener)
                             and ("run", listener["run"]) not in recovering
                             and self.store.get(listener["actor"]).get("listener") == listener["id"]

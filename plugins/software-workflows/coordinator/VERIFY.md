@@ -15582,3 +15582,136 @@ ruff finding beyond 2.4.19's 35, `claude plugin validate --strict` for the plugi
   current app-server connected, as before.
 - **An MCP call whose app-server exited before its end was read** keeps its custody until its own end or a lead's
   `custody/reconcile`, as before: its server can outlive the app-server (review turn 116).
+
+## 2.4.21
+
+One change: the reads the worker's event loop made for each writer hook, each second, each reconcile and each start
+by testing or decoding every record of a kind now go through an index and read only the records they act on.
+Measured on 10-29 between 18:10 and 19:05 on the user's Mac (macOS 26.6.2, Python 3.15.2, SQLite 3.54.1,
+Codex 0.163.0). (A) was read from the live 2.4.20 daemon and ledger, read-only. (B) runs a `Store` on an APFS clone of
+a consistent copy of the user's ledger (`res/state-copy`, taken 10-29 08:21 with SQLite's online backup; 16.2 GB);
+no daemon ran on it. (C) runs a real daemon (supervisor, worker) with a real Codex writer in `code_mode_only` and the
+loopback fixture provider, on a disposable state, against the tree before this change (2.4.20, `6a282b4`).
+
+### What it changes
+- **Indexes** (partial, on `records`): `live_listener` (`root_thread`, id) over listeners `connected` or
+  `disconnected`; `failed_listener` (id) over listeners whose `recovery_state` is `failed`; `writer_mail` (id) over
+  messages not `entered_context` nor `acknowledged` and not to `lead` or a lead mailbox; `unfinished_run` (id) over runs
+  not in `writer.TERMINAL`; `lead_edit_operation` (id) over operations of kind `lead-edit`. And `record_children`
+  (parent, kind, id) over every record, created with the schema so that the migrations' `Store.all` reads find it.
+- **`Store.all(kind, parent)`** reads through `record_children`. **`Store`** gains `session_listeners(session)`
+  (`root_thread IS ?`), `connected_listeners()`, `failed_listeners()`, `unfinished_runs()`, `writer_mail()` and
+  `operations_in_flight(unit)` (through `quiet_operation`, there since 2.4.8).
+- **Callers**: `recovery.writer_ready` (each writer hook), `watch_answers` and the failed-listener retry (maintenance,
+  each second), the startup plan's held writers, `Messages.retry` (each second), `Daemon._release_lease` (each second
+  while a lease is held; its runs and its owed mail), `_reconcile_listener` and `reconcile_effects` (their unit's
+  operations in flight), `Runs.quiet_but_inputs` (the same existence check as `Daemon.unit_quiet`) and
+  `lead_calls.recover` (the lead edits, at each start). Each loop still filters as before: only the records it would
+  have skipped are no longer read.
+
+### (A) The live findings (2.4.20, read-only)
+- The worker (pid 63588, up 22.5 min): 144% CPU, 149 MB resident. `daemon/status`: loop lag at most 3.57 s, 345
+  diagnostic signals since its start at 17:48.
+- `r2421/stall_events.py`: 368 stalls of at least 0.75 s in the 30 minutes to 18:16 (median age when seen 0.80 s),
+  among 13,100 events: no one kind of work owned them, the loop was saturated. In 10 minutes: 3,813 native messages
+  (781 `hook/started`, 466 `item/started`), 172 operations prepared, 164 settlements, 339 checkout scans, 134 watchdog
+  signals.
+- One settlement's trace (`op_0f277040`): 10.57 s, of which 4.44 s unattributed, 2.20 s in the journal queue and
+  1.06 s waiting for the loop after its executor returned; its own reads 8.7 ms (181 fetches) and decoding 31.6 ms.
+- `/usr/bin/sample` of the worker, 10 s (`r2421/worker-sample-1.txt`, `sample_tree.py`): of the main thread's 8,465
+  samples, 6,816 (80.5%) in task callbacks and 1,584 idle in `kevent`. 4,064 (48%) at the top of the stack in `pread`,
+  under `sqlite3_step`: mostly `sqlite3VdbeFinishMoveto` → `sqlite3BtreeTableMoveto`, the table rows of an index's
+  entries read from disk. 978 decoding JSON (`scanner_call`).
+- Lead admissions in the 6 hours to 18:00 (`r2421/admissions_now.py`): 300, 252 granted, 43 expired, 5 refused; from
+  the hook process's birth to its decision p99 2.83 s, at most 4.15 s (the bound is 2 s).
+- The reads (`decode_cost.py`, `children_cost.py`, `maintenance_cost.py`; first run, best of 3):
+
+  | read | records | 2.4.20 |
+  |---|---|---|
+  | `Store.all("listener")`, each writer hook (`writer_ready`) | 3,783, 47.3 MB | 483 / 278 ms |
+  | connected listeners, each second | 3,783 tested, 10 rows | 58 / 47 ms |
+  | failed listeners, each second | 3,783 tested, 21 rows | 52 / 52 ms |
+  | mail to deliver, each second | 5,000 tested, 99 rows | 21 / 19 ms |
+  | `Store.all("run")`, each second for a leased checkout | 110, 11.4 MB | 65 / 17 ms |
+  | `Store.all("operation", unit)`, 3,077 of 24,224, through `record_kind` / through `record_parent` (columns but `data`) | | 1,253 / 21 ms |
+  | `Store.all("custody", unit)`, 2,476 of 18,297, the same | | 1,339 / 6 ms |
+  | `Store.all("dynamic", unit)`, 3,334 of 35,296, the same | | 1,741 / 40 ms |
+  | `Store.all("lead_batch_item", batch)`, 9 of 5,577, the same | | 159 / 0.5 ms |
+
+- `r2421/sql_capture.py` (C's scenario) with `r2421/inject` recording every statement the worker ran, then
+  `explain_capture.py` on the live ledger: every `Store.all(kind, parent)` was planned `SEARCH records USING INDEX
+  record_kind (kind=?)`, every record of the kind visited to test its parent, 101 times in the 30 s run.
+
+### (B) The reads on a copy of the user's ledger
+`r2421/store_probe2421.py <plugin> <clone>`: each read as 2.4.20 makes it, before this release's indexes exist; then
+the tree's `Store` opens the clone, its first start; then the same reads as the tree makes them. 5 sessions with a
+live listener, 101 units. First run and best of 3, in ms:
+
+| read | rows | 2.4.20 | tree |
+|---|---|---|---|
+| a writer hook's owner (5 sessions) | 1 | 175-206 / 166-179 | 0.27-0.51 / 0.26-0.44 |
+| connected listeners | 5 | 39.7 / 38.8 | 2.47 / 2.35 |
+| failed listeners | 18 | 44.3 / 43.7 | 7.38 / 6.76 |
+| `Messages.retry` | 94 | 467.4 / 14.1 | 1.79 / 0.62 |
+| `_release_lease`'s runs | 5 | 61.5 / 14.5 | 1.06 / 0.96 |
+| `_release_lease`'s owed mail | 0 | 36.4 / 35.2 | 1.77 / 1.39 |
+| `all("operation", unit)` | 3,077 | 3,074 / 396 | 228 / 226 |
+| `all("custody", unit)` | 2,476 | 592 / 72 | 43 / 38 |
+| `all("dynamic", unit)` | 3,334 | 1,547 / 461 | 501 / 391 |
+| `all("declaration", actor)` | 2,307 | 81.6 / 23.9 | 15.6 / 6.6 |
+| `all("read", actor)` | 1,344 | 57.3 / 13.8 | 74.9 / 3.7 |
+| `all("claim", unit)` | 9,997 | 128.6 / 40.5 | 32.7 / 25.1 |
+| `all("lead_batch_item", batch)` | 9 | 79.0 / 5.6 | 0.51 / 0.03 |
+| `all("native_obligation", listener)` | 1,101 | 102.9 / 14.6 | 4.9 / 2.2 |
+| a reconcile's operations in flight (2 units) | 0 | 368-1,098 / 347-404 | 0.00-0.18 / 0.00 |
+| `quiet_but_inputs`, every unit (once) | 101 | 13,417 | 0.47 |
+| `lead_calls.recover`'s lead edits (once) | 341 | 9,288 | 37.9 |
+
+Every read returned the same records in the same order. The first open built the six indexes in 4.6 s (1.46 to 2.62 s
+in two runs without `lead_edit_operation`); a second open took 0.002 s. Plans on the clone: `Store.all(kind, parent)`
+`SEARCH records USING INDEX record_children (parent=? AND kind=?)`, which SQLite also picks unforced;
+`session_listeners` `SEARCH records USING INDEX live_listener (<expr>=?)`.
+
+### (C) A writer's run on a real daemon
+`r2421/sql_capture.py <plugin> <dir> <label>`, from r2415's daemon probe: one native run whose turn adds a file with
+`apply_patch`, runs two commands and answers, while an Office-like poller asks `run/list` and brief `daemon/status`
+every 0.5 s; then the lead's reads (`run/status`, `run/result`, `run/events`, `claim/list`, `unknown/list`, full
+`daemon/status`) and a graceful stop. `r2421/inject` records every statement the worker executes.
+
+| code | run | operations | UNKNOWNs | loop lag max | polls p50 / max | stop |
+|---|---|---|---|---|---|---|
+| 2.4.20 (`sqlcap2`) | completed, 29.6 s | patch verified, 2 commands reconciled | 0 | 4.2 ms | 0.8-0.9 / 19-54 ms | graceful |
+| tree (`sqlcap-tree2`) | completed, 30.3 s | patch verified, 2 commands reconciled | 0 | 4.3 ms | 0.7-0.9 / 3.8-11 ms | graceful |
+
+The disposable ledger is small, so the times say little; the statements say what each read visits.
+`explain_capture.py` planned every statement on a ledger of the user's size: 2.4.20's on the live ledger, the
+tree's on the clone (B left, which holds the indexes). Statements that visit every record of a kind:
+
+| statement | 2.4.20 | tree |
+|---|---|---|
+| `Store.all(kind, parent)` | 101, `record_kind (kind=?)` | none: `record_children` |
+| connected listeners (maintenance) | 28, every listener | none: `live_listener` |
+| failed listeners (maintenance) | 29, every listener | none: `failed_listener` |
+| `Messages.retry` | 29, every message | 30: `writer_mail`; its lead-actor subquery reads every actor |
+| maintenance's runs to act on | 28, every run | 29, unchanged |
+
+The rest, unchanged, read kinds of at most 184 records or run once at a start.
+
+### Static checks
+`r2421/static_checks2421.py`, as 2.4.20's, against the installed 2.4.20, on the final tree.
+
+### Known limits
+- **A caller that asks for all of a unit's operations** still decodes them: publication's mutation scope, a workflow
+  phase's report, a claim's release, a writer's first command's service inventory (226-228 ms for 3,077 on the copy).
+  `all("dynamic", unit)` for publication likewise (391-501 ms for 3,334).
+- **Each second**, maintenance still evaluates its runs-to-act-on filter over every run (110), and the mail pass its
+  lead-actor filter over every actor (184).
+- **A start** still decodes every listener record a few times (3,420 records, 0.35 s each on the copy) and every
+  lead hook record twice (15,424, 0.6 s each).
+- **The lead admission's 2 s decision bound** is unchanged; whether it holds once the loop is free is measured live,
+  after the switch.
+- **A workflow run's record** (up to 400 KB on the user's ledger) is written again at each notification of its phase's
+  turn (`Writer.observe`).
+- **The new partial indexes' upkeep**: each save of a listener, message, run or operation evaluates their
+  conditions. That cost was not measured apart; the live measurement after the switch gives the net (review turn
+  118).

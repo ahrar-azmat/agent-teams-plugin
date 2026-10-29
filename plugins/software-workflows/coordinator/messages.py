@@ -5,7 +5,7 @@ import time
 
 from .client import CoordinatorError
 from .native import page
-from .store import uid
+from .store import WRITER_MAIL, uid
 from .locks import KeyedLocks
 
 
@@ -710,11 +710,10 @@ class Messages:
         return message
 
     async def retry(self):
-        # Every second: decode only messages still to be delivered, not every message ever sent. A lead's mail (to
+        # Every second: decode only messages still to be delivered, not every message ever sent, and read only those
+        # (their index: through 2.4.20 each pass tested every message, 19-21 ms for 5,000 on 10-29). A lead's mail (to
         # `lead`, a mailbox or a lead actor) is read through its inbox and never delivered.
-        messages = list(self.store.selected("SELECT * FROM records WHERE kind='message' AND "
-                "json_extract(data,'$.state') NOT IN ('entered_context','acknowledged') AND "
-                "json_extract(data,'$.recipient')!='lead' AND substr(json_extract(data,'$.recipient'),1,13)!='lead_mailbox_' AND "
+        messages = list(self.store.selected("SELECT * FROM records INDEXED BY writer_mail WHERE " + WRITER_MAIL + " AND "
                 "json_extract(data,'$.recipient') NOT IN (SELECT id FROM records WHERE kind='actor' AND "
                 "json_extract(data,'$.kind')='lead') ORDER BY id"))
         # A message queued natively on an app-server that runs another release's hooks would start a turn there

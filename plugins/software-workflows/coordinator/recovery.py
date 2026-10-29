@@ -756,7 +756,7 @@ async def _reconcile_listener(daemon, listener):
             await end_wedged(daemon, listener, why, "stopped")
             return await _reconcile_listener(daemon, store.get(listener["id"]))
         await answers(daemon, listener)  # attached and silent: reported, and this pass refused (LISTENER_SILENT)
-    for operation in list(store.all("operation", actor["unit"])):
+    for operation in list(store.operations_in_flight(actor["unit"])):
         if operation.get("parts") and operation["state"] in ("prepared", "allowed", "running"):
             if daemon.ledger.current_lead(operation):
                 # A writer reconnect does not interrupt this daemon's lead edit
@@ -1007,7 +1007,7 @@ async def _reconcile_listener(daemon, listener):
 
 async def reconcile_effects(daemon, listener, actor):
     store = daemon.store
-    for operation in list(store.all("operation", actor["unit"])):
+    for operation in list(store.operations_in_flight(actor["unit"])):
         if operation["state"] in ("prepared", "allowed", "running"):
             if daemon.ledger.current_lead(operation):
                 # A lead attached to this writer's unit can still be editing.
@@ -1085,8 +1085,7 @@ async def recover(daemon):
     # reconciling below, nor tried by this start. Maintenance tries it once it is due; one that cannot heal
     # (permanently_failed) waits for a resume or the next release. Through 2.4.15 every start tried each once more,
     # before its backoff.
-    for listener in list(store.selected("SELECT * FROM records WHERE kind='listener' AND "
-                                        "json_extract(data,'$.recovery_state')='failed'")):
+    for listener in list(store.failed_listeners()):
         if (listener["run"] not in permanent and store.get(listener["actor"]).get("listener") == listener["id"]
                 and not retry_due(daemon, listener)):
             permanent.add(listener["run"])
@@ -1436,10 +1435,12 @@ async def writer_ready(daemon, session, cutoff):
     it, the replacement is returned: the hook's process is checked against that one after, and a hook of the one it
     replaced is no descendant of it."""
     store = daemon.store
-    waiting = ("connected", "disconnected")  # disconnected: a transport gap's reconcile reconnects it
+    waiting = ("connected", "disconnected")  # disconnected: a transport gap's reconcile reconnects it (LIVE_LISTENER)
 
     def owner():
-        found = [l for l in store.all("listener") if l.get("root_thread") == session and l["state"] in waiting]
+        # The session's live listeners through their index: every hook decoded every listener record through 2.4.20
+        # (10-29: 3,783 records, 47.3 MB; 278-483 ms of the event loop a hook).
+        found = list(store.session_listeners(session))
         if not found:
             raise CoordinatorError("HOOK_IDENTITY", "No live native listener owns this hook session")
         return next((l for l in found if l["state"] == "connected"), found[0])
@@ -1475,7 +1476,7 @@ def watch_answers(daemon):
     now = time.monotonic()
     probes = daemon.answer_probes
     connected = set()
-    for listener in daemon.store.selected("SELECT * FROM records WHERE kind='listener' AND json_extract(data,'$.state')='connected'"):
+    for listener in daemon.store.connected_listeners():
         connected.add(listener["id"])
         if (not listener.get("root_thread") or listener.get("recovery_state") == "reconciling" or not silent_failed(listener)
                 and listener.get("recovery_state") == "failed" or ("run", listener["run"]) in daemon.recovering):

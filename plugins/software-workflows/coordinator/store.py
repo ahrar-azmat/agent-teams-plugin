@@ -37,6 +37,19 @@ LEAD_COMPLETION_PENDING = "kind='lead_hook' AND json_extract(data,'$.execution.u
 LEAD_BATCH_PENDING = "kind='lead_batch' AND json_extract(data,'$.state')='pending'"
 LEAD_BATCH_ITEM_PENDING = "kind='lead_batch_item' AND json_extract(data,'$.state')='pending'"
 LEAD_BATCH_LEGACY = "kind='lead_batch' AND coalesce(json_extract(data,'$.schema'),1)=1"
+# The event loop reads these few records instead of every one of their kind (10-29, live: 3,783 listeners, 47.3 MB;
+# 5,000 messages; 110 runs, 11.4 MB). Each writer hook finds its app-server by session among the live listeners (all
+# decoded: 278-483 ms a hook); maintenance probes the connected ones and retries the failed ones each second (47-58 and
+# 52 ms), delivers the writers' mail (19-21 ms), and keeps a checkout's compatibility lease while one of its runs is
+# unfinished (17-65 ms).
+LIVE_LISTENER = "kind='listener' AND json_extract(data,'$.state') IN ('connected','disconnected')"
+FAILED_LISTENER = "kind='listener' AND json_extract(data,'$.recovery_state')='failed'"
+WRITER_MAIL = ("kind='message' AND json_extract(data,'$.state') NOT IN ('entered_context','acknowledged') AND "
+               "json_extract(data,'$.recipient')!='lead' AND substr(json_extract(data,'$.recipient'),1,13)!='lead_mailbox_'")
+UNFINISHED_RUN = "kind='run' AND json_extract(data,'$.state') NOT IN ('completed','failed','interrupted','blocked','refused','cancelled')"
+# Each start imports the lead's file edits left open (lead_calls.recover): it decoded every operation to find them
+# (10-29, a copy of the user's ledger: 23,283 records, 1,772 MB, 10.7 s of the event loop for 341 lead edits).
+LEAD_EDIT_OPERATION = "kind='operation' AND json_extract(data,'$.kind')='lead-edit'"
 
 def custody_window(prefix=""):
     """Every unreleased custody reservation is an active effect window.
@@ -130,6 +143,10 @@ class Store:
           parent TEXT REFERENCES records(id), data TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1);
         CREATE INDEX IF NOT EXISTS record_kind ON records(kind, id);
         CREATE INDEX IF NOT EXISTS record_parent ON records(parent, kind);
+        -- Store.all(kind, parent), the migrations' included: a parent's records of one kind in id order. With no
+        -- statistics SQLite chose record_kind for it, whose order needs no sort, and read every record of the kind to
+        -- test its parent (10-29, live: 1.0-1.7 s cold for a unit's operations, custody or dynamic calls; 6-40 ms).
+        CREATE INDEX IF NOT EXISTS record_children ON records(parent, kind, id);
         CREATE TABLE IF NOT EXISTS events(
           seq INTEGER PRIMARY KEY AUTOINCREMENT, time REAL NOT NULL, kind TEXT NOT NULL,
           subject TEXT, data TEXT NOT NULL);
@@ -248,6 +265,11 @@ class Store:
                 ("custody_completed", "json_extract(data,'$.checkout'),json_extract(data,'$.completed')", "kind='custody'"),
                 ("visible_run", "json_extract(data,'$.created') DESC,id DESC", "kind='run' AND "
                  "(json_extract(data,'$.workflow') IS NOT NULL OR json_extract(data,'$.project_revision') IS NOT NULL)"),
+                ("live_listener", "json_extract(data,'$.root_thread'),id", LIVE_LISTENER),
+                ("failed_listener", "id", FAILED_LISTENER),
+                ("writer_mail", "id", WRITER_MAIL),
+                ("unfinished_run", "id", UNFINISHED_RUN),
+                ("lead_edit_operation", "id", LEAD_EDIT_OPERATION),
             ):
                 self.db.execute("CREATE INDEX IF NOT EXISTS " + name + " ON records(" + expression + ") WHERE " + condition)
             self.db.execute("CREATE INDEX IF NOT EXISTS unknown_checkout ON unknowns(checkout)")
@@ -404,11 +426,11 @@ class Store:
         self.put(record["_kind"], record["id"], {k: v for k, v in record.items() if not k.startswith("_") and k != "id"})
 
     def all(self, kind, parent=None):
-        query, args = "SELECT * FROM records WHERE kind=?", [kind]
-        if parent is not None:
-            query += " AND parent=?"
-            args.append(parent)
-        yield from self.selected(query + " ORDER BY id", args)
+        if parent is None:
+            yield from self.selected("SELECT * FROM records WHERE kind=? ORDER BY id", (kind,))
+        else:
+            yield from self.selected("SELECT * FROM records INDEXED BY record_children WHERE parent=? AND kind=? ORDER BY id",
+                                     (parent, kind))
 
     def selected(self, query, args=()):
         """Decode only records selected by an internal, parameterized query."""
@@ -446,6 +468,31 @@ class Store:
     def call_operations(self, unit, call):
         return self.selected("SELECT * FROM records WHERE kind='operation' AND "
                              "json_extract(data,'$.native.call')=? AND parent=? ORDER BY id", (call, unit))
+
+    def operations_in_flight(self, unit):
+        """A unit's operations prepared, allowed or running, in id order: what a reconcile settles. Every operation of
+        the unit decoded cost 0.2-3.0 s for a unit of 3,077 (10-29, a copy of the user's ledger)."""
+        return self.selected("SELECT * FROM records INDEXED BY quiet_operation WHERE " + WINDOW_ACTIVE["operation"] +
+                             " AND parent=? ORDER BY id", (unit,))
+
+    def session_listeners(self, session):
+        """The connected and disconnected listeners of a writer session (their root thread), in id order."""
+        return self.selected("SELECT * FROM records INDEXED BY live_listener WHERE " + LIVE_LISTENER +
+                             " AND json_extract(data,'$.root_thread') IS ? ORDER BY id", (session,))
+
+    def connected_listeners(self):
+        return self.selected("SELECT * FROM records INDEXED BY live_listener WHERE " + LIVE_LISTENER +
+                             " AND json_extract(data,'$.state')='connected' ORDER BY id")
+
+    def failed_listeners(self):
+        return self.selected("SELECT * FROM records INDEXED BY failed_listener WHERE " + FAILED_LISTENER + " ORDER BY id")
+
+    def unfinished_runs(self):
+        return self.selected("SELECT * FROM records INDEXED BY unfinished_run WHERE " + UNFINISHED_RUN + " ORDER BY id")
+
+    def writer_mail(self):
+        """Messages not yet in their recipient's context, in id order, but for mail to `lead` or a lead's mailbox."""
+        return self.selected("SELECT * FROM records INDEXED BY writer_mail WHERE " + WRITER_MAIL + " ORDER BY id")
 
     def heads_fingerprint(self, checkout):
         return fingerprint((row["path"], row["revision"]) for row in

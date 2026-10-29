@@ -21,7 +21,7 @@ from .custody import normalize, overlaps
 from .ledger import read_path, UNREADABLE
 from .locks import finish
 from .observations import checkout_at, identity_changed
-from .store import digest, LEAD_COMPLETION_PENDING, WINDOW_ACTIVE
+from .store import digest, LEAD_COMPLETION_PENDING, LEAD_EDIT_OPERATION, WINDOW_ACTIVE
 
 
 PHASES = {"admitting", "open", "settling"}
@@ -812,7 +812,8 @@ async def recover(daemon):
     """
     store = daemon.store
     from .intents import FILES
-    operations = {o["id"]: o for o in store.all("operation") if o["kind"] == "lead-edit"}
+    operations = {o["id"]: o for o in store.selected("SELECT * FROM records INDEXED BY lead_edit_operation WHERE " +
+                                                      LEAD_EDIT_OPERATION + " ORDER BY id")}
     for record in list(store.all("lead_hook")):
         if record.get("tool") not in FILES or record.get("execution"):
             continue

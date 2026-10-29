@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .locks import KeyedLocks, finish_thread
 from .client import CoordinatorError
-from .store import uid, digest
+from .store import WINDOW_ACTIVE, uid, digest
 from .writer import TERMINAL
 from . import processes, participants, rollout
 
@@ -786,7 +786,8 @@ class Runs:
         unit = run["unit"]
         if (any(a.get("active_turn") for a in self.store.all("actor", unit)) or self.daemon.custody.unit_active(unit)
                 or self.daemon.admitting_units.get(unit)
-                or any(o["state"] in ("prepared", "allowed", "running") or o.get("executing") for o in self.store.all("operation", unit))
+                or any(self.store.db.execute("SELECT 1 FROM records INDEXED BY quiet_" + kind + " WHERE " + WINDOW_ACTIVE[kind] +
+                                             " AND parent=? LIMIT 1", (unit,)).fetchone() for kind in ("operation", "executing"))
                 or any(p.get("input_id") in self.daemon.writer.starting for p in (run.get("phases") or {}).values())):
             return False
         if mode != "resume" and run["id"] in self.daemon.writer.locks.entries or mode != "cancel" and run["id"] in self.cancel_locks.entries:
