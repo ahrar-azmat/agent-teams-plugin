@@ -130,7 +130,7 @@ class Runs:
                 data.append(self.summary(run, listed=True))
         return {"data": data, "generation": self.store.generation}
 
-    def events(self, run, cursor=0, limit=100):
+    async def events(self, run, cursor=0, limit=100):
         if type(cursor) is not int or cursor < 0 or type(limit) is not int or not 1 <= limit <= 400:
             raise CoordinatorError("EVENT_CURSOR", "Use a nonnegative sequence cursor and limit 1..400")
         subjects = {run["id"], run["unit"], run["attempt"]}
@@ -141,10 +141,10 @@ class Runs:
         subjects.update(row["id"] for row in self.store.db.execute(
             "SELECT id FROM records WHERE kind='message' AND json_extract(data,'$.unit')=?", (run["unit"],)))
         subjects.update(r["id"] for r in self.store.all("listener", run["id"]))
-        placeholders = ",".join("?" for _ in subjects)
-        rows = list(self.store.db.execute("SELECT * FROM events WHERE seq>? AND subject IN (" + placeholders + ") ORDER BY seq LIMIT ?",
-                                         [cursor, *sorted(subjects), limit + 1]))
-        data = [dict(row, data=json.loads(row["data"])) for row in rows[:limit]]
+        from . import archive
+        from .locks import finish_thread
+        rows = await archive.page(self.store, subjects, cursor, limit + 1)
+        data = await finish_thread(lambda: [dict(row, data=json.loads(row["data"])) for row in rows[:limit]])
         listener = self.store.get((self.store.get(run.get("root_actor") or "", required=False) or {}).get("listener") or "", required=False) or {}
         from .dormancy import view
         from .retention import archives

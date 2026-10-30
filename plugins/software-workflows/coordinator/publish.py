@@ -139,15 +139,16 @@ class Publisher:
         revision. A reference to a path outside the ledger (ledger.unwatched) is no dependency: nothing there is
         published (2.4.0-2.4.3 refused a unit whose writer had read test output while it was UNKNOWN). A reference to a
         restore depends on whose bytes it restored (provenance). A git failure refuses (GIT_FAILED)."""
+        from .dependencies import references as dependency_references
+        operations = [operation for operation in operations if operation["state"] != "resolved" and operation["kind"] != "restore"]
+        reads = await dependency_references(self.store, operations)
         rows = {}
-        for operation in operations:
-            if operation["state"] == "resolved" or operation["kind"] == "restore":
-                continue  # Restores deliberately replace an UNKNOWN base with known receipt bytes.
+        for operation, read_revisions in zip(operations, reads):
             # Opaque-operation snapshots describe possible effects, not reads of
             # every checkout file. Only actual mutation bases and explicit reads
             # are dependencies on another unit's unpublished revisions.
             references = list(operation["bases"].values()) if operation["kind"] not in ("command", "mcp", "lead-command") else []
-            references += [revision for read in operation.get("dependencies", []) for revision in read.values()]
+            references += read_revisions
             for revision in references:
                 if not revision or revision in rows:
                     continue

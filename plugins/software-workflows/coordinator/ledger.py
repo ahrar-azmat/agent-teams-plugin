@@ -907,6 +907,8 @@ class Ledger:
         them already) are written but never recorded: the operation keeps them apart (`outside`), with no base, claim
         or receipt, and nothing there refuses it. A restore names only paths in the ledger."""
         unit, checkout = self.store.get(actor["unit"]), self.store.get(actor["checkout"])
+        from . import dependencies
+        await dependencies.ensure_actor(self.store, actor)
         self.require_owned(checkout)
         if unit["state"] != "open" or checkout.get("quarantine"):
             raise CoordinatorError("UNIT_FROZEN", "Unit or checkout is not open for operations")
@@ -993,18 +995,14 @@ class Ledger:
                 # fingerprint pins the heads it was admitted against. A copy of every head cost 365 KB
                 # a command on a 3,679-file checkout, decoded again by every later scan.
                 heads = self.store.heads_fingerprint(checkout["id"]) if kind in ("command", "mcp", "lead-command") else None
-                reads = [r for r in self.store.all("read", actor["id"])
-                         if unit.get("project_revision") or r.get("checkout", actor["checkout"]) == checkout["id"]]
-                dependencies = [r["revisions"] for r in reads]
                 operation = {"checkout": checkout["id"], "unit": unit["id"], "actor": actor["id"], "kind": kind,
                              "attempt": actor.get("attempt"), "generation": self.store.generation,
                              "state": "prepared", "paths": paths, "pre": pre, "bases": bases,
-                             "intended": intended, "native": native or {}, "dependencies": dependencies,
+                             "intended": intended, "native": native or {},
                              "created": started, "hook_valid": False, **({"heads": heads} if heads else {}),
                              **({"outside": sorted(outside)} if outside else {})}
-                if unit.get("project_revision"):
-                    operation["qualified_dependencies"] = [{"checkout": r.get("checkout", actor["checkout"]), "revisions": r["revisions"]} for r in reads]
                 with self.store.transaction():
+                    operation["dependency_ref"] = dependencies.capture(self.store, actor, checkout["id"], bool(unit.get("project_revision")))
                     self.store.put("operation", opid, operation, unit["id"])
                     self.store.event("operation/prepared", opid, {"bases": bases, **({"heads": heads} if heads else {}), "native": native or {}})
                 return self.store.get(opid)

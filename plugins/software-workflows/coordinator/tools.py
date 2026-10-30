@@ -8,7 +8,7 @@ import zlib
 from .locks import finish_thread
 from .client import CoordinatorError
 from .ledger import normalize, read_path
-from .store import uid, encoded
+from .store import encoded
 from . import routing, participants, runtime
 
 VERSION = runtime.plugin_version()
@@ -311,7 +311,8 @@ async def dispatch(daemon, actor, name, args, effect=None):
     for row in shown:
         revisions[row["root_id"]][row["path"]] = row["revision"]
     for key in ids:
-        daemon.store.put("read", uid("read"), {"checkout": key, "revisions": revisions[key]}, actor["id"])
+        from .dependencies import record_read
+        record_read(daemon.store, actor, key, revisions[key])
     return page
 
 
@@ -352,7 +353,8 @@ async def read_page(daemon, actor, args):
     want = requested if requested is not None else page
     data, size = (await finish_thread(daemon.store.read_blob_range, image["blob"], offset, min(want, page))
                   if image["blob"] else (b"", 0))
-    daemon.store.put("read", uid("read"), {"checkout": checkout["id"], "revisions": {path: revision}}, actor["id"])
+    from .dependencies import record_read
+    record_read(daemon.store, actor, checkout["id"], {path: revision})
     value.update(size=size, bytes_base64=base64.b64encode(data).decode(),
                  next_offset=offset + len(data) if offset + len(data) < size else None)
     if len(data) < min(want, max(0, size - offset)):

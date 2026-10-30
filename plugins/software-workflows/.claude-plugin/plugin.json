@@ -1,7 +1,7 @@
 {
   "name": "software-workflows",
   "description": "Agent-teams orchestration with Codex as the cross-model advisor and writer: the Codex Oracle MCP server (architect_review, code_review, research, codex_query, abraham and its run tools) and the hooks that gate plan mode and git push on a Codex review.",
-  "version": "2.4.25",
+  "version": "2.4.26",
   "author": {
     "name": "Ahrar Ahmad"
   },
@@ -33,6 +33,42 @@
       "title": "Concurrent writer reclamations",
       "description": "Maximum simultaneous verified writer parks and quarantine retirements. Must be a positive integer; default 2. Excess candidates remain queued. SOFTWARE_WORKFLOWS_WRITER_RECLAIM_CONCURRENCY overrides this setting. Changes apply at the next coordinator start.",
       "default": "2"
+    },
+    "retention_rows": {
+      "type": "string",
+      "title": "Archive selection rows",
+      "description": "Positive scheduling slice for lossless archive selection; default 1024. Byte and elapsed budgets also apply. No evidence is discarded at this limit. Changes apply at coordinator start; SOFTWARE_WORKFLOWS_RETENTION_ROWS overrides this setting.",
+      "default": "1024"
+    },
+    "retention_bytes": {
+      "type": "string",
+      "title": "Archive selection bytes",
+      "description": "Positive logical-byte scheduling slice; default 8388608 (8 MiB). A larger row runs alone asynchronously and is reported. SOFTWARE_WORKFLOWS_RETENTION_BYTES overrides this setting.",
+      "default": "8388608"
+    },
+    "retention_delete_rows": {
+      "type": "string",
+      "title": "Archive deletion rows",
+      "description": "Positive maximum rows per short delete transaction; default 64, also bounded by the selection byte and elapsed budgets. SOFTWARE_WORKFLOWS_RETENTION_DELETE_ROWS overrides this setting.",
+      "default": "64"
+    },
+    "retention_seconds": {
+      "type": "string",
+      "title": "Compaction cooperative slice",
+      "description": "Positive seconds before yielding or ending a delete transaction; default 0.05. An individual SQLite statement or commit cannot be preempted; actual maxima are reported. SOFTWARE_WORKFLOWS_RETENTION_SECONDS overrides this setting.",
+      "default": "0.05"
+    },
+    "retention_wal_high_bytes": {
+      "type": "string",
+      "title": "Compaction WAL pause threshold",
+      "description": "Pause compaction at this many outstanding WAL bytes; default 134217728 (128 MiB). Observed without checkpointing. Must exceed the low threshold. SOFTWARE_WORKFLOWS_RETENTION_WAL_HIGH_BYTES overrides this setting.",
+      "default": "134217728"
+    },
+    "retention_wal_low_bytes": {
+      "type": "string",
+      "title": "Compaction WAL resume threshold",
+      "description": "Resume compaction below this many outstanding WAL bytes; default 33554432 (32 MiB). Positive and below the high threshold. SOFTWARE_WORKFLOWS_RETENTION_WAL_LOW_BYTES overrides this setting.",
+      "default": "33554432"
     },
     "memory_warn_ratio": {
       "type": "string",

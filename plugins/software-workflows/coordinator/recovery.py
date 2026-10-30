@@ -246,9 +246,9 @@ async def replay_native(daemon, listener):
                 ensure_running(daemon)
                 if (obligation["state"] == "failed" or obligation["state"] == "pending"
                         and obligation["generation"] != store.generation):
-                    row = store.db.execute("SELECT data FROM events WHERE seq=?", (obligation["sequence"],)).fetchone()
-                    if row:
-                        request_uncertain(daemon, incarnation, json.loads(row["data"]), obligation)
+                    from .archive import exact
+                    row = await exact(store, incarnation["id"], obligation["sequence"])
+                    request_uncertain(daemon, incarnation, json.loads(row["data"]), obligation)
                 await asyncio.sleep(0)
             after = obligations[-1]["id"]
         key = "native_applied:" + incarnation["id"]

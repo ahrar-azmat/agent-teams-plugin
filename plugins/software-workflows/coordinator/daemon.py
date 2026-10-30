@@ -1867,6 +1867,8 @@ class Daemon:
                 if (not applied.get("failed") and not applied.get("pending")
                         and sequence > applied.get("sequence", 0)):
                     self.store.put("native_applied", "native_applied:" + ident, {"sequence": sequence}, ident)
+        for ident in self.native_progress:
+            self.retention.request(ident)
         self.native_progress.clear()
         self.native_progress_count = 0
 
@@ -3087,7 +3089,7 @@ class Daemon:
             self.runs.get(params["run"], params.get("cwd"))
             return self.writer.result(params["run"], params.get("cursor", 0), params.get("limit", 50000))
         if method == "run/events":
-            return self.runs.events(self.runs.get(params["run"], params.get("cwd")), params.get("cursor", 0), params.get("limit", 100))
+            return await self.runs.events(self.runs.get(params["run"], params.get("cwd")), params.get("cursor", 0), params.get("limit", 100))
         if method in ("run/interrupt", "run/resume"):
             run = self.runs.get(params["run"], params.get("cwd"))
             if method == "run/interrupt":
@@ -3597,10 +3599,9 @@ class Daemon:
             from .lead_calls import observe
             self.start_service("lead_calls", lambda: observe(self))
             self.background(self.compact_history())
+            self.retention.request()
             for listener in list(self.store.all("listener")):
-                if listener["state"] == "dormant":
-                    self.retention.request(listener["id"])
-                elif listener["state"] == "connected":
+                if listener["state"] == "connected":
                     self.parking.schedule(listener["id"])
             await self.stop.wait()
         finally:

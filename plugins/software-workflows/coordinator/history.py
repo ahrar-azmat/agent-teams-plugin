@@ -197,7 +197,24 @@ class History:
                 lane = capacity(self.daemon) if bootstrap else self.incremental_capacity()
                 async with lane, self.locks.hold(actor["id"]):
                     try:
-                        return await self._observe(listener, actor, connection, bootstrap=bootstrap)
+                        result = await self._observe(listener, actor, connection, bootstrap=bootstrap)
+                        # Incremental observation also proves received receipts.
+                        # A fallback may have reset received_verified; the merged
+                        # reader recovers that evidence from archives as well.
+                        receipts, costs = await self.daemon.dormancy.received(listener, [actor], record=False)
+                        try:
+                            compared = await self.daemon.dormancy.compare(actor, connection, receipts[actor["thread"]],
+                                                                         costs[actor["thread"]], pending=True, record=False)
+                        except CoordinatorError as exc:
+                            if exc.code != "PERSISTENCE_PENDING":
+                                raise
+                        else:
+                            cp = self.checkpoint(actor)
+                            if cp and not compared["gaps"]:
+                                cp["received_verified"] = compared["through"]
+                                self.store.save(cp)
+                                self.daemon.retention.request(listener["id"])
+                        return result
                     except BootstrapRequired:
                         # Never wait for the full lane while holding the actor lock
                         # or a short-lane slot: a full recovery may need this actor.

@@ -3,6 +3,48 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.26] — 2026-10-30
+
+One change: lossless ledger retention with working archive readers, for both the
+existing backlog and newly completed work.
+
+- Event pagination, receipt/history verification and obligation recovery read
+  verified archives together with hot events. Exact coverage and a single native
+  deletion gate retain unapplied, undispatched, obligated, quarantined and
+  history-pinned evidence; an unrelated checkout UNKNOWN no longer blocks the
+  drain. Completed deltas, diff notifications, verified stopped/dead listeners
+  and raw park-abandonment events have explicit eligibility rules.
+- Durable gzip chunks preserve original event payloads, survive interrupted
+  publication and deletion, and contribute park summaries once. Legacy dynamic
+  responses retain exact replay through deflate and revision-checked conversion.
+  Historical dependency lists become verified shared objects; new operations
+  capture immutable admission-read cutoffs without copying cumulative prefixes.
+- Subject-major chunks amortize files, manifests and durability flushes across
+  interleaved listeners. Compact exact membership avoids repeated coverage JSON.
+  Indexed pending queues and durable bootstrap cursors skip completed manifests;
+  unfinished deletion stays queued across graceful shutdown, while unchanged
+  pins sleep until their evidence changes. Stronger synchronization
+  applies only to manifest/storage publication transactions and is restored after
+  commit or rollback, preserving ordinary foreground commit latency.
+- Lazy storage migration 4 prevents an older daemon from misreading compacted
+  state while older lead hooks remain usable. Worker-thread conversion, short
+  delete transactions, configurable scheduling budgets and WAL-pressure pauses
+  preserve responsiveness. Status exposes backlog/pin bytes, archive totals,
+  freshness, failures, throughput, latency, WAL pressure and reusable free pages.
+
+`coordinator/VERIFY.md` records installed-2.4.25 reds, real disposable-daemon
+greens, crash boundaries, compatibility checks, measured limits and proof gaps.
+The required live-ledger clone drained 11.36 million event rows in 38 min 29 s,
+created 13,370 event archives, and left 12.22 GB of reusable SQLite pages. Park
+archives held a median 1,024 rows. Ten idle minutes with pinned evidence produced
+zero rescans or SQLite changes and used 0.0213 CPU-seconds; ordinary transaction
+p99 remained below 0.13 ms before and after the drain. The clone was deleted.
+On the lead's copy preserving the live ledger's page layout, first-open index
+creation took 36.557 s (second open 0.003 s), adding about 37 s to 2.4.25's 31 s
+first answer, with lead hooks waiting about 11 s behind the upgrade lock.
+File-space reclamation and checkpoint control are the next release; receipt
+blobs, custody excludes and `operation/prepared` events are not collected here.
+
 ## [software-workflows 2.4.25] — 2026-10-30
 
 Two changes: reclaim quiet finished writers promptly, and stop permanently failed

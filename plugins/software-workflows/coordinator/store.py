@@ -85,6 +85,20 @@ BLOCKERS = {
 }
 
 
+ARCHIVE_DELETE = """CREATE TRIGGER immutable_events_delete BEFORE DELETE ON events
+WHEN OLD.kind NOT IN ('native','listener/park_abandoned') OR NOT (EXISTS (
+  SELECT 1 FROM archive_members m JOIN archive_objects o ON o.number=m.archive JOIN archive_catalog a ON a.id=o.id
+  WHERE m.seq=OLD.seq AND coalesce(json_extract(a.manifest,'$.subject'),json_extract(a.manifest,'$.listener'))=OLD.subject
+    AND json_extract(a.manifest,'$.event_kind')=OLD.kind
+    AND (OLD.kind!='native' OR coalesce(json_extract(OLD.data,'$.method'),'') IN
+         (SELECT value FROM json_each(a.manifest,'$.methods')))) OR EXISTS (
+  SELECT 1 FROM archive_coverage c JOIN archive_catalog a ON a.id=c.archive
+  WHERE c.kind=OLD.kind AND c.subject=OLD.subject
+    AND c.method=CASE WHEN OLD.kind='native' THEN coalesce(json_extract(OLD.data,'$.method'),'') ELSE '' END
+    AND c.first<=OLD.seq AND c.last>=OLD.seq))
+BEGIN SELECT RAISE(ABORT,'immutable event without exact verified coverage'); END"""
+
+
 def uid(prefix):
     return prefix + "_" + uuid.uuid4().hex
 
@@ -121,6 +135,8 @@ class Store:
         self.watched = {}
         self._listener_processes = None  # listener id -> its services' and helpers' identities (listener_processes)
         self._listener_written = False  # a listener was written in the open transaction
+        self._sync_restore = None
+        self.retention_wake = None
         self.root = validate_state(root, create=True)
         self._validated_blobs = {}
         self._path_blobs = {}  # advisory source stamps; never persisted across a restart
@@ -187,7 +203,7 @@ class Store:
         INSERT OR IGNORE INTO migrations VALUES(1,unixepoch());
         """)
         current = self.db.execute("SELECT max(version) FROM migrations").fetchone()[0]
-        if current not in (1, 2, 3):
+        if current not in (1, 2, 3, 4):
             raise CoordinatorError("SCHEMA_VERSION", "Unknown ledger migration version")
         if current == 1:
             with self.transaction():
@@ -353,6 +369,57 @@ class Store:
           AND json_extract(data,'$.state') IN ('durable','complete')
           AND OLD.seq BETWEEN json_extract(data,'$.first') AND json_extract(data,'$.last'))
         BEGIN SELECT RAISE(ABORT,'immutable event without durable archive'); END"""
+        # Additive sidecars are safe for an old reader. Merely starting this
+        # daemon does not establish the incompatible-storage barrier.
+        with self.transaction():
+            self.db.execute("CREATE TABLE IF NOT EXISTS archive_catalog(id TEXT PRIMARY KEY, manifest TEXT NOT NULL)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS archive_catalog_order ON archive_catalog("
+                            "coalesce(json_extract(manifest,'$.subject'),json_extract(manifest,'$.listener')),"
+                            "json_extract(manifest,'$.first'),id)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS archive_record_order ON records(parent,json_extract(data,'$.first'),id) "
+                            "WHERE kind='archive'")
+            self.db.execute("CREATE TABLE IF NOT EXISTS archive_coverage(archive TEXT NOT NULL REFERENCES archive_catalog(id), "
+                            "kind TEXT NOT NULL,subject TEXT NOT NULL,method TEXT NOT NULL,first INTEGER NOT NULL,last INTEGER NOT NULL, "
+                            "PRIMARY KEY(archive,first),CHECK(first<=last))")
+            self.db.execute("CREATE INDEX IF NOT EXISTS archive_membership ON archive_coverage(subject,kind,method,last,first)")
+            # Global event sequences are immutable. Store each verified member
+            # once with a stable integer object key, not repeated scope JSON.
+            self.db.execute("CREATE TABLE IF NOT EXISTS archive_objects(number INTEGER PRIMARY KEY AUTOINCREMENT, "
+                            "id TEXT UNIQUE NOT NULL REFERENCES archive_catalog(id))")
+            self.db.execute("CREATE TABLE IF NOT EXISTS archive_members(seq INTEGER PRIMARY KEY,archive INTEGER NOT NULL REFERENCES archive_objects(number))")
+            self.db.execute("CREATE TABLE IF NOT EXISTS read_ordinals(ordinal INTEGER PRIMARY KEY AUTOINCREMENT, "
+                            "read_id TEXT UNIQUE NOT NULL,actor TEXT NOT NULL,checkout TEXT NOT NULL,data TEXT NOT NULL)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS read_actor_ordinal ON read_ordinals(actor,ordinal)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS read_scope_ordinal ON read_ordinals(actor,checkout,ordinal)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS native_completions(subject TEXT NOT NULL,thread TEXT NOT NULL, "
+                            "turn TEXT NOT NULL,item TEXT NOT NULL,sequence INTEGER NOT NULL,PRIMARY KEY(subject,thread,turn,item))")
+            self.db.execute("CREATE TABLE IF NOT EXISTS retention_revisions(id TEXT PRIMARY KEY,revision INTEGER NOT NULL)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS retention_inventory(id TEXT PRIMARY KEY,kind TEXT NOT NULL, "
+                            "listener TEXT,bytes INTEGER NOT NULL,payload_bytes INTEGER NOT NULL,form TEXT NOT NULL)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS archive_pending ON records(id) WHERE kind='archive' AND json_extract(data,'$.state')='durable'")
+            self.db.execute("CREATE INDEX IF NOT EXISTS archive_pending_subject ON records(parent,id) "
+                            "WHERE kind='archive' AND json_extract(data,'$.state')='durable'")
+            self.db.execute("CREATE INDEX IF NOT EXISTS retention_listener_unit ON records(json_extract(data,'$.unit'),id) WHERE kind='listener'")
+            self.db.execute("CREATE INDEX IF NOT EXISTS retention_listener_run ON records(json_extract(data,'$.run'),id) WHERE kind='listener'")
+            self.db.execute("CREATE TABLE IF NOT EXISTS retention_subjects(subject TEXT PRIMARY KEY,epoch INTEGER NOT NULL DEFAULT 1, "
+                            "scanned INTEGER NOT NULL DEFAULT 0,pass_epoch INTEGER NOT NULL DEFAULT 0,through INTEGER NOT NULL DEFAULT 0, "
+                            "phase TEXT NOT NULL DEFAULT '',after INTEGER NOT NULL DEFAULT 0,counts TEXT NOT NULL DEFAULT '{}', "
+                            "census TEXT NOT NULL DEFAULT '{}',completed REAL)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS retention_subject_pending ON retention_subjects(subject) WHERE epoch!=scanned")
+            self.db.execute("CREATE TABLE IF NOT EXISTS retention_records(id TEXT PRIMARY KEY,kind TEXT NOT NULL)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS retention_record_kind ON retention_records(kind,id)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS retention_archives(id TEXT PRIMARY KEY,retry REAL NOT NULL DEFAULT 0)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS retention_archive_due ON retention_archives(retry,id)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS retention_seed(kind TEXT PRIMARY KEY,after TEXT NOT NULL DEFAULT '',done INTEGER NOT NULL DEFAULT 0)")
+            for kind in ("subjects", "archive", "dynamic", "operation"):
+                self.db.execute("INSERT OR IGNORE INTO retention_seed(kind) VALUES(?)", (kind,))
+            for table in ("archive_catalog", "archive_coverage", "archive_objects", "archive_members", "read_ordinals"):
+                for action in ("UPDATE", "DELETE"):
+                    self.db.execute("CREATE TRIGGER IF NOT EXISTS immutable_" + table + "_" + action.lower() +
+                                    " BEFORE " + action + " ON " + table + " BEGIN SELECT RAISE(ABORT,'immutable storage evidence'); END")
+            self.retention_triggers()
+        if current == 4:
+            archive_delete = ARCHIVE_DELETE
         existing = self.db.execute("SELECT sql FROM sqlite_master WHERE name='immutable_events_delete'").fetchone()
         if not existing or existing[0] != archive_delete:
             with self.transaction():
@@ -362,6 +429,100 @@ class Store:
         self.generation = (generation or {}).get("generation", 0) + 1
         self.put("meta", "daemon", {"generation": self.generation, "pid": os.getpid(),
                                     "sqlite": sqlite3.sqlite_version, "started": time.time()})
+
+    def storage4(self):
+        """Call in the transaction that first publishes an incompatible value.
+
+        No executescript: the barrier, coverage and representation must commit
+        together. Check the database, not a cache that could survive rollback.
+        """
+        if not self.db.in_transaction:
+            raise CoordinatorError("STORAGE_TRANSACTION", "Storage version publication requires a transaction")
+        if self.db.execute("SELECT 1 FROM migrations WHERE version=4").fetchone():
+            return
+        self.durable()
+        self.db.execute("DROP TRIGGER immutable_events_delete")
+        self.db.execute(ARCHIVE_DELETE)
+        self.db.execute("INSERT INTO migrations VALUES(4,?)", (time.time(),))
+
+    def durable(self):
+        """Strengthen only this transaction, restoring the caller's setting.
+
+        A manifest must reach the device before a later deletion may commit.
+        Deletion itself can use ordinary FULL: losing it leaves a readable
+        hot/cold overlap. Foreground notifications keep their previous policy.
+        """
+        if not self.db.in_transaction:
+            raise CoordinatorError("STORAGE_TRANSACTION", "Durability requires a transaction")
+        if self._sync_restore is None:
+            self._sync_restore = self.db.execute("PRAGMA fullfsync").fetchone()[0]
+            self.db.execute("PRAGMA fullfsync=ON")
+
+    def retention_triggers(self):
+        # Durable work discovery also works when an older compatible daemon
+        # writes before the storage barrier. Bootstrap uses bounded key cursors;
+        # thereafter only new data or changed pin evidence queues a subject.
+        enqueue = "INSERT INTO retention_subjects(subject) SELECT subject FROM ({}) WHERE subject IS NOT NULL " \
+                  "ON CONFLICT(subject) DO UPDATE SET epoch=epoch+1;"
+        def trigger(sql):
+            name = sql.split()[2]
+            prior = self.db.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)).fetchone()
+            if not prior or prior[0] != sql:
+                self.db.execute("DROP TRIGGER IF EXISTS " + name)
+                self.db.execute(sql)
+        trigger("CREATE TRIGGER retention_event AFTER INSERT ON events "
+                        "WHEN NEW.kind IN ('native','listener/park_abandoned') BEGIN " +
+                        enqueue.format("SELECT NEW.subject AS subject") + " END")
+        conditions = {
+            "listener": ("SELECT NEW.id AS subject", "$.state","$.recovery_state","$.history_gaps","$.family_gone","$.dormant_proof","$.root_thread"),
+            "native_applied": ("SELECT NEW.parent AS subject", "$.sequence","$.pending","$.failed"),
+            "native_obligation": ("SELECT NEW.parent AS subject", "$.state","$.sequence"),
+            "operation": ("SELECT id AS subject FROM records INDEXED BY retention_listener_unit WHERE kind='listener' "
+                          "AND json_extract(data,'$.unit')=NEW.parent", "$.state","$.executing","$.native.listener"),
+            "native_history": ("SELECT l.id AS subject FROM records a JOIN records l INDEXED BY retention_listener_unit "
+                               "ON l.kind='listener' AND json_extract(l.data,'$.unit')=a.parent WHERE a.id=NEW.parent",
+                               "$.received_verified","$.invalid","$.pending"),
+            "actor": ("SELECT id AS subject FROM records INDEXED BY retention_listener_unit WHERE kind='listener' "
+                      "AND json_extract(data,'$.unit')=NEW.parent", "$.thread","$.listener"),
+            "writer_start": ("SELECT id AS subject FROM records INDEXED BY retention_listener_run WHERE kind='listener' "
+                             "AND json_extract(data,'$.run')=NEW.parent", "$.state"),
+        }
+        for kind, (query, *fields) in conditions.items():
+            paths = ",".join("'" + field + "'" for field in fields)
+            for action in ("INSERT", "UPDATE"):
+                changed = "" if action == "INSERT" else " AND json_extract(NEW.data," + paths + ") IS NOT json_extract(OLD.data," + paths + ")"
+                trigger("CREATE TRIGGER retention_" + kind + "_" + action.lower() +
+                                " AFTER " + action + " ON records WHEN NEW.kind='" + kind + "'" + changed +
+                                " BEGIN " + enqueue.format(query) + " END")
+        for action in ("INSERT", "UPDATE"):
+            trigger("CREATE TRIGGER retention_record_" + action.lower() + " AFTER " + action +
+                            " ON records WHEN NEW.kind IN ('dynamic','operation') BEGIN "
+                            "INSERT INTO retention_records VALUES(NEW.id,NEW.kind) ON CONFLICT(id) DO NOTHING; END")
+            trigger("CREATE TRIGGER retention_archive_" + action.lower() + " AFTER " + action +
+                            " ON records WHEN NEW.kind='archive' AND (json_extract(NEW.data,'$.state')='durable' OR NOT EXISTS "
+                            "(SELECT 1 FROM archive_catalog WHERE id=NEW.id)) BEGIN "
+                            "INSERT INTO retention_archives(id) VALUES(NEW.id) ON CONFLICT(id) DO NOTHING; END")
+        trigger("CREATE TRIGGER retention_archive_wake AFTER UPDATE OF epoch ON retention_subjects "
+                        "WHEN NEW.epoch!=OLD.epoch BEGIN INSERT INTO retention_archives(id) "
+                        "SELECT id FROM records INDEXED BY archive_pending_subject WHERE kind='archive' "
+                        "AND json_extract(data,'$.state')='durable' AND parent=NEW.subject ON CONFLICT(id) DO NOTHING; END")
+
+    def compare_record(self, ident, kind, revision, data):
+        """Publish pre-encoded worker output only if its captured revision won.
+
+        Conversion is currently limited to payloads of dynamic/operation rows;
+        invalidation follows put(), including watched unit accounting.
+        """
+        if kind not in ("dynamic", "operation"):
+            raise CoordinatorError("STORAGE_KIND", "Unsupported background record conversion")
+        rows = self.db.execute("UPDATE records SET data=?,revision=revision+1 WHERE id=? AND kind=? AND revision=? "
+                               "AND data IS NOT ? RETURNING parent", (data, ident, kind, revision, data)).fetchall()
+        if not rows:
+            return False
+        if rows[0][0] in self.watched:
+            self.watched[rows[0][0]] += 1
+        self.puts[kind] += 1
+        return True
 
     @contextmanager
     def transaction(self):
@@ -391,11 +552,18 @@ class Store:
                 except BaseException as rollback:
                     exc.add_note("Rollback also failed: " + type(rollback).__name__ + ": " + str(rollback))
             raise
+        finally:
+            if self._sync_restore is not None:
+                prior, self._sync_restore = self._sync_restore, None
+                self.db.execute("PRAGMA fullfsync=" + str(prior))
 
     @telemetry.measured("sql_work", False)
     def event(self, kind, subject, data):
-        return self.db.execute("INSERT INTO events(time,kind,subject,data) VALUES(?,?,?,?)",
-                               (time.time(), kind, subject, encoded(data))).lastrowid
+        sequence = self.db.execute("INSERT INTO events(time,kind,subject,data) VALUES(?,?,?,?)",
+                                   (time.time(), kind, subject, encoded(data))).lastrowid
+        if self.retention_wake and kind in ('native', 'listener/park_abandoned'):
+            self.retention_wake()
+        return sequence
 
     @telemetry.measured("sql_work", False)
     def put(self, kind, ident, data, parent=None):
@@ -406,6 +574,9 @@ class Store:
             ON CONFLICT(id) DO UPDATE SET data=excluded.data,revision=records.revision+1
             WHERE records.data IS NOT excluded.data RETURNING parent""", (ident, kind, parent, encoded(data))).fetchall()
         if written:
+            if self.retention_wake and kind in {"listener", "native_applied", "native_obligation", "operation", "dynamic",
+                                               "native_history", "actor", "writer_start", "archive"}:
+                self.retention_wake()
             if written[0][0] in self.watched:
                 self.watched[written[0][0]] += 1
             if kind in {"run", "unit", "actor", "listener", "checkout", "claim", "custody", "message", "claim_request",

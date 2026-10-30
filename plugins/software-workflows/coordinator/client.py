@@ -161,7 +161,8 @@ def clean_environment(source=None):
     """Detach from the launching Claude session and its push gate, keeping user configuration."""
     environment = dict(os.environ if source is None else source)
     for option in ("WRITER_MCP_SERVERS", "WRITER_PARK_IDLE_SECONDS", "MEMORY_WARN_RATIO", "MEMORY_CRITICAL_RATIO",
-                   "MEMORY_HYSTERESIS", "OWNER_JOURNAL_BYTES"):
+                   "MEMORY_HYSTERESIS", "OWNER_JOURNAL_BYTES", "RETENTION_ROWS", "RETENTION_BYTES",
+                   "RETENTION_DELETE_ROWS", "RETENTION_SECONDS", "RETENTION_WAL_HIGH_BYTES", "RETENTION_WAL_LOW_BYTES"):
         key = "CLAUDE_PLUGIN_OPTION_" + option
         if key in environment:
             environment.setdefault("SOFTWARE_WORKFLOWS_" + option, environment[key])

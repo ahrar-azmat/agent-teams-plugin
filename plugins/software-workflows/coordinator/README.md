@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.25 / P1
+# Writer coordinator — software-workflows 2.4.26 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -1491,24 +1491,156 @@ and is retired explicitly; recovery never reruns it on a replacement listener.
 Terminal inventory of a dormant writer is empty without waking it, and terminating
 an absent terminal returns `NO_SUCH_TERMINAL`.
 
-Retention runs one listener at a time after dormancy and at startup. The listener
-and its replacement ancestry must be dormant; unresolved UNKNOWNs, quarantines,
-open operations and pending obligations prevent deletion. Only rows at or below
-both received verification and the native applied cursor qualify. Rows first go
-to `archive/native/<listener>/<first>-<last>.jsonl.gz`; the file and directories
-are fsynced and a SHA-256 archive record is committed before deletion. Deletion
-uses 64-row transactions with a cooperative yield, reusing the native journal's
-measured batch size rather than limiting retained evidence. A crash resumes the
-same durable range and verifies its digest before deleting any remaining rows.
+### Lossless ledger retention
 
-`run/events` includes archive paths and ranges. The office sees `native/archived`
-events. Replay continues beyond its durable applied cursor, and run/log and
-history use native saved history. Archive records preserve the removed raw
-receipt range for diagnosis. Status reports ledger bytes, freelist pages,
-archived rows/bytes and the last archive action. SQLite reuses freed pages; it
-does not shrink the file automatically. To reclaim physical file space, stop the
-coordinator completely, retain its backups and archives, and run SQLite `VACUUM`
-on its ledger while no coordinator process has it open. Never vacuum on a timer.
+Retention drains the backlog and new events, revisiting pinned work when its
+conditions change. Durable bootstrap cursors discover existing subjects, legacy
+manifests and record revisions once. Thereafter indexed queues track new work;
+unchanged pinned subjects do not cause timed sweeps. Listener state, application
+progress, history checkpoints, obligations, execution and quarantine transitions
+invalidate the relevant subject's saved pass. An unrelated checkout UNKNOWN does not prevent
+archiving. UNKNOWNs still block publication and restoration still uses retained
+revisions, receipts and `unknown/restored` / `unknown/checkout_restored` events.
+Quarantined writers, including dormant listeners with a quarantined operation,
+keep every event. Failed recovery and relevant history gaps also retain evidence.
+
+Every native deletion uses the same gate: durable application progress covers
+the sequence; any live dispatch queue has consumed it (both cursor and high water);
+the daemon is not currently applying it; no pending or failed native obligation
+names it; and a committed, verified archive covers that exact sequence, subject,
+kind and method. Eligibility is checked again after worker I/O, immediately
+before each delete transaction. Additional conditions depend on the payload:
+
+| Payload | Additional condition / representation |
+|---|---|
+| `turn/diff/updated` | No dormancy requirement. |
+| Streaming deltas | The same listener/thread/turn/item has an applied completion. Unfinished streams remain hot. |
+| `item/completed` and other native evidence | The thread's `received_verified` covers it, with no unresolved execution or history pin. Dormant, stopped and dead listeners also need recorded family-exit proof. Threadless startup evidence from a listener that never created a thread can use its genuine applied progress and family-exit proof. |
+| `listener/park_abandoned` | Preserve the raw events in an archive. A derived per-listener/reason count and first/last time is committed once with each new chunk. |
+| Legacy dynamic responses | Use the existing `tools.stored` representation only after `tools.replayed` reconstructs the same canonical response and embedded text. Compare the captured record revision before replacing it. Known responses never become uncertainty. |
+| Historical operation dependencies | Preserve the exact original dependency and qualified-dependency lists in shared, content-addressed gzip objects; skip non-beneficial replacements. Never infer historical membership from timestamps. |
+| New operation dependencies | Capture immutable read ordinals and their cutoff in the admission transaction, after preparation awaits. Pre-upgrade reads are indexed first. Ordinary checkout scope and project-wide qualified scope remain distinct. Sealing reads each actor/scope range once. Project seal-time current reads and preflight checks retain their separate scope. |
+
+`run/events` now returns the merged hot/archive stream, ordered by sequence, using
+the existing cursor, `more` and page-limit contract. Identical crash overlaps appear
+once; disagreement is `ARCHIVE_CONFLICT`. Receipt verification uses the same reader,
+including after a history checkpoint fallback. Obligation recovery requests exact
+sequence evidence. Unapplied replay and native dispatch remain hot-only because
+the deletion gate cannot pass their application/queue boundaries. The complete
+reader inventory and measured behavior are in [VERIFY.md](VERIFY.md#software-workflows-2426--lossless-retention-2026-10-30).
+
+New chunks live under `archive/events/<digest-prefix>/<digest>.jsonl.gz` and preserve
+the original SQLite `data` text in `gzip-jsonl-raw-v2`. Existing
+`archive/native/...` gzip JSONL files remain readable. Verification derives their
+exact mixed-method coverage from their contents; first/last endpoints alone never
+authorize deletion. Selection proceeds by subject and kind through
+`event_subject_kind`, accumulating a full scheduling slice even when the global
+journal interleaves thousands of listeners. New manifests store a digest of exact
+membership instead of repeating every interval's scope JSON. Immutable sequence
+membership uses stable integer archive IDs; legacy interval coverage remains
+supported. This catalog and membership protect deletion in SQLite. Every event update and every other event deletion stays
+forbidden. `ARCHIVE_MISSING`, `ARCHIVE_DIGEST`, `ARCHIVE_COVERAGE` and
+`ARCHIVE_ENCODING` fail the read rather than omit promised evidence. Dependency
+objects have corresponding `DEPENDENCY_MISSING`, `DEPENDENCY_DIGEST`,
+`DEPENDENCY_ENCODING` and `DEPENDENCY_COVERAGE` failures.
+
+Publication finishes gzip, flushes the underlying file, publishes on the same
+filesystem, flushes parent directories, reopens and verifies the entire object,
+then commits its manifest before deletion. On macOS it uses `F_FULLFSYNC` before
+publication and after directory flushing. SQLite `fullfsync` is scoped to manifest
+publication and the first incompatible-storage transaction; the previous setting
+is restored after either commit or rollback. Ordinary foreground commits and
+deletions retain the previous `synchronous=FULL` policy. Losing a deletion can
+leave a readable hot/archive overlap, because its manifest was already durable.
+`synchronous=FULL` alone
+does not request this device-cache flush. A durability failure retains hot evidence
+and reports `ARCHIVE_DURABILITY` with the failed stage. Restart attempts existing
+durable manifests through an indexed pending queue before new chunks. A pinned
+manifest leaves that queue until its subject's evidence changes; completed indexed
+manifests are never rescanned to find pending work. Broken objects have a named,
+bounded retry path. Deterministic partial or unmanifested files are adopted
+only after verification and completed durability. They never permit deletion on
+their own. This release does not garbage-collect archives or receipt blobs.
+
+The October 30 production-scale verification used one disposable ledger clone,
+without daemon recovery or process machinery. The full drain took **38 min 29 s**:
+**11,361,138 event rows / 6.29 GB of payload** moved to **13,370 new event files**,
+and record conversions removed another **4.36 GB** from hot JSON. Park files held
+a median **1,024 rows**, with only **3 single-row files** among **10,477**. SQLite
+gained **12.22 GB of reusable free pages**; its file was not shrunk. All generated
+and legacy archives passed verification. Ordinary transaction p50/p99 were
+**0.058/0.123 ms before** and **0.047/0.082 ms after**; the drain's maximum requested
+1 ms ticker interval was **116.568 ms**. During ten idle minutes with **414,424**
+pinned events, retention performed **0 rescans, retries or SQLite changes** and
+the harness used **0.0213 CPU-seconds**. These are measurements on that ledger and
+machine, not latency guarantees. Full sizes, overhead, timing definitions, pin
+reasons and proof limits are recorded in [VERIFY.md](VERIFY.md#required-production-scale-drain).
+
+Storage migration **4** is committed atomically before the first incompatible
+archive/deletion or dependency-reference write. A plain start only adds compatible
+sidecars and leaves the migration at 3. Once version 4 is present, a 2.4.25 daemon
+refuses startup with `SCHEMA_VERSION`; older lead hooks can continue using the
+serving 2.4.26 daemon. Do not downgrade a migrated state directory independently
+of its archives. Existing plain and deflated response forms remain supported.
+
+Selection, decoding, compression, hashing, archive readback and census work run
+in joined worker threads. The daemon's SQLite connection stays on its own thread.
+Selection has row and byte scheduling budgets; deletion also checks elapsed time
+between statements and yields between transactions. A larger row is processed
+whole, alone, through the asynchronous path. One SQLite statement or commit cannot
+be preempted, so the measured maximum can exceed the cooperative time slice.
+Record conversion similarly handles one whole record and uses a revision check.
+
+The following settings are captured at daemon start. Plugin option names are
+lowercase; the corresponding environment variable is
+`SOFTWARE_WORKFLOWS_` followed by the uppercase option name and takes precedence.
+
+| Plugin option | Default | Meaning |
+|---|---:|---|
+| `retention_rows` | 1024 | Selection rows per slice. |
+| `retention_bytes` | 8388608 | Logical payload bytes per ordinary selection/deletion slice (8 MiB). |
+| `retention_delete_rows` | 64 | Maximum delete statements per transaction. |
+| `retention_seconds` | 0.05 | Cooperative loop/transaction slice in seconds. |
+| `retention_wal_high_bytes` | 134217728 | Pause compaction at 128 MiB of outstanding WAL work. |
+| `retention_wal_low_bytes` | 33554432 | Resume at or below 32 MiB outstanding WAL work. |
+
+All values must be positive; counts/bytes must be integers, seconds must be finite,
+and the low threshold must be less than the high threshold. Invalid settings refuse
+startup with `CONFIG`. Limits schedule work and never truncate evidence. The
+64-row journal slice was retained; 1024 small rows amortized durable file creation
+in the probes. The 8 MiB ordinary slice keeps observed 17.8/21 MB inputs in the
+explicit oversized lane. A 50 ms cooperative slice gives more than three times
+the initial measured 12.8 ms commit maximum. The 32 MiB low threshold exceeds the
+initial 21,147,992-byte WAL peak by more than 50%; the high threshold allows four
+such budgets. Later default-threshold acceptance and all actual maxima are in
+VERIFY. Status counts warnings when a row/byte/time/high-WAL budget reaches 80%.
+
+WAL observation uses only `wal_checkpoint(NOOP)` and reports outstanding frames
+separately from allocated file bytes. The default 1000-page automatic checkpoint
+policy is unchanged. A recycled WAL file can remain large after pressure clears.
+On a SQLite version without NOOP (before 3.51.0), retention reports
+`WAL_OBSERVATION_UNSUPPORTED` and pauses; it never substitutes another checkpoint
+mode. The existing WAL-safety version guard remains in force. A long reader can
+still allow unrelated foreground writes to grow WAL while compaction is paused.
+
+`daemon/status.retention` is a cached, incremental census: hot event rows/bytes by
+kind, method and listener state; eligible bytes; pinned rows/bytes and oldest time
+by reason; record bytes by kind/form/state; archived rows, logical bytes and gzip
+bytes; file counts including partial/unmanifested files; scan position, completeness
+and freshness; drain bytes/second and a remaining-time estimate; WAL pressure,
+pause state and peaks; batch/commit/oversized-row maxima and revision conflicts;
+page count and freelist pages/bytes. The estimate is `null` until event and record
+inventory is complete and a nonzero drain rate is known. Counters/rate are for this
+daemon incarnation; archive totals and scan progress are durable. The census can
+lag current activity, so read its timestamps and completeness flags. Status does
+not scan multi-gigabyte payloads on demand. Persistent failures are keyed by work
+identity, exposed in `errors`, and emit an audit event when their condition changes.
+
+`operation/prepared`, custody `excludes`, receipt blobs and all other event kinds
+remain outside this release. Compaction creates reusable freelist pages; it does
+not shrink the SQLite file. Physical reclamation, auto-vacuum conversion and
+checkpoint control are the next release. Total retained storage can still grow
+through necessary records, archives and these excluded payloads.
 
 ### Explicit writer MCP profile
 

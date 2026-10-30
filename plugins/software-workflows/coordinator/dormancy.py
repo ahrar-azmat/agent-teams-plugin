@@ -4,10 +4,15 @@ import json
 import time
 
 from .client import CoordinatorError
-from .locks import finish
+from .locks import finish, finish_thread
 from .store import digest
 from .item_projection import receipt_digests
 from . import native, participants, processes
+
+
+def completed_receipt(data):
+    params = json.loads(data)["params"]
+    return params.get("threadId"), params["turnId"], params["item"]["id"], receipt_digests(params["item"]), len(data.encode())
 
 
 def view(listener):
@@ -88,7 +93,8 @@ class Dormancy:
         recovery capacity bound. Verified per-thread prefixes are skipped.
         """
         began = time.monotonic()
-        end = self.store.db.execute("SELECT coalesce(max(seq),0) FROM events").fetchone()[0]
+        from . import archive
+        end = archive.highwater(self.store)
         after = {actor["thread"]: (self.daemon.history.checkpoint(actor) or {}).get("received_verified", 0)
                  for actor in actors}
         receipts = {thread: {} for thread in after}
@@ -96,25 +102,20 @@ class Dormancy:
                  for thread, value in after.items()}
         incarnation, passes, rows_seen, index_bytes = listener, 0, 0, 0
         while incarnation:
-            cursor = self.store.db.execute("SELECT seq,data FROM events WHERE subject=? AND kind='native' "
-                "AND seq>? AND seq<=? AND json_extract(data,'$.method')='item/completed' ORDER BY seq",
-                (incarnation["id"], min(after.values(), default=end), end))
             passes += 1
-            while rows := cursor.fetchmany(25):
-                for row in rows:
-                    rows_seen += 1
-                    params = json.loads(row["data"])["params"]
-                    thread = params.get("threadId")
-                    if thread not in after or row["seq"] <= after[thread]:
-                        continue
-                    turn, ident = params["turnId"], params["item"]["id"]
-                    value = (row["seq"], receipt_digests(params["item"]))
-                    wanted = receipts[thread].setdefault(turn, {})
-                    # The newest receipt wins if a reconnect repeated an item.
-                    if ident not in wanted or wanted[ident][0] < row["seq"]:
-                        wanted[ident] = value
-                    costs[thread]["bytes"] += len(row["data"].encode())
-                    index_bytes += len(thread) + len(turn) + len(ident) + 64 + 8
+            async for row in archive.events(self.store, [incarnation["id"]], min(after.values(), default=end),
+                                             kind="native", method="item/completed", through=end):
+                rows_seen += 1
+                thread, turn, ident, digests, size = await finish_thread(completed_receipt, row["data"])
+                if thread not in after or row["seq"] <= after[thread]:
+                    continue
+                value = (row["seq"], digests)
+                wanted = receipts[thread].setdefault(turn, {})
+                # The newest receipt wins if a reconnect repeated an item.
+                if ident not in wanted or wanted[ident][0] < row["seq"]:
+                    wanted[ident] = value
+                costs[thread]["bytes"] += size
+                index_bytes += len(thread) + len(turn) + len(ident) + 64 + 8
                 if check:
                     check()
                 await asyncio.sleep(0)

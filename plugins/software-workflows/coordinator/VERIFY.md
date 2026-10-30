@@ -16528,3 +16528,1050 @@ A new empty `W/fresh-install-review129` configuration also ran local marketplace
 **both exit 0**. Its installed manifest is **2.4.25**, and SHA-256 comparison confirmed that installed `recovery.py`,
 `parking.py` and `store.py` exactly match the fixed checkout (`W/fresh-install-review129-result.json`). This installation
 used only scratch configuration; the manifest was not bumped again and no Git command was run.
+
+## software-workflows 2.4.26 — lossless retention (2026-10-30)
+
+This release moves eligible ledger payloads to verified, readable archives. It does not
+shrink the database file, change automatic checkpoint policy, collect receipt blobs,
+or compact `operation/prepared` events or custody `excludes`. The charter takes
+precedence over the earlier architecture review: stopped/dead listeners are included
+when their evidence is sufficient, and physical reclamation is the next release.
+
+### Source, apparatus and run index
+
+Base: installed **2.4.25**, commit
+`885a68b6c4475198889a840c304a2d8d43ca2ebc`, at
+`~/.claude/plugins/cache/agent-teams/software-workflows/2.4.25`.
+Candidate: the uncommitted working plugin, with a narrowly scoped import-time
+2.4.26 identity during acceptance so the manifest could remain 2.4.25 until every
+probe stopped. `candidate-source-final.json` contains SHA-256 for all **62** coordinator
+Python files; SHA-256 of their sorted JSON mapping is
+`01963f23e035c7e42c0fc98f2afb059c18b951c34f480496512b6984462a0848`.
+`crash-final`, `green-release`, and `green-clean` ran this source. The final cleanup
+audit independently recomputed the same digest. Runtime: Python **3.15.2**, SQLite
+**3.54.1**, Codex CLI/app-server **0.163.0**; older hooks ran with Python **3.9.6**.
+
+In this section, **W** is
+`/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2426/writer`.
+The supplied lifecycle/provider/quarantine probes and import injector were copied
+and extended there. No repository test files were added. Each native run used a
+real supervisor, daemon worker, Codex app-servers, a loopback provider, and its own
+`--state`; no model spend. Prepared repositories are the sibling
+`scratchpad/r2425/fixture-repos/repo-N`. The driver rejects a missing `PROBE_REPO`;
+it never creates a repository or baseline commit. Admission fixture setup uses
+that prepared repository. Fault injection and seeded payloads are restricted to
+the selected disposable state. The production retention, history, dependency,
+restore and seal functions execute inside the real daemon.
+
+| Run directory under W | Fixture | Tree / observer exit / elapsed | Disposition |
+|---|---:|---|---|
+| `red-01` | 54 | Installed 2.4.25 / 1 | Discarded: admission setup shared a fixture checkout. |
+| `red-02` | 55 | Installed 2.4.25 / 0 / 128.0 s | Discarded despite observer exit 0: seed `KeyError`, control `AttributeError`. |
+| `red-03` | 56 | Installed 2.4.25 / 0 / 38.6 s | Calibrated UNKNOWN/backlog red and resolving-UNKNOWN control. |
+| `green-01` | 57 | Candidate / 0 / 48.7 s | Initial backlog conversion run. |
+| `red-04` | 58 | Installed 2.4.25 / 0 / 38.7 s | Repeated baseline; stopped state later used for legacy archive upgrade. |
+| `green-02` | 59 | Candidate / 0 / 57.8 s | Matrix not accepted: injector omitted `NativeBacklog.publish` count. |
+| `green-03` | 60 | Candidate / 0 / 58.5 s | Initial complete matrix and batching/WAL calibration. |
+| `crash-01` | 61 | Candidate / 0 / 52.1 s | Initial 16-stage crash matrix. |
+| `green-04` | 62 | Candidate / 0 / 144.6 s | Extended matrix; fixture object timestamps changed, disclosed below. |
+| `green-05` | 63 | Candidate / 0 / 148.6 s | Default WAL thresholds and additional edges; timestamp deviation. |
+| `red-05` | 64 | Installed 2.4.25 / 0 / 38.8 s | Final red, including missing archive readback and dependency-copy scaling. |
+| `green-final` | 65 | Candidate / 0 / 148.7 s | Extended matrix before final path/error-recovery fixes; timestamp deviation. |
+| `crash-final` | 66 | Final source / 0 / 46.3 s | All 16 crash stages on final production source. |
+| `green-release` | 67 | Final source / 0 / 149.5 s | Full matrix and public CLI follow-up; timestamp deviation. |
+| `green-clean` | 68 | Final source / 0 / 148.6 s | Full matrix with independent scratch Git objects and verified unchanged `.git`. |
+
+Each named native run has `W/<name>.out`, `.err` and `W/<name>/state`.
+Other evidence: `legacy-01.out` (exit 0, reuses stopped `red-04/state`),
+`settings.out` (exit 0; separate states under `W/settings`), `public-cli.json`,
+`static-interim.out`, `static-prebump.out`, `cleanup-audit.json`, and
+`cleanup-final.json`. Earlier successful runs establish calibration, not an assertion
+that their source is identical to the final source. The final two production fixes
+reject archive paths containing `..` and clear a recovered event-scan error from
+persistent status. A record-loop idle throttle found in `legacy-01` was also removed
+before the final runs; the final backlog converts all **17** seeded mutable records.
+
+### L1 — every event reader and lossless readback
+
+`archive.py:116` verifies the whole file, not just the requested page. It checks
+digest, encoding, subject/kind/method, exact sequence intervals, row count, endpoints
+and logical content. New `gzip-jsonl-raw-v2` preserves the original SQLite `data`
+text. Existing gzip JSONL files are supported without rewriting their files;
+their decoded payload is compared canonically because their original writer had
+already re-serialized it. `archive.py:201` takes a short SQLite snapshot of the hot
+page and first catalog entry, closes it before file I/O, and advances manifests by
+key. Identical overlap is emitted once. The sequence clock comes from
+`sqlite_sequence`, so deletion cannot move it backwards.
+
+| Reader in final source | Disposition and reason |
+|---|---|
+| `runs.py:133`, dispatched at `daemon.py:3092` | Asynchronous merged hot/archive page; existing cursor validation, 1–400 limit and `more` contract. |
+| `dormancy.py:88,106` | Merged `item/completed` evidence through a durable sequence high-water mark; no SQL cursor held across archive I/O or native RPC. |
+| `history.py:187` | Existing checkpoint fallback still resets/re-observes history; subsequent receipt comparison reads cold evidence and advances `received_verified` only on success. |
+| `recovery.py:249` obligation evidence | Exact-sequence merged lookup; absent promised evidence is a named failure rather than a silent skip. |
+| `recovery.py:257` unapplied replay | Hot-only: common deletion gate refuses every row above durable applied progress, and obligations remain pins. |
+| `daemon.py:98` native dispatch | Hot-only: deletion stays behind both live queue cursor and high water and outside current application. |
+| `daemon.py:1053,1291` unapplied/high-water checks | Hot-only suffix detection: unapplied rows cannot be deleted. A historical maximum is not used to authorize deletion. |
+| `publish.py:85` restore provenance | Reads `unknown/restored` and `unknown/checkout_restored`; those kinds remain hot and immutable. |
+| `messages.py:48` delivery transitions | Message event kinds are outside compaction and remain hot. |
+| `lead_calls.py:56` legacy diagnostics | `lead_hook/legacy_limit` remains hot. |
+| `recovery.py:1251` timing | `recovery/complete` remains hot. |
+| `retention.py:82,88,470` selection/deletion | Select exact rows; reverify archive membership, then recheck the common gate immediately before each transaction. |
+| `archive.py:235` shared hot-page query | Part of the short consistent snapshot and verified merge described above. |
+
+The inventory was checked against all event SQL in `coordinator/*.py`, including
+readers outside the original charter list. `store.py:88` allows only exact verified
+native/park coverage; every other event deletion and all event updates remain forbidden.
+
+**Red (`red-05`):** resolving the unrelated UNKNOWN lets 2.4.25 archive **18** native
+rows, but `run/events` then returns **2,073** rows instead of **2,091**; equality is
+false. Its archive filenames do not supply readback.
+
+**Green (`green-clean`):** the same complete **2,090-row** event stream is identical
+before/after compaction at limits **1, 7, 100, 400**, with an empty terminal page.
+An identical hot/cold overlap appears once; an independently valid conflicting
+overlap returns `ARCHIVE_CONFLICT`. Missing file, digest mismatch and malformed
+coverage return `ARCHIVE_MISSING`, `ARCHIVE_DIGEST`, `ARCHIVE_COVERAGE` respectively.
+The real history fallback changed the epoch, observed **2 items / 2 pages / 1 turn**
+in **0.007907 s**, and recovered `received_verified=2456` from archived receipts.
+
+`legacy-01` upgraded a disposable state actually written by installed 2.4.25:
+**2,067** merged rows before and after, canonical stream SHA-256
+`26bd540ab926166b1baf46089868297f80fb39c02308f0acc27ca120041ac96f`.
+The existing gzip file was preserved; verification derived **22** exact intervals.
+Both readback RPCs exited 0. After eight seconds the candidate had archived
+**2,067 rows / 43,986 logical bytes / 16,239 gzip bytes** and deleted **2,049 rows /
+37,081 bytes** newly eligible beyond the existing archive.
+
+Direct public CLI follow-up on the owned `green-release/state`, using
+`python3.15 -B -m coordinator --state STATE rpc ...`, is in `public-cli.json`:
+`run/events` with cursor 0/limit 100 exited **0**, returned **100 rows**, `more=true`;
+cursor -1 exited **2**, `EVENT_CURSOR`; `daemon/status` with `brief=true` exited
+**0**, `ready=true`; graceful daemon stop exited **0**. The CLI follow-up daemon
+was stopped before the version bump.
+
+### L2 — one gate, without the unrelated UNKNOWN blocker
+
+`retention.py:285,324` builds the scoped pin context and makes the single native
+eligibility decision. `retention.py:436` verifies the archived chunk and obtains a
+fresh context after worker awaits, immediately before each delete transaction.
+Durable applied progress, both queue boundaries, current application, named pending
+or failed obligations, quarantine, history, execution, receipts and family-exit
+proof are separate facts. It never calls the side-effecting family-reaper path to
+manufacture storage eligibility. The SQL trigger independently requires exact
+kind/subject/method/sequence coverage in a committed immutable catalog.
+
+**Red (`red-05`):** with the unrelated UNKNOWN present, native payload remained
+**19 rows / 7,122 bytes**, park payload **2,048 / 36,864**, legacy response field
+**1,245,245**, and dependency fields **1,387,488** bytes; archives remained **0**.
+The control resolved only that UNKNOWN: **18** native rows archived, leaving one
+**217-byte** native row. Park, response and dependency fields did not shrink.
+
+**Green (`green-clean`):** while the UNKNOWN was still unresolved, **19 native rows /
+7,132 bytes** and **2,048 park rows / 36,864 bytes** became **0 hot rows**. The
+**2,067 rows / 43,996 logical bytes** occupied **5 archives / 16,288 gzip bytes**.
+The matrix independently held and released **9** pins: `APPLICATION`, `DISPATCH`,
+`APPLYING`, `OBLIGATION`, `QUARANTINE`, `HISTORY`, `EXECUTION`, `RECEIPT`,
+`FAMILY_EXIT`. Every held sequence stayed hot and drained after its pin cleared.
+An uncovered sequence inside an archive's endpoints stayed hot; uncovered deletion,
+other-kind deletion and event update were all refused (**3/3**).
+
+UNKNOWN restoration still executed through the real restore path and finished
+`state=resolved`, `resolution=baseline`. Retained revisions/receipts/provenance,
+not native payloads, supplied that evidence. Existing pins were not independently
+re-proven on every baseline case; the calibrated baseline failure is the broad
+UNKNOWN gate, and the discrimination matrix is candidate evidence.
+
+### L3 — per-kind backlog, exact responses and immutable dependencies
+
+The following byte counts are raw SQLite payload bytes in the real daemon's
+per-state discrimination fixture (`green-clean`, same sizes as `green-release`).
+Each row contains one diff, delta, completion, other native notification and raw
+park event. State labels are deliberately varied on a completed listener with real
+history comparison; these are not five separate naturally occurring native families.
+
+| Listener state | Diff | Agent delta | Completion | Other native | Park | Total hot before → after |
+|---|---:|---:|---:|---:|---:|---:|
+| Connected | 116 | 219 | 360 | 120 | 28 | 843 → 0 |
+| Dormant | 114 | 217 | 360 | 120 | 26 | 837 → 0 |
+| Stopped | 114 | 217 | 360 | 120 | 26 | 837 → 0 |
+| Dead | 111 | 214 | 360 | 120 | 23 | 828 → 0 |
+| Quarantined | 118 | 221 | 360 | 120 | 30 | 849 → 849; all 5 pinned |
+
+Quarantined rows drained only after the quarantine condition was removed. An
+unfinished stream and a stream with an unapplied completion stayed hot; application
+of the matching listener/thread/turn/item completion allowed deletion. The lookup
+is maintained from hot and archived completion evidence. Diffs need no dormancy;
+other native evidence needs receipt coverage and no execution/history pin.
+Stopped/dead/dormant listeners additionally require recorded family exit. A
+threadless startup notification from a family that never created a thread can use
+genuine applied progress plus family exit, without inventing a history checkpoint.
+
+Legacy response conversion (`retention.py:106,567`, `store.py:420`) uses the existing
+`tools.stored` / `tools.replayed`, verifies canonical response equality including
+embedded text, then conditionally replaces the captured record revision. It does
+not manufacture uncertainty or use an unproved receipt-range substitution.
+`green-clean` reduced the seeded response field from **1,245,245 to 4,193 bytes**;
+the canonical inventory payload is **4,188 bytes** (a different serialization
+measurement). Before/after response SHA-256 is
+`53d90bd51490f2e8974094e03202c219233587241d134e9f257755673e4be455`.
+Repeating native call identity **70001** through the daemon's real `native_request`
+handler returned the identical response with **0** additional read effects. The
+probe captures the reply transport; it does not cause the external app-server to
+retransmit that request over its wire.
+
+`dependencies.py:18` assigns immutable read ordinals atomically at both read insertion
+sites (`tools.py:315,357`). `dependencies.py:37` indexes pre-upgrade reads before
+cutoffs can be admitted. `ledger.py:911,1005` captures the cutoff in the final
+operation transaction after preparation awaits. Ordinary checkout scope and
+project-wide qualified scope remain distinct. Historical dependency and qualified
+lists become exact content-addressed gzip objects, shared when identical; no
+membership is inferred from timestamps. `publish.py:137` uses the batched resolver
+at `dependencies.py:76`, preserving restore/resolved exclusions and refusal order.
+Project seal-time current-read evidence and preflight in `group_publish.py` retain
+their separate scope and behavior.
+
+**Red (`red-05`):** 16 cumulative dependency lists grow from **11,402** to **182,432**
+bytes in the seed's JSON serialization, in increments of **11,402**; SQLite field
+measurements total **1,387,488 bytes**. A **1,000-operation** legacy workload visits
+**9,600,000 references**; its dependency check took **0.101466500 s**.
+
+**Green (`green-clean`):** those 16 legacy fields become references: **8,007 bytes**
+of canonical reference payload in **11,925 bytes** of whole operation records, plus
+**16 gzip objects / 36,514 bytes**. No legacy dependency-field bytes remain. The
+new **1,000-operation** workload materializes **9,601 references from 17 captured
+reads** in **0.002055333 s**. This is resolver time, whereas the baseline number
+includes dependency checking; it is not a controlled end-to-end speedup ratio.
+
+Eight ordinary dependency cases have identical old/new codes and refusal details:
+known (`OK`), UNKNOWN (`UNKNOWN_DEPENDENCY`), unpublished (`UNPUBLISHED_DEPENDENCY`),
+null revision (`OK`), missing (`PROVENANCE_MISSING`), resolved (`OK`), restore
+exclusion (`OK`), restored (`OK`). Cutoff admission excludes a later bad read:
+the three decisions are `OK`, `OK`, `UNKNOWN_DEPENDENCY`. Five project decisions
+are `OK`, `UNKNOWN_DEPENDENCY`, `UNPUBLISHED_DEPENDENCY`, `OK` for null, and
+`UNKNOWN_DEPENDENCY` for missing revision, matching existing project behavior.
+Missing/corrupt dependency objects fail `DEPENDENCY_MISSING` / `DEPENDENCY_DIGEST`.
+
+Actual ordinary seals before/after produced the same candidate tree
+`c2a6dac293e5787b6df04d6a343bb905fbe79a13`. A one-participant project seal preserved
+its **601-read** evidence vector and passed real preflight. New operation admission
+stored `form=read_cutoff`, `count=1`, `through=1`. This exercises the actual seal
+paths and scoped resolver cases; a multi-repository native project workflow was
+not run. The scratch Git-isolation correction below is material to this evidence.
+
+### L4 — durable archives, recovery and concurrent changes
+
+`archive.py:55,74,116,173` implements deterministic gzip level **6**, `mtime=0`, a
+private partial file, completed compression, file flush, macOS `F_FULLFSYNC`, atomic
+publication, parent-directory sync and final device flush, then full reopen/verify.
+`retention.py:371,389,436` commits catalog, exact coverage and once-only park-summary
+contribution together, resumes durable manifests before new chunks, and deletes
+short eligible subsets. SQLite `fullfsync` is enabled for the storage transition
+and subsequent writes. A file or durability error retains hot evidence. Unmanifested
+files never authorize deletion; deterministic retries verify and adopt them.
+
+`crash-final` exited **0** after **46.3 s**. Each stage terminates only its own worker
+with `os._exit(86)`; the interrupted RPC reports `RPC_UNCERTAIN`. Restart generations
+**2–17** resume the same disposable state. Each stage seeds **130** park rows and
+recovers exactly **130** visible rows, **0** hot rows, a summary count of **130**, and
+**0** partial/unmanifested files. The three delete batches are **64, 64, 2** rows.
+
+| Crash stage | Hot rows remaining at interrupted delete boundary, where applicable | Maximum measured commit seconds after restart |
+|---|---:|---:|
+| Before compression | — | 0.005034917 |
+| After compression | — | 0.004893292 |
+| Before file flush | — | 0.005720750 |
+| After file flush | — | 0.005574250 |
+| Before publication | — | 0.004889958 |
+| After publication | — | 0.004865375 |
+| Before verification | — | 0.004961917 |
+| After verification | — | 0.010032625 |
+| Before manifest commit | — | 0.005114584 |
+| After manifest commit | — | 0.004820750 |
+| Before delete batch 1 | 130 | 0.004934541 |
+| After delete batch 1 | 66 | 0.004823500 |
+| Before delete batch 2 | 66 | 0.005090541 |
+| After delete batch 2 | 2 | 0.004665208 |
+| Before delete batch 3 | 2 | 0.004166084 |
+| After delete batch 3 | 0 | 0.000024042 |
+
+Crash-run final archive totals: **4,147 rows / 138,696 logical bytes / 37,383 gzip
+bytes**, including the initial backlog. Peak allocated WAL **4,136,512 bytes**;
+peak outstanding WAL **3,694,592 bytes**. The last incarnation's loop maximum was
+**0.000331292 s over 3 samples**; that is not a whole-crash-run loop maximum.
+These are process-crash observations, not hardware power-loss experiments.
+
+`green-clean` separately injects a file-device-flush `OSError(5)`: the daemon
+reports `ARCHIVE_DURABILITY`, `stage=file_durability`, keeps hot evidence, and retries
+after the fault clears. A missing promised archive prevents deletion with
+`ARCHIVE_MISSING`. A concurrent record update wins: revision **2** survives, the
+newer value remains, and **1** compare-and-swap conflict is recorded. Failed
+conversion never overwrites it. Corruption and overlap errors are listed under L1/L3.
+
+### L5 — lazy compatibility barrier and old hooks
+
+`store.py:405` records migration **4** in the same transaction as the first
+incompatible archive/deletion or dependency-reference write. Individual migration
+statements avoid `executescript`'s implicit commit. Additive sidecars at plain start
+remain compatible; a version-4 restart preserves the exact-coverage trigger.
+
+`green-clean` plain start had migrations **1, 2, 3** only. After compaction and
+admission, installed 2.4.25 startup exited **3**, with `SCHEMA_VERSION` / “Unknown
+ledger migration version”. Its older hook code made **196** calls while the
+candidate served: **196 coordinated**, **0 unavailable**, **0 nonzero exits**;
+maximum call latency **0.268204208 s**. The equivalent `green-release` measurement
+was **194/194**, maximum **0.408187792 s**. Candidate graceful stop exited **0**.
+
+### L6 — measured responsiveness, scheduling and WAL backpressure
+
+Selection/JSON decoding, compression, hashes, archive reads, record conversion and
+census work use joined workers; the daemon's SQLite connection stays on its owning
+thread. The normal slice is bounded by rows and bytes; deletes also check elapsed
+time between individual statements and yield between transactions. An oversized
+row is processed whole and alone; one SQLite statement or commit is indivisible.
+`retention.py:24` records the named threats and measured derivation beside defaults.
+
+| Setting / environment suffix after `SOFTWARE_WORKFLOWS_` | Default | Derivation / behavior |
+|---|---:|---|
+| `retention_rows` / `RETENTION_ROWS` | 1,024 | Small park rows amortize durable file creation; a scheduling slice, not a retention cap. |
+| `retention_bytes` / `RETENTION_BYTES` | 8,388,608 | 8 MiB ordinary slice; observed larger payloads use the explicit single-row lane. |
+| `retention_delete_rows` / `RETENTION_DELETE_ROWS` | 64 | Retain the existing journal slice; measure every transaction. |
+| `retention_seconds` / `RETENTION_SECONDS` | 0.05 | More than 3× initial 12.8 ms maximum commit; cooperative checks cannot preempt a statement. |
+| `retention_wal_high_bytes` / `RETENTION_WAL_HIGH_BYTES` | 134,217,728 | Four low-water allowances; pause only compactor work. |
+| `retention_wal_low_bytes` / `RETENTION_WAL_LOW_BYTES` | 33,554,432 | More than 50% headroom above initial 21,147,992-byte allocated WAL peak. |
+
+All six settings have plugin options and environment overrides (`client.py:164`).
+Status warns/counts at **80%** of a budget. Invalid settings fail startup with
+`CONFIG`, rather than silently clipping. `settings.out` records **7** real invalid
+starts, each exit **3**: rows 0, fractional rows, bytes 0, delete rows -1, seconds
+NaN, seconds infinity, high equal to low. A valid plugin-option start exited **0**
+with rows **7**, bytes **4,096**, delete rows **2**, seconds **0.01**, high
+**8,388,608**, low **1,048,576**. The settings observer exited **0**.
+
+| Measurement | Calibration `green-03` | Final `green-clean` |
+|---|---:|---:|
+| Largest event-loop gap | 0.132608 s | 0.198323666 s, 1,452 samples |
+| Maximum compactor commit | 0.0128015 s | 0.012421167 s |
+| Maximum whole compactor batch, including worker awaits | 0.307706 s | 0.228885958 s |
+| Combined oversized event/response handling | 0.546693 s | 0.625567541 s |
+| Allocated WAL peak | 21,147,992 bytes | 136,260,792 bytes |
+| Outstanding WAL peak | See raw run output | 134,889,472 bytes |
+| Lead-hook maximum | See raw run output | 0.268204208 s |
+| Diagnostics / dumps / watchdog restarts | See raw run output | 0 / 0 / 0 |
+
+The final oversized event contains **17,825,843 bytes**; response contains
+**20,971,584 bytes**, with **20,971,617 bytes** in its raw record. These exceed the
+live observations of **16,717,442-byte** native and **19,458,709-byte** response rows.
+Both reconstruct exactly. The final counters record **2** oversized rows, maximum
+delete size **17,825,843 bytes**, maximum delete statements **64**. `green-release`
+independently measured loop **0.107638084 s / 1,462 samples**, commit **0.009716583 s**,
+batch **0.408714208 s**, oversized work **0.621950083 s** on the same source.
+
+The pinned-reader experiment holds a real read transaction while **16** foreground
+writes of **8 MiB** each grow WAL. At the default high-water threshold, compaction
+pauses with **134,889,472 outstanding bytes**, **136,248,432 allocated bytes**,
+**33,070 log frames / 138 checkpointed frames**. Releasing the reader and performing
+an ordinary foreground commit lets unchanged automatic checkpointing progress:
+**0 outstanding bytes**, **33,073 / 33,073 frames**, and compaction resumes even
+though allocated WAL remains **136,260,792 bytes**. Only `wal_checkpoint(NOOP)` is
+used by the compactor; no explicit checkpoint mode or policy change is introduced.
+Foreground writes can keep growing WAL while compaction pauses; this is not a
+global WAL bound. On pre-3.51 SQLite, `WAL_OBSERVATION_UNSUPPORTED` pauses retention;
+that version branch was inspected but not run against a separate older binary.
+
+### L7 — observable progress, residual growth and free pages
+
+`retention.py:489,502,611,683` maintains an incremental event census, record inventory,
+archive/file totals, scoped pins and oldest pin, completeness/freshness, drain rate,
+ETA, timing/oversize/conflict counters, WAL pressure and page/freelist observations.
+`daemon/status` reads cached results; it does not decode the ledger on demand.
+Scan position and archive totals are durable. Rates and timing counters belong to
+the current daemon incarnation. ETA stays null until inventories are complete and
+a measured nonzero rate exists. A cached census is explicitly not a current snapshot.
+
+`green-clean`'s first backlog drain converted **17 records**, saving **2,620,500
+whole-record bytes**. The database had **923 pages / 3,780,608 bytes**, with
+**703 free pages / 2,879,488 bytes**; all seeded in-scope hot event payload was gone.
+Reported drain rate was **73,778.406 bytes/s**, eligible bytes **0**, ETA **0**,
+complete inventory, **0** errors. This rate includes startup/idle time and is not
+a sustained production throughput claim.
+
+At the final status sample, totals were **2,177 archived/deleted rows /
+17,899,569 logical bytes / 51,036 manifest gzip bytes**, plus **19 converted records /
+24,611,887 bytes saved**. The file census found **55 event files / 51,241 bytes** and
+**23 dependency files / 37,463 bytes**, **0** partial and **0** unmanifested files.
+The extra **205 event-file bytes** belong to the deliberately conflicting fixture
+object whose promise was retired; fault cases also leave dependency objects. No
+archive or object collection is claimed. Final timing counters include **1** revision
+conflict and **40** warnings: delete rows **31**, selection rows **2**, delete bytes
+**1**, record bytes **1**, selection bytes **1**, WAL bytes **4**.
+
+Final page count **33,572**, database **137,510,912 bytes**, freelist **169 pages /
+692,224 bytes**. The large excluded foreground WAL workload reused earlier free
+pages and grew the database; this is why final freelist is below the first-drain
+freelist. No vacuum or file-space reclamation was performed.
+
+The final cached hot census was **495 bytes**: **278** receipt-pinned completion
+bytes plus **217** eligible threadless-notification bytes. Scan age was
+**0.111517906 s**, remaining estimate **0.000756242 s**, rate **286,945.018 bytes/s**,
+errors **0**, pending record revisions **0**. A subsequent read-only audit after
+shutdown found only **1 completion / 278 bytes** hot: the deliberately retained
+receipt pin. The eligible notification had drained. Oldest receipt-pin timestamp
+was **1793339125.868213**. This distinguishes real pins from census lag.
+
+Three subsequent real native completed-work cycles, without restarting the daemon,
+each reached **0 hot rows** for their listeners in **1.044503333**, **1.468213334**,
+and **0.626399834 s** after completion. This establishes continuous discovery and
+draining over the measured cycles, not a lifetime storage bound or long-duration
+soak. Necessary records, archives, retained receipt blobs and excluded event kinds
+still accumulate. The user's approximately **16.9 GB** live ledger was not drained
+or copied in this phase; production-scale completion time is unproved.
+
+### Cleanup, boundary deviation and packaging checks
+
+The first cleanup audit (`cleanup-audit.json`) exited **1** because it detected a
+real boundary violation: Git refreshed mtime/ctime on **8 pre-existing object files**
+in fixtures **repo-62, repo-63, repo-65, repo-67** during seal probes. The paths in
+each are `.git/objects/d9/50090c376331ff798cc2c5d2b081dba5c5880a` and
+`.git/objects/c2/a6dac293e5787b6df04d6a343bb905fbe79a13`. Their contents match the
+unused baseline fixture: SHA-256 respectively
+`88574e93fb021b305421492de4bbd55dcd378ce66489f7cf758e9571fb644e42` and
+`ff433030e062d9f76b39841640e357fccb80362f0c0e892552b7c5d8a7deec54`.
+Their birth times predate all runs. No content difference was found, but changing
+these timestamps still violates the no-`.git`-changes requirement. It was reported
+to the caller; the timestamps were not rewritten to conceal or undo the violation.
+
+The brief assumed `GIT_ALTERNATE_OBJECT_DIRECTORIES` was read-only lookup. Actual
+Git **2.56.0** refreshes existing alternate objects when writing a duplicate object:
+`odb_freshen_object` traverses every ODB source, `odb_write_object` calls it before
+skipping the write, and `freshen_file` calls `utime`. Primary source:
+[odb.c](https://github.com/git/git/blob/v2.56.0/odb.c#L824),
+[object-file.c](https://github.com/git/git/blob/v2.56.0/object-file.c#L71).
+This justified a correction to the probe plan: copy object files independently to
+scratch before the daemon starts, use that object directory and a scratch index,
+and supply no alternates. No production seal logic was changed for this correction.
+
+`green-clean` reran the entire matrix on unused **repo-68** with that correction.
+`git-before.json` and `git-after.json` compare all **40** `.git` entries, including
+file hashes, sizes, mtimes and ctimes: identical, `git_unchanged=true`.
+`cleanup-final.json` exited **0**: **23** disposable state directories audited,
+**0 held worker/supervisor locks**, **0 surviving owned probe processes**, matching
+final source hash, and **308,000,800,768 bytes** free (above the **15 GiB** floor).
+Historical timestamp deviations remain listed in that successful cleanup report;
+its success does not erase them. No live coordinator process was signalled and no
+direct write to its state was performed. No live clone was made. All repository
+changes remain uncommitted and were applied through `apply_patch`.
+
+The existing release-check recipe was adapted to installed 2.4.25. The actual
+`static-prebump` command used `EXPECTED_VERSION=2.4.25` and
+`EXPECTED_README_VERSION=2.4.26`, then Python 3.15 `-I -B` to execute
+`W/static_checks2426.py W/static-prebump`. It exited **0**, with empty stderr:
+
+| Existing check | Actual result |
+|---|---|
+| Python 3.15 in-memory compilation | 86 files, no syntax errors. |
+| Python 3.9.6 hook/import compilation | 14 files, exit 0. |
+| `coordinator/hooks.py --check` | Exit 0; compatible true; protocol `jsonl-v1`. |
+| Git shim syntax | sh, bash POSIX, zsh sh emulation each exit 0; executable mode 100755. |
+| Ruff F821/F822/F823/F811/F841/F401 | 35 installed findings, 35 candidate findings, 0 added. |
+| Strict plugin validation | Exit 0, “Validation passed”, scratch configuration. |
+| Strict marketplace validation | Exit 0, “Validation passed”, scratch configuration. |
+| Direct changed-file whitespace/newline checks | 17 files clean at the pre-documentation sample. |
+| Transitional release/title check | Manifest 2.4.25, README 2.4.26, explicitly expected until probes stop. |
+| Existing reclaim-concurrency option checks | 1, 2, 4 exit 0; 0, -1, 1.5, invalid exit 1 with CONFIG positive-integer refusal. |
+
+After this documentation was added, the same command ran again with output directory
+`W/static-docs`: **exit 0, 19 PASS lines, 0 stderr bytes**. All **17** changed files
+passed the whitespace/newline check, including this section. Read-only Git diff
+checking also exited **0** with no whitespace findings; scope was **15 modified
+files and 2 new Python modules**, all under the authorized paths.
+
+The manifest is bumped last, after this evidence and process cleanup. The same
+recipe must then run with its default expected **2.4.26** and a new scratch output
+directory; the final report records that actual exit rather than claiming a
+future run here. No new test suite substitutes for the real daemon runs above.
+
+### Primary-source facts and remaining proof limits
+
+The implementation preserves the existing SQLite WAL safety guard. Verified primary
+sources: SQLite **3.54.1**, released **2026-10-16**
+([release](https://www.sqlite.org/releaselog/3_54_1.html)); WAL reset fix in **3.51.3**,
+backported to **3.44.6 / 3.50.7**
+([WAL](https://www.sqlite.org/wal.html#the_wal_reset_bug)); NOOP added in **3.51.0**,
+released **2025-11-04**, C mode **-1**, with no frames checkpointed
+([release](https://www.sqlite.org/releaselog/3_51_0.html),
+[pragma](https://www.sqlite.org/pragma.html#pragma_wal_checkpoint)). Automatic
+checkpointing defaults to **1,000 pages**, PASSIVE, and may execute on the committer;
+WAL allocation can remain after outstanding work clears
+([SQLite](https://www.sqlite.org/pragma.html#pragma_wal_autocheckpoint)).
+With auto-vacuum **0**, free pages are reusable without shrinking the file
+([SQLite](https://www.sqlite.org/pragma.html#pragma_auto_vacuum)).
+
+SQLite `fullfsync` defaults off; `synchronous=FULL` alone does not select macOS
+`F_FULLFSYNC` (local constant **51**)
+([SQLite](https://www.sqlite.org/pragma.html#pragma_fullfsync),
+[Apple](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fsync.2.html)).
+Python requires buffer flush before `fsync`; same-filesystem `replace` is atomic
+but does not itself establish directory durability
+([Python os](https://docs.python.org/3/library/os.html)). `GzipFile.close` leaves a
+supplied underlying file open; `mtime=0` removes timestamp variability; Python
+**3.15** changed default compression **9 → 6**, so this implementation explicitly
+chooses **6** ([gzip](https://docs.python.org/3/library/gzip.html)). SQLite connections
+default `check_same_thread=True`; legacy `executescript` commits a pending transaction
+([sqlite3](https://docs.python.org/3/library/sqlite3.html)). Native method/correlation
+names and explicit pagination directions are pinned to Codex **0.163.0**
+([notifications](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/app-server-protocol/src/protocol/common.rs),
+[history](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs)).
+
+Unproved: hardware power-loss behavior; full live-ledger drain time and SQL latency
+at user scale; a long-duration steady-state soak; older-SQLite NOOP refusal on an
+actual alternate binary; external native-wire retransmission of a compacted call;
+a multi-repository native project seal workflow. Process crashes, real handler
+replay, ordinary/project seal functions, scoped dependency decisions, oversized
+rows, pinned-reader backpressure, and three ongoing native cycles were measured.
+The Git timestamp boundary violation is an observed deviation, not an unproved
+claim. File-space reclamation remains intentionally outside this release.
+
+### Blind-review follow-up — 2.4.26, 2026-10-30
+
+This follow-up supersedes the initial submission's production-scale proof limit
+and the earlier implementation's repeated sweep and synchronization descriptions.
+The four findings from review session `01a14eac`, turn **131**, were accepted.
+The plugin version remains **2.4.26**. Repository edits remain uncommitted.
+
+1. **Archive amplification:** selection now seeks one subject and kind through
+   `event_subject_kind`, preserving its progress across selection boundaries.
+   Interleaved global sequence order no longer creates a file per subject per
+   global batch. New manifests carry a membership digest rather than repeated
+   interval JSON. Exact immutable sequence membership stores a stable numeric
+   archive key; the original event's sequence is unique and immutable. Catalog
+   scope and native methods remain checked by the deletion trigger. Legacy
+   interval coverage remains supported. Publication performs the required file
+   and post-directory flushes without a redundant third device flush.
+2. **Pending discovery:** `retention_archives` is a durable ready/retry queue,
+   selected through `retention_archive_due` and a primary-key record lookup.
+   `archive_pending_subject` finds durable manifests when a subject's evidence
+   changes. Legacy manifests are discovered once through a bounded persisted
+   `retention_seed` cursor. Completed indexed manifests are not repeatedly read
+   to discover pending work. This ready queue also lets a pinned durable manifest
+   sleep instead of repeatedly decompressing its file.
+3. **Synchronization scope:** `Store.durable()` saves the connection's prior
+   `fullfsync` value; `Store.transaction()` restores it after commit or rollback.
+   Manifest publication and the first storage barrier use stronger synchronization.
+   Later deletions and ordinary foreground writes retain the existing policy:
+   a lost deletion leaves a deduplicated hot/archive overlap behind an already
+   durable manifest. Opening storage version 4 no longer enables connection-wide
+   full-sync writes.
+4. **Unchanged pins:** `retention_subjects` persists a subject's evidence epoch,
+   pass boundary, cursor and census. Only new events or relevant evidence changes
+   enqueue another pass. Completion discovery invalidates earlier delta decisions
+   once. Record revision work has its own durable queue. Census refreshes are
+   separate from selection, and an idle worker waits for a wake rather than
+   starting a timed sweep. A changed epoch during an awaited archive operation
+   remains pending after the older pass finishes.
+
+The existing scratch runner was extended, not replaced by a repository test
+suite. Per-state and oversized probes now finish the persisted subject pass;
+the production selection, gate, archive protocol and record conversion remain
+unchanged by the injector. Fixture object storage remains independently copied,
+without Git alternates, and every used fixture compares hashes, sizes, mtimes
+and ctimes before and after the run.
+
+`W/review-red` used installed **2.4.25**, fixture **repo-69**, and exited **0** in
+**35.0 s**. With the unrelated UNKNOWN, **19 native rows / 7,130 bytes** and
+**2,048 park rows / 36,864 bytes** remained; archives stayed **0**. The control
+resolved that UNKNOWN and created **1** archive, leaving **1 native row / 217
+bytes**. Park rows remained unchanged. Legacy response JSON remained **1,245,245
+bytes**, dependency fields **1,387,488 bytes**. Hot-only readback returned
+**2,073 of 2,091** original events, `same=false`. Graceful stop and fixture
+immutability both passed.
+
+`W/review-green-01`, fixture **repo-70**, exited **1**. UNKNOWN restoration exposed
+an outer UPSERT overriding a trigger's `INSERT OR IGNORE` conflict handling.
+The queue triggers now use explicit `ON CONFLICT(id) DO NOTHING`; startup compares
+and replaces changed trigger definitions. `W/review-green-02`, fixture **repo-71**,
+reran the full real-daemon matrix and exited **0** in **138.5 s**. Its matrix,
+graceful stop and fixture immutability all passed. A final run after the remaining
+metadata/flush cleanup is recorded below.
+
+The explicitly requested production-scale harness is `W/review_scale.py`. It
+imports the real `Store`, `Retention` and archive helpers. Its adapter provides
+only queues, current application state, stored history checkpoints, stored
+writer-start demand, a closing flag and background task scheduling. It never
+starts a daemon on the clone, enumerates recorded processes, performs recovery,
+contacts native threads or enters a checkout. Clone-local archive paths are
+rebased to independently copied files before Store opens. Original listener,
+application, quarantine and history evidence is preserved.
+
+#### Required production-scale drain
+
+`W/review-live-scale` used the **one** authorized `VACUUM INTO` from a SQLite
+`mode=ro` connection to the live ledger. Copying took **129.618547 s**. The source
+connection then closed; all remaining writes were confined to disposable state.
+The clone included **25** legacy archive files. No daemon, recovery, owner,
+process or writer machinery ran on that clone. The real Store's first open,
+including new indexes, took **0.562952 s**; the preceding census had warmed the
+filesystem cache. Migrations at plain open remained **1, 2, 3**.
+
+The complete real Retention drain took **2,308.846691 s** (**38 min 28.847 s**),
+including discovery, selection, decoding, archive publication, verification,
+manifest installation, deletion, record conversion and final inventory refresh.
+It excludes clone creation, the baseline census, Store open and the ordinary
+commit calibration. No row-count or elapsed-time cutoff ended the drain: all
+bootstrap cursors and ready queues finished, eligible bytes reached **0**, and
+the retained evidence had explicit pin reasons. There were **0 retention errors**
+and **0 revision conflicts**.
+
+| Hot payload | Before: rows / UTF-8 JSON bytes | After: rows / UTF-8 JSON bytes | Removed bytes |
+|---|---:|---:|---:|
+| Native events | 1,914,534 / 7,525,555,969 | 382,895 / 1,494,655,315 | 6,030,900,654 |
+| Park-abandoned events | 9,861,028 / 256,368,157 | 31,529 / 801,436 | 255,566,721 |
+| Dynamic records | 39,972 / 3,928,905,275 | 39,972 / 883,486,422 | 3,045,418,853 |
+| Operation records | 29,369 / 1,851,642,461 | 29,369 / 539,290,142 | 1,312,352,319 |
+
+Thus **11,361,138 event rows / 6,286,467,375 payload bytes** left hot event storage;
+**29,992** beneficial record conversions removed another **4,357,771,172 JSON
+bytes**. Small non-beneficial plain responses/lists remain valid and are not
+reconsidered until their revision changes. Out-of-scope event kinds and receipt
+blobs remain untouched.
+
+| New file storage | Files | Logical file bytes | Allocated bytes (`st_blocks * 512`) |
+|---|---:|---:|---:|
+| Event archives, excluding the 25 copied files | 13,370 | 1,260,206,321 | 1,299,984,384 |
+| Shared dependency objects | 1,958 | 46,225,327 | 50,802,688 |
+| Total added | 15,328 | 1,306,431,648 | 1,350,787,072 |
+
+Archive records increased **25 → 13,395** and **14,456 → 12,377,203 JSON bytes**:
+**13,370 records / 12,362,747 JSON bytes added**. The immutable catalog contains
+**13,395 rows / 13,039,439 manifest JSON bytes**, including the indexed legacy
+archives. Exact membership contains **11,412,839 rows**, with **56,995,885 SQLite
+payload bytes / 160,763,904 allocated B-tree bytes**. Its **13,395** stable numeric
+archive keys use **1,017,812 payload bytes / 1,101,824 allocated bytes**. Legacy
+interval coverage has **0 rows** on this run. These are measured `dbstat` sizes,
+not estimates based on JSON length. The catalog's table uses **15,093,760 allocated
+bytes**; its primary-key and ordering indexes add **1,245,184** and **1,961,984
+bytes**. Derived park summaries add **2,362 records / 213,359 JSON bytes**.
+The complete per-table/index census is retained in `result.json`, including
+completion, revision, inventory and queue overhead.
+
+Across the whole `records` table, counts changed **259,190 → 274,924** and JSON
+bytes **6,084,364,329 → 1,739,169,363**. The **15,734** additional rows comprise
+**13,370 archives**, **2,362 park summaries**, **1 retention-total record**, and
+**1 harness calibration record**. Production metadata added **12,576,169 JSON
+bytes** across archives, summaries and totals; the calibration record added
+**39 bytes** and Store's daemon metadata changed by **-2 bytes**. End-to-end event
+payload drain rate was **2,722,773.842 bytes/s**; including record JSON reduction,
+the rate was **4,610,197.199 bytes/s**.
+
+The database retained its allocated file: page count **4,093,320 → 4,096,064** at
+**4,096 bytes/page**. Freelist **0 → 2,982,752 pages**, or **12,217,352,192 reusable
+bytes**. This is free space *inside* SQLite, not file-space reclamation. Free disk
+before cloning was **306,949,906,432 bytes**; after the drain, before deleting the
+clone, it was **288,584,343,552 bytes**, comfortably above the **15 GiB** floor.
+
+| Timing, seconds unless marked | Count | p50 | p99 | Maximum |
+|---|---:|---:|---:|---:|
+| Measured COMMIT/autocommit execute duration during drain | 424,290 | 0.000096666 | 0.021295625 | 0.062983791 |
+| Entire explicit transaction during drain | 266,033 | 0.000624250 | 0.029245667 | 0.110076083 |
+| Interval of a requested 1 ms event-loop ticker | 1,228,062 | 0.001272000 | 0.019178125 | 0.116567625 |
+| Ordinary one-row transaction before drain | 300 | 0.000057959 | 0.000123042 | 0.006515166 |
+| Ordinary one-row transaction after drain | 300 | 0.000046709 | 0.000082125 | 0.000437125 |
+
+The COMMIT observer measures explicit commits and autocommit mutation execution;
+it does not separately time finalizing a `RETURNING` cursor. The whole-transaction
+and ticker measurements cover the resulting loop stalls. Ordinary transaction
+calibration includes the write and commit, with `fullfsync=0` before and after.
+The explicit commit/rollback restoration sequence was **1, 0, 1, 0**. The largest
+ticker interval was **116.568 ms**, or **115.568 ms** beyond the requested delay;
+this is measured responsiveness, not a claim that every SQL statement is below
+the **50 ms** batching target. Retention measured a **110.082 ms** transaction
+maximum and a **1.352688 s** asynchronous batch maximum. Its **286** oversized
+record/selection observations included a **19,458,791-byte** encoded record;
+the largest event delete was **16,717,442 bytes**. WAL allocation peaked at
+**14,267,592 bytes**, outstanding observed WAL at **4,091,904 bytes**. No explicit
+checkpoint or checkpoint-policy change was used.
+
+The completed subject census retained these first blocking reasons. Reasons are
+exclusive in this table; quarantine can occur under a dormant listener label.
+
+| Pin | Rows | Payload bytes |
+|---|---:|---:|
+| HISTORY | 159,073 | 618,132,743 |
+| QUARANTINE | 154,083 | 582,359,374 |
+| RECEIPT | 55,429 | 283,251,514 |
+| APPLICATION | 347 | 62,862 |
+| FAMILY_EXIT | 501 | 96,759 |
+| COMPLETION | 44,991 | 11,553,499 |
+
+The production query plans use `retention_archive_due (retry<?)` plus the record
+primary key for pending work, `archive_pending_subject (parent=?)` for evidence
+invalidation, `retention_subject_pending (subject>?)` for changed subjects, and
+`event_subject_kind (subject=? AND kind=? AND seq>?)` for payload selection.
+There is no completed-manifest JSON scan in pending discovery.
+
+After the drain, **414,424 pinned event rows / 1,495,456,751 payload bytes** stayed
+present for **600.002257 s**. The 1 ms measuring ticker was stopped for this idle
+window. The adapter, worker and one progress-log wake every ten seconds consumed
+**0.021319 CPU-seconds**, or **0.003553% of one core**. SQLite changes, selected
+rows and archive attempts were all **0**. `getrusage` input/output blocks and
+major faults were **0**; minor faults were **11**.
+
+A separate read-only `proc_pid_rusage` observer checked the harness process's
+birth identity and sampled **590.083796 s** of that interval. It measured
+**425,984 disk-read bytes**, **0 disk-write bytes**, **847,872 logical-write
+bytes**, and **0 page-ins**. These process-wide figures include progress-log
+bookkeeping; they are reported separately from the zero SQLite/work counters,
+not represented as zero filesystem activity. The observer captured only clone
+catalog metadata for the subsequent archive audit.
+
+The harness exited **0**, `ok=true`, with **0 stderr bytes**. It closed Store and
+immediately removed its clone database; `clone_database_exists=false` and a
+directory audit found **no `ledger.sqlite*` files**. Generated archives remain
+as verification artifacts. The three reviewed runtime sources were unchanged
+throughout the run: `store.py` SHA-256
+`89034403b37d97d5e0ad53147e26e641b0609b5366f4823dcae40a312813cb84`,
+`retention.py`
+`228e2b977b2b4f0605a1ff9022cc27aff6eaef6ca88f65555f06ca64bb56624b`,
+and `archive.py`
+`b3e98f6251d44dad9aee3de2bb5bc931fcd482b25c92ca4794615185862af0e0`.
+
+`W/scale_archive_audit.py` then independently read every retained file after the
+clone database was gone. It exited **0** in **147.483215 s**, verifying digest,
+encoding and exact coverage for **13,395 event files**, including all **25 legacy
+files**, and the content-addressed data of **1,958 dependency objects**. The new
+files' rows and original payload bytes exactly equal the hot-event reductions.
+The **10,477 park files** contain **9,829,499 rows**, median **1,024**, maximum
+**1,024**, and only **3 single-row files**. The **2,918 native files**, including
+legacy files, contain **1,583,340 rows**, median **540**, and **120 single-row
+files**; the maximum **18,052** belongs to a legacy archive. Small subject tails
+and oversized native rows remain valid chunks; global interleaving no longer
+splits them into one-row files.
+
+Verified event payload removed by category and original stored listener state:
+
+| Category | Connected bytes | Dormant rows / bytes | Stopped rows / bytes | Dead rows / bytes | Quarantined bytes |
+|---|---:|---:|---:|---:|---:|
+| Diff notifications | 0 | 18,472 / 2,308,908,909 | 0 / 0 | 0 / 0 | 0 |
+| Four text/output delta methods | 0 | 1,006,065 / 317,873,147 | 0 / 0 | 0 / 0 | 0 |
+| Completed items | 0 | 78,075 / 3,131,633,145 | 0 / 0 | 0 / 0 | 0 |
+| Other native methods | 0 | 427,317 / 272,120,924 | 1,710 / 364,529 | 0 / 0 | 0 |
+| Park-abandoned | 0 | 93,024 / 2,419,616 | 9,708,537 / 252,421,962 | 27,938 / 725,143 | 0 |
+
+Zero native removal under connected/dead labels describes this snapshot's pins;
+the real-daemon per-state matrix separately proves those eligible paths. Quarantine
+overrides a dormant/stopped label. No quarantined event was removed. Record JSON
+reductions above are exact totals; the saved post-drain inventory additionally
+groups forms and bytes by listener state. The clone's initial record census was
+by kind, so an exact before/after *record* byte reduction by state was not captured
+and is not inferred from timestamps or a later live snapshot.
+
+#### Final interleaving and wake-up regression run
+
+`W/review_scale_followup.py` ran the final tree on fresh disposable state
+`W/review-interleaved-final`, mode `synthetic`, idle **15 s**: **exit 0**,
+`ok=true`, **0 stderr bytes**. Its **131,072** globally interleaved park rows
+belonged to **64 subjects**; **8,192** additional native rows were quarantined.
+The park backlog's **3,538,944 payload bytes** drained in **11.044230 s** to
+**128 files / 1,087,082 file bytes / 1,572,864 allocated bytes**. All **506,794
+pinned native bytes** remained. Freelist grew **0 → 4,216 pages**. Exact membership
+held **131,072 rows**; archive records/catalog each held **128 rows**. This run
+uses the final compact membership without the preliminary run's unused secondary
+index.
+
+COMMIT measurements: **3,033**, p50 **0.212417 ms**, p99 **4.126500 ms**, maximum
+**6.356875 ms**. Entire explicit transactions: **2,182**, p99 **4.672209 ms**,
+maximum **8.604500 ms**. The 1 ms ticker recorded **6,637 intervals**, p99
+**5.637167 ms**, maximum **9.740459 ms**. Ordinary transaction p50/p99 changed
+**0.043750/0.098667 ms → 0.058291/0.095042 ms**, with `fullfsync=0` on both sides.
+Commit and rollback both restored the setting (**1, 0, 1, 0**).
+
+The **15.001582 s** pinned idle window used **0.000299 CPU-seconds**, with **0**
+SQLite changes, rescans, archive attempts, block I/O or faults. Changing only
+the listener's quarantine state and application evidence, without calling
+`Retention.request()`, drained all **8,192** previously pinned rows in
+**0.589696 s**. A separate durable-but-pinned manifest survived a retention-worker
+restart, slept with **0 idle retries**, then completed **0.010100 s** after its
+application record advanced, again without an explicit request. This exercises
+both subject invalidation and the partial-index pending-manifest wake path.
+
+#### Final real-daemon crash matrix
+
+`W/review-crash-final`, fixture **repo-72**, ran the candidate with
+`PROBE_CRASH=1` and exited **0** in **47.4 s**. All **16** process-crash stages
+passed: before/after compression, file flush, publication, verification, manifest
+commit, and each of three deletion batches (**64, 64, 2 rows**). Each interrupted
+RPC reported `RPC_UNCERTAIN`; restarting the same disposable state returned all
+**130 original events**, `same=true`, **0 covered hot rows**, and a park summary
+count of **130**, never a doubled contribution. Maximum recorded recovery
+transaction was **1.165042 ms**. Every recovery's partial/unmanifested inventory
+was empty. Final generation was **17**, graceful stop succeeded, and the supplied
+fixture's Git contents and timestamps were unchanged.
+
+After that run, only the scheduling-limit comment in `retention.py` was updated
+to include the measured production maxima and explicitly distinguish the **50 ms**
+yield target from an indivisible-statement bound. Its executable AST SHA-256 was
+identical before and after:
+`97e907ac42e919f7709d81065521bc75558ab346142e764eb0d9b0b8617770d8`.
+The final green and static checks below include that comment update; the live
+clone and crash run exercised the same executable implementation.
+
+#### Final installed red and candidate green
+
+The final commands use the existing real-daemon driver and unused supplied
+repositories; `W` is the scratch writer directory defined above, `P` is the
+working `plugins/software-workflows` directory, and `OLD` is the installed
+`~/.claude/plugins/cache/agent-teams/software-workflows/2.4.25` directory:
+
+```sh
+PROBE_REPO="$W/../../r2425/fixture-repos/repo-72" PROBE_CRASH=1 \
+  python3.15 -I -B "$W/retention_probe.py" "$P" "$W/review-crash-final" review-crash-final completed 3
+PROBE_REPO="$W/../../r2425/fixture-repos/repo-73" \
+  python3.15 -I -B "$W/retention_probe.py" "$P" "$W/review-green-final" review-green-final completed 3
+PROBE_REPO="$W/../../r2425/fixture-repos/repo-74" \
+  python3.15 -I -B "$W/retention_probe.py" "$OLD" "$W/review-red-final" review-red-final completed 3
+```
+
+`review-red-final` exited **0** in **34.7 s**. The unrelated UNKNOWN held
+**19 native rows / 7,142 bytes**, **2,048 park rows / 36,864 bytes**, with **0
+archives**. Legacy response JSON stayed **1,245,245 bytes** and dependency fields
+**1,387,488 bytes**. Resolving the UNKNOWN created **1** archive and left **1 native
+row / 217 bytes**, with park and record bytes unchanged. This reconfirms the
+installed red after the candidate rerun; `review-red` had already calibrated the
+same failure before the fixes. Both final fixtures reported successful graceful
+stop and unchanged Git contents, sizes, mtimes and ctimes.
+
+`review-green-final` exited **0** in **138.5 s**, `matrix.ok=true`. With the
+UNKNOWN still present, all **19 native rows / 7,146 bytes** and **2,048 park rows /
+36,864 bytes** drained into **4 event files / 16,183 compressed bytes**. Legacy
+response JSON became **4,193 bytes** with its response digest unchanged; copied
+dependency fields became **0 bytes**, replaced by **16 shared objects / 36,514
+file bytes**. Initial freelist reached **722 pages / 2,957,312 bytes**. The final
+matrix recorded the following:
+
+| Contract / path | Final measured result |
+|---|---|
+| L1 merged pagination | Limits **1, 7, 100, 400** each returned all **2,091** original events, `same=true`; terminal page correct. Identical hot/cold overlap visible once; conflicting overlap `ARCHIVE_CONFLICT`. |
+| L1 receipt fallback | The real history fallback changed the checkpoint epoch, read **2 items / 2 pages / 1 turn**, then verified archived receipt evidence through sequence **2,359**. |
+| L1/L4 broken evidence | Missing, digest-mismatched and malformed coverage archives returned `ARCHIVE_MISSING`, `ARCHIVE_DIGEST`, `ARCHIVE_COVERAGE`; missing evidence prevented deletion. Dependency object failures were `DEPENDENCY_MISSING` and `DEPENDENCY_DIGEST`. |
+| L2 gate discrimination | APPLICATION, DISPATCH, APPLYING, OBLIGATION, QUARANTINE, HISTORY, EXECUTION, RECEIPT and FAMILY_EXIT each retained its row, then released it when its own pin cleared. An uncovered sequence gap stayed hot; all **3** forbidden mutations were refused. |
+| L3 listener states | Connected **843**, dormant **837**, stopped **837**, dead **828** native bytes each drained to **0 rows / 0 bytes**. Quarantined **5 rows / 849 bytes** remained unchanged. |
+| L3 completion | Unfinished stream and unapplied completion retained deltas; applied matching completion released them. |
+| L3 exact replay | Repeated native response identity **70001** returned identical content with **0 read effects** executed again. |
+| L3 dependency parity | All **8** known/unknown/unpublished/null/missing/resolved/restore-exclusion/restored decisions matched old forms, including refusal details. Ordinary and project seal outputs matched; project preflight passed. |
+| L3 dependency work | **1,000 operations**, **17 captured reads**, **9,601 materialized references** in **0.001720 s**; ordinal and qualified-project refusal paths passed. |
+| L3 UNKNOWN restore | The archived-native fixture restored its baseline and resolved the UNKNOWN through retained provenance. |
+| L4 revision race | **1** detected conflict; the newer record survived at revision **2**. |
+| L4 durability error | Injected `errno=5` produced `ARCHIVE_DURABILITY`, stage `file_durability`, retaining evidence. |
+| L5 barrier | Plain start migrations **1, 2, 3**; installed 2.4.25 on migrated state exited **3**, `SCHEMA_VERSION`, empty stderr. |
+| L5 older hooks | **148** actual 2.4.25 hook calls, **148 coordinated**, **0 unavailable**, **0 nonzero exits**; maximum **0.262876 s**. |
+| L6 oversized work | Exact **17,825,843-byte native row** and **20,971,584-byte response** survived conversion/readback in **0.618560 s**; both equality checks true. |
+| L6 latency | Longest daemon loop gap **0.106201 s**; retention transaction maximum **0.010855 s**; asynchronous batch maximum **0.109245 s**. |
+| L6 pinned WAL | **16** foreground writes of **8 MiB** held pending WAL at **134,709,248 bytes**, causing pause. After reader release and ordinary foreground commits, pending bytes became **0** and compaction resumed. Allocated WAL peak **136,573,912 bytes**; no forced checkpoint. |
+| L7 new work | Three additional real native cycles each ended with **0 hot native rows**, draining in **0.836925, 0.836723, 0.629016 s**, without daemon restart. |
+
+The intentionally generated foreground WAL pressure is separate from compactor
+write contribution. Counts, bytes, warnings, pin census and loop metrics remain
+in the run's JSON output, with hook samples in `old-hooks.json`. These measurements
+exercise the real daemon, supervisor, worker and Codex **0.163.0** app-servers
+against the loopback provider, with no model spend.
+
+The final installed red's hot-only readback returned **2,073 / 2,091** original
+events, `same=false`. Its **1,000** cumulative operations materialized
+**9,600,000 references** in **0.104826 s**, versus the candidate's **9,601**
+references in **0.001720 s** for the corresponding ordinal workload. These are
+actual handler runs, not timing extrapolations to the live ledger.
+
+#### Final checks, cleanup and proof limits
+
+```sh
+python3.15 -I -B "$W/settings_probe.py" "$W/review-settings-final" "$P"
+python3.15 -I -B "$W/static_checks2426.py" "$W/review-static-final"
+```
+
+Both commands exited **0**, each with **0 stderr bytes**. The settings driver
+ran **8** isolated states: zero/fractional rows, zero bytes, negative delete rows,
+NaN/infinite seconds and equal WAL thresholds each exited **3** with `CONFIG`.
+Valid plugin options exited **0** and reported rows **7**, bytes **4,096**,
+delete rows **2**, seconds **0.01**, warning fraction **0.8**, and WAL high/low
+**8,388,608 / 1,048,576 bytes**.
+
+The existing static recipe reported **19 PASS** lines:
+
+| Check | Actual output / result |
+|---|---|
+| In-memory Python 3.15 compilation | **86 files**, no errors. |
+| Python 3.9 hook/import compilation | **3.9.6**, **14 files**, exit **0**. |
+| `coordinator/hooks.py --check` | `compatible: true`, protocol `jsonl-v1`, exit **0**. |
+| Git-shim shell syntax | sh, bash POSIX and zsh sh-emulation each exit **0**; executable mode retained. |
+| Ruff selected correctness rules | Installed **35**, candidate **35**, **0 added findings**. |
+| Strict plugin / marketplace validation | Both exit **0**, `Validation passed`; configuration directories stayed in scratch. |
+| Whitespace / final newline | All **17 changed files** clean. |
+| Manifest / README version | Both **2.4.26**. |
+| Existing writer-capacity options | **1, 2, 4** exit **0**; **0, -1, 1.5, invalid** exit **1**, `CONFIG positive integer`. |
+
+`W/review-cleanup.json` audited **32** owned disposable state directories:
+**0 held supervisor/worker/upgrade locks**, **0 active owned probe processes**,
+**0 clone database files**, and **304,460,746,752 free disk bytes**. The plugin
+remained **2.4.26** throughout this review follow-up. Final runtime fingerprint
+of the **62** coordinator Python files, using sorted filename/SHA-256 JSON, is
+`a21d6f9c4ee424d08a1715651169e9af842c00c390e10a1c43f039f7abf747a1`.
+Read-only Git whitespace checking exited **0**; status showed **15 modified files
+and 2 new modules**, entirely within the authorized paths, all uncommitted.
+No repository tests were added. No live coordinator process was signaled and no
+live ledger data or configuration was changed.
+
+The earlier timestamp-only Git-object boundary violation remains documented in
+the initial evidence; it was not reversed or hidden. Every fixture in this
+follow-up (**repo-69 through repo-74**) passed the stronger content/size/mtime/ctime
+comparison, including the failed first green run.
+
+The production-scale SQL/drain and requested ten-minute idle proof gaps are now
+closed for this machine and snapshot. Remaining limits: process crashes do not
+prove hardware power-loss durability; the ten-minute idle window and three new
+native cycles are not a lifetime soak; the older-SQLite NOOP refusal was not run
+on an alternate SQLite binary; replay was through the real daemon handler rather
+than an external native-wire retransmission; project seal/preflight functions
+were exercised but not a multi-repository native project workflow. The clone's
+record byte reductions were not captured by initial listener state, as stated
+above. Runtime maxima remain observations, not hard latency promises. Archives,
+receipt blobs and out-of-scope records still grow with retained history. The
+release bounds eligible hot work and reports pins; it does not promise constant
+total lifetime storage. Physical file-space reclamation, checkpoint control and
+receipt-blob collection remain outside this release.
+
+#### Turn-132 follow-up — graceful shutdown
+
+The review found that `resume()` could dequeue a durable archive after shutdown
+interrupted `delete()` before its full coverage pass. `delete()` now reports
+`complete`, `pinned`, `paused` or `interrupted`. Resume dequeues only completion
+or a fully visited pinned pass with unchanged subject evidence; `write()`
+explicitly dequeues only completion. Interrupted and WAL-paused passes stay
+queued; non-durable records retain their prior queue cleanup. Selection, archive
+publication and event-delete transaction bodies are
+unchanged, so the 38-minute clone drain above was **not repeated**, as requested.
+`W/turn132-change-audit.json` verifies that only `resume`, `write` and `delete`
+changed, with identical publication and event-delete transaction ASTs.
+
+The pre-fix `retention.py` SHA-256 was
+`b515ef8e3851348cdd5b5f08c3c92b165b83a66b8b56127d79da896817e430bf`;
+the fixed file is
+`6276948e0e94930d5f923f68eff6affff69204b6f1f21fbf9402e85dab0aac79`.
+The scratch driver uses real daemons and Codex **0.163.0** app-servers against
+the loopback provider. After a completed native run, it archives **512** park
+rows with **16-row** deletion slices. Resume cases first crash after the first
+committed deletion batch. The stop injection waits between selection calls and
+holds the normal owner-stop await until background deletion observes the real
+`closing` flag and returns; it does not replace deletion, eligibility or dequeue
+logic. The final restart uses the normal retention scheduler, with bootstrap
+already complete and no change to listener evidence.
+
+```sh
+S=/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad
+W="$S/r2426/writer"; F="$S/r2425/fixture-repos"
+P=/Users/ahrar/Documents/agent-teams-plugin/plugins/software-workflows
+# Actual invocation template; the table gives each run's arguments.
+PROBE_REPO="$F/repo-$fixture" TURN132_CASE="$case" \
+  python3.15 -I -B "$W/turn132_probe.py" "$P" "$W/$label" "$label" completed 3
+```
+
+Each run saved `W/<label>/result.json`, exited **0**, and stopped its owned
+processes before deleting its state. RED means the driver successfully observed
+the defect, not that the coordinator was correct.
+
+| Label / fixture / case | At graceful stop | After restart / result |
+|---|---|---|
+| `turn132-red-resume` / 75 / resume, before patch | Queue absent; durable; **480** hot rows. | Still **480** after **5.074307 s** idle; epoch **550** unchanged. |
+| `turn132-red-confirm` / 76 / resume, before patch | A nonempty resume batch ran before stop; queue absent; durable; **464** hot rows. | Still **464** after **5.064050 s** idle; epoch **551** unchanged; **0** archive verifications after restart. |
+| `turn132-final-resume` / 82 / resume | Queue retained; durable; **464** hot rows. | **0** hot, complete, queue empty after **5.083012 s**; epoch **551** unchanged. |
+| `turn132-final-write` / 83 / write | Fresh-write queue retained; durable; **480** hot rows. | **0** hot, complete, queue empty after **5.057680 s**; epoch **551** unchanged. |
+| `turn132-final-pinned` / 84 / pinned | Queue retained; durable; **496** hot rows under HISTORY. | Restart completes the pinned pass and sleeps: **496** hot, queue empty, epoch **551** unchanged; clearing the pin drains to **0**, complete, in **0.094206 s**. |
+
+The pinned run's extra **5-second** idle window added **0 archive attempts,
+0 archive verifications and 0 scanned rows**. Pin release changed epoch to
+**552** and woke the archive through the production trigger. Every row set read
+back identically through `run/events` at limits **7 and 100**: **554, 555, 555,
+555 and 554** events respectively, all `same=true`. Every summary remained
+exactly **512**, including both restarts. Run durations were **34.9, 35.1, 36.1,
+34.7 and 40.1 s**; all fixture Git content/size/mtime/ctime comparisons
+passed. This verifies the injected shutdown interleaving and persistent-pin
+sleeping, not every possible process-scheduling interleaving.
+
+The initial shutdown greens (`turn132-fixed-resume`, `turn132-fixed-write`,
+`turn132-fixed-pinned`, repos **77–79**) passed, but `turn132-green-final` and
+`turn132-green-repeat` (repos **80–81**) exited **1**: their continuous-work
+checks left **19** eligible native rows after **90.190243 / 90.154198 s**.
+Read-only diagnostics identified a queued synthetic `probe_conflict_retired`
+manifest, created by the existing overlap-conflict check. Initializing the
+outcome to that state instead of completed non-durable work caused **67,440**
+archive attempts in the diagnostic run, starving subject scans. The final code
+preserves prior cleanup of non-durable queue entries, while durable records use
+the explicit deletion outcome. The matrix assertions were not weakened. Both
+failed states were deleted after their JSON evidence was saved.
+
+The final full green and crash matrices used fresh fixtures and the same
+production fingerprint as the final shutdown greens:
+
+```sh
+PROBE_REPO="$F/repo-85" python3.15 -I -B "$W/turn132_matrix.py" \
+  "$P" "$W/turn132-green-verified" turn132-green-verified completed 3
+PROBE_REPO="$F/repo-86" PROBE_CRASH=1 python3.15 -I -B "$W/turn132_matrix.py" \
+  "$P" "$W/turn132-crash-verified" turn132-crash-verified completed 3
+```
+
+The full green exited **0** in **139.5 s**, `matrix.ok=true`:
+
+| Repeated acceptance | Final measured result |
+|---|---|
+| Backlog / unrelated UNKNOWN | **19 native rows / 7,154 bytes** and **2,048 park rows / 36,864 bytes** drained to **0** while UNKNOWN remained; response JSON **1,245,245 → 4,193 bytes**, digest unchanged; copied dependency bytes **1,387,488 → 0**. |
+| Readers / gates / failures | All **2,091** events identical at limits **1, 7, 100, 400**; **9** pins retained then released; history fallback verified through **2,365**; overlap, corruption, coverage, durability and missing-object checks passed with the same named errors as above. |
+| Per-state native payload | Connected **843**, dormant **837**, stopped **837**, dead **828 bytes** each became **0**; quarantine kept **5 rows / 849 bytes**. |
+| Replay / dependencies / publication | Call **70001** replayed identically with **0** repeated effects; **8** parity decisions, ordinary/project seals and UNKNOWN restoration passed; **1,000** operations used **9,601** references in **0.001910 s**. The newer record won **1** revision conflict at revision **2**. |
+| Oversized work / responsiveness | **17,825,843-byte** native and **20,971,584-byte** response remained exact, **0.644148 s**; loop maximum **0.151837 s**, retention transaction maximum **0.012353 s**, asynchronous batch maximum **0.112139 s**. |
+| WAL / continued work | **16 × 8 MiB** foreground writes pinned **134,774,784 bytes** and paused compaction; ordinary commits after reader release reduced pending bytes to **0** and resumed it. Allocated WAL peak **136,446,192 bytes**. Three new native cycles reached **0 hot rows** in **0.837317, 0.616250, 0.822207 s**. |
+| Compatibility / final census | **152** older-hook calls, all coordinated, **0** unavailable/nonzero exits, maximum **0.291980 s**. Plain start migrations **1–3**; installed 2.4.25 refused migrated state with exit **3**, `SCHEMA_VERSION`. Final eligible bytes **0**, queued subjects **0**, retention errors **0**; the intentionally unverifiable receipt kept **1 row / 278 bytes**. |
+
+The crash matrix exited **0** in **47.3 s**. All **16** before/after stages
+(compression, file flush, publication, verification, manifest commit and three
+delete batches) recovered **130** identical rows, **0** hot rows and summary
+count **130**, without duplication. The batches remained **64 / 64 / 2**;
+final generation **17**, maximum recovery transaction **0.001317 s**. Both
+final matrices stopped gracefully, saved JSON and deleted their states.
+
+The lead's separate `scratchpad/r2426/lead/first_open.py` measurement is the
+relevant startup cost for the live page layout. Its read-only online backup
+preserved **4,136,762 pages** and their ordering, taking **25.221 s**. First
+Store open then took **36.557 s wall / 2.962 s CPU** for the five new partial
+record indexes, each requiring a full table scan. A `NOT INDEXED` listener scan
+alone took **6.364 s wall / 0.518 s CPU**. Migrations stayed **1, 2, 3**; second
+open took **0.003 s**, and the copy was deleted. The earlier **0.562952 s**
+first-open number above was on a compact VACUUM clone warmed by the census,
+not this layout. The lead estimates the first live 2.4.26 answer at about
+**68 s**, roughly **37 s later** than 2.4.25's **31 s**, with lead hooks waiting
+about **11 s** behind the upgrade lock (`HOOK_SECONDS=14`, `CALL_SECONDS=3`).
+This is a one-time first-start cost; no index design or live upgrade was changed
+or rerun for this follow-up.
+
+```sh
+python3.15 -I -B "$W/static_checks2426.py" "$W/turn132-static-final"
+```
+
+Static checks exited **0**, **19 PASS**, **0 stderr bytes**: **86** Python 3.15
+files and **14** Python 3.9 imports compiled; hooks reported compatible
+`jsonl-v1`; all three shell syntax checks, executable mode and strict plugin /
+marketplace validation passed. Ruff stayed at **35 baseline / 35 candidate,
+0 added findings**. All **17** changed files passed whitespace/newline checks;
+version remained **2.4.26**; all **7** existing writer-capacity setting checks
+had their expected exit codes. Final read-only `git diff --check` exited **0**.
+
+`W/turn132-cleanup.json` records **12** deleted disposable coordinator states,
+**0** remaining states or active owned processes, unchanged Git metadata for
+fixtures **75–86**, and a minimum recorded **307,099,463,680 free bytes** (about
+**286 GiB**, above the **15 GiB** reserve). Result JSON preceded each state
+deletion. Repos **87–90** were unused by this follow-up. Final **62-file**
+coordinator fingerprint is
+`21145a5f5f60bb1a22723ad494d39901fd42f206735719e34b511b12cc24a78d`,
+recorded in `W/turn132-source.json`. All edits remain uncommitted; no repository
+tests were added. This follow-up changed only `retention.py`, this evidence and
+the changelog; README semantics, plugin version and reclamation scope stayed
+unchanged. The earlier power-loss, alternate-SQLite and lifetime-soak proof
+limits still apply; the live coordinator was neither modified nor upgraded.
