@@ -327,7 +327,7 @@ class Daemon:
     def status(self, checkout=None, brief=False):
         """The daemon's identity and readiness; unless brief, every run's writers too. A client checking
         readiness asks for brief: the full answer decodes each run's claims and custody."""
-        from .recovery import recovering_counts, startup_counts
+        from .recovery import recovering_counts, startup_counts, retry_claim
         from .lead_calls import legacy_status
         cached = self.writer_status.get(checkout)
         epoch = self.store.status_epoch
@@ -343,7 +343,11 @@ class Daemon:
                                       required=False) or {}
             writers.append({"run": run["id"], "unit": unit["id"], "task": run["task"], "state": self.runs.reported(run)[0],
                             "capabilities": listener.get("capabilities"),
-                            "listener": {k: listener.get(k) for k in ("state", "dormant_at", "dormant_reason", "history_gaps", "writer_profile")},
+                            "listener": {**{k: listener.get(k) for k in ("state", "dormant_at", "dormant_reason", "history_gaps", "writer_profile",
+                                "recovery_state", "recovery_error", "recovery_retryable", "recovery_version")},
+                                "quarantined": listener.get("recovery_state") == "failed",
+                                "retirement": self.parking.intent(listener.get("id", "")),
+                                "retry_claim": retry_claim(self.store, listener) if listener.get("run") else None},
                             **({"capability_fallback": listener["capability_fallback"]} if listener.get("capability_fallback") else {}),
                             "actors": [a for a in self.store.all("actor", unit["id"])],
                             "claims": self.custody.claims(run["checkout"], unit["id"]),
@@ -1042,8 +1046,9 @@ class Daemon:
         connection = self.connections.get(ident)
         return ident in self.retiring_listeners or bool(connection and connection.retiring)
 
-    def native_unapplied(self, ident):
-        self.flush_native_progress()
+    def native_unapplied(self, ident, *, flush=True):
+        if flush:
+            self.flush_native_progress()
         applied = self.store.get("native_applied:" + ident, required=False) or {}
         return self.store.db.execute("SELECT 1 FROM events WHERE kind='native' AND subject=? AND seq>? LIMIT 1",
                                      (ident, applied.get("sequence", 0))).fetchone() is not None
@@ -1530,9 +1535,13 @@ class Daemon:
         if listener["state"] == "dormant" or listener["state"] == "stopped" and listener.get("allocation_cleaned"):
             return
         began_stop = time.monotonic()
+        detached_already = (listener["state"] == "stopping" and listener["id"] not in self.connections
+                            and listener["id"] not in self.workers and not self.listener_requests.get(listener["id"])
+                            and not self.native_unapplied(listener["id"], flush=False))
         listener["state"] = "stopping"
         self.store.save(listener)
-        await self.detach_listener(listener["id"])
+        if not detached_already:
+            await self.detach_listener(listener["id"])
         detached = time.monotonic()
         kill = kill or bool(listener.get("wedged"))
         if listener.get("owner_sequence"):
@@ -1576,15 +1585,15 @@ class Daemon:
                                    {"listener": listener["id"], "state": listener["state"], "retryable": True}, True)
         return connection
 
-    async def discover_descendants(self, listener):
-        connection = self.listener_connection(listener)
+    async def discover_descendants(self, listener, connection=None):
+        connection = connection or self.listener_connection(listener)
         async for page in native.page(connection, "thread/loaded/list", {}):
             for entry in page["data"]:
-                await self.resolve_actor(listener, entry if isinstance(entry, str) else entry["id"])
+                await self.resolve_actor(listener, entry if isinstance(entry, str) else entry["id"], connection=connection)
         for archived in (False, True):
             async for page in native.page(connection, "thread/list", {"ancestorThreadId": listener["root_thread"], "archived": archived}):
                 for entry in page["data"]:
-                    await self.resolve_actor(listener, entry["id"])
+                    await self.resolve_actor(listener, entry["id"], connection=connection)
 
     async def resolve_actor_locked(self, listener, thread, session=None, connection=None):
         for actor in self.store.all("actor", listener["unit"]):
@@ -2657,7 +2666,10 @@ class Daemon:
                      operation["kind"] == "command" and operation.get("result_ready") and not operation.get("returned"))
             if resolve_quarantine and not reservation["processes"] and not own_terminals and not ended:
                 metadata = await connection.call("thread/read", {"threadId": actor["thread"], "includeTurns": False})
-                if metadata["thread"].get("status", {}).get("type") in ("idle", "notLoaded") and not actor.get("active_turn"):
+                reason = native.quiet_status(metadata["thread"].get("status"))
+                if reason and reason != "native_active_turn":
+                    raise CoordinatorError("NATIVE_STATUS_UNKNOWN", reason, {"actor": actor["id"]})
+                if reason is None and not actor.get("active_turn"):
                     operation["completed_item"] = {"exitCode": None, "observedGone": True, "missingNativeCompletion": True}
                     self.store.save(operation)
                     ended = True
@@ -3466,6 +3478,7 @@ class Daemon:
                             and self.store.get(reservation["id"])["state"] != "released"):
                         await settle_lead_command(self, reservation)
                 watch_answers(self)
+                self.parking.maintain()
                 # A writer whose reconcile failed holds its unit's work until it is reconciled again. Once its retry is
                 # due, it is retried here in either case:
                 # - a startup incident, which stays owed even for a finished run (only a retryable one; one that

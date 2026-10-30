@@ -3,6 +3,38 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.25] — 2026-10-30
+
+Two changes: reclaim quiet finished writers promptly, and stop permanently failed
+writers after inspection while retaining their quarantine.
+
+- One native thread-status classifier treats `systemError`, `idle` and `notLoaded`
+  as quiet everywhere quiescence is checked. Active and unfamiliar statuses keep
+  their own refusal reasons. Terminal runs still require a quiet unit and native
+  family; message-driven work is not interrupted merely because a run has ended.
+- Indexed maintenance finds current finished writers after startup and late
+  eligibility changes. Parking and retirement share a configurable concurrency
+  bound (default 2, measured at capacities 1, 2 and 4). Read-only readiness checks,
+  semantic refusal deduplication and per-listener backoff prevent blocked parks
+  from repeatedly saving records or emitting events. Demand preempts before the
+  first unsubscribe; afterward it joins verified family exit and cold start.
+  A family-reaping wait remains retryable for waking mail and workflows. An
+  unfinished verified park stays scheduled even after its physical stop, so a
+  transient cleanup failure heals without demand or a daemon restart.
+- A permanently failed writer is retired only after its bound live incarnation
+  passes local and native inspection plus an owner snapshot. Recovery errors,
+  retry classification, incidents, UNKNOWNs and history checkpoints survive the
+  physical stop. Release-attempt claims precede automatic launches; durable
+  pending/stopping/complete retirement states prevent crash-time replacement
+  from overtaking an authorized stop. Claim lookup retains a run's consumed
+  release attempt when startup reconstructs an incident for its listener-only
+  failure. Explicit resume remains available.
+
+`coordinator/VERIFY.md` records real installed-2.4.24 reds, build measurements,
+crash boundaries, failed probe attempts and remaining proof limits. No offline
+UNKNOWN reconciliation, Office release selection or historical-event compaction
+is included.
+
 ## [software-workflows 2.4.24] — 2026-10-30
 
 One change: an MCP server that a writer's thread starts after the writer's first command is now its app-server's

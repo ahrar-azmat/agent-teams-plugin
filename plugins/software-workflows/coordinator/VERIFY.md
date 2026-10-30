@@ -16157,3 +16157,374 @@ release only in `lineage()`'s check of a failed read (review turn 127); no read 
   children). Review turn 127 found that raising there ends the owner during a family's cleanup (`Owner.snapshot` from
   `begin_end`, called by the supervisor's shutdown and its worker-death handling with no handler), which does not
   retry a failed snapshot: that read is refused once the owner retries.
+
+## 2.4.25 — finished writers and quarantined families (2026-10-30)
+
+Two changes: prompt verified parking of finished, quiet writers, and inspection-proved retirement of permanently
+failed writers without clearing their quarantine. The implementation is in `native.py` (one runtime-status
+classifier), `parking.py` (selection, proof, demand fences, backoff and retirement), `recovery.py` (durable release
+attempts and restart joining), `store.py` (indexed candidates), and the existing demand, history and stop paths.
+
+### Reproduction and evidence
+
+These are real local coordinator supervisors, workers, owners and Codex **0.163.0** app-servers, using the loopback
+fixture provider and disposable state. No model service was charged. Red is the installed
+`~/.claude/plugins/cache/agent-teams/software-workflows/2.4.24`; green is this checkout's successive 2.4.25 candidates.
+The checkout's manifest stayed 2.4.24 throughout the initial executable probes. Release-retry cases inject a version through
+`coordinator.runtime.plugin_version`, as stated below; they do not edit a copied coordinator tree.
+
+Evidence root (`W` below):
+
+```text
+/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2425/writer
+```
+
+Each run directory was `W/<label>`. Results survive beside it as `<label>.out`, `.err`, `.result.json` where produced,
+and `.cleanup.json`; crash and campaign runs also preserve selected trace, listener and event evidence. The work
+directories were removed after their numbers and exit audit were saved. `fixture-runs.json` records the initial **40**
+one-use precommitted fixture repositories, `repo-01` through `repo-40`, plus the review runs below. No fixture was reused. There were at most
+three probe daemons at once. All 40 cleanup records show no live bound listener or owned daemon. The final campaign
+audit checked **27 red and 21 green PID/birth family identities**, all gone, and found no remaining owned process
+(`final-family-audit.json`). The user's live coordinator ledger was never modified by these probes.
+
+The scripts are scratch files, copied from the caller's probes and extended there: `life_probe.py`, `quar_probe.py`,
+`matrix_probe.py`, `crash_probe.py`, `campaign_probe.py`, `life_provider.py`, and import-time instrumentation in
+`inject/sitecustomize.py`. Run from the actual plugin directory, with a fresh work directory and an unused fixture:
+
+```sh
+PROBE_REPO=<unused-absolute-fixture-repository> python3.15 -I -B "$W/life_probe.py" "$PWD" "$W/<label>" <label> syserr 90
+PROBE_REPO=<unused-absolute-fixture-repository> python3.15 -I -B "$W/life_probe.py" "$PWD" "$W/<label>" <label> completed 90
+PROBE_REPO=<unused-absolute-fixture-repository> python3.15 -I -B "$W/quar_probe.py" "$PWD" "$W/<label>" <label> 60
+PROBE_REPO=<unused-absolute-fixture-repository> python3.15 -I -B "$W/matrix_probe.py" "$PWD" "$W/<label>" <label> <scenario>
+PROBE_REPO=<unused-absolute-fixture-repository> python3.15 -I -B "$W/crash_probe.py" "$PWD" "$W/<label>" <label> <scenario>
+PROBE_REPO=<unused-absolute-fixture-repository> python3.15 -I -B "$W/campaign_probe.py" "$PWD" "$W/<label>" <label> campaign
+```
+
+The principal completed red/green pairs below exited **0**, except the first three green life/quarantine launches:
+their execution handles were lost in the serving coordinator switch, so their exit codes are unavailable. Their
+complete result output, graceful-stop results and later process audits remain. Later cold, demand, crash and campaign
+greens have recorded exit 0. Both final campaigns finished without a phase error and stopped gracefully, in
+**647.916 s red / 411.255 s green**. An exit 0 means the probe collected its observations; the observations below,
+not the exit code alone, establish the property.
+
+### P1 — systemError is quiet; unknown status is not activity
+
+`red-syserr-01` / `green-syserr-01` used fixtures **01 / 04**. The provider's real HTTP 500 produced a failed turn
+and native `systemError`. Red failed at about **29.7 s** (native event **29.42 s**), remained alive for the following
+**90 s**, and recorded **18 after-fence native_active_turn refusals, 36 park events, zero successful parks**. Seal
+refused `ACTIVE_TURN`. Green became dormant at **29.86 s**, about **0.66 s after completion**, with `dormant_proof`
+and durable family exit; its successful park took about **0.12 s**. Seal reached `UNIT_EMPTY` because that fixture
+had made no edit, rather than refusing the thread's status.
+
+The full edit/seal/reopen/cold-turn pair is `red-cold-02` / `green-cold-02`, fixtures **11 / 18**. Native made a real
+fixture edit before the provider failed. Red stayed alive after **65 s** and seal/resume returned `ACTIVE_TURN`
+(CLI exit **2**). Green parked, sealed and reopened; resume joined the existing `WRITER_START_PENDING` demand,
+then completed an actual new turn. Seal, reopen and the joined resume returned CLI **0**; cold resume plus joining
+took **54.519 s**. Its first stop request met `NOT_QUIESCENT` during background parking; the probe's own state-scoped
+SIGTERM and later PID/birth audit confirmed exit.
+
+`red-blocker-02` / `green-blocker-01` (fixtures **10 / 14**) supplied an unknown `futureStatus` through import-time
+`thread/read` instrumentation on the real daemon. Red called it `native_active_turn`; green reported
+`native_status_unknown:futureStatus`. The final campaign also exercised a missing status after the fence. The
+classifier is shared by parking, publishing, cancellation/input reconciliation, history settlement and quarantine
+resolution; turn statuses such as `inProgress` remain a separate protocol concept.
+
+### P2 — prompt reclamation and measured capacity
+
+`red-completed-01` / `green-completed-01`, fixtures **02 / 05**: red completed at about **29.2 s**, stayed connected
+and alive **90 s** later, and attempted no park. Green parked about **0.83 s** after completion, with proof and family
+exit. P1 supplies the failed-run pair.
+
+The final campaign pair, `red-campaign-01` / `green-campaign-01`, fixtures **39 / 40**, exercised real eligibility
+changes. Every green entry below ended dormant with `dormant_proof` and `family_gone`:
+
+| Eligibility change | Red 2.4.24 | Green candidate |
+| --- | --- | --- |
+| Finished before daemon restart | Still connected, no proof after 65.02–65.05 s | Parked 0.231 s after ready |
+| Background command custody released late | Still connected, no proof after 65.02–65.05 s | 0.145 s after the recorded custody release (11.144 s after the turn, because the command still ran) |
+| Waking mail consumed and acknowledged | Still connected, no proof after 65.02–65.05 s | 0.930 s after settlement |
+| Cancellation settled | Already dormant after the old path unloaded it | 0.463 s after settlement |
+| Real Abraham workflow, analysis then implementation | Both phases completed; still connected without proof after 65.02–65.05 s | Both phases completed successfully; parked 0.555 s after completion |
+
+The active native thread in the guard campaign remained alive even though its run was terminal. Startup scope,
+reconciliation, demand, custody, delivery and native application remain independent eligibility guards; terminal
+run state alone is not a stop proof. Candidates use the existing `live_listener` / `failed_listener` indexes and
+primary-key run/actor joins. The analysis-phase read-only live-ledger observation selected five terminal candidates
+in **0.000939 s**, without decoding historical listener JSON.
+
+Four real writers were parked with each configured capacity:
+
+| Run / fixture | Capacity / observed maximum active | Total elapsed | Individual successful parks | Maximum interval of a 50 ms event-loop sampler |
+| --- | --- | --- | --- | --- |
+| `green-capacity-1` / 23 | 1 / 1 | 0.567712 s | 0.135851–0.139547 s | 0.052207 s |
+| `green-capacity-2` / 26 | 2 / 2 | 0.405620 s | 0.156598–0.167237 s | 0.051832 s |
+| `green-capacity-4` / 29 | 4 / 4 | 0.357288 s | 0.228035–0.254159 s | 0.051164 s |
+
+Capacity 4 also had one **0.000316 s** local refusal. Capacity 1 preceded the added read-only descendant inventory
+and partial-history-observation bookkeeping; the 2/4 measurements include those changes, so this is a calibration,
+not a controlled throughput benchmark. **Default 2** keeps most of the observed throughput gain while limiting
+concurrent native history responses. Its rationale is beside `DEFAULT_RECLAIM_CONCURRENCY`. The positive-integer
+setting has both environment forms; status reports capacity, active work and queued work. Queueing does not discard
+excess candidates or create a waiting task for every candidate.
+
+### P3 — no writes for a standing blocker; retry without a notification
+
+`red-blocker-02` made ten attempts roughly **0.051–0.052 s** apart under repeated requests. Each wrote **4 listener
+records and 2 events**. `green-blocker-01` made **10 attempts, each with zero record saves and zero events**.
+Consecutive intervals were **5.029, 10.027, 20.007, 20.006, 20.009, 20.006, 20.008, 20.007, 20.007 s**, with the
+configured **20 s** ceiling. Removing the injected blocker, without sending native activity, yielded a proved
+dormant writer **20.037 s** later.
+
+The final campaigns used a **5 s** retry ceiling. The after-fence missing-status green sequence had one initial
+native-application refusal with zero writes, then one raced refusal (**4 listener, 1 native_history, 2 native_turn
+saves; 3 events**), followed by **eight repeated attempts with zero saves/events**. The separate ten-attempt run
+above supplies the full steady-blocker count.
+
+| Campaign standing refusal | Red writes/events per attempt | Green writes/events per attempt |
+| --- | --- | --- |
+| Native RPC, native timeout, closed connection, resource refusal (three attempts each) | 4 listener saves / 2 events | 0 / 0 |
+| Persistence pending (three attempts) | 5 listener saves / 4 events | 0 / 0 |
+| Unsubscribe pending (three attempts) | 7, 6, 6 listener saves / 6 events each | First 7 / 6; next two 0 / 0 |
+| Family reaping | One attempt wrote 8 listener saves plus history saves / 14 events, then remained stopping | First 6 listener saves plus history saves / 7 events; next two 0 / 0 |
+
+After all transient injections were removed without another native notification, red remained `stopping` without
+proof after **25.034 s**; green became dormant with proof in **5.055 s**. These faults are import-time exceptions
+with the actual coordinator error codes, on real daemons; they are not claims of a physically full disk or a real
+network outage. The successful sequence still verifies history, unload, owner family exit, then dormancy. A partial
+unload retains the resume requirement and a verified stop suffix, so reaping can retry after native is detached.
+
+### P4 — demand before and after unsubscribe
+
+`red-demand-05` / `green-demand-02`, fixtures **24 / 25**, issued actual resume requests while an import-time gate
+held each park phase. Each timing includes a deliberate **0.3 s** gate release delay:
+
+| Phase at demand | Red resume seconds | Green resume seconds | Red unsubscribe / stop | Green unsubscribe / stop |
+| --- | --- | --- | --- | --- |
+| Before fence | 27.758 | 0.502 | 1 / 1 | 0 / 0 |
+| Fenced | 27.856 | 0.507 | 1 / 1 | 0 / 0 |
+| Preverify | 27.737 | 0.410 | 1 / 1 | 0 / 0 |
+| Unloading, before first dispatch | 27.805 | 0.515 | 1 / 1 | 0 / 0 |
+| After unsubscribe | 27.757 | 27.852 | 1 / 1 | 1 / 1 |
+
+The first four greens reused the same listener; the after-dispatch green completed one verified park and used one
+cold replacement. Every red replaced the listener. In the final campaign, a waking message took **34.978 s red /
+6.597 s green** (the fixture intentionally delayed its provider by 6 s). Red unsubscribed/stopped once; green did
+neither and consumed/acknowledged the message on the same listener. Cancel took **0.441 s red / 0.390 s green**;
+red unsubscribed/stopped once, green did neither, then parked promptly after cancellation settled. The real two-phase
+workflow above completed normally; advancement was not separately gated at every park phase.
+
+### P5–P7 — retire the physical family, retain the quarantine
+
+`red-quarantine-01` / `green-quarantine-01`, fixtures **03 / 06**, killed only the disposable daemon/server mid-turn
+and removed only its fixture rollout. Native itself then refused `thread/resume` with **NATIVE_RPC / -32600**.
+The pending startup incident was nonretryable and retained one unresolved checkout-wide UNKNOWN. Red kept its
+replacement alive after **60 s**, and did so again after the next-release automatic retry (`2.4.99`). Green stopped
+both failed replacements, with retirement completion taking about **0.059 / 0.056 s**, while retaining the incident
+and UNKNOWN. This is the composite red for the retirement properties: 2.4.24 has no retirement path.
+
+The final campaigns inspected the current bound, genuinely quarantined writer. A real native thread with
+`active` and **`activeFlags: []`** was retained, with **zero stop dispatches and zero owner end requests**. A real
+queued item (one queue entry) was also retained, but that thread was active, so this does not isolate the queue
+guard. Removing the daemon's connection mapping produced `no_connection` twice, one recorded semantic refusal,
+zero stop/end requests and a live family. A failed loaded-thread inventory (`NATIVE_RPC` injection) also retained
+the family without changing its classification. Clearing the guards yielded physical `stopped` in **3.072 s green**;
+red was still alive and quarantined after **65.042 s**.
+
+`green-retirement-03` (fixture **36**) captured **five** before/after retirement comparisons; **all five were equal**
+for the protected recovery fields, incident fields, UNKNOWN resolution state, history checkpoints and absence of
+dormant proof. The final campaign's retirement comparison was equal too. The exact recovery fields are
+`recovery_state`, `recovery_error`, `recovery_error_details`, `recovery_retryable`, `recovery_version`, `retry_at`,
+and `recovery_retries`. Incident state, error, retryable, version, unknowns and resolutions stay unchanged. The new
+retirement record carries the release, family snapshot, inspection facts and durable family-exit evidence; the
+listener's physical state changes to `stopped`, and status still reports it quarantined.
+
+### P8 — claim the release retry before any launch
+
+`red-retry-03` / `green-retry-03`, fixtures **30 / 31**, crashed real daemon workers around release retries, with
+bound-writer replacements counted separately from admission bootstrap servers. On red, there was no durable claim
+boundary; the binding crash was reached, produced **one** replacement, and left a `reconciling` classification
+through two restarts (connected, then stopped). Its later pre-failure boundary was unreachable because that baseline
+was already stranded. **A duplicate automatic retry was not observed**; the red is the absent claim and unrepaired
+classification, not an invented duplicate count.
+
+Green used releases **2.4.101, 2.4.102, 2.4.103**, respectively. Crashes immediately after claim, after replacement
+binding, and before failure stamping produced **0, 1, 1** bound replacements. Two restarts under each same release
+produced **no second automatic attempt**. Durable claims numbered **1, 2, 3** across the three releases. Protected
+quarantine comparisons remained equal. Explicit resume still reached the real `NATIVE_RPC` refusal; after restoring
+only the fixture rollout, explicit resume succeeded. The existing owner also reaps families when its worker dies,
+so these crashes did not leave a live stranded replacement after restart.
+
+### P9 — retirement restart protocol
+
+`red-retirement-02` / `green-retirement-03`, fixtures **32 / 36**, targeted four boundaries: pending proof, durable
+stopping before owner dispatch, after the retirement's actual owner dispatch, and durable family exit before
+completion. Red reached none: the mechanism is absent and the failed family remained alive. All four green
+boundaries were reached. Each next release made one bound replacement. After two restarts at each boundary,
+`pending` was discarded without another automatic retry; the other three finished `complete` before startup
+reconciliation could replace the listener. Classification/incident/UNKNOWN/history comparisons stayed equal.
+Explicit repeated refusal and restored-history success were both exercised. The common reconcile entry also joins
+authorized stops for demand; a separately gated concurrent resume-versus-stopping crash was not measured.
+
+### Scope and limits of the measurements
+
+- Independent positive blockers for an approval wait, user-input wait, a quiet queued thread, a surviving background
+  terminal, or a quarantined operation still executing were not produced by the final native fixture. The active
+  and queued observations above must not be read as separate proof of every guard. Native application catch-up
+  occurred in the campaigns, but was not isolated as a timed late-eligibility case.
+- The once-per-release claim survived the measured crashes. A live replacement surviving owner worker-death
+  cleanup, and demand joining an in-progress retirement at every crash boundary, remain unmeasured. No independent
+  stale-binding or PID-reuse fault was injected. Historical listener selection is checked by the binding join and
+  source inspection; that is not an empirical PID-reuse result.
+- Backoff doubling, ceiling, notification-free healing and shared request throttling were measured. Reset on real
+  activity, the positive retry ceiling with idle timer set to zero, and retry after every possible transport failure
+  were not independently timed. The final failed-demand eligibility refinement and status presentation received
+  source/static checks, rather than another dedicated daemon scenario.
+- The concurrency observations are local calibration on this 24 GB Mac, not a capacity guarantee for other native
+  histories or MCP profiles. Capacity 1 ran on the earlier candidate described above.
+- Several fixture revisions failed before establishing their intended observation: fixtures 07–09 lacked a running
+  event loop at import; 12, 13, 16, 17 had partial demand-gate/message setup; 15 did not join a still-running cold
+  start; 19–22 had overly broad crash targeting; 27–28 initially targeted the supervisor instead of its worker;
+  33–35 encountered an unrelated process command with unmatched shell quoting. Fixtures 37–38 did not hold native
+  queue/background work long enough; 38 correctly retired a quiet family and then its harness lost the connection.
+  These are preserved calibration failures, not product reds or successful guard proofs. The completed pairs named
+  above supersede them. All their owned families were audited and cleaned.
+- The inherited owner `processes.lineage()` failed-enumeration limitation recorded under 2.4.24 above remains. This
+  release does not claim a stronger process-enumeration proof. UNKNOWN reconciliation, Office release selection and
+  historical event compaction are unchanged and outside this release.
+
+### Native protocol facts used
+
+The pinned upstream **rust-v0.163.0** matches the executable used. The four runtime types are `notLoaded`, `idle`,
+`systemError`, `active`; active includes empty flags. `note_system_error` clears running and pending approval/input
+counters; active takes precedence over system error. See the [runtime implementation](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/app-server/src/thread_status.rs)
+and [thread protocol](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/app-server-protocol/src/protocol/v2/thread.rs).
+The unload delay is an integer with minimum **0**, default **1800**; this coordinator already passes **0**.
+Native unload requires non-active status and a non-running agent; its **10 s** shutdown warning does not establish
+exit. See the [schema](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/core/config.schema.json) and
+[lifecycle implementation](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/app-server/src/request_processors/thread_lifecycle.rs).
+Loaded-thread, terminal and queue inventories are exhausted through `nextCursor`; an empty page is not exhaustion
+while a cursor remains. Background-terminal inspection requires a loaded runtime and experimental capability;
+queue inspection can read stored threads. Missing/unsupported observations are refusals, not empty inventories.
+See [app-server documentation](https://developers.openai.com/codex/app-server), the
+[queue processor](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/app-server/src/request_processors/thread_queue_processor.rs),
+and [thread processor](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/app-server/src/request_processors/thread_processor.rs).
+
+### Release checks
+
+The release-check recipe is `W/static_checks2425.py`, adapted from 2.4.24's existing compatibility and packaging
+recipe. Git commands are prohibited for this implementation run, so the whitespace check directly reads the changed
+files instead of invoking `git diff --check`. Executable probes and their process audits finished before the manifest
+version changed. The final recipe exited **0**, with **19 PASS lines**, no failures and empty stderr
+(`static-final.out`, `static-final.err`):
+
+| Check | Actual result |
+| --- | --- |
+| In-memory Python 3.15 compilation | 84 plugin Python files; no syntax errors |
+| System Python 3.9.6 compilation | 14 hook-run files/imports; exit 0 |
+| `coordinator/hooks.py --check` | Exit 0; `{"compatible": true, "protocol": "jsonl-v1"}` |
+| Git-shim syntax under sh, bash --posix and zsh sh emulation | All three exit 0; executable mode retained |
+| Ruff F821,F822,F823,F811,F841,F401 against installed 2.4.24 | 35 existing findings in each tree; **zero added findings** |
+| `claude plugin validate --strict plugins/software-workflows` | Exit 0; `Validation passed` |
+| `claude plugin validate --strict .` | Exit 0; `Validation passed` |
+| Direct changed-file whitespace/newline check | All 14 files clean |
+| Manifest and README title | Both 2.4.25 |
+| Reclamation capacity 1, 2, 4 | Each parser process exits 0 with its configured capacity |
+| Reclamation capacity 0, -1, 1.5, invalid | Each parser process exits 1 with `CONFIG` / positive-integer diagnostic, as required |
+
+The validations used scratch `CLAUDE_CONFIG_DIR` directories. A separate **empty** `fresh-install-2425` configuration
+then ran `claude plugin marketplace add <checkout> --scope user --json` and
+`claude plugin install software-workflows@agent-teams --scope user --json`: **both exit 0**. Reading the installed
+cache manifest confirmed **2.4.25** (`fresh-install-result.json`). The install's message that six user options were
+not explicitly configured is informational; defaults remain in the manifest. No user's plugin configuration or
+running coordinator was changed by this isolated installation. No repository test files were added.
+
+### Review turn 129 — retry waits, reconstructed incidents, and stopped park cleanup
+
+The three MEDIUM findings were reproduced on the **pre-fix 2.4.25 working tree**, then rerun after the fixes.
+These are additional review reds, not the installed-2.4.24 baselines above. Source hashes are saved in
+`W/review-red-source.json` and `W/review-green-source.json`. The manifest stayed **2.4.25** throughout this review.
+All runs used actual daemons, supervisors, owners and native app-servers, with the loopback provider and a fresh
+fixture repository for each run. The targeted import-time instrumentation is described below; no product code
+was copied into a substitute tree and no repository test files were added.
+
+The command, from this checkout's plugin directory, was:
+
+```sh
+PROBE_REPO="$S/fixture-repos/repo-NN" python3.15 -I -B "$W/review_probe.py" \
+  "$PWD" "$W/<label>" <label> <scenario>
+```
+
+Here `S` is the parent of `W`, the `r2425` scratch directory. Each label below identifies its former work directory
+and the retained `.result.json`, `.out`, `.err`, `.trace.jsonl`, `.listeners.json` and `.cleanup.json` files beside it.
+The six accepted probe commands each exited **0**: the runner records the observed red or green rather than
+asserting that the unfixed product must pass.
+
+| Finding / scenario | Red before the fix | Green after the fix |
+| --- | --- | --- |
+| 1 — `family_wait` | `red-review-family-01`, **repo-44**: `FAMILY_REAPING` produced `retryable=false`, `start_held=true`. **90.197 s** after capacity cleared, demand still had **1** attempt, **0** replacements, and no message acknowledgement. | `green-review-family-01`, **repo-48**: `retryable=true`, `start_held=false`; demand retried **5.199 s** after failure. Attempt **2** completed, **1** replacement served the message, and it was acknowledged **33.598 s** after capacity cleared. Cold start itself took **27.073 s**. |
+| 2 — `claim_identity` | `red-review-claim-02`, **repo-47**: a listener-only failure, a crash after replacement binding, and two restarts produced **2** automatic replacements and **2** unresolved claims in release **2.4.25**: one run-keyed and one incident-keyed. | `green-review-claim-01`, **repo-49**: the same sequence reconstructed a pending incident but retained **1** claim and **1** automatic replacement. No second attempt appeared during **45 s** after the second restart; the saved failure version remained **2.4.24**. |
+| 3 — `stopped_park` | `red-review-stop-01`, **repo-46**: after one post-stop unlink failure, `kind=null`, no timer and no candidate. **16.046 s** after removing the fault, the listener was still physically stopped with `park_stop`, without a dormant proof. | `green-review-stop-01`, **repo-50**: `kind=park`, a timer and an indexed candidate remained. **4.935 s** after removing the fault, the listener was dormant with `family_gone` and `dormant_proof`, and no `park_stop`. **0** replacements or demand starts; no restart. |
+
+**Finding 1 — a capacity wait must remain retryable.** `recovery.retryable_failure()` now explicitly classifies
+`FAMILY_REAPING` as temporary. `Dormancy._start_locked()` therefore keeps its existing failed-but-retryable demand
+record and five-second initial retry deadline; `start_held()` does not permanently exclude waking mail or workflow
+starts for this release. The fix does not trust arbitrary exception detail flags or alter other error classes.
+
+The probe first made writer A's verified park reach the owner-stop suffix, then injected `FAMILY_REAPING` at owner
+`end`. Writer B was held at the preverify boundary and occupied the single configured reclamation slot. A real
+`message/send` with `wake="start"` exercised A's capacity refusal. After releasing B and removing the owner fault,
+new automatic park requests were suppressed to isolate demand's join path; message retry and cold start remained
+normal product behavior. The green's old listener retained durable family exit and dormant proof before replacement.
+This measures a controlled owner refusal, not a deliberately wedged kernel process. The waking-message path was
+executed; a separate workflow-start instance was not rerun for this review, though it uses the same classifier.
+
+**Finding 2 — the release claim belongs to the run despite incident reconstruction.** `recovery.retry_claim()` now
+looks for an unresolved claim by run and release, using the existing parent-indexed record lookup, before falling
+back to the current key. `claim_retry()` uses that same lookup. Scheduled retry policy and startup claim repair
+therefore find the original claim even when `retry_key()` would now name a reconstructed incident. Claim creation
+still precedes launch, and the incident's classification is not rewritten to enforce this policy.
+
+The native refusal was genuine: the probe unloaded its own quiet thread, removed only its disposable rollout,
+and called `thread/resume`, which returned `NATIVE_RPC`, method `thread/resume`, native code **-32600**. Import-time
+setup passed that exception through `reconcile_failed()` with classification version **2.4.24**, initially without
+an incident. Under the writer lock it stopped that fixture's old listener and set the fixture run to `running` to
+exercise replacement with owed work. The normal scheduled readmission path claimed release **2.4.25**. An import
+gate stopped the daemon after replacement binding, before failure stamping; the runner killed only the daemon
+and supervisor identified by that disposable state path. The first restart repaired the claim, and a second crash
+and restart let normal startup reconstruction create the incident. Neither claim nor incident was fabricated by
+the probe. This extends `green-retry-03`, whose original failure already had an incident.
+
+`red-review-claim-01` used **repo-45** and exited **1** because its initial setup kept the old connection alive:
+recovery retried in place, so the binding-crash gate was never reached within **120 s**. It is a discarded calibration,
+not a product red. The corrected replacement setup used fresh repo-47 and the identical setup was used for green.
+
+**Finding 3 — physical stop does not finish a verified park.** `Parking.kind()`, `schedule()` and `maintain()` now
+keep a listener with `park_stop` eligible until its remaining verified cleanup commits dormancy, regardless of its
+physical stopped state. `Store.reclaim_listeners()` includes a `pending_park` partial-index arm, retaining the current
+root-binding check. The new arm's measured plan was `SCAN records USING INDEX pending_park`, then primary-key
+lookups of the run and root actor (`W/review-pending-park-plan.json`). Historical stopped listeners without a pending
+park do not enter this arm. Existing history verification and family-exit requirements remain in `finish_park()`.
+
+Import-time `Path.unlink` instrumentation failed **once**, only for the selected listener's native log after
+`_stop_listener()` had durably saved `state="stopped"`, with `park_stop` still present. Both versions had durable
+`family_gone` at that boundary. The fault then cleared; the green completed through its ordinary retry timer without
+demand, restart or replacement. This directly exercises post-stop log cleanup; a separate event-write failure was
+not injected in this review.
+
+All seven allocated work directories, including the discarded repo-45 calibration, were removed after evidence
+capture and cleanup checks. The final recursive PID/birth audit covered **12** recorded identities across the three
+accepted reds and **13** across the greens, with **0** survivors and **0** probe daemons (`W/review129-family-audit.json`).
+The waking green's graceful `daemon/stop` returned **2 / NOT_QUIESCENT** for two pending history obligations, so its
+cleanup used the required state-path-scoped **SIGTERM**; the probe process itself exited **0**. The other five
+accepted probes' graceful stop commands exited **0**. No user's live coordinator state was changed.
+
+The existing `static_checks2425.py` recipe was rerun on the fixed source: **exit 0, 19 PASS lines**, empty stderr
+(`W/static-review129.out`, `.err`). This includes Python **3.15** compilation of **84** files, Python **3.9.6** compilation
+of **14** hook-run files, hooks `--check`, all three shell syntax checks, **zero added** Ruff findings against installed
+2.4.24 (**35** existing findings in each tree), both strict plugin validations, release/title checks and all capacity
+configuration checks. The remaining proof limitations in the original P1–P9 evidence above still apply.
+
+A new empty `W/fresh-install-review129` configuration also ran local marketplace addition and plugin installation:
+**both exit 0**. Its installed manifest is **2.4.25**, and SHA-256 comparison confirmed that installed `recovery.py`,
+`parking.py` and `store.py` exactly match the fixed checkout (`W/fresh-install-review129-result.json`). This installation
+used only scratch configuration; the manifest was not bumped again and no Git command was run.

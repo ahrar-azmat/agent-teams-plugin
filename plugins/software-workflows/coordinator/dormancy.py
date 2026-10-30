@@ -11,13 +11,16 @@ from . import native, participants, processes
 
 
 def view(listener):
-    return {key: listener.get(key) for key in ("state", "dormant_at", "dormant_reason", "history_gaps", "writer_profile")}
+    return {**{key: listener.get(key) for key in ("state", "dormant_at", "dormant_reason", "history_gaps", "writer_profile",
+                                                "recovery_state", "recovery_error", "recovery_retryable", "recovery_version")},
+            "quarantined": listener.get("recovery_state") == "failed"}
 
 
 class Dormancy:
     def __init__(self, daemon):
         self.daemon, self.store = daemon, daemon.store
         self.tasks = {}
+        self.entering = {}
         self.cold = []
         self.counts = None  # (the record writes it was read at, the counts): status()
 
@@ -77,7 +80,7 @@ class Dormancy:
                 and bool(run.get("workflow") or run.get("task") or run.get("production_started") or run.get("phases"))
                 and not startup_obligation(self.store, run["id"]) and (parking or not self.daemon.writer_owed(listener["unit"])))
 
-    async def received(self, listener, actors):
+    async def received(self, listener, actors, *, record=True, check=None):
         """One streamed journal pass per incarnation, indexed by completed item.
 
         Keep identities and digests, not native payloads. Each page releases its
@@ -112,14 +115,19 @@ class Dormancy:
                         wanted[ident] = value
                     costs[thread]["bytes"] += len(row["data"].encode())
                     index_bytes += len(thread) + len(turn) + len(ident) + 64 + 8
+                if check:
+                    check()
                 await asyncio.sleep(0)
+                if check:
+                    check()
             incarnation = self.store.get(incarnation["replaces"]) if incarnation.get("replaces") else None
-        self.store.event("history/received_indexed", listener["id"],
+        if record:
+            self.store.event("history/received_indexed", listener["id"],
                          {"passes": passes, "rows": rows_seen, "threads": len(after), "through": end,
                           "identity_digest_bytes": index_bytes, "seconds": round(time.monotonic() - began, 6)})
         return receipts, costs
 
-    async def compare(self, actor, connection, expected, cost, *, pending=False):
+    async def compare(self, actor, connection, expected, cost, *, pending=False, record=True):
         """Compare the grouped receipt suffix with saved items, never a loaded thread."""
         began = time.monotonic()
         for turn, wanted in expected.items():
@@ -152,13 +160,14 @@ class Dormancy:
                 gap = {"code": "HISTORY_GAP", "thread": actor["thread"], "turn": turn, "item": ident,
                        "sequence": sequence, "received": received, "saved": seen.get(ident), "run": actor["run"]}
                 key = "history_gap:" + actor["id"] + ":" + digest([turn, ident, received])
-                if not self.store.get(key, required=False):
+                if record and not self.store.get(key, required=False):
                     with self.store.transaction():
                         self.store.put("history_gap", key, gap, actor["run"])
                         self.store.event("history/gap", actor["run"], gap)
                 cost["gaps"].append(key)
         cost["seconds"] = round(time.monotonic() - began, 6)
-        self.store.event("history/received_compared", actor["id"], cost)
+        if record:
+            self.store.event("history/received_compared", actor["id"], cost)
         return cost
 
     async def recover(self, listener):
@@ -236,6 +245,17 @@ class Dormancy:
         daemon.retention.request(listener["id"])
 
     async def start(self, runid, reason):
+        # Register before waiting for a park: until its first unsubscribe it
+        # must yield to this demand. Cancellation removes only this caller.
+        self.entering[runid] = self.entering.get(runid, 0) + 1
+        try:
+            return await self._requested_start(runid, reason)
+        finally:
+            self.entering[runid] -= 1
+            if not self.entering[runid]:
+                del self.entering[runid]
+
+    async def _requested_start(self, runid, reason):
         """Persist intent before launch. All callers join the same task and RPC bound."""
         from .recovery import RECOVERY_WAIT_S
         daemon, store = self.daemon, self.store
@@ -277,7 +297,7 @@ class Dormancy:
         store.put("writer_start", record["id"], {k: v for k, v in record.items() if not k.startswith("_") and k != "id"}, runid)
         if task is None:
             store.event("writer/demand", runid, {"reason": reason, "demand": record["id"]})
-            task = daemon.background(self._start(runid, listener, generation, resume_cancelled))
+            task = daemon.background(self._start(runid, listener, generation, resume_cancelled, reason == "resume"))
             self.tasks[runid] = task
             task.add_done_callback(lambda done: self.tasks.pop(runid, None))
         try:
@@ -286,11 +306,11 @@ class Dormancy:
             raise CoordinatorError("WRITER_START_PENDING", "Writer start is still owned; retry to join it",
                                    {"retryable": True, "run": runid}, True) from exc
 
-    async def _start(self, runid, original, generation, resume_cancelled):
+    async def _start(self, runid, original, generation, resume_cancelled, explicit=False):
         async with self.daemon.parking.locks.hold(runid):
-            return await self._start_locked(runid, original, generation, resume_cancelled)
+            return await self._start_locked(runid, original, generation, resume_cancelled, explicit)
 
-    async def _start_locked(self, runid, original, generation, resume_cancelled):
+    async def _start_locked(self, runid, original, generation, resume_cancelled, explicit=False):
         from .recovery import reconcile_listener, ensure_running
         daemon, store = self.daemon, self.store
         record = self.demand(runid)
@@ -305,7 +325,7 @@ class Dormancy:
                 raise CoordinatorError("RUN_CANCELLED", "The run was cancelled before its demand start")
             if store.get(run["unit"])["state"] != "open":
                 raise CoordinatorError("UNIT_FROZEN", "The unit closed before its demand start")
-            await reconcile_listener(daemon, original, advance=False, demand=True)
+            await reconcile_listener(daemon, original, advance=False, demand=True, scheduled=not explicit)
             run = store.get(runid)
             if run.get("cancel_generation", 0) != generation:
                 raise CoordinatorError("RUN_CANCELLED", "The run was cancelled during its demand start")

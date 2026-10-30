@@ -376,12 +376,15 @@ class History:
             raise CoordinatorError("HISTORY_ANCHOR", "Native history changed at the ordered status fence")
         current = self.store.get(actor["id"])
         last = summary.get("last_turn", {})
+        status_reason = native.quiet_status(after.get("status"))
+        if self.readers.get(actor["id"]) is not connection and status_reason and status_reason != "native_active_turn":
+            raise CoordinatorError("NATIVE_STATUS_UNKNOWN", status_reason, {"actor": actor["id"]})
         if self.readers.get(actor["id"]) is connection:
             # A saved inProgress turn is evidence of interruption, not a live turn
             # on this unloaded reader. Cancellation must not wait for it forever.
             current.update(active_turn=None, state="interrupted" if last.get("status") == "inProgress"
                            else last.get("status", "idle"))
-        elif after.get("status", {}).get("type") == "idle":
+        elif status_reason is None:
             current.update(active_turn=None, state=last.get("status", "idle"))
         elif last.get("status") == "inProgress" and (not current.get("active_turn") or current["active_turn"] in covered):
             current.update(active_turn=last["id"], state="running")

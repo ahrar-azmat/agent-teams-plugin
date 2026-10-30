@@ -141,19 +141,34 @@ async def reconcile_listener(daemon, listener, advance=True, *, demand=False, sc
         return await finish(_registered_reconcile(daemon, listener, advance, invocation, demand, scheduled))
     finally:
         daemon.listener_reconciles.pop(token, None)
+        run = daemon.store.get(listener["run"])
+        current = daemon.store.get(daemon.store.get(run["root_actor"]).get("listener"), required=False)
+        if current and permanently_failed(daemon, current):
+            # The invocation and reconcile lock have ended. Retirement takes
+            # writer -> parking -> reconcile, never the reverse order here.
+            daemon.parking.request(current["id"])
 
 
 async def _registered_reconcile(daemon, listener, advance, invocation, demand, scheduled):
     store = daemon.store
     async with daemon.reconcile_locks.hold(listener["run"]):
-        listener = store.get(listener["id"])
-        bound = store.get(listener["actor"]).get("listener")
-        if listener.get("root_thread") and listener["state"] in ("dead", "stopped", "dormant") and bound and bound != listener["id"]:
-            listener = store.get(bound)
-        if scheduled and listener.get("recovery_state") == "failed" and not retry_due(daemon, listener):
+        run = store.get(listener["run"])
+        bound = store.get(run["root_actor"]).get("listener")
+        listener = store.get(bound or listener["id"])
+        repair_retry_claim(daemon, listener)
+        await daemon.parking.join_retirements(run["id"])
+        await daemon.parking.join_park(listener["id"])
+        listener = store.get(bound or listener["id"])
+        if scheduled and (permanently_failed(daemon, listener) or
+                          listener.get("recovery_state") == "failed" and not retry_due(daemon, listener)):
             # Decided here, under the run's lock, on the incarnation current by then: a pass queued behind one that
             # failed (a cancel's behind maintenance's) ran too, even after a failure that cannot heal.
+            if demand:
+                raise CoordinatorError("WRITER_START_FAILED", "Automatic recovery is held until its retry is due",
+                                       {"retryable": not permanently_failed(daemon, listener), "run": run["id"]}, True)
             return
+        if scheduled and permanent_classification(store, listener)[0]:
+            claim_retry(daemon, listener)
         if listener["state"] == "dormant" and not demand:
             if not listener.get("dormant_proof"):
                 async with capacity(daemon):
@@ -161,6 +176,7 @@ async def _registered_reconcile(daemon, listener, advance, invocation, demand, s
             return
         invocation["listener"] = listener["id"]
         invocation["phase"] = "queued"
+        claim = retry_claim(store, listener)
         async with capacity(daemon):
             invocation["phase"] = "active"
             try:
@@ -173,6 +189,10 @@ async def _registered_reconcile(daemon, listener, advance, invocation, demand, s
                 if startup_obligation(store, listener["run"]):
                     quarantine_failed(daemon, listener, exc)
                 raise
+            else:
+                if claim:
+                    claim.update(state="resolved", completed=time.time())
+                    store.save(claim)
     # Outside the reconcile lock: advancement may need another reconcile. Unproven inputs are never resent.
     ensure_running(daemon)
     run = store.get(listener["run"])
@@ -413,7 +433,7 @@ def retryable_failure(info):
     if code in {"RESOURCE_PAUSED", "RESOURCE_EXHAUSTED", "NATIVE_INTAKE_STOPPED", "NATIVE_JOURNAL_FAILED", "WRITER_HISTORY_READ_FAILED", "WRITER_START_FAILED", "WRITER_START_PENDING", "NATIVE_UNCERTAIN", "NATIVE_DISCONNECTED", "LISTENER_SILENT", "TimeoutError", "HISTORY_CHANGED", "HISTORY_APPLY_PENDING",
                 "ConnectionError", "ConnectionResetError", "ConnectionRefusedError", "BrokenPipeError", "EOFError",
                 "EXCLUSIVE_WRITER", "CUSTODIAN_LOST", "LEASE_UNCERTAIN", "PROBE_TIMEOUT",
-                "RESTORE_CUSTODY", "RESTORE_EXECUTING", "UNSTABLE_SNAPSHOT", "RECOVERY_BUSY", "REPLACEMENT_UNBOUND"}:
+                "RESTORE_CUSTODY", "RESTORE_EXECUTING", "UNSTABLE_SNAPSHOT", "RECOVERY_BUSY", "FAMILY_REAPING", "REPLACEMENT_UNBOUND"}:
         return True
     if code in ("LISTENER_START", "PROBE_LISTENER"):
         # No exit yet is a socket-start timeout; a signal can reflect resource pressure.
@@ -472,15 +492,75 @@ def permanently_failed(daemon, listener):
     """A writer whose reconcile failed with a failure that cannot heal, which this release has tried (retry_due): no
     schedule reconciles it again, only a resume or the next release. Startup recovery keeps it as it is (recover), and
     so does a transport gap."""
-    if listener.get("recovery_state") != "failed":
-        return False
-    incident = startup_obligation(daemon.store, listener["run"])
+    failed, version = permanent_classification(daemon.store, listener)
+    claim = retry_claim(daemon.store, listener)
+    return (bool(claim and claim["state"] != "resolved") or
+            failed and listener.get("recovery_state") == "failed" and version == plugin_version())
+
+
+RECOVERY_CLASSIFICATION = ("recovery_state", "recovery_error", "recovery_error_details", "recovery_retryable",
+                           "recovery_version", "retry_at", "recovery_retries")
+
+
+def permanent_classification(store, listener):
+    incident = startup_obligation(store, listener["run"])
     if incident:
         retryable, version = incident["retryable"], incident.get("version")
     else:
         retryable = listener.get("recovery_retryable", listener["state"] != "quarantined")
         version = listener.get("recovery_version")
-    return not retryable and version == plugin_version()
+    return not retryable, version
+
+
+def retry_key(store, listener):
+    incident = startup_obligation(store, listener["run"])
+    return "writer_retry:" + (incident["id"] if incident else listener["run"]) + ":" + plugin_version()
+
+
+def retry_claim(store, listener):
+    # A listener-only failure may acquire an incident on a later restart. Its
+    # unresolved release claim still belongs to the run, whichever key saved it.
+    release = plugin_version()
+    for claim in store.all("writer_retry", listener["run"]):
+        if claim["release"] == release and claim["state"] != "resolved":
+            return claim
+    return store.get(retry_key(store, listener), required=False)
+
+
+def claim_retry(daemon, listener):
+    """Commit the release attempt before admission, including its bootstrap launches.
+
+    The run/release lookup survives listener replacement and incident reconstruction.
+    The sidecar preserves classification without changing the incident to claim it.
+    """
+    store = daemon.store
+    ident = retry_key(store, listener)
+    prior = retry_claim(store, listener)
+    if prior and prior["state"] != "resolved":
+        raise CoordinatorError("RECOVERY_ATTEMPT_CLAIMED", "This release already claimed its automatic recovery attempt",
+                               {"run": listener["run"], "claim": prior["id"]})
+    store.put("writer_retry", ident, {"state": "claimed", "run": listener["run"], "listener": listener["id"],
+        "release": plugin_version(), "generation": store.generation, "claimed": time.time(),
+        "classification": {k: listener[k] for k in RECOVERY_CLASSIFICATION if k in listener}}, listener["run"])
+
+
+def repair_retry_claim(daemon, listener):
+    """A crash after a claim cannot turn reconciling/initializing into an untried failure."""
+    store = daemon.store
+    claim = retry_claim(store, listener)
+    if (not claim or claim["state"] == "resolved" or claim["generation"] == store.generation
+            or listener.get("recovery_state") == "failed"):
+        return
+    current = store.get(store.get(store.get(listener["run"])["root_actor"])["listener"])
+    for key in RECOVERY_CLASSIFICATION:
+        if key in claim["classification"]:
+            current[key] = claim["classification"][key]
+        else:
+            current.pop(key, None)
+    current["recovery_state"] = "failed"
+    if current["state"] not in ("stopped", "stopping", "dead"):
+        current["state"] = "quarantined"
+    store.save(current)
 
 
 def startup_counts(store):
@@ -986,6 +1066,7 @@ async def _reconcile_listener(daemon, listener):
     listener = store.get(listener["id"])
     listener.update(recovery_state="reconciled", state="connected")
     listener.pop("park_resume_required", None)
+    listener.pop("park_observed", None)
     for key in ("recovery_error", "recovery_error_details", "recovery_retryable", "recovery_version", "recovery_retries", "retry_at"):
         listener.pop(key, None)
     initialized = listener.pop("initializing", None)
@@ -1085,12 +1166,29 @@ async def recover(daemon):
         attempt["daemon_generation"] = store.generation
         store.save(attempt)
     repair_startup_records(daemon)
+    # Retirement authorization is independent of recovery classification. Join
+    # authorized stops before startup can plan a replacement; pending proofs
+    # authorize no signal and are rejudged by reclamation.
+    retirement_runs = set()
+    for runid in {i["run"] for i in store.all("writer_retirement") if i["state"] in ("pending", "stopping")}:
+        try:
+            async with daemon.reconcile_locks.hold(runid):
+                await daemon.parking.join_retirements(runid)
+        except CoordinatorError as exc:
+            if exc.code != "FAMILY_REAPING":
+                raise
+            retirement_runs.add(runid)
+    for claim in store.all("writer_retry"):
+        if claim["release"] == plugin_version() and claim["state"] != "resolved":
+            run = store.get(claim["run"])
+            repair_retry_claim(daemon, store.get(store.get(run["root_actor"])["listener"]))
     defer_unbound(store)
     # All units regain coverage before any listener reconnects or input advances. A threadless bootstrap needs none: it
     # is stopped, never given work. A checkout whose lease is refused (a writer outside the coordinator took it while no
     # daemon ran) fails only its own writers' recovery: each reconcile takes its leases again before it reconnects, and
     # is quarantined with an UNKNOWN when refused. Every other checkout recovers.
     permanent = {i["run"] for i in store.all("startup_recovery") if i["state"] == "pending" and not i["retryable"]}
+    permanent.update(retirement_runs)
     # A writer whose reconcile failed keeps that failure until the one retry policy makes it due (retry_due): not marked
     # reconciling below, nor tried by this start. Maintenance tries it once it is due; one that cannot heal
     # (permanently_failed) waits for a resume or the next release. Through 2.4.15 every start tried each once more,
@@ -1285,7 +1383,7 @@ async def recover_writers(daemon, plan):
                     else:
                         await reconcile_listener(daemon, listener, advance=False, scheduled=True)
                 except Exception as exc:
-                    if getattr(exc, "code", "").startswith("WRITER_") or getattr(exc, "code", None) in ("UNIT_FROZEN", "RUN_CANCELLED"):
+                    if getattr(exc, "code", "").startswith("WRITER_") or getattr(exc, "code", None) in ("UNIT_FROZEN", "RUN_CANCELLED", "FAMILY_REAPING"):
                         store.event("writer/recovery_deferred", runid, {"code": exc.code})
                     else:
                         quarantine_failed(daemon, listener, exc)

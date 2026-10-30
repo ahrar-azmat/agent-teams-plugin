@@ -10,7 +10,7 @@ from .locks import KeyedLocks, finish_thread
 from .client import CoordinatorError
 from .store import WINDOW_ACTIVE, uid, digest
 from .writer import TERMINAL
-from . import processes, participants, rollout
+from . import processes, participants, rollout, native
 
 
 class Runs:
@@ -507,14 +507,17 @@ class Runs:
         """Keep ordered queue/status fences around paginated observation. Native pages
         are not ordered thread requests. A tail that changes during the scan counts as
         active/uncertain, never as evidence that an input is absent."""
-        from .native import page
+        from .native import page, quiet_status
         try:
             entries = {}
             if queue:
                 async for result in page(connection, "thread/queue/list", {"threadId": thread}):
                     entries.update({e.get("clientUserMessageId"): e["id"] for e in result["data"]})
             status = await connection.call("thread/read", {"threadId": thread, "includeTurns": False})
-            active = (status["thread"].get("status") or {}).get("type") == "active"
+            reason = quiet_status(status["thread"].get("status"))
+            if reason and reason != "native_active_turn":
+                raise CoordinatorError("NATIVE_STATUS_UNKNOWN", reason)
+            active = reason is not None
             actors = list(self.store.selected("SELECT * FROM records WHERE kind='actor' AND json_extract(data,'$.thread')=?", (thread,)))
             actor = actor or next((a for a in actors if self.daemon.connections.get(a.get("listener")) is connection), None)
             if actor is None:
@@ -523,7 +526,10 @@ class Runs:
             if turns or not active:
                 await self.daemon.history.observe(self.store.get(actor["listener"]), actor, connection)
                 read = await connection.call("thread/read", {"threadId": thread, "includeTurns": False})
-                active = active or (read["thread"].get("status") or {}).get("type") == "active"
+                reason = quiet_status(read["thread"].get("status"))
+                if reason and reason != "native_active_turn":
+                    raise CoordinatorError("NATIVE_STATUS_UNKNOWN", reason)
+                active = active or reason is not None
                 tail = await connection.call("thread/turns/list", {"threadId": thread, "itemsView": "notLoaded",
                                                                   "sortDirection": "desc", "limit": 1})
                 latest = tail["data"][0]["id"] if tail["data"] else None
@@ -865,7 +871,10 @@ class Runs:
                 if await self.thread_loaded(connection, actor["thread"]) is not False:
                     return False
                 continue  # only a loaded thread runs a turn
-            if (read["thread"].get("status") or {}).get("type") == "active":
+            reason = native.quiet_status(read["thread"].get("status"))
+            if reason and reason != "native_active_turn":
+                raise CoordinatorError("NATIVE_STATUS_UNKNOWN", reason, {"actor": actor["id"]})
+            if reason:
                 return False
         return True
 

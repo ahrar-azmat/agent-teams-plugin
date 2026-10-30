@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.24 / P1
+# Writer coordinator — software-workflows 2.4.25 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -1392,7 +1392,8 @@ continues. Waking mail requests the same shared start. Cancellation of a dormant
 run, status, list and log reads start no writer. The start notice says "started
 from dormancy", includes the runtime note and any history gap, and does not
 create UNKNOWN merely because the writer was dormant. Once started, a writer is
-eligible for parking again after its next idle interval.
+eligible for prompt parking when its run finishes, or after its next idle interval
+while its run remains unfinished.
 
 `daemon/status.dormancy` reports current dormant/running families, history gaps,
 persisted demand attempts, durable failure counters and this generation's cold-start
@@ -1409,31 +1410,62 @@ after a listener, actor, writer start or history gap was written (2.4.15: throug
 `writer_park_idle_seconds` defaults to 1800; its
 `SOFTWARE_WORKFLOWS_WRITER_PARK_IDLE_SECONDS` override takes precedence. The
 measured 388 live turn gaps had a median of 792 s, with 27% exceeding 1800 s.
-Zero disables parking. A malformed value disables it and reports
-`WRITER_PARK_SETTING` in status; it does not stop the daemon.
+Zero disables idle-timer parking. A malformed value disables that timer and reports
+`WRITER_PARK_SETTING` in status; it does not stop the daemon. Finished-writer
+reclamation and memory-pressure requests remain enabled.
+
+Finished runs (`completed`, `failed`, `interrupted`, `blocked`, `refused`,
+`cancelled`) with materialized work are reconsidered each maintenance pass through
+an indexed query of current root bindings. Quiet writers park promptly, including
+after startup recovery, custody, mail, cancellation or native application settles.
+A terminal run can still have a message-driven turn: the run state alone never
+authorizes parking. Recovery, readmission and an actual demand start exclude it.
+
+`writer_reclaim_concurrency` bounds shared park and quarantine-retirement work;
+the default is 2. `SOFTWARE_WORKFLOWS_WRITER_RECLAIM_CONCURRENCY` overrides
+`CLAUDE_PLUGIN_OPTION_WRITER_RECLAIM_CONCURRENCY`. A non-positive, fractional or
+malformed value refuses daemon startup with `CONFIG`. Additional candidates stay
+queued. The capacity-1/2/4 measurements and default derivation are in VERIFY.
 
 A park requires a connected, reconciled family with no active turn, prepared or
 queued input, owed workflow work, delivery or notice, native tool request,
 background terminal, unsettled operation, custody or lead hold. Last native
 activity resets the idle interval. One demand-driven timer schedules that
 family's pending park; no parking timer remains for a dormant family. Memory
-pressure asks for a park of every family it has seen active, at each launch;
-only a connected one is attempted, and one that left (stopped, dead, dormant,
-quarantined) is no longer asked. A park refused before its fence changes
-nothing and writes nothing: status counts it by reason. Through 2.4.12 each such
-refusal saved the listener record and logged `listener/park_abandoned`, about
-one per listener per launch.
+pressure uses the same candidate, concurrency and retry decision. Native status,
+loaded and descendant inventories, background terminals, queues, receipt readiness
+and the owner's inspection-only snapshot are checked before writing a fence.
+`idle`, `notLoaded` and `systemError` are quiet native statuses; `active` is busy
+with any flags, and a missing or unfamiliar type reports `native_status_unknown`
+with that type. Actor activity and all other local guards still apply.
+
+A standing blocker causes no repeated record saves or events. A race discovered
+after the fence records each semantic refusal once; subsequent attempts first
+recheck it read-only. Per-listener retries start after 5 seconds and double up to
+the idle setting (1800 seconds when the idle timer is disabled). Activity and
+success reset the backoff. Local eligibility changes are reconsidered each pass;
+memory-pressure requests cannot bypass a native blocker's deadline.
 
 Under the run's start/park and reconciliation locks, parking fences deliveries,
 compares saved items with received evidence, unsubscribes every loaded thread,
 confirms unload through loaded-thread inventory, compares saved items again,
 and only then asks the owner to end the family. Pre-verification missing a suffix
 reports `PERSISTENCE_PENDING` and retries later. A post-unload mismatch records a
-`HISTORY_GAP`; it never authorizes a successful park. Demand waits for the park
-outcome. A partial unload retains a durable resume requirement for recovery.
+`HISTORY_GAP`; it never authorizes a successful park. Waiting resume, waking mail,
+workflow advance and cancellation preempt the park before its first unsubscribe
+dispatch. Demand arriving after that boundary joins the verified park and cold
+starts afterward. A partial unload retains a durable resume requirement for
+recovery, including when an unsubscribe response is lost. A verified stop suffix
+is durable, so a reaping retry does not repeat history observation or detach events.
+An unfinished suffix remains an indexed reclamation candidate after physical
+`stopped`, until dormancy is committed. A demand waiting for reclamation capacity
+or family cleanup reports retryable `FAMILY_REAPING`; its ordinary start backoff
+keeps waking mail and workflow work eligible to retry in the same release.
 `FAMILY_GONE` precedes the dormant transition and advancement of
 `received_verified`. Status includes attempts, completions, abandonment reasons,
-persistence-pending count, parking p50/max and cold-start p50/max.
+persistence-pending count, parking p50/max and cold-start p50/max, plus
+`reclaim.capacity`, `reclaim.active`, `reclaim.queued` and each current blocker's
+reason, delay and `next_attempt` time.
 
 Receipt equality retains all fields, with only the native 0.163.0 persistence
 transformations below accepted as alternatives. This is the same table as
@@ -2023,7 +2055,15 @@ reconcile failed keeps that failure across a restart and a transport gap until
 the policy makes it due: neither marks it reconciling nor tries it before then
 (`recovery/writer_held` at startup). An incident rebuilt from an earlier
 release's quarantine keeps that failure's release (none before 2.4.16), so this
-release still tries it once. A memory-gate refusal, made directly or in every
+release still tries it once. Before any admission or replacement launch, the
+scheduled reconcile durably claims that incident's (otherwise run's) release
+attempt under the reconcile lock. The claim survives listener replacement and
+crashes before failure stamping. Restart restores an interrupted attempt's saved
+classification; it cannot launch another automatic attempt for that release.
+Unresolved claims are found by run and release even if startup has since rebuilt
+an incident for a failure that originally belonged only to the listener.
+Explicit resume still tries and resolves a recovered incident through the normal
+history and UNKNOWN reconciliation path. A memory-gate refusal, made directly or in every
 failed case of a calibration, is also due before its backoff once the gate would
 admit a launch. A writer is held while its reconcile failed and is not
 `retry_due` (its backoff has not passed, or its cause cannot heal and this
@@ -2043,6 +2083,24 @@ chosen delay; `listener/startup_retry`, `listener/startup_quarantined` and
 `listener/startup_recovered` record the incident's progress. Waiting incidents
 do not hold the initial `recovering` barrier. Startup adopts older quarantines
 and their UNKNOWNs, including those already narrowed by a lead.
+
+A permanently failed writer that this release has tried can release its native
+family while keeping its quarantine. Retirement holds writer, parking and
+reconcile locks in that order and rechecks the current root binding, live PID and
+birth, quiet unit, executing operations, outstanding native evidence and demand.
+It requires a live connection (`no_connection` retains the family), complete
+loaded-thread pagination, quiet native statuses, empty terminal and queue
+inventories, and an owner snapshot. These are inspections: no history resume,
+descendant creation, owner `end` or signal is used to establish the proof.
+
+The separate retirement intent moves from `pending` proof to durable `stopping`
+authorization before owner dispatch, then to `complete` only after durable
+`family_gone` and physical `stopped`. Restart discards pending proof for fresh
+inspection and finishes any authorized stop before replacement. Resume joins that
+stop or returns retryable `FAMILY_REAPING`. Retirement changes no recovery
+classification, pending incident, UNKNOWN resolution or history checkpoint and
+creates no dormant proof. Status exposes `state: stopped`, `quarantined: true`,
+the retirement's release, times, members and proof, and the release-attempt claim.
 
 Each retry completes the same history, admission and replacement checks as a
 successful startup. An attached connection is resumed again when its earlier

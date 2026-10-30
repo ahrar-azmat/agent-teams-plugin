@@ -18,6 +18,21 @@ import time
 from .client import CoordinatorError, clean_environment
 
 
+def quiet_status(status):
+    """None for a quiet thread, otherwise the native reason that prevents quiescence.
+
+    Thread status is distinct from a saved turn's status. In Codex 0.163,
+    systemError follows running/approval/input checks and is eligible for unload.
+    An active thread is busy even when its activeFlags list is empty.
+    """
+    kind = status.get("type") if isinstance(status, dict) else None
+    if kind in ("idle", "notLoaded", "systemError"):
+        return None
+    if kind == "active":
+        return "native_active_turn"
+    return "native_status_unknown:" + (str(kind) if kind is not None else "missing")
+
+
 # Count wire JSON at the decode boundary, including late responses. These counters
 # contain lengths/timings only; no native payloads or credentials are retained.
 DECODE_METRICS = {"json_bytes": 0, "history_json_bytes": 0, "messages": 0,

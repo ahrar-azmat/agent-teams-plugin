@@ -13,6 +13,10 @@ class KeyedLocks:
     def __len__(self):
         return len(self.entries)
 
+    def contended(self, key):
+        """Called by a holder: another caller registered before awaiting this lock."""
+        return self.entries.get(key, (None, 0))[1] > 1
+
     @asynccontextmanager
     async def hold_many(self, keys):
         # Lifecycle checkout locks precede unit locks, which precede ledger

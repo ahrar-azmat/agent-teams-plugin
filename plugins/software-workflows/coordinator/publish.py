@@ -13,7 +13,7 @@ import time
 
 from .locks import finish, finish_thread
 from .client import CoordinatorError
-from . import gitio, processes
+from . import gitio, processes, native
 from .ledger import read_path
 from .store import digest, uid, fsync_dir
 
@@ -49,8 +49,10 @@ class Publisher:
                 if not connection or connection.closed:
                     raise CoordinatorError("LISTENER_UNAVAILABLE", "Cannot prove writer quiescence")
                 response = await connection.call("thread/read", {"threadId": actor["thread"], "includeTurns": False})
-                status = response["thread"].get("status", {}).get("type")
-                if status not in ("idle", "notLoaded") or actor.get("active_turn"):
+                reason = native.quiet_status(response["thread"].get("status"))
+                if reason and reason != "native_active_turn":
+                    raise CoordinatorError("NATIVE_STATUS_UNKNOWN", reason, {"actor": actor["id"]})
+                if reason or actor.get("active_turn"):
                     raise CoordinatorError("ACTIVE_TURN", "Root or descendant is not quiescent", {"actor": actor["id"]})
                 await self.daemon.settle_actor(actor)
                 terminals = await connection.call("thread/backgroundTerminals/list", {"threadId": actor["thread"]})

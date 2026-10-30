@@ -44,6 +44,7 @@ LEAD_BATCH_LEGACY = "kind='lead_batch' AND coalesce(json_extract(data,'$.schema'
 # unfinished (17-65 ms).
 LIVE_LISTENER = "kind='listener' AND json_extract(data,'$.state') IN ('connected','disconnected')"
 FAILED_LISTENER = "kind='listener' AND json_extract(data,'$.recovery_state')='failed'"
+PENDING_PARK = "kind='listener' AND json_extract(data,'$.park_stop') IS NOT NULL"
 WRITER_MAIL = ("kind='message' AND json_extract(data,'$.state') NOT IN ('entered_context','acknowledged') AND "
                "json_extract(data,'$.recipient')!='lead' AND substr(json_extract(data,'$.recipient'),1,13)!='lead_mailbox_'")
 UNFINISHED_RUN = "kind='run' AND json_extract(data,'$.state') NOT IN ('completed','failed','interrupted','blocked','refused','cancelled')"
@@ -270,6 +271,7 @@ class Store:
                  "(json_extract(data,'$.workflow') IS NOT NULL OR json_extract(data,'$.project_revision') IS NOT NULL)"),
                 ("live_listener", "json_extract(data,'$.root_thread'),id", LIVE_LISTENER),
                 ("failed_listener", "id", FAILED_LISTENER),
+                ("pending_park", "id", PENDING_PARK),
                 ("writer_mail", "id", WRITER_MAIL),
                 ("unfinished_run", "id", UNFINISHED_RUN),
                 ("lead_edit_operation", "id", LEAD_EDIT_OPERATION),
@@ -407,7 +409,8 @@ class Store:
             if written[0][0] in self.watched:
                 self.watched[written[0][0]] += 1
             if kind in {"run", "unit", "actor", "listener", "checkout", "claim", "custody", "message", "claim_request",
-                        "release_request", "custody_request", "participant", "publication", "publication_group", "project_revision", "resolution"}:
+                        "release_request", "custody_request", "participant", "publication", "publication_group", "project_revision", "resolution",
+                        "writer_retry", "writer_retirement"}:
                 self.status_epoch += 1
             self.puts[kind] += 1
         if kind == "listener":
@@ -495,6 +498,23 @@ class Store:
 
     def failed_listeners(self):
         return self.selected("SELECT * FROM records INDEXED BY failed_listener WHERE " + FAILED_LISTENER + " ORDER BY id")
+
+    def reclaim_listeners(self):
+        """Current root bindings only; historical listener JSON is never decoded.
+
+        Each arm uses its occupancy index, then primary-key run/actor lookups.
+        Failed listeners include a retirement already stopping. A verified park
+        suffix also stays owed after physical stop, until dormancy is committed.
+        """
+        for predicate, index in ((LIVE_LISTENER, "live_listener"), (FAILED_LISTENER, "failed_listener"),
+                                 (PENDING_PARK, "pending_park")):
+            yield from self.selected(
+                "SELECT l.* FROM (SELECT * FROM records INDEXED BY " + index + " WHERE " + predicate + ") l "
+                "JOIN records r ON r.id=json_extract(l.data,'$.run') "
+                "JOIN records a ON a.id=json_extract(r.data,'$.root_actor') "
+                "WHERE json_extract(a.data,'$.listener')=l.id AND json_extract(l.data,'$.root_thread') IS NOT NULL "
+                "AND (json_extract(l.data,'$.park_stop') IS NOT NULL OR json_extract(l.data,'$.recovery_state')='failed' OR "
+                "json_extract(r.data,'$.state') IN ('completed','failed','interrupted','blocked','refused','cancelled')) ORDER BY l.id")
 
     def unfinished_runs(self):
         return self.selected("SELECT * FROM records INDEXED BY unfinished_run WHERE " + UNFINISHED_RUN + " ORDER BY id")
