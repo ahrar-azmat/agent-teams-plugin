@@ -48,6 +48,8 @@ def stop_control_command(command):
     words = words[2:]
     if words[:1] == ["--state"] and len(words) >= 2:
         words = words[2:]
+    if words[:2] == ["maintenance", "reclaim"]:
+        return len(words) == 4 and set(words[2:]) == {"--outage-announced", "--lead-work-paused"}
     if words[:2] != ["daemon", "stop"]:
         return False
     words = words[2:]
@@ -413,6 +415,8 @@ class Client:
             return self.call("daemon/stop")
 
     def ensure(self, timeout=30, python=None, inherited_fds=None):
+        from .maintenance import admit_start
+        admit_start(self.state)
         from .owner_journal import control_state
         if control_state(self.state)["inhibited"]:
             raise CoordinatorError("AUTOSTART_INHIBITED", "Coordinator was explicitly stopped; run daemon start to resume",
@@ -427,6 +431,7 @@ class Client:
             if status is not None and not superseded(status.get("version")):
                 return status
         with self.upgrading(timeout):
+            admit_start(self.state)
             for _ in range(3):
                 # Looked at again under the lock: another process may have started or replaced it.
                 status = self.current(timeout)
@@ -439,6 +444,8 @@ class Client:
                                {"running": status.get("version"), "pid": status.get("pid")}, True)
 
     def resume(self):
+        from .maintenance import admit_start
+        admit_start(self.state)
         from .leases import control
         from .owner_journal import control_state
         owner = control_state(self.state)
@@ -467,6 +474,8 @@ class Client:
         return status
 
     def start(self, timeout=30, python=None, inherited_fds=None):
+        from .maintenance import admit_start
+        admit_start(self.state)
         self.state = validate_state(self.state, create=True)
         # Each detached supervisor competes for the same flock; losers simply exit.
         started = time.time()

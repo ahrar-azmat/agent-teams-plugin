@@ -35,7 +35,7 @@ DEFAULT_DELETE_ROWS = 64
 DEFAULT_SECONDS = 0.050
 # Threat: a long reader pins WAL. Green-03 allocated peak was 21,147,992 bytes;
 # 32 MiB leaves >50% headroom for that size class, 128 MiB permits four such
-# allowances before pausing. Ordinary 1000-page autocheckpoint remains untouched.
+# allowances before pausing. The supervised checkpoint keeps running when paused.
 # This bounds compactor contribution, not unrelated foreground WAL growth.
 DEFAULT_WAL_HIGH = 128 << 20
 DEFAULT_WAL_LOW = 32 << 20
@@ -277,12 +277,14 @@ def wal_observation(root):
         db.close()
     path = Path(root) / "ledger.sqlite-wal"
     try:
-        allocated = path.stat().st_size
+        info = path.stat()
+        length, allocated = info.st_size, info.st_blocks * 512
     except FileNotFoundError:
-        allocated = 0
+        length, allocated = 0, 0
     busy, log, checkpointed = result
     return {"busy": busy, "log_frames": log, "checkpointed_frames": checkpointed,
-            "pending_bytes": max(0, log - checkpointed) * page_size, "allocated_bytes": allocated,
+            "pending_bytes": max(0, log - checkpointed) * page_size if log >= 0 and checkpointed >= 0 else None,
+            "allocated_bytes": allocated, "length_bytes": length,
             "page_size": page_size, "page_count": pages, "freelist_pages": free, "freelist_bytes": free * page_size}
 
 
@@ -728,8 +730,13 @@ class Retention:
         return True
 
     async def pressure(self):
-        self.wal = await finish_thread(wal_observation, self.store.root)
-        if self.wal.get("error"):
+        return self.observe_pressure(await finish_thread(wal_observation, self.store.root))
+
+    def observe_pressure(self, observation):
+        self.wal = observation
+        # A competing checkpoint can return unknown (-1) frame counts. It is
+        # not evidence of an empty WAL; pause until a measurable pass returns.
+        if self.wal.get("error") or self.wal["log_frames"] < 0 or self.wal["checkpointed_frames"] < 0:
             self.paused = True
             return False
         size = self.wal["pending_bytes"]
@@ -746,6 +753,9 @@ class Retention:
         try:
             while not self.daemon.closing:
                 self.wake.clear()
+                if self.daemon.draining:
+                    await asyncio.sleep(1)
+                    continue
                 began = time.monotonic()
                 retry = None
                 try:
@@ -765,6 +775,8 @@ class Retention:
                     # vice versa). Give both kinds a slice before deciding idle.
                     converted = await self.compact_record() or converted
                     active = seeded or resumed or scanned or converted
+                    if active and self.store.reclamation_wake:
+                        self.store.reclamation_wake()
                     if self.inventory_dirty and (not active or time.monotonic() - self.record_sampled >= 1):
                         self.record_census = await finish_thread(record_census, self.store.root)
                         self.census, complete, completed = await finish_thread(event_census, self.store.root)

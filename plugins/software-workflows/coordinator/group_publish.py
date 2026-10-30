@@ -32,41 +32,36 @@ class GroupPublisher:
                     result[key][(path, revision)] = {"path": path, "revision": revision}
         return {key: sorted(values.values(), key=lambda value: (value["path"], value["revision"] or "")) for key, values in result.items()}
 
-    async def check_dependencies(self, unitid, checkoutid, evidence):
+    async def check_dependencies(self, unitid, checkoutid, evidence, base=None):
         """Refuse a project seal whose writers read unexplained bytes or another unit's unpublished revision in this
         participant. A read of a path outside the ledger (ledger.unwatched) is no dependency, a read of a restore depends
         on whose bytes it restored (Publisher.provenance), and a git failure refuses."""
         paths = sorted({row["path"] for row in evidence})
         if not paths:
-            return
+            return []
         checkout = self.store.get(checkoutid)
         await self.daemon.ledger.reconcile(checkout, paths)
         outside = await self.daemon.ledger.unwatched(checkout, paths)
         paths = [path for path in paths if path not in outside]
         if not paths:
-            return
+            return []
         unknowns = self.store.unresolved(checkoutid, paths)
         if unknowns:
             raise CoordinatorError("UNKNOWN_DEPENDENCY", "Participant read scope includes unresolved UNKNOWN",
                                    {"root": checkout["root"], "unknowns": [u["id"] for u in unknowns],
                                     "paths": sorted({u["path"] for u in unknowns})})
-        unknown, unpublished = set(), {}
+        unknown, rows = set(), []
         for entry in evidence:
             if entry["revision"] and entry["path"] not in outside:
                 row = self.store.db.execute("SELECT * FROM revisions WHERE id=?", (entry["revision"],)).fetchone()
                 if not row or row["checkout"] != checkoutid or row["path"] != entry["path"] or row["attribution"] == "UNKNOWN":
                     unknown.add(entry["path"])
                     continue
-                source = self.repo.provenance(row, unitid)  # a restore: whose bytes it restored
-                if source and source["unit"] and source["unit"] != unitid and self.store.get(source["unit"])["state"] != "published":
-                    unpublished.setdefault(source["unit"], set()).add(entry["path"])
+                rows.append(row)
         if unknown:
             raise CoordinatorError("UNKNOWN_DEPENDENCY", "Recorded participant read is not a known revision",
                                    {"root": checkout["root"], "paths": sorted(unknown)})
-        if unpublished:
-            unit = min(unpublished)
-            raise CoordinatorError("UNPUBLISHED_DEPENDENCY", "Read depends on an unpublished other unit",
-                                   {"unit": unit, "paths": sorted(path for paths in unpublished.values() for path in paths)})
+        return await self.repo.dependency_proofs(unitid, rows, {checkoutid: base})
 
     async def seal(self, unitid, validation, order):
         unit = self.store.get(unitid)
@@ -96,18 +91,45 @@ class GroupPublisher:
     async def freeze(self, unit, members, order, validation, sealid):
         await self.repo.quiescent(unit)
         operations = list(self.store.all("operation", unit["id"]))
-        await self.repo.dependency_check(unit, operations)
         dependencies = self.dependencies(unit)
-        await finish_all(*(self.check_dependencies(unit["id"], key, values) for key, values in dependencies.items()))
         vector, seals = [], []
         prefix = unit.get("published_prefix", {})
+        selected, bases = {}, {}
+        # Pin every participant, including unchanged ones, before evaluating a
+        # cross-repository operation or read. An installed prefix keeps its base.
         for member in members:
             checkout = self.store.get(member["checkout"])
             metadata = await finish_thread(self.repo.repository_identity, checkout)
             if metadata["branch"] != member["branch"]:
                 raise CoordinatorError("BRANCH_CHANGED", "Participant branch changed", {"root": checkout["root"]})
-            view = self.view(unit, member)
             paths = self.daemon.ledger.mutation_scope(unit["id"], checkout["id"])
+            rows, base = [], member["base"]
+            if checkout["id"] in prefix:
+                saved = prefix[checkout["id"]]
+                part, journal = self.store.get(saved["seal"]), self.store.get(saved["publication"])
+                if not await finish_thread(self.repo.installed_tip, checkout, part, journal, metadata["base"]):
+                    raise CoordinatorError("PUBLICATION_REF_DIVERGED", "Completed prefix is no longer installed")
+                base = part["base"]
+            else:
+                rows = await self.repo.scope_rows(self.view(unit, member), sealing=True) if paths else []
+                if metadata["base"] != base:
+                    old, new = await finish_all(finish_thread(gitio.entries, checkout["root"], base),
+                                               finish_thread(gitio.entries, checkout["root"], metadata["base"]))
+                    for row in rows:
+                        if old.get(row["path"]) != new.get(row["path"]):
+                            operation = self.store.get(row["operation"])
+                            if not unit.get("reopened") or operation.get("completed", 0) <= unit["reopened"]:
+                                raise CoordinatorError("BASE_SCOPE_CHANGED", "Changed base overlaps frozen work; a new verified edit after reopening is required",
+                                                       {"root": checkout["root"], "path": row["path"]})
+                    base = metadata["base"]
+            selected[checkout["id"]] = (metadata, paths, rows)
+            bases[checkout["id"]] = base
+        operation_proofs = await self.repo.dependency_check(unit, operations, bases)
+        read_proofs = {key: await self.check_dependencies(unit["id"], key, values, bases[key])
+                       for key, values in dependencies.items()}
+        for member in members:
+            checkout = self.store.get(member["checkout"])
+            metadata, paths, rows = selected[checkout["id"]]
             if checkout["id"] in prefix:
                 saved = prefix[checkout["id"]]
                 part = self.store.get(saved["seal"])
@@ -127,18 +149,7 @@ class GroupPublisher:
                     raise CoordinatorError("PUBLICATION_REF_DIVERGED", "Completed prefix is no longer installed")
                 vector.append(dict(saved["vector"], commit=journal["commit"], publication=journal["id"]))
                 continue
-            rows = await self.repo.scope_rows(view, sealing=True) if paths else []
-            base = member["base"]
-            if metadata["base"] != base:
-                old, new = await finish_all(finish_thread(gitio.entries, checkout["root"], base),
-                                                finish_thread(gitio.entries, checkout["root"], metadata["base"]))
-                for row in rows:
-                    if old.get(row["path"]) != new.get(row["path"]):
-                        operation = self.store.get(row["operation"])
-                        if not unit.get("reopened") or operation.get("completed", 0) <= unit["reopened"]:
-                            raise CoordinatorError("BASE_SCOPE_CHANGED", "Changed base overlaps frozen work; a new verified edit after reopening is required",
-                                                   {"root": checkout["root"], "path": row["path"]})
-                base = metadata["base"]
+            base = bases[checkout["id"]]
             partid = uid("seal_part")
             candidate, entries = (None, {})
             if rows:
@@ -151,6 +162,7 @@ class GroupPublisher:
                         unit=unit["id"], base=base, branch=member["branch"], candidate=candidate, unchanged=candidate is None,
                         paths=paths, rows=rows, entries=entries, provenance=provenance, validation=validation,
                         dependencies=dependencies[checkout["id"]], dependency_digest=digest(dependencies[checkout["id"]]),
+                        dependency_proofs=read_proofs[checkout["id"]] + [p for p in operation_proofs if p["checkout"] == checkout["id"]],
                         validation_digest=digest(validation), seal=partid, created=time.time())
             seals.append(part)
             vector.append({k: part[k] for k in ("checkout", "root", "identity", "repository", "branch", "base", "candidate", "unchanged", "provenance", "dependencies", "dependency_digest", "validation_digest", "seal")})
@@ -162,6 +174,12 @@ class GroupPublisher:
             metadata = await finish_thread(self.repo.repository_identity, self.store.get(part["checkout"]))
             if metadata["base"] != part["base"] or metadata["branch"] != part["branch"]:
                 raise CoordinatorError("STALE_BASE", "Participant base changed while freezing", {"root": part["root"]})
+        for key, saved in prefix.items():
+            checkout = self.store.get(key)
+            metadata = await finish_thread(self.repo.repository_identity, checkout)
+            if metadata["branch"] != self.store.get(saved["seal"])["branch"] or not await finish_thread(
+                    self.repo.installed_tip, checkout, self.store.get(saved["seal"]), self.store.get(saved["publication"]), metadata["base"]):
+                raise CoordinatorError("PUBLICATION_REF_DIVERGED", "Completed prefix moved while freezing")
         seal = dict(binding_version=2, unit=unit["id"], seal=sealid, project_revision=unit["project_revision"],
                     generation=unit.get("generation", 1), publication_order=order, vector=vector,
                     validation=validation, validation_digest=digest(validation), created=time.time())
@@ -189,10 +207,16 @@ class GroupPublisher:
 
     async def preflight(self, unit, item, publication=None):
         checkout, part = self.store.get(item["checkout"]), self.store.get(item["seal"])
-        await self.check_dependencies(unit["id"], checkout["id"], part.get("dependencies", []))
+        config = await finish_thread(self.repo.publication_guards, checkout, part)
+        await self.check_dependencies(unit["id"], checkout["id"], part.get("dependencies", []), part["base"])
+        # Recheck operation dependencies against the same sealed vector, never a
+        # newer branch tip. Participants already published retain their old base.
+        seal = self.store.get(unit["seal"])
+        bases = {v["checkout"]: v["base"] for v in seal["vector"]}
+        operations = list(self.store.all("operation", unit["id"]))
+        await self.repo.dependency_check(unit, operations, bases)
         if part["paths"]:
             await self.repo.scope_rows(self.view(unit, part), part)
-        config = await finish_thread(self.repo.publication_guards, checkout, part)
         base, real = await finish_all(finish_thread(gitio.entries, checkout["root"], part["base"]),
                                           finish_thread(gitio.entries, checkout["root"]))
         for path in part["paths"]:
@@ -202,6 +226,7 @@ class GroupPublisher:
         lock = str(index) + ".lock"
         if Path(lock).exists() and not (publication and publication.get("index_lock") and self.repo.pinned(publication["index_lock"], lock)):
             raise CoordinatorError("INDEX_LOCKED", "Foreign index lock blocks the complete group", {"root": checkout["root"]})
+        await finish_thread(self.repo.publication_guards, checkout, part)
         return {"config_digest": config, "base_index_entries": {p: real.get(p, []) for p in part["paths"]}}
 
     async def publish(self, unitid, reviewid, metadata):

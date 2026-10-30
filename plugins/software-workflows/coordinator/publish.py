@@ -134,7 +134,42 @@ class Publisher:
             return None
         return holders[0] if holders else row
 
-    async def dependency_check(self, unit, operations):
+    async def dependency_proofs(self, unitid, rows, bases):
+        """One publication predicate for operation reads and project reads.
+
+        A proof satisfies this dependency only. It never publishes its source
+        unit or replaces the receipt with the path's current head.
+        """
+        proofs, unpublished = [], []
+        for row in rows:
+            if row["attribution"] == "UNKNOWN":
+                raise CoordinatorError("UNKNOWN_DEPENDENCY", "Dependency has unexplained provenance", {"path": row["path"]})
+            source = self.provenance(row, unitid)
+            if not source or not source["unit"] or source["unit"] == unitid or self.store.get(source["unit"])["state"] == "published":
+                continue
+            checkout = self.store.get(row["checkout"])
+            base = bases.get(checkout["id"])
+            matches, entry = False, None
+            if base:
+                entry = await finish_thread(gitio.tree_entry, checkout["root"], base, row["path"])
+                if row["blob"] is None:
+                    matches = row["mode"] is None and entry is None
+                elif row["mode"] in ("100644", "100755"):
+                    content = await finish_thread(self.store.read_blob, row["blob"])
+                    oid = gitio.blob_oid(content, checkout["object_format"])
+                    matches = entry == {"path": row["path"], "type": "blob", "mode": row["mode"], "oid": oid}
+            if matches:
+                proofs.append({"revision": row["id"], "source_revision": source["id"], "checkout": checkout["id"],
+                               "base": base, "path": row["path"], "entry": entry})
+            else:
+                unpublished.append(source)
+        if unpublished:
+            raise CoordinatorError("UNPUBLISHED_DEPENDENCY", "Operation read an unpublished other-unit revision",
+                                   {"unit": unpublished[0]["unit"], "revision": unpublished[0]["id"],
+                                    "paths": sorted({row["path"] for row in unpublished})})
+        return proofs
+
+    async def dependency_check(self, unit, operations, bases=None):
         """Refuse a seal whose operations started from, or read, unexplained bytes or another unit's unpublished
         revision. A reference to a path outside the ledger (ledger.unwatched) is no dependency: nothing there is
         published (2.4.0-2.4.3 refused a unit whose writer had read test output while it was UNKNOWN). A reference to a
@@ -164,12 +199,7 @@ class Publisher:
         unknown = sorted({row["path"] for row in rows if row["attribution"] == "UNKNOWN"})
         if unknown:
             raise CoordinatorError("UNKNOWN_DEPENDENCY", "Operation depends on unexplained bytes", {"paths": unknown})
-        rows = [source for source in (self.provenance(row, unit["id"]) for row in rows) if source]
-        unpublished = [row for row in rows if row["unit"] and row["unit"] != unit["id"] and self.store.get(row["unit"])["state"] != "published"]
-        if unpublished:
-            raise CoordinatorError("UNPUBLISHED_DEPENDENCY", "Operation read an unpublished other-unit revision",
-                                   {"unit": unpublished[0]["unit"], "revision": unpublished[0]["id"],
-                                    "paths": sorted({row["path"] for row in unpublished})})
+        return await self.dependency_proofs(unit["id"], rows, bases or {})
 
     async def seal(self, unitid, validation, order=None):
         unit = self.store.get(unitid)
@@ -241,17 +271,17 @@ class Publisher:
         rows = await self.scope_rows(unit, sealing=True)
         paths = [row["path"] for row in rows]
         operations = list(self.store.all("operation", unitid))
-        await self.dependency_check(unit, operations)
-        branch = await finish_thread(gitio.text, checkout["root"], ["symbolic-ref", "HEAD"])
-        if branch != unit["branch"]:
+        metadata = await finish_thread(self.repository_identity, checkout)
+        if metadata["branch"] != unit["branch"]:
             raise CoordinatorError("BRANCH_CHANGED", "Unit's named branch changed")
-        current_base = await finish_thread(gitio.text, checkout["root"], ["rev-parse", branch])
+        current_base = metadata["base"]
         if current_base != unit["base"]:
             original = await finish_thread(gitio.entries, checkout["root"], unit["base"])
             current = await finish_thread(gitio.entries, checkout["root"], current_base)
             if any(original.get(path, []) != current.get(path, []) for path in paths):
                 raise CoordinatorError("BASE_SCOPE_CHANGED", "Branch advanced through this unit's paths; a new verified operation is required")
             unit["base"] = current_base
+        proofs = await self.dependency_check(unit, operations, {checkout["id"]: current_base})
         for item in validation:
             if not isinstance(item, dict) or not all(k in item for k in ("command", "exit_code", "inputs", "scope")):
                 raise CoordinatorError("VALIDATION_EVIDENCE", "Validation records need command, exit_code, actual inputs and scope")
@@ -267,10 +297,14 @@ class Publisher:
             final_rows = await self.scope_rows(unit, sealing=True)
             if [r["id"] for r in final_rows] != [r["id"] for r in rows]:
                 raise CoordinatorError("REVISION_CHANGED", "Candidate revisions changed while freezing")
+            metadata = await finish_thread(self.repository_identity, checkout)
+            if metadata["branch"] != unit["branch"] or metadata["base"] != unit["base"]:
+                raise CoordinatorError("STALE_BASE", "Branch changed while freezing; reseal against its new base")
             provenance = digest([{k: row[k] for k in ("id", "path", "previous", "operation", "blob", "mode")} for row in rows])
             sealid = uid("seal")
             seal = {"repository": checkout["repository"], "unit": unitid, "base": unit["base"], "branch": unit["branch"],
                     "candidate": candidate, "paths": paths, "entries": entries, "rows": rows, "provenance": provenance,
+                    "dependency_proofs": proofs,
                     "validation": validation, "validation_digest": digest(validation), "created": time.time(), "seal": sealid}
             with self.store.transaction():
                 self.store.put("seal", sealid, seal, unitid)

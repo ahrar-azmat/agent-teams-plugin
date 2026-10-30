@@ -137,6 +137,7 @@ class Store:
         self._listener_written = False  # a listener was written in the open transaction
         self._sync_restore = None
         self.retention_wake = None
+        self.reclamation_wake = None
         self.root = validate_state(root, create=True)
         self._validated_blobs = {}
         self._path_blobs = {}  # advisory source stamps; never persisted across a restart
@@ -156,6 +157,9 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
+        self.db.execute("PRAGMA journal_size_limit=67108864")
+        if self.db.execute("PRAGMA journal_size_limit").fetchone()[0] != 67108864:
+            raise CoordinatorError("JOURNAL_SIZE_LIMIT", "Retained WAL limit did not persist")
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS migrations(version INTEGER PRIMARY KEY, applied REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS records(
@@ -540,6 +544,8 @@ class Store:
                     self.db.execute("COMMIT")
             else:
                 self.db.execute("COMMIT")
+            if self.reclamation_wake:
+                self.reclamation_wake()
         except BaseException as exc:
             if self._listener_written:
                 self._listener_processes = None  # what this transaction's listeners kept is read again

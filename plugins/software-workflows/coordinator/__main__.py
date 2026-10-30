@@ -16,6 +16,10 @@ def main(argv=None):
     daemon.add_argument("--state", dest="daemon_state")
     daemon.add_argument("--park", action="store_true", help="Inhibit automatic starts after the drain")
     daemon.add_argument("--consent", action="store_true", help="Explicit consent for the requested LaunchAgent change")
+    maintenance = sub.add_parser("maintenance", help="Explicit outage ledger maintenance; never autostarts for status")
+    maintenance.add_argument("action", choices=["reclaim", "status"])
+    maintenance.add_argument("--outage-announced", action="store_true")
+    maintenance.add_argument("--lead-work-paused", action="store_true")
     rpc = sub.add_parser("rpc", help="Call a documented C2 RPC method with JSON params")
     rpc.add_argument("method")
     rpc.add_argument("params", nargs="?", default="{}", help="JSON object, or '-' for stdin")
@@ -32,6 +36,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     state = getattr(args, "daemon_state", None) or args.state
     try:
+        if args.command == "maintenance":
+            from . import maintenance
+            value = (maintenance.status(state_root(state)) if args.action == "status" else
+                     maintenance.reclaim(state_root(state), args.outage_announced, args.lead_work_paused))
+            print(json.dumps({"ok": True, "result": value}, ensure_ascii=True, sort_keys=True))
+            return 0
         if args.command == "daemon" and args.action in ("serve", "worker"):
             from .daemon import supervise, worker
             try:

@@ -143,6 +143,8 @@ class Daemon:
         self.memory = memory.Memory(self)
         memory.CURRENT = self.memory
         self.retention = Retention(self)
+        from .reclamation import Reclamation
+        self.reclamation = Reclamation(self)
         from .services import Services
         self.broker = Services(self)
         from .writer_profile import setting, suggestion
@@ -384,6 +386,7 @@ class Daemon:
                 "lead_edit_legacy_limit": legacy_status(self.store),
                 "ended": dict(self.ended), "silent": len(self.silent), "dormancy": self.dormancy.status(), "writer_mcp_profile": self.writer_profile,
                 "retention": self.retention.status(), "tool_results": tools.metrics(),
+                "reclamation": self.reclamation.status(),
                 "sqlite": sqlite3.sqlite_version, "version": VERSION, **({} if brief else {"writers": writers})}
 
     def intake_status(self):
@@ -3600,6 +3603,7 @@ class Daemon:
             self.start_service("lead_calls", lambda: observe(self))
             self.background(self.compact_history())
             self.retention.request()
+            self.start_service("reclamation", self.reclamation.run)
             for listener in list(self.store.all("listener")):
                 if listener["state"] == "connected":
                     self.parking.schedule(listener["id"])
@@ -3693,6 +3697,7 @@ class Daemon:
         self.store.event("daemon/native_intake_closed", None, {"receivers": len(connections)})
         if hasattr(self, "admission_executor"):
             self.admission_executor.shutdown(wait=True, cancel_futures=True)
+        await self.reclamation.drained_checkpoint()
         # No unconditional finally: an unsuccessful join must never release the
         # database or descriptors still owned by its unfinished users.
         if allocation is not None:
@@ -3756,6 +3761,8 @@ def _worker(root, control):
         except BlockingIOError:
             return 0
         try:
+            from .maintenance import continue_start
+            continue_start(root)
             daemon = Daemon(root)
             daemon.stop_control = control
             if upgrade:

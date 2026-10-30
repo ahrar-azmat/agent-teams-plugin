@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.26 / P1
+# Writer coordinator — software-workflows 2.4.27 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -35,6 +35,8 @@ State defaults to `~/.local/state/software-workflows`. `--state DIR` or
 `SOFTWARE_WORKFLOWS_STATE` selects a development state directory. State must be
 owned, private, outside every checkout and outside the plugin installation.
 Directories are `0700`; sockets are `0600`. Do not put state in the repository.
+The one-time ledger conversion has a separate [announced-outage maintenance
+procedure](#ledger-reclamation-and-maintenance); ordinary startup never rebuilds.
 
 Clients read the private, atomically replaced `endpoint.json` manifest. The RPC
 socket lives in a unique short directory beneath canonical `/tmp/c1-<uid>/`,
@@ -1230,7 +1232,7 @@ client connected.
 
 Sealing checks the root and all discoverable descendants, active turns, pending
 hooks/tools, native terminals, process custody and unverified operations. It
-refuses UNKNOWN paths and dependencies on unpublished other-unit revisions; a
+refuses UNKNOWN paths and unresolved dependencies on other-unit revisions; a
 dependency refusal (`UNKNOWN_DEPENDENCY`, `UNPUBLISHED_DEPENDENCY`) names its paths
 (`details.paths`). A reference to a path outside the ledger is no dependency. A
 revision a restore wrote is the work of whoever wrote the bytes it restored: the
@@ -1238,6 +1240,19 @@ source the restore recorded, followed through restores of restores, or where it
 recorded none, the receipt holding the same bytes. The path's baseline, or its
 absence where the baseline lacks it, is no unit's work; bytes no receipt holds
 remain the restoring unit's.
+
+In 2.4.27, each checkout's immutable base commit is selected and validated before
+dependency checks. After UNKNOWN and provenance checks, an otherwise unpublished
+revision is satisfied if its original path, object type, mode and Git blob object
+ID exactly match that base tree; absence matches absence. This includes lead
+revisions committed with plain Git. Ledger content hashes are not Git object IDs.
+Singleton seals, project seals and project preflight use the same predicate and
+store the revision/base/path proof. They do not publish or reattribute the source
+revision, or change its unit's state. A partial commit satisfies only its matching
+dependencies, a rename does not satisfy the old path, and an older revision must
+match the selected base. A moved branch is revalidated: existing seals refuse
+`STALE_BASE`, and overlapping advancement still refuses `BASE_SCOPE_CHANGED`.
+
 The complete mutation scope comes from operations, including add/delete and both
 move endpoints. An UNKNOWN head or another unit's later revision cannot make a
 path disappear. Every scoped path must still have this unit's final exact receipt,
@@ -1615,9 +1630,11 @@ initial 21,147,992-byte WAL peak by more than 50%; the high threshold allows fou
 such budgets. Later default-threshold acceptance and all actual maxima are in
 VERIFY. Status counts warnings when a row/byte/time/high-WAL budget reaches 80%.
 
-WAL observation uses only `wal_checkpoint(NOOP)` and reports outstanding frames
-separately from allocated file bytes. The default 1000-page automatic checkpoint
-policy is unchanged. A recycled WAL file can remain large after pressure clears.
+Retention's read-only WAL observation uses `wal_checkpoint(NOOP)` and reports
+outstanding frames separately from allocated file bytes. The checkpoint service
+below also feeds the same pressure gate. Unknown frame counts during checkpoint
+contention pause compaction and reclamation until a measurable pass returns.
+A recycled WAL file can remain large after pressure clears.
 On a SQLite version without NOOP (before 3.51.0), retention reports
 `WAL_OBSERVATION_UNSUPPORTED` and pauses; it never substitutes another checkpoint
 mode. The existing WAL-safety version guard remains in force. A long reader can
@@ -1637,10 +1654,152 @@ not scan multi-gigabyte payloads on demand. Persistent failures are keyed by wor
 identity, exposed in `errors`, and emit an audit event when their condition changes.
 
 `operation/prepared`, custody `excludes`, receipt blobs and all other event kinds
-remain outside this release. Compaction creates reusable freelist pages; it does
-not shrink the SQLite file. Physical reclamation, auto-vacuum conversion and
-checkpoint control are the next release. Total retained storage can still grow
-through necessary records, archives and these excluded payloads.
+remain outside the retention policy. Compaction creates reusable freelist pages;
+the reclamation service below returns them to the filesystem after conversion.
+Total retained storage can still grow through necessary records, archives and
+these excluded payloads.
+
+### Ledger reclamation and maintenance
+
+The conversion from `auto_vacuum=NONE` (`0`) to `INCREMENTAL` (`2`) is an explicit
+one-time outage job. Announce the outage and pause **every lead session** before
+invoking it. Quiet time does not authorize it. Older hooks can allow lead edits
+after their wait expires; the 2.4.25 hook did so after 8.06 s in the outage probe.
+
+Install 2.4.27 before the outage. When the serving daemon is still 2.4.26, issue
+these as **two separate pure Bash invocations** from Claude Code, waiting for the
+first to complete:
+
+```sh
+cd /Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows/2.4.26 && /opt/homebrew/bin/python3.15 -B -m coordinator --state /Users/ahrar/.local/state/software-workflows daemon stop --park
+```
+
+```sh
+cd /Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows/2.4.27 && /opt/homebrew/bin/python3.15 -B -m coordinator --state /Users/ahrar/.local/state/software-workflows maintenance reclaim --outage-announced --lead-work-paused
+```
+
+These paths are this installation's verified layout; use the actual installed
+release path elsewhere. Serving 2.4.26 supports an identity-checked draining stop,
+but its hook classifier does not recognize the new maintenance command. Invoking
+maintenance directly through its enrolled Bash hook therefore refuses
+`NOT_QUIESCENT` on that command's own hook. The two-command sequence works within
+one outage. A serving 2.4.27 daemon recognizes the pure maintenance invocation and
+can be drained by that command itself. Other pending work still refuses the stop;
+resolve it before continuing. Do not add environment prefixes, redirections or
+additional shell commands to these invocations: recognition checks the whole
+command, including the optional `cd` path.
+
+The launching Claude shell must already inherit the intended environment. For
+this live installation the values are:
+
+```text
+SOFTWARE_WORKFLOWS_WRITER_MCP_SERVERS=["MCP_DOCKER","openaiDeveloperDocs"]
+SOFTWARE_WORKFLOWS_OWNER_JOURNAL_BYTES=134217728
+```
+
+`Client.start()` uses `launch_environment()`, which passes `clean_environment()`
+to the new supervisor. Explicit `SOFTWARE_WORKFLOWS_*` variables survive;
+matching `CLAUDE_PLUGIN_OPTION_*` values supply defaults when an explicit variable
+is absent. Settings are not copied from the previous supervisor. The journal
+size setting applies when creating a journal; an existing journal retains its
+header capacity. Ensure the environment before the outage, rather than adding
+an unrecognized prefix to the maintenance command.
+
+The job durably records intent and the initial ledger mode in `maintenance.json`,
+parks the old daemon after an identity-checked drain, and holds the upgrade,
+supervisor and worker locks while converting. A separate maintenance lock
+serializes jobs. These are the
+real process exclusions, including against installed 2.4.26 clients. It checks
+database and temporary-volume headroom for twice the database length plus
+15 GiB, scopes and restores SQLite's process-global temporary directory, and
+reads back WAL/FULL/fullfsync/checkpoint-fullfsync settings. VACUUM runs outside
+a transaction. A TRUNCATE checkpoint retries transient readers for about 30 s;
+its attempts and elapsed time are recorded.
+
+Verification hashes every logical row, including implicit rowids, event-kind
+counts, sequence high water, archive metadata/membership and explicit dependency
+ordinals. It also reads a stable SHA-256-ranked selection of up to 256 hot
+subjects and 256 authoritative archive manifests through merged readers at their
+first/last sequences. The exact requests are persisted and replayed afterward;
+sampling bounds reader cost, not logical evidence retention. Completion is saved
+before resumption, and `phase=resumed` requires a ready daemon. Final record
+updates reacquire the maintenance lock and check the attempt ID, so an older
+invocation cannot overwrite a newer job's intent or completion.
+
+Inspect the job without starting a daemon:
+
+```sh
+python3 -B -m coordinator --state /absolute/state maintenance status
+```
+
+After the live command exits 0, run these checks from the installed 2.4.27
+directory, as separate commands:
+
+```sh
+/opt/homebrew/bin/python3.15 -B -m coordinator --state /Users/ahrar/.local/state/software-workflows maintenance status
+```
+
+```sh
+/opt/homebrew/bin/python3.15 -B -m coordinator --state /Users/ahrar/.local/state/software-workflows daemon status
+```
+
+The job should be inactive with `phase=resumed`, readiness true, ledger mode 2,
+integrity `["ok"]` and a successful checkpoint result `[0,0,0]`. Daemon status
+should report version 2.4.27 and ready true. After the first checkpoint heartbeat,
+reclamation should be healthy, conversion_pending false and writer_autocheckpoint
+0; verify the intended writer MCP profile too. Check the reported allocation,
+free disk and any active alarms before releasing the paused lead sessions.
+
+After a crash, ordinary startup never executes VACUUM. An attempt interrupted
+before conversion, with its recorded initial mode unchanged, becomes `aborted`
+and permits ordinary startup. A capacity refusal before baseline capture also
+records `aborted`; use `daemon start` to resume service or retry maintenance after
+restoring capacity. This applies to repeat invocations on an INCREMENTAL ledger.
+Once an attempt reaches the durable conversion boundary, mode NONE records
+`failed_none` and reports `conversion_pending`; another explicit outage job is
+required. Mode INCREMENTAL checkpoints and verifies against the original durable
+baseline before serving. An expired reader wait returns
+`MAINTENANCE_CHECKPOINT`, preserving WAL and the converted job for continuation.
+Never remove WAL/SHM to resolve it. A restart failure returns `MAINTENANCE_RESUME`
+with conversion still `complete` and readiness false; fix the startup failure and
+use `daemon start`. Do not erase the verification baseline to obtain a success.
+
+The complete storage phase on the October 31 live-layout copy took **219.481 s**
+(3 min 39.5 s), including both full logical digests, both merged samples, VACUUM,
+checkpoint, integrity and durable progress. Database length fell from
+17,026,473,984 to 4,495,679,488 bytes. The separate read-only online backup took
+31.266 s. The live outage does not need that measurement copy, but drain and
+restart time must be added to the storage duration; five minutes is an estimate,
+not a deadline guarantee. The live ledger itself was not converted by the writer.
+
+Once converted, reclamation starts above 16 MiB of freelist and stops below
+4 MiB. Each transaction consumes all `incremental_vacuum(N)` results, starts with
+256 pages, and leaves at least 100 ms after the previous step. Steps above the
+50 ms target reduce the batch, never to zero; eight consecutive steps below
+25 ms grow it back toward 256. Ordinary FULL durability is retained, without an
+extra fullfsync per space-only commit. Drain/close and shared WAL pressure are
+checked immediately before each step. Mode NONE performs no reclamation.
+
+A supervised thread owns its checkpoint connection and runs PASSIVE about once
+per second with `checkpoint_fullfsync=ON`. Writer autocheckpoint is disabled only
+while that thread has a healthy heartbeat; loss restores the captured fallback
+(normally 1000 pages), raises a condition and retries. The thread is a daemon
+thread so an abnormal main-loop exit cannot strand the worker lock; normal exit
+still stops and joins it. The reclamation coroutine is supervised too. TRUNCATE
+runs only in maintenance or after coordinated shutdown has joined background
+users. The 67,108,864-byte `journal_size_limit` is read back on writer/checkpoint
+connections: it limits retained allocation at reset, not WAL growth under load.
+
+`daemon/status.reclamation` is cached and reports mode/conversion state, freelist,
+database/WAL lengths and allocated bytes, free disk, archive storage, checkpoint
+frames/busy/progress/freshness, step latency and batch, and writer fallback state.
+`pending_frames=null` with negative SQLite counts means a contended, unknown
+sample, not zero outstanding work. `physical_reductions_bytes` sums observed
+decreases in database-plus-WAL allocation during this daemon incarnation; it is
+neither net disk savings nor a durable lifetime total. Alarms record transitions
+for failed checkpoint/reclamation, 60 s stalled reclamation or WAL pressure, and
+free disk below 15 GiB or a projected reserve crossing within one hour. Projection
+uses 60 s free-space samples and is unknown until a consumption rate exists.
 
 ### Explicit writer MCP profile
 

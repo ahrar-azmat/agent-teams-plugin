@@ -3,6 +3,36 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.27] — 2026-10-31
+
+Two changes: return unused ledger space to the filesystem, and accept a seal's
+dependency when its validated base commit already contains that exact revision.
+
+- `maintenance reclaim --outage-announced --lead-work-paused` explicitly drains,
+  excludes other writers, converts the ledger to incremental auto-vacuum, verifies
+  all logical rows and sampled merged archive reads, and resumes service. Startup
+  never rebuilds. Durable progress lets a committed conversion finish verification
+  after a crash without another VACUUM. Failed pre-conversion attempts permit
+  ordinary startup, including repeat jobs on an already converted ledger; older
+  invocations cannot overwrite a newer attempt's durable record. The complete
+  storage phase took 219.481 s on a page-for-page live-ledger copy; draining and
+  startup add to that duration.
+- Reclamation runs paced, adaptive incremental steps with the shared WAL-pressure
+  gate. A supervised PASSIVE checkpoint thread requests device-cache flushing;
+  writer autocheckpoint remains the fallback. The 64 MiB journal setting is a
+  retained-allocation target. Cached status reports allocation, progress, latency,
+  disk reserve and condition transitions; unknown checkpoint counts pause work.
+- Singleton and project seals/preflight share exact immutable-base dependency
+  proofs, including path, object type, mode and Git blob identity. UNKNOWN,
+  partial/renamed/mismatched dependencies and stale or overlapping bases retain
+  their refusals. Source attribution and source-unit state do not change.
+
+The conversion requires an announced outage with every lead session paused.
+From a serving 2.4.26 Claude shell, use the documented pure `daemon stop --park`
+command first, then the 2.4.27 maintenance command. The replacement inherits
+`SOFTWARE_WORKFLOWS_*` settings from its launching shell, not the stopped daemon.
+See the coordinator README and 2.4.27 verification record for commands and evidence.
+
 ## [software-workflows 2.4.26] — 2026-10-30
 
 One change: lossless ledger retention with working archive readers, for both the

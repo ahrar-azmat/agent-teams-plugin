@@ -182,6 +182,19 @@ def entries_at(root, path):
     return found[0], found[1]
 
 
+def tree_entry(root, commit, path):
+    """An exact literal path in an immutable tree, including directory entries."""
+    result = git(root, ["ls-tree", "-z", "--full-tree", commit, "--", path],
+                 extra_env={"GIT_LITERAL_PATHSPECS": "1"})
+    for entry in result.stdout.split(b"\0"):
+        if entry:
+            meta, name = entry.split(b"\t", 1)
+            if name.decode("utf-8", "strict") == path:
+                mode, kind, oid = meta.decode("ascii").split()
+                return {"path": path, "mode": mode, "type": kind, "oid": oid}
+    return None
+
+
 def blob_oid(data, algorithm="sha1"):
     return hashlib.new(algorithm, b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
 

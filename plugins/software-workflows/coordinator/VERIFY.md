@@ -1,3 +1,477 @@
+# software-workflows 2.4.27 — 2026-10-31
+
+The release implements R1–R4: explicit outage conversion, paced incremental
+reclamation, supervised PASSIVE checkpoints, and dependency satisfaction by an
+already validated Git base. The live coordinator was only read through SQLite
+`mode=ro`; the writer did not stop, convert or restart it.
+
+## Trees, runs and evidence
+
+In this section **old** means the installed tree at
+`/Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows/2.4.26`.
+**Candidate** means `fa3b3843d39b` plus the uncommitted 2.4.27 edits in
+`/Users/ahrar/Documents/agent-teams-plugin/plugins/software-workflows`.
+The final eleven changed Python files have SHA-256
+`9715e78d60db8c377c294f9b4f652bcf2c04bd2a074fc7f75f882fb4b370a8ec`
+(sorted module name without `.py`, then that name, NUL, file bytes, NUL for each file).
+The initial acceptance pass ended at Python-source hash
+`777db973b6a4bd54e628ca16c3792939dcb5ed61cc514dcdd0691d41b10ba844`.
+Its final contention and two-participant R4 runs use that pre-review source;
+earlier load runs precede its checkpoint-contention correction. The review-134
+fix round below identifies the final source and repeats the affected R1 cases.
+The initial pass kept the manifest at 2.4.26 and selected candidate identity by
+scratch import injection, without copying the source tree. The fix round keeps
+the already-bumped manifest at 2.4.27.
+
+Persistent probe scripts and aggregate results are under:
+
+```text
+/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2427/writer
+```
+
+Call that directory **S** below. Disposable daemon state was `<run>/state`.
+Each wrapper stopped and waited for its daemons, native app-servers, provider
+and helpers before returning. State, fixture homes and copied Git objects were
+then removed; JSON, stdout/stderr and Git metadata snapshots remain in the run
+directories. No repository test files were added. Fixture Git changes were made
+by the lead in separate batches; the writer did not commit or change Git refs.
+
+The native runs use real supervisors/workers and Codex 0.163 app-servers with the
+loopback fixture provider and `code_mode_only` writers. The additional
+two-participant run uses real daemons and lead units. Import injection supplies
+fixtures, observations and intentional faults; the commands exercise production
+maintenance, retention, seal and preflight paths.
+
+## Review 134 — maintenance attempt recovery and ownership
+
+The blind review found two maintenance-record defects. Both were reproduced on
+the pre-review candidate above before editing, then the identical sequences ran
+on final-source hash `9715e78d60db8c377c294f9b4f652bcf2c04bd2a074fc7f75f882fb4b370a8ec`.
+These are real CLI invocations and supervisors/workers on disposable states.
+`S/review134_probe.py` and `S/inject/review134_inject.py` inject a capacity
+observation or suspension point through `sitecustomize`; they do not replace
+the maintenance or daemon implementation. Aggregate files are
+`S/review134-red.json`, `S/review134-green.json` and
+`S/review134-green-extra.json`. Every wrapper exits **0** for its expected result.
+
+### Failed repeat before its baseline
+
+Each sequence first completes a real conversion, then invokes maintenance again
+against the resumed INCREMENTAL daemon. The injected capacity observation is
+1 byte free against a requirement of **16,107,118,592 bytes**; the production
+capacity guard refuses before baseline capture.
+
+| Tree / run directory | Repeat invocation | Ordinary startup | VACUUM count before / after startup |
+|---|---|---|---:|
+| Pre-review red, `/private/tmp/r2427-review134-red-capacity` | Exit 3, `MAINTENANCE_SPACE`, 0.320 s; leaves intent without baseline | Exit 3, `MAINTENANCE_EVIDENCE`, 0.426 s | 1 / 1 |
+| Fixed green, `/private/tmp/r2427-review134-green-capacity` | Exit 3, same capacity refusal, 0.269 s; records initial_mode=2 and aborted | Exit 0, ready, 0.613 s | 1 / 1 |
+| Fixed crash supplement, `/private/tmp/r2427-review134-green-capacity-crash` | Exit 74 immediately before capacity; leaves intent with initial_mode=2 | Exit 0, ready, 0.630 s; records aborted | 1 / 1 |
+
+`maintenance.reclaim()` now persists the initial mode with a fresh intent and
+terminates a known pre-baseline failure as `aborted`. On ordinary startup,
+`continue_start()` also aborts an intent/baseline attempt when its recorded
+initial mode still matches the ledger. The durable `vacuum_started` boundary
+precedes conversion; attempts that reached it keep the existing recovery and
+baseline requirements. No committed conversion is given a replacement baseline.
+
+### Older invocation overwriting the newer attempt
+
+Invocation A is suspended after releasing maintenance exclusion. Invocation B
+then acquires it and durably saves a distinct intent. Releasing A exercises both
+its failed-resume and successful-resume final writes while B is still suspended.
+The `result.json` files preserve both attempt IDs and the record observed after A.
+
+| Case | Pre-review red directory / observation | Fixed green directory / observation |
+|---|---|---|
+| A resumes while B owns the lock | `/private/tmp/r2427-review134-red-race-failure`: A exits 3, `MAINTENANCE_RESUME` caused by `MAINTENANCE_ACTIVE`; record reverts to A/complete | `/private/tmp/r2427-review134-green-race-failure`: same explicit refusal; record remains B/intent |
+| A already resumed before B's intent | `/private/tmp/r2427-review134-red-race-success`: A exits 0; record reverts to A/resumed | `/private/tmp/r2427-review134-green-race-success`: A exits 0; record remains B/intent |
+
+Thus B's intent survives **0/2 red** versus **2/2 green** finalizations. Once
+released, B exits 0 and reaches resumed in every run; each state records only
+one VACUUM. A third ordering in
+`/private/tmp/r2427-review134-green-extra-race-completed`, driven by
+`S/review134_compare_probe.py`, lets B finish before releasing A. Both exit 0;
+B's resumed record survives A's finalization, again with VACUUM count 1.
+This exercises the attempt-ID comparison with a free lock as well as exclusion
+while the newer job still owns the lock.
+
+`save_current()` reacquires maintenance exclusion and compares the persisted
+attempt ID before either post-resume save. An occupied lock or a different
+attempt leaves the newer record untouched. The older caller still receives its
+own success or specific resumption failure.
+
+### Affected regression subset on the fixed tree
+
+`/private/tmp/r2427-review134-r1`, fresh repo-115, uses the existing `r1_job.py`
+through `execute_probe.py`. The serving-candidate whole job exits **0**, reads
+back mode 2 and integrity `ok`, and resumes ready. Pages **940 → 210**, freelist
+**720 → 0**, database length **3,850,240 → 860,160 bytes**. Checkpoint succeeds
+after **8 attempts / 2.556 s** once the pinned reader releases. The deliberate
+15 s hold makes storage time **17.780 s**; it is not an outage estimate.
+All **2,094** merged events through the fixed cutoff, **2,067** archive members,
+one explicit read ordinal, event/ordinal/replay digests and publication candidate
+remain identical. There are 47 merged-reader calls over 34 hot subjects and four
+manifests. The old client refuses after 2.121 s; the older hook exits 0/fail-open
+after 8.070 s. Fixture Git snapshots match and cleanup reports remaining `[]`.
+
+`S/review134_crashes.py` repeats the existing six-stage matrix, aggregate
+`S/review134-crashes.json`, wrapper exit **0**. Each directory below is under
+`/private/tmp/` and retains `result.json` and `vacuum-count.txt`.
+
+| Stage / directory | Job exit | VACUUM count before / after ordinary restart | Recovery |
+|---|---:|---:|---|
+| Before VACUUM, `r2427-review134-crash-before` | 73 | 0 / 0 | failed_none; explicit retry succeeds |
+| During VACUUM, `r2427-review134-crash-during` | 73 | 1 / 1 | failed_none; explicit retry succeeds |
+| After VACUUM, `r2427-review134-crash-after` | 73 | 1 / 1 | complete, ready |
+| After checkpoint, `r2427-review134-crash-checkpoint` | 73 | 1 / 1 | complete, ready |
+| Before completion save, `r2427-review134-crash-completion` | 73 | 1 / 1 | complete, ready |
+| Reader timeout, `r2427-review134-crash-reader-timeout` | 3 | 1 / 1 | MAINTENANCE_CHECKPOINT after 30.464 s; release/restart completes |
+
+All ordinary starts reach ready with **zero additional VACUUM statements**.
+Every continuation leaves the temporary directory unset and sorts `[1,2,3]`.
+
+`S/review134_hooks.py`, `/private/tmp/r2427-review134-hooks/result.json`, fresh
+repo-116, repeats the enrolled-hook transition against serving installed 2.4.26.
+Wrong PID/boot still refuses `DAEMON_REPLACED`; one-command maintenance still
+refuses `NOT_QUIESCENT`. The pure old `daemon stop --park` exits **0 / 0.043 s**;
+the separate candidate maintenance exits **0 / 0.791 s** and resumes ready.
+After delayed post/batch delivery, another maintenance invocation against the
+serving candidate exits **0 / 0.977 s**, ready. Wrapper and final stop exit 0;
+Git metadata is unchanged. The two-step live commands and environment contract
+in the README remain unchanged.
+
+The final-source static/package rerun is
+`/private/tmp/r2427-review134-static/checks.txt`: **exit 0, 20/20 checks pass**.
+It compiles 88 Python 3.15 files and 18 Python 3.9 files, imports the ten hook
+modules on 3.9, passes `hooks --check`, all three shell-shim checks, strict plugin
+and marketplace validation, option checks and version/title checks. Ruff retains
+35 findings versus installed 2.4.26's 35, with zero added. Plugin version remains
+2.4.27. Only maintenance.py and these explanatory documentation changes belong
+to this fix round; reclamation and R4 code are unchanged.
+
+Final inventory and the documentation whitespace check are recorded in
+`S/review134-final.json`: all **16** disposable daemon states removed, no matching
+processes remaining, both fixture Git snapshots unchanged, and no whitespace
+errors. Free disk is **302,906,617,856 bytes**. Evidence files remain; no live
+state or live process was changed in this fix round.
+
+## R1 — explicit conversion and recovery
+
+Installed red: `maintenance status` exits **2**, command unavailable.
+The fresh baseline in `/private/tmp/r2427-red-03` (old, fixture repo-94)
+exits **0** in 32.9 s, preserves 2,090 merged events, archives 2,067 rows and
+leaves 727 free pages in a 939-page database. Git metadata is unchanged.
+The unavailable-command red was repeated and saved in
+`/private/tmp/r2427-resume-failure/result.json`.
+
+Whole-job runs use `S/r1_job.py` and the actual candidate CLI:
+`python3.15 -B -m coordinator --state <run>/state maintenance reclaim
+--outage-announced --lead-work-paused`.
+
+| Case and trees | Run directory | Observed result |
+|---|---|---|
+| Serving old → candidate job/resume, repo-95 | `/private/tmp/r2427-r1-old` | Wrapper/job exit 0; 939 → 208 pages; freelist 721 → 0; final database 851,968 B; ready |
+| Serving candidate → candidate job/resume, repo-96 | `/private/tmp/r2427-r1-new` | Wrapper/job exit 0; 940 → 210 pages; freelist 720 → 0; final database 860,160 B; ready |
+| Missing outage assertions, candidate | `/private/tmp/r2427-resume-failure` | Exit 2, `OUTAGE_REQUIRED` |
+| Resumption failure after durable completion, candidate | Same | Injected restart failure: exit 3, `MAINTENANCE_RESUME`; phase remains complete/readiness false; later ordinary start exits 0 with VACUUM count still 1 |
+
+Both whole-job records read back `auto_vacuum=2`, `synchronous=2`,
+`fullfsync=1`, `checkpoint_fullfsync=1`,
+`journal_size_limit=67108864`, `wal_autocheckpoint=0`, integrity `ok`.
+Each preserves exactly 2,095 merged events through the pre-job cutoff, 2,067
+archive members, one explicit read ordinal, the ordinal/event/replay digests,
+and the publication candidate tree
+`c2a6dac293e5787b6df04d6a343bb905fbe79a13`. Expected new startup events are
+outside that cutoff. Each merged sample makes 47 reader calls covering 34 hot
+subjects and four archive manifests. Fixture Git snapshots match.
+
+A read-only snapshot pins WAL in both runs. After release, checkpoint succeeds
+on attempt 8 in 2.554 s / 2.746 s. A deliberate 15 s pre-checkpoint hold makes
+these storage phases 17.81 s / 17.98 s; these are exclusion probes, not normal
+outage timing. Installed 2.4.26 `Client.start(timeout=2)` exits 1 with
+`DAEMON_START` after 2.108 s / 2.120 s, without a competing writer. The installed
+2.4.25 hook exits 0 after 8.066 s / 8.063 s and explicitly allows edits while the
+coordinator is unavailable. This is why every lead must remain paused.
+
+Crash matrix: `S/r1_crashes.py`, aggregate `S/r1-crashes.json`; all candidate.
+Each run's `result.json` and `vacuum-count.txt` remain. Deliberate crash exit is
+73; the reader-timeout CLI exits 3. Matrix wrapper exits 0.
+
+| Crash boundary | Run directory under `/private/tmp/` | VACUUM count before / after ordinary restart | Recovery |
+|---|---|---:|---|
+| Before VACUUM | `r2427-crash-before` | 0 / 0 | NONE, failed_none; explicit retry converts |
+| During VACUUM | `r2427-crash-during` | 1 / 1 | NONE, failed_none; explicit retry converts |
+| After VACUUM | `r2427-crash-after` | 1 / 1 | INCREMENTAL; checkpoint/verification complete |
+| After checkpoint | `r2427-crash-checkpoint` | 1 / 1 | Verification complete |
+| Before completion save | `r2427-crash-completion` | 1 / 1 | Verification complete |
+| Reader outlives wait | `r2427-crash-reader-timeout` | 1 / 1 | `MAINTENANCE_CHECKPOINT` after 30.535 s; release/restart verifies |
+
+The during-VACUUM counter includes the aborted statement; only a later explicit
+maintenance invocation issues another one. Ordinary restart never does.
+After continuation, `temp_store_directory` is unset and a temporary sort returns
+`[1,2,3]` in every case. WAL/SHM were never manually removed.
+
+### The Claude Code outage path
+
+`/private/tmp/r2427-hook-outage-batch/result.json`, repo-99, exercises real
+Python 3.9 hook entry points, enrolled lead Bash commands, post hooks and the
+host post-tool batch. Wrapper exits 0 and Git metadata remains unchanged.
+
+| Operation | Serving tree | Result |
+|---|---|---|
+| Stop with wrong expected PID/boot | Old | Exit 2, `DAEMON_REPLACED` |
+| Candidate maintenance as one enrolled Bash command | Old | Exit 2, `NOT_QUIESCENT`; old classifier does not exempt its own hook |
+| Pure old `daemon stop --park` | Old | Exit 0, 0.047 s |
+| Separate pure candidate maintenance after that park | Stopped old | Exit 0, 0.816 s; ready candidate |
+| Pure maintenance after delayed old post/batch delivery | Candidate | Exit 0, 0.940 s; ready candidate |
+
+Thus the requested single-command sequence B is not supported through the old
+Claude hook. The proven transition is two separate commands in one announced
+outage; no preliminary candidate daemon start is needed. The first stop's hook
+reports unavailable while parked; the probe explicitly delivers its delayed
+post and batch after resumption before the additional candidate-serving job.
+This does not prove every Claude UI retry schedule. An earlier probe at
+`/private/tmp/r2427-hook-outage` omitted that batch and correctly refused the
+later job on unfinished hook work; it is not counted as the successful sequence.
+
+The exact live commands and environment requirements are in
+[README: maintenance](README.md#ledger-reclamation-and-maintenance).
+The resumed supervisor inherits the launching shell through
+`Client.start → launch_environment → clean_environment`, not the old
+supervisor's environment. The live values to retain are
+`SOFTWARE_WORKFLOWS_WRITER_MCP_SERVERS='["MCP_DOCKER","openaiDeveloperDocs"]'`
+and `SOFTWARE_WORKFLOWS_OWNER_JOURNAL_BYTES=134217728`.
+The probe confirms MCP profile inheritance; an existing 8 MiB fixture journal
+retains its header capacity, as the journal-size option is a creation setting.
+
+### Complete storage timing on the live page layout
+
+`/private/tmp/r2427-live-timing/result.json`, candidate maintenance functions,
+Python 3.15.2 / SQLite 3.54.1. Wrapper exit **0**, `copy_deleted=true`.
+SQLite online backup from a `mode=ro` live connection with default
+`pages=-1` takes **31.266 s**, separately from storage maintenance.
+
+The copy starts with 4,156,854 pages and 3,012,321 free pages. The measurement
+calls production capacity/settings, durable progress, logical verification,
+merged readers, conversion, checkpoint and integrity code. It constructs no
+Store, daemon, owner or recovery machinery. For merged reads, the scratch
+adapter routes every database open to the copy, retaining the live root only
+for validation and read-only access to the original immutable archive files;
+it does not rewrite manifests.
+
+| Storage stage | Seconds |
+|---|---:|
+| First merged sample, 256 hot subjects + 256 manifests, 834 deduplicated calls | 8.491 |
+| Full logical baseline | 78.692 |
+| VACUUM | 56.872 |
+| TRUNCATE checkpoint, one attempt, `[0,0,0]` | 17.414 |
+| Integrity check | 13.217 |
+| Full logical verification | 38.777 |
+| Same 834 merged reads after conversion | 5.900 |
+| Whole storage phase including settings/capacity/progress records | **219.481** |
+
+Database length: **17,026,473,984 → 4,495,679,488 B**; final page count
+1,097,578, freelist 0, mode 2, integrity ok, WAL length/allocation 0.
+Observed conversion WAL length is 4,522,017,272 B and allocation 4,529,852,416 B.
+Every table digest, including implicit rowids, matches: 920,051 events,
+11,481,319 archive members, 13,490 catalog entries, 19 explicit read ordinals,
+64,021 revisions and 283,940 records, with sequence high water preserved.
+
+This is 3 min 39.5 s of storage work, not total live downtime. Real drain and
+restart time must be added. The previous 80.583 s VACUUM-only measurement does
+not establish the whole job's duration. An initial stepped backup kept restarting
+under live writes; the lead terminated only that identified measurement process.
+Its partial copy and journal were deleted before the successful default-page
+backup. The successful copy was deleted immediately after measurement.
+
+## R2/R3 — load, pacing, checkpointing and pressure
+
+`/private/tmp/r2427-r23/r23-result.json`, repo-97, `S/r23_probe.py`.
+Old runs first, then candidate in NONE mode, explicit conversion, then candidate
+INCREMENTAL. Wrapper exits **0**; final readback matches 2,090 merged events,
+including 2,067 archived rows. All 168 old-hook observations recorded, none
+unavailable; maximum observed hook latency 0.658 s. Git metadata is unchanged.
+
+| Measurement | Installed 2.4.26 red | Candidate green |
+|---|---|---|
+| Writer settings | mode 0; FULL 2; fullfsync 0; checkpoint_fullfsync 0; journal limit -1; autocheckpoint 1000 | FULL 2; fullfsync 0 for space-only commits; checkpoint_fullfsync 1; journal limit 67,108,864; autocheckpoint 0 while healthy |
+| Foreground load | 10.007 s, 697 commits; max transaction 2.170 ms; max loop gap 14.202 ms | 11.840 s with retention and automatic reclamation, 841 commits; max transaction 12.000 ms; max loop gap 22.202 ms |
+| Free pages | 11,771 → 11,736; file stays allocated | Automatic phase 23,896 → 791, below 4 MiB |
+| Automatic reclamation | Absent | 93 steps; max transaction 4.106 ms |
+| Database/WAL allocation around candidate automatic phase | No corresponding reclamation | 336,343,040 / 654,323,712 B → 5,472,256 / 67,108,864 B |
+| Checkpoint thread in normal load window | Absent | 17 passes, maximum 375.918 ms off the loop, zero contentions |
+
+The fixture initially frees 89,966 pages; manual latency/adaptation measurements
+remove pages before the automatic phase starts at 23,896. Do not attribute that
+entire reduction to the 93 automatic steps. The run's
+`physical_reductions_bytes=1157529600` sums observed allocation decreases
+across phases; it is not net or lifetime disk savings. WAL allocation samples
+are preserved in the result, not inferred from file length.
+
+Eight samples at each step size use the production writer's FULL setting with
+fullfsync off and the checkpoint thread's fullfsync on:
+
+| Requested pages | Median transaction ms | Maximum ms |
+|---:|---:|---:|
+| 256 | 0.264 | 12.213 |
+| 1024 | 3.304 | 5.886 |
+| 2048 | 9.299 | 10.726 |
+| 4096 | 21.509 | 44.994 |
+
+An injected 75 ms commit delay reduces the batch 256 → 160. Eight consecutive
+fast steps recover it to 256. The 50 ms value is an adaptation target, not a
+guaranteed disk-latency ceiling.
+
+Commit/wakeup measurement uses 2,000 commits per phase:
+
+| Tree/mode | Median commit µs | p99 ms | Maximum ms |
+|---|---:|---:|---:|
+| Old NONE | 31.166 | 0.161 | 15.463 |
+| Candidate NONE | 30.729 | 0.067 | **216.472** |
+| Candidate INCREMENTAL, below threshold | 30.063 | 0.048 | 0.178 |
+
+The NONE outlier is retained in the evidence; a median improvement does not erase
+it. Candidate wake callbacks have medians 625 ns / 584 ns and maxima
+7,542 ns / 10,042 ns. Each 2,000-commit phase causes 6,000 reclamation PRAGMA
+reads. No wakeup redesign was made: the measured callback cost is sub-microsecond.
+Candidate NONE idle uses 0.009781 CPU-s over 3.002 s. The main run's INCREMENTAL
+idle interval includes a hook observer; the separate final-source idle run below
+is the clean idle measurement.
+
+Faults in the same real daemon: stopping the checkpoint worker restores writer
+autocheckpoint to 1000, raises `checkpoint_failed`, restarts the thread and clears
+the condition after healthy observations. Cancelling the reclamation coroutine
+causes the daemon's service supervision to restart it after one second. A 65 s
+pinned reader reaches 44,013 pending frames (180,277,248 B), raises sustained
+`wal_pressure` and `reclamation_stalled`, and clears both after release.
+The complete fixture/fault session records a 0.704 s maximum loop gap and one
+diagnostic signal, including deliberate seed/fault work; that is distinct from
+the 22.202 ms normal-load window.
+
+### Contention correction, idle and abnormal exit
+
+The first candidate contention probe,
+`/private/tmp/r2427-contention-before/result.json`, finds a real defect:
+PASSIVE returns `[1,-1,-1]` while another checkpoint owns the checkpoint lock,
+but the inherited calculation reports pending=0 and releases the pressure gate.
+The correction reports unknown pending frames as null and keeps the shared gate
+paused until valid frame counts return. It does not count an unknown sample as
+checkpoint progress.
+
+`/private/tmp/r2427-contention-after/result.json` verifies the correction.
+The final-source repetition is
+`/private/tmp/r2427-contention-final/result.json`, wrapper exit **0**:
+
+- Pure INCREMENTAL idle with no hook observer and no eligible freelist:
+  5.001 s wall, 0.011201 CPU-s (about 0.22% of one core).
+- A separate TRUNCATE contends for 3.247 s, returns `[1,43473,0]`.
+  All 29 sampled busy PASSIVE observations keep pending=null and pressure paused.
+- Concurrent production NOOP observations return valid 43,473 pending frames,
+  178,065,408 B, and remain paused. After reader release, pending=0 and the gate
+  resumes. NOOP did not return unknown counts in this run.
+- Injecting a one-byte free-space observation raises projected-exhaustion alarm;
+  the next real observation clears it. The disk was not actually filled.
+
+`/private/tmp/r2427-thread-exit/result.json` constructs the production
+Checkpoint in an isolated process and raises an unhandled main-thread exception
+without its orderly cleanup. The checkpoint thread is a daemon thread; the child
+exits **1** in 0.295 s, wrapper exits **0**, without hanging. This demonstrates
+interpreter exit with that thread, not a whole-daemon main-loop crash.
+Normal daemon cleanup still stops and joins the thread.
+
+## R4 — exact dependency in the validated base
+
+`S/r4-phase-a.json`, `r4-phase-b.json`, `r4-final.json`, and the
+lead's `r4-git-request.result.json` / `r4-advance-request.result.json`
+preserve setup, Git history and decisions. Each numbered case has
+`/private/tmp/r2427-r4-<number>/phase-b.json`; 105, 106 and 110 also have
+`final.json`. All phase wrappers exit **0**. Decisions are RPC results:
+an expected refusal is `ok=false` with its code, not a shell failure.
+
+| Fixture / case | Tree | Decision |
+|---|---|---|
+| 100: 10-30 lead revision, plain Git commit, writer reads it | Old then candidate | Old `UNPUBLISHED_DEPENDENCY`; same unit seals on candidate with stored base proof |
+| 101: partial commit | Candidate | `UNPUBLISHED_DEPENDENCY` for the unmatched `c.txt` revision |
+| 102: rename | Candidate | `UNPUBLISHED_DEPENDENCY` at original `a.txt` |
+| 103: executable-mode difference | Candidate | `UNPUBLISHED_DEPENDENCY` |
+| 104: symlink/type difference | Candidate | `UNPUBLISHED_DEPENDENCY` |
+| 105: real UNKNOWN revision and new dependent read | Candidate, final.json | `UNKNOWN_DEPENDENCY` |
+| 106: project seal/preflight, then branch advance | Candidate | Seal and preflight succeed; later `STALE_BASE` |
+| 107: older revision equals selected base | Candidate | Seal succeeds with proof |
+| 108: older revision differs from selected base | Candidate | `UNPUBLISHED_DEPENDENCY` |
+| 109: absent dependency path, absent in base | Candidate | Seal succeeds with absence proof |
+| 110: branch advance through candidate scope | Candidate | Initial seal succeeds; later `BASE_SCOPE_CHANGED` |
+
+The source revisions and attribution remain unchanged and source units remain
+open. Native cases retain an explicit dependency read ordinal. The first 105
+fixture merely labelled an exact known read UNKNOWN and therefore sealed; it is
+not evidence of the required refusal. The corrected final run creates a real
+UNKNOWN revision, records a new read and verifies the proper refusal. A fixture
+`UNIT_FROZEN` while correcting it was resolved by reopening the unit and making
+a new verified operation. Case 100 also contains an invalid intermediate
+`daemon resume` CLI invocation (exit 2); the subsequent real RPC starts the
+candidate and performs the successful seal.
+
+Two actual project participants are covered separately by
+`S/r4_multi.py`, `/private/tmp/r2427-r4-multi/phase-b.json`, fixtures
+repo-111/repo-112. Lead Git steps all exit 0, with bases
+`329f6ed609d472a7d69d6e396df51130413bbfe2` and
+`edfa0ef24e43537ef563139edfdab9c4aa195cb0`.
+Installed old first refuses `UNPUBLISHED_DEPENDENCY`; final-source candidate
+seals a vector of **two** checkouts, records proofs against each base and
+preflights both. Both source units remain open, both revisions unchanged.
+Wrapper and both daemon stops exit 0; Git snapshots match; remaining processes
+is the empty list. No publication or branch mutation is performed by the writer.
+
+## Static checks and cleanup
+
+`S/static_checks2426.py` was extended for both new modules, all eleven changed
+Python files, and the actual hook import closure; its comparison baseline is
+installed 2.4.26. The final-source pre-version run is
+`/private/tmp/r2427-static-final-source/checks.txt`, exit **0**:
+
+- Python 3.15 compilation: **88 files**, zero errors.
+- Python 3.9.6 compilation: **18 hook/CLI files**; actual imports of ten hook
+  modules, including maintenance: exit 0.
+- `hooks --check`: exit 0, `{"compatible": true, "protocol": "jsonl-v1"}`.
+- Git shim syntax under sh, POSIX bash and sh-emulated zsh: each exit 0;
+  executable mode 100755.
+- Ruff F821/F822/F823/F811/F841/F401 comparison: **35 existing findings versus
+  35 installed findings, zero added**. This is regression-clean, not zero lint.
+- `claude plugin validate --strict` for plugin and marketplace: each exit 0,
+  `Validation passed`.
+- Fifteen changed files: no trailing whitespace or missing final newline.
+- Reclaim-concurrency values 1, 2 and 4: exit 0; 0, -1, 1.5 and invalid:
+  expected exit 1 with the positive-integer configuration refusal.
+- The pre-version run intentionally expects manifest 2.4.26 and README 2.4.27.
+  Final metadata/package checks after the last version edit are saved separately
+  in `/private/tmp/r2427-static-release`.
+
+The live-layout copy is deleted. A final process inventory finds no process
+naming the probe states/provider. The inherited `r2427-red-01` state, fixture
+home and copied Git objects were removed after that check; its original JSON
+and `final-cleanup.json` remain. Free disk then measures 303,665,393,664 B,
+well above the 15 GiB reserve. Earlier `r2427-red-02` hit
+`CHECKOUT_OWNED` on a reused fixture and was cleaned; fresh repo-94 supplies
+the actual red baseline. No live process was signalled by this writer.
+
+## Limits of the evidence
+
+The live ledger has not yet been converted, and 219.481 s does not include its
+actual drain/restart. Crash injection proves process-crash recovery, not a
+physical power-cut experiment. The exhaustion alarm uses an injected observation,
+not an exhausted volume. The full native workload preceded the final unknown
+checkpoint-count correction; the final contention/idle run exercises that
+correction directly. The two-participant supplement uses lead units while the
+other R4 cases use native writers. No Git publication is performed in acceptance;
+candidate decisions and immutable trees are compared. Long-lived reader and
+disk-latency delays remain visible operational conditions, not hard deadlines.
+
+Office release selection, quarantined-writer relaunch and cancelled-writer
+resumption are unchanged and belong to 2.4.28.
+
+---
+
 # C1 rework — fresh operational verification, 2026-10-18
 
 This replaces the previous verification record. **The eleven findings have implementation changes and direct operational evidence below. This is not an unconditional all-green release certificate.** The remaining coverage gaps and the observed process-attribution limitation are explicitly marked below.

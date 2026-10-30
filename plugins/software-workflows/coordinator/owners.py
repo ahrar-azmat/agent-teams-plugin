@@ -318,6 +318,8 @@ def supervise(root):
 
 def _supervise(root, control):
     root = validate_state(root, create=True)
+    from .maintenance import admit_start
+    admit_start(root)
     os.umask(0o077)
     agent = bool(os.environ.get("SOFTWARE_WORKFLOWS_LAUNCH_AGENT"))
     with open(root / "supervisor.lock", "a+b") as lock:
@@ -325,6 +327,7 @@ def _supervise(root, control):
             fcntl.flock(lock, fcntl.LOCK_EX | (0 if agent else fcntl.LOCK_NB))
         except BlockingIOError:
             return 0
+        admit_start(root)
         journal = Journal(root)
         owner = Owner(root, journal)
         custodian = Custodian(json.loads(os.environ.pop("SOFTWARE_WORKFLOWS_RECOVERY_LEASES", "[]")))
@@ -551,6 +554,7 @@ def _supervise(root, control):
                                 sent = processes.signal_identity(worker, signal.SIGUSR2)
                             send(connection, {"ok": True, "sent": sent})
                         elif action == "owner/start":
+                            admit_start(root)
                             journal.append("INHIBIT", cleanup=True, value=False)
                             (root / "autostart-inhibit").unlink(missing_ok=True)
                             stopping = False
