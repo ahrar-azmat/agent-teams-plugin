@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.27 / P1
+# Writer coordinator — software-workflows 2.4.28 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -7,6 +7,128 @@ connects Abraham, the run tools and Claude lead operations to that durable
 coordinator. The package does not import `server.py`; the MCP server uses the
 same Python client and JSONL RPC as the CLI. Actual verification results are in
 [VERIFY.md](VERIFY.md).
+
+Version 2.4.28 contains two changes: Codex publishing guards and cleanup of leaked
+calibration directories.
+
+## Calibration directory lifetime
+
+Writer admission removes its `software-workflows-admission-*` directory in a
+`finally` block after the real probes have stopped, including failure and
+cancellation. Evidence stays in ledger events: `admission/probe` contains each
+observation, and `admission/calibrated` contains the outcome and cleanup status.
+Capability fallback evidence points to that event instead of a retained file.
+Git lazy-fetch calibration similarly removes `software-workflows-git-*` before
+writing its cache; `evidence.removed` records the result. Failed measurements are
+recorded with `completed=false` and cannot become cache hits.
+
+Before each new calibration directory, that path sweeps only its own prefix in
+the same parent directory. A candidate must be a real directory owned by the
+current UID with a modification time more than one hour old. Each new calibration
+creates `.lifetime.lock` immediately after directory creation and holds an exclusive
+process lock until its own removal finishes. A sweeper opens that lock with
+`O_NOFOLLOW`, acquires `LOCK_EX | LOCK_NB`, and holds it through removal. A held lock
+keeps the directory and increments `active`, regardless of age. Process exit releases
+the lock. A missing lock never establishes abandonment: lockless directories from
+earlier releases are preserved regardless of age and counted as `legacy`, without
+walking their contents. Symlinks, regular
+files, other owners/prefixes and newer directories survive. Removal uses Python's
+symlink-safe directory deletion; unsupported removal and filesystem errors are
+recorded without failing calibration. Admission records `admission/temp-sweep`;
+Git cache status includes `sweep`. Both report removed counts, logical `bytes`,
+`allocated_bytes` (the sum of filesystem blocks), kept/active/legacy entries and errors. These
+byte counts describe removed trees, not a guarantee about immediate APFS free
+space. Admission deletion runs off the coordinator event loop and is joined
+before cancellation propagates.
+
+The sweep is opportunistic, not a background timer: a cache hit creates no Git
+probe directory and does not sweep. Existing running code must be replaced during
+the lead's normal rollout before it stops creating the old leaks.
+
+For one-time legacy cleanup, first establish that no release before 2.4.28 is still
+running, including stopped or suspended calibration processes. Then remove only
+real directories owned by your UID in `TMPDIR` whose names start with
+`software-workflows-admission-` or `software-workflows-git-` and which have no
+`.lifetime.lock` entry. Preserve symlinks, other prefixes and any directory with a
+lock entry. This cleanup is an operator action, never part of an automatic sweep;
+the lead will do it on this machine after the live switch.
+
+## Codex publishing policy
+
+The lead (Claude) publishes. Codex leaves edits uncommitted. Native writers still
+refuse unestablished Git commands at the coordinator gate. Their visible `gh`
+mutation commands now refuse with `LEAD_PUBLISHES`; known built-in read paths and
+API GET/HEAD without field/input flags remain available. The gate reads command
+text, so an arbitrary program can hide a `gh` invocation.
+
+Every Codex launch receives a guard-only `GIT_CONFIG_PARAMETERS` URL rewrite and
+inline pre-push refusal hook. A dedicated `git-remote-sw-codex-no-push` helper is
+added at the end of PATH. It reports that the lead pushes and exits 1. The guard
+does not replace `core.hooksPath` or route Codex through Claude's git shim.
+Configured user stdio MCP processes receive explicit guard entries because Codex does
+not inherit Git parameters into them by default. Native and exec configuration
+preflight refuses `CODEX_PUBLISH_ENV` when the effective shell policy removes the
+guard, the helper is absent, or an enabled stdio server lacks its environment.
+The guard is carried in Codex's `shell_environment_policy.set`, so `inherit=core`
+works. Existing user entries survive the deep merge; a nonempty `include_only` list
+is extended only with the guard variable names. Inheritance, exclusions and `filters`
+are preserved. A configured PATH receives the helper suffix. Overrides contain only
+the guard leaves, never unrelated MCP environment credentials. A nonempty foreign
+`GIT_CONFIG_PARAMETERS` in the launch environment, `shell_environment_policy.set`,
+or a stdio server's own `env` refuses before inference with `CODEX_PUBLISH_ENV`.
+The refusal names only that location and says to move those settings into a Git
+config file. It never includes the value. An already installed exact guard is
+accepted; composition with any foreign prefix is refused. Only the public guard
+constant enters overrides or service thread configuration. No shell-policy Git
+setting is silently overwritten. Guard entries are prepared for disabled user
+stdio servers too, because an explicit writer profile can subsequently enable them.
+Service variables
+share the effective set table and cannot replace PATH or Git configuration. Ordinary advisors retain
+`--ignore-user-config`; ambiguous project-trust or managed-layer parity refuses
+before inference instead of assuming app-server and exec load the same policy.
+Codex 0.163.0 plugin MCP overlays exclude transport environment settings. Plugin MCP
+servers are disabled individually while their plugins and skills stay enabled.
+An explicit writer-profile selection of a plugin MCP server refuses `CODEX_PUBLISH_ENV`
+because that choice cannot carry the guard. Unreadable plugin metadata disables that
+plugin and is recorded in the evidence. All launches also set `features.apps=false`:
+the built-in `codex_apps` server exposes publishing tools outside the MCP profile.
+Effective configuration verifies this switch. Native live web search stays available.
+Writer/advisor context and profile evidence identify disabled transports and why.
+The plugin inventory is frozen with a disabled default so later installations
+cannot add an unverified server to an admitted listener.
+Names-only plugin metadata is cached in process and, when `CLAUDE_PLUGIN_DATA` is
+available, under `codex-plugin-catalog`. Its key includes Codex binary identity and
+the plugin's id, version, localVersion, installedAt, source and enabled state.
+
+Coordinator/supervisor environments detach only this plugin's guard contribution.
+The lead's process environment is never modified. Already running 2.4.27 listeners
+do not gain the guard from a file update; rollout requires new processes. Durable
+context notices update publishing instructions in resumed native threads.
+
+**Limits:** this is inherited configuration, not a security boundary around
+unrestricted programs. Explicit `pushurl` skips the URL rewrite. Apple Git 2.50.1
+does not enforce the configuration hook. On Git 2.56.0, `--no-verify` skips that
+hook; pairing it with an explicit push URL or a more-specific rewrite escapes
+both defenses. Clearing/replacing the environment, alternate implementations,
+hidden `gh`/API calls, and MCP wrappers that launch containers or remote programs
+also remain routes requiring an independent execution/credential boundary.
+The pre-push hook runs after remote-ref discovery, so hook refusal does not prove
+that no bytes were sent. Remote/container MCP reach has not been established by
+host stdio environment propagation. Infra advisors deliberately retain user-configured
+MCP servers, including their write tools; disabling connected apps and plugin servers
+does not restrict those user servers.
+
+`/software-workflows:setup` measures `/usr/bin/git` and each distinct executable
+named git on the launch PATH against disposable local bare remotes. It checks a
+successful unguarded control, ordinary/local-URL pushes, explicit push URLs, hook
+bypass and cleared environments. Every case records actual exits and remote refs;
+an unrelated error or failed control is unverified. The cache includes executable
+identity, guard/probe bytes and helper resolution. Setup readiness requires refusal
+of ordinary, path and file-URL pushes; its details list the measured bypass limitations.
+SessionStart reports only a cached ordinary-route failure or missing launch guard.
+A missing/stale cache and documented limit cases stay silent; no push runs at SessionStart.
+These measurements describe isolated
+fixtures; they do not certify arbitrary repository configuration or descendants.
 
 The central rule is that **claims and custody coordinate access; only a verified
 operation establishes authorship**. Shell commands, MCP calls, external editors,
@@ -76,7 +198,8 @@ one coordinator WebSocket connection and a namespace for its native IDs.
 
 Native writers retain the user's normal CODEX_HOME, provider and unrelated hook
 trust. Their MCP servers follow the explicit writer profile described below;
-`all` preserves the normal MCP configuration. The supervisor, the worker and every app-server they
+`all` preserves user-configured servers while disabling plugin MCP transports
+and connected ChatGPT apps under the publishing policy. The supervisor, the worker and every app-server they
 start run without the launching Claude Code session's identity and messaging
 variables (`CLAUDECODE`, `CLAUDE_PID`, `CLAUDE_ENV_FILE`, `CLAUDE_EFFORT`,
 `CLAUDE_PROJECT_DIR`, `CLAUDE_JOB_DIR`, `CLAUDE_PLUGIN_ROOT`, `CLAUDE_PLUGIN_DATA`,
@@ -1805,8 +1928,10 @@ uses 60 s free-space samples and is unknown until a consumption rate exists.
 
 `writer_mcp_servers` accepts `all` (the default) or a JSON list of exact server
 names, such as `["calendar","repository"]`; `[]` disables every server.
-An explicit list enables exactly those servers, including a listed server that
-the native configuration disables.
+An explicit list enables exactly those user servers, including a listed server
+that the native configuration disables. Selecting a plugin MCP server refuses
+`CODEX_PUBLISH_ENV`: Codex 0.163.0 cannot carry the guard into its transport.
+Connected ChatGPT apps (`codex_apps`) are disabled independently of this profile.
 `SOFTWARE_WORKFLOWS_WRITER_MCP_SERVERS` overrides the plugin setting. The daemon
 captures the selection at startup; status records its source and that changes
 apply at the next daemon start. The captured selection controls subsequent
@@ -1825,8 +1950,13 @@ whole). Per-server keys preserve a plugin's skills and other content, including
 plugins with no MCP servers. Whole-plugin fallbacks are named with their reasons
 in status and context. The explicit profile freezes its plugin catalog at first
 admission: plugins installed later stay disabled for writers until the daemon
-restarts. In `all` mode no plugin enumeration runs; status captures user-server
-names from the first native config only, explicitly excluding plugin inventory.
+restarts. In `all` mode plugin metadata is also inspected for the publishing
+policy: every plugin MCP server is disabled while readable plugins and their
+skills retain their enablement. Profile evidence records disabled server names,
+the transport limitation and `apps_disabled=true`; status captures user-server
+names separately. The same restrictions apply to advisors without imposing the
+writer's user-server selection on them. Names-only plugin metadata is cached by
+binary and installed-plugin identity so a warm preflight avoids repeated reads.
 An unknown selected name is refused with `WRITER_MCP_UNKNOWN`; ignored
 disable flags are refused with `WRITER_MCP_UNENFORCEABLE`. The lead-tool
 restriction remains in force for enabled related servers. Excluded names and

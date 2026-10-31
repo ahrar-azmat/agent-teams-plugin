@@ -1,6 +1,18 @@
 # agent-teams-plugin
 
-A Claude Code plugin marketplace, **`agent-teams`**, with one plugin, **`software-workflows`** (2.0.0).
+A Claude Code plugin marketplace, **`agent-teams`**, with one plugin, **`software-workflows`** (2.4.28).
+This release adds Codex publishing guards and fixes leaked calibration directories;
+the measured coverage and cleanup behavior are recorded in
+[coordinator/VERIFY.md](plugins/software-workflows/coordinator/VERIFY.md).
+Foreign `GIT_CONFIG_PARAMETERS` in Codex launch, shell-policy or stdio MCP environments
+refuses with `CODEX_PUBLISH_ENV`; move those settings into a Git config file. Explicitly
+selected user stdio servers receive the guard even when initially disabled. Calibration
+directories hold a lifetime lock so another sweep cannot remove a live calibration.
+Automatic sweeps preserve and count lockless directories from earlier releases as
+`legacy`, regardless of age: an older calibration could still be running. For one-time
+cleanup, first stop every earlier release, then remove only the lockless
+`software-workflows-admission-*` and `software-workflows-git-*` directories owned by
+your UID in `TMPDIR`. The lead will do this machine's cleanup after the live switch.
 It adds three things to Claude Code:
 
 - **Agent teams that work.** A skill that runs multi-agent work through Claude Code's
@@ -186,7 +198,13 @@ What it guarantees:
   undo.
 - Several writers can share a checkout, each on its own **claims** (next section). A run on the
   fallback `codex exec` backend still holds its checkout alone, across both phases.
-- Codex never commits or pushes. Every run ends with a **CHANGED FILES** report, compared by
+- Codex must leave commits and pushes to the lead. Native command admission and an inherited
+  push guard enforce the ordinary routes; unrestricted descendants, explicit push URLs and
+  hook/environment bypasses have [documented limits](plugins/software-workflows/coordinator/README.md#codex-publishing-policy).
+  Connected ChatGPT apps and plugin MCP servers are disabled for these runs; plugin skills
+  and native live web search remain available. Infra advisors retain user-configured MCP
+  servers, including any write tools they expose.
+  Every run ends with a **CHANGED FILES** report, compared by
   content, inside submodules and across every index stage. The report also gives the mode Codex
   recorded for each turn. Review the diff, then record it yourself.
 

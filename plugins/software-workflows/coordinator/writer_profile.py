@@ -68,41 +68,28 @@ async def configure(connection, effective, cwd, selected):
     name without metadata proving that name exists. No profile widens itself.
     """
     require_valid(selected)
+    from . import push_guard
+    from .roles import merge
     users = effective.get("mcp_servers") or {}
+    plugins, unknown = await push_guard.plugin_inventory(connection, effective, cwd)
     if selected["mode"] == "all":
-        # No plugin metadata (which may contact a marketplace) is needed to
-        # preserve native configuration. Capture only names, once for status.
+        policy = push_guard.plugin_restrictions(effective, plugins, unknown)
         selected.setdefault("inventory", {"servers": sorted(users),
-                            "scope": "first native user-server configuration; plugin enumeration skipped"})
-        return {}, {**selected, "enabled": sorted(name for name, config in users.items() if config.get("enabled", True)),
+                            "scope": "user servers; plugin MCP transports are disabled to preserve the publishing guard"})
+        return policy, {**selected, "publish_plugins": policy.get("plugins"),
+                    **push_guard.plugin_evidence(policy, plugins, unknown),
+                    "enabled": sorted(name for name, config in users.items() if config.get("enabled", True)),
                     "disabled": [], "disabled_plugins": []}
-    plugins, unknown = {}, set()
     declared = {key: value for key, value in (effective.get("plugins") or {}).items()
                 if key != "_default" and isinstance(value, dict)}
-    if declared or effective.get("features", {}).get("plugins", True):
-        try:
-            listed = await connection.call("plugin/installed", {"cwds": [cwd]})
-            for market in listed.get("marketplaces", []):
-                for plugin in market.get("plugins", []):
-                    if not plugin.get("installed"):
-                        continue
-                    params = {"pluginName": plugin["name"]}
-                    if market.get("path"):
-                        params["marketplacePath"] = market["path"]
-                    else:
-                        params["remoteMarketplaceName"] = market["name"]
-                    try:
-                        detail = (await connection.call("plugin/read", params))["plugin"]
-                        plugins[plugin["id"]] = detail.get("mcpServers", [])
-                    except CoordinatorError:
-                        unknown.add(plugin["id"])
-        except CoordinatorError:
-            unknown.update(declared)
-    unknown.update(set(declared) - set(plugins))
     all_names = set(users) | {name for names in plugins.values() for name in names}
     catalog = set(selected.setdefault("plugin_catalog", sorted(set(plugins) | unknown)))
     selected["later_plugins"] = "Plugins installed later are disabled for writers until the coordinator restarts"
     chosen = set(selected["names"])
+    incompatible = chosen & {name for names in plugins.values() for name in names}
+    if incompatible:
+        push_guard.fail("Writer MCP profile explicitly selects a plugin MCP server: " + push_guard.PLUGIN_MCP_REASON,
+                        servers=sorted(incompatible))
     if chosen - all_names:
         raise CoordinatorError("WRITER_MCP_UNKNOWN", "Writer MCP profile names are not in the native configuration",
                                {"servers": sorted(chosen - all_names), "unreadable_plugins": sorted(unknown)})
@@ -123,19 +110,26 @@ async def configure(connection, effective, cwd, selected):
     evidence = {**selected, "enabled": sorted(chosen), "disabled": sorted(all_names - chosen),
                 "disabled_plugins": sorted(disabled_plugins), "disabled_plugin_reasons": disabled_plugins,
                 "plugin_servers": plugins, "user_servers": sorted(users)}
+    restrictions = merge(restrictions, push_guard.plugin_restrictions(merge(effective, restrictions), plugins, unknown))
+    evidence.update(push_guard.plugin_evidence(restrictions, plugins, unknown))
+    evidence["publish_plugins"] = restrictions.get("plugins")
     line = context(evidence)
     prior = [part for part in (effective.get("developer_instructions") or "").splitlines()
-             if not part.startswith("Writer MCP profile excludes:")]
+             if not part.startswith(("Writer MCP profile excludes:", "Plugin MCP servers disabled:",
+                                     "Connected ChatGPT apps (codex_apps) are disabled;",
+                                     "Plugins disabled because MCP metadata is unavailable:"))]
     restrictions["developer_instructions"] = "\n".join(prior + [line]).strip()
     return restrictions, evidence
 
 
 def context(profile):
+    from .push_guard import plugin_context
     excluded = profile.get("disabled", []) + ["plugin:" + name + " (" + profile.get("disabled_plugin_reasons", {}).get(name, "metadata unavailable") + ")"
                for name in profile.get("disabled_plugins", [])]
-    return ("Writer MCP profile excludes: " + (", ".join(excluded) or "none") +
+    line = ("Writer MCP profile excludes: " + (", ".join(excluded) or "none") +
             ". To enable a server, change writer_mcp_servers and restart the coordinator. "
-            "Plugins installed later stay disabled until that restart.")
+            "Plugins installed later stay disabled until that restart.") if profile.get("mode") == "list" else ""
+    return "\n".join(part for part in (line, plugin_context(profile)) if part)
 
 
 async def deliver_context(daemon, actor, preparing_input=False):
@@ -148,9 +142,8 @@ async def deliver_context(daemon, actor, preparing_input=False):
     from .store import digest
     store = daemon.store
     profile = store.get(actor["listener"]).get("writer_profile", {})
-    if profile.get("mode") != "list":
-        return
-    line = context(profile)
+    from .push_guard import INSTRUCTIONS
+    line = "\n".join(part for part in (context(profile), INSTRUCTIONS) if part)
     if actor.get("writer_profile_context") == line:
         return
     ident = "writer_profile:" + actor["id"] + ":" + digest(line)
@@ -172,6 +165,10 @@ async def deliver_context(daemon, actor, preparing_input=False):
 def verify(effective, profile):
     """Refuse a native configuration layer that did not honor the launch policy."""
     require_valid(profile)
+    from .push_guard import verify as verify_guard
+    verify_guard(effective)
+    from .push_guard import verify_plugin_policy
+    verify_plugin_policy(effective, profile.get("publish_plugins"))
     if profile["mode"] == "all":
         return
     users = effective.get("mcp_servers") or {}

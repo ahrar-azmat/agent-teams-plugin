@@ -8,8 +8,9 @@ SessionStart hook runs the quick checks and points to setup when one fails.
   plugin_setup.py prepare [--data DIR]  build the Codex Oracle server's venv now (DIR is the
                                         plugin's data directory, ${CLAUDE_PLUGIN_DATA})
 
-It runs under any python3 from 3.9 on (what macOS ships). Nothing changes without `apply` or
-`prepare`; `apply` adds one key to one file and leaves everything else in it as it was."""
+It runs under any python3 from 3.9 on (what macOS ships). `check` measures push refusal
+using disposable local repositories and retains a capability cache in plugin data.
+`apply` adds one key to one settings file and leaves everything else as it was."""
 import ctypes
 import errno
 import importlib.util
@@ -25,6 +26,8 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))  # SessionStart loads this module by path.
 TEAMS = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
 MEASURED_CODEX = (0, 163, 0)  # the codex-cli this release was measured on
 
@@ -160,6 +163,35 @@ def checks(data_dir=None, quick=False):
                     else "install git with your package manager", ""))
     else:
         out.append(("git", True, git, "", ""))
+    from coordinator.push_capabilities import report
+    from coordinator.client import clean_environment
+    from coordinator import push_guard
+    try:
+        push_guard.verify({}, clean_environment(), configuration=False)
+    except Exception as exc:
+        out.append(("Codex launch guard", False, str(getattr(exc, "code", type(exc).__name__)),
+                    "The Codex launch environment or refusal helper is unavailable; reinstall the plugin.", ""))
+    try:
+        capabilities = report(data_dir, quick=quick)
+    except Exception as exc:
+        capabilities = [{"binary": {"path": "git"}, "cases": [],
+                         "error": "unverified: " + str(getattr(exc, "code", type(exc).__name__))}]
+    for result in capabilities:
+        cases = [row for row in result["cases"] if row["case"] != "control"]
+        ordinary = [row for row in cases if row["case"] in ("ordinary", "url", "file_url")]
+        limits = [row for row in cases if row not in ordinary]
+        # SessionStart reports a measured ordinary failure, never missing/stale
+        # evidence or the documented ways unrestricted programs escape a guard.
+        if quick and not any(row["status"] != "refused" for row in ordinary):
+            continue
+        detail = result.get("version", result["binary"]["path"]) + ": " + (result.get("error") or
+                 ", ".join(row["case"] + "=" + row["status"] for row in ordinary))
+        if limits:
+            detail += "; measured limitations: " + ", ".join(row["case"] + "=" + row["status"] for row in limits)
+        ready = (len(ordinary) == 3 and not result.get("error")
+                 and all(row["status"] == "refused" for row in ordinary))
+        out.append(("Codex push guard: " + result["binary"]["path"], ready, detail,
+                    "The lead (Claude) pushes. Review measured limitations with /software-workflows:setup; unrestricted descendants are not a security boundary." if not ready else "", ""))
     return out
 
 

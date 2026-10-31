@@ -3,6 +3,66 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.28] — 2026-10-31
+
+Two changes: Codex publishing guards, and cleanup of leaked calibration
+directories. Publishing belongs to the lead (Claude); the lead's Bash gate and
+coordinator publication environment remain separate.
+
+- Native writers, exec writers, Abraham analysis and advisors receive guard-only
+  Git configuration and a dedicated remote helper. User stdio MCP servers receive
+  explicit environment entries. Effective shell policies that drop the guard
+  refuse before inference with `CODEX_PUBLISH_ENV`; service mappings cannot
+  replace guard variables. Existing repository hook directories are preserved.
+  Codex's shell policy carries the guard even with `inherit=core`; existing user
+  set entries and service variables survive the merge. MCP overrides contain only
+  guard leaves, keeping unrelated credentials out of argv and listener records.
+  Foreign `GIT_CONFIG_PARAMETERS` in the launch environment, shell policy or a
+  stdio server's environment refuses with `CODEX_PUBLISH_ENV`, naming only the
+  location and asking that those settings move to a Git config file. Only the
+  guard's own constant enters overrides, including service thread overrides.
+  Disabled user stdio servers receive guard entries too, so an explicit writer
+  profile can enable them without breaking admission.
+  Codex 0.163.0 cannot apply transport environment overrides to plugin MCP servers,
+  so their servers are disabled while plugin skills stay enabled. An explicit
+  writer selection of such a server refuses admission. Every launch disables
+  connected ChatGPT apps (`features.apps=false`), verified in effective configuration;
+  native live web search stays available. Context and profile evidence name these
+  restrictions. Names-only plugin metadata caching avoids repeated plugin/read calls.
+- Native command admission refuses visible `gh` mutations, aliases and extensions
+  with `LEAD_PUBLISHES`. Built-in reads and API GET/HEAD without payloads remain
+  admitted. Fresh and resumed writers receive the common publishing instruction.
+- Setup reports per-binary local-fixture capabilities and caches by binary,
+  implementation and resolution identity. Readiness covers ordinary/path/file-URL
+  refusal; details retain measured limitations. SessionStart stays silent for missing
+  or stale caches and those limitations, and reports cached ordinary-route failures
+  or a missing launch guard. Successful calibration controls run only from the lead.
+- Admission and Git lazy-fetch calibrations now remove their disposable directories
+  in `finally`, including failed or cancelled admission checks. Admission evidence
+  remains in ledger events; Git's cache keeps the observation and removal status.
+  Before creating a directory, each path sweeps this UID's directories of its own
+  prefix in the same temp root when they are older than one hour and their lifetime
+  lock can be acquired. Symlinks, regular
+  files, other owners/prefixes and fresh directories are preserved. Events/cache
+  status record removed counts, logical/allocated bytes and nonfatal cleanup errors.
+  Each new calibration holds an exclusive `.lifetime.lock` through its own removal.
+  Sweeps open locks without following symlinks, skip and count held locks as active,
+  and hold an acquired lock through deletion. A process exit releases its lock for
+  a later sweep. Lockless directories from earlier releases are never removed
+  automatically: those calibrations could still be running. Sweeps count them as
+  `legacy` without walking their contents, in admission events and Git cache status.
+  For one-time cleanup, once no earlier release runs, remove this UID's lockless
+  `software-workflows-admission-*` and `software-workflows-git-*` directories in
+  `TMPDIR`. The lead will perform that cleanup after this machine's live switch.
+
+This inherited guard is **not an execution or credential boundary**. Apple Git
+2.50.1 ignores the configuration hook; explicit push URLs bypass URL rewriting.
+Hook bypasses, replaced environments, more-specific rewrites, arbitrary programs
+and remote/container MCP execution remain limitations. Infra advisors retain
+user-configured MCP servers, including their write tools. A pre-push hook can run
+after transport contact. See VERIFY for observed exits and verification gaps;
+the absolute "no descendant can publish" property is not established.
+
 ## [software-workflows 2.4.27] — 2026-10-31
 
 Two changes: return unused ledger space to the filesystem, and accept a seal's

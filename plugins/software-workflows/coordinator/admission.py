@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 from .locks import KeyedLocks, finish_all, finish_thread, retire
 from .client import CoordinatorError
-from . import native, gitio, processes, runtime, children
+from . import native, gitio, processes, runtime, children, calibration_temp
 from .fixture import Provider, action, function, patch, message, scratch_directory
 from .ledger import case_sensitive
 from .store import digest, uid, encoded
@@ -367,14 +367,32 @@ class Admission:
         """
         temporary_roots = {Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve()}
         parent = self.store.root / "calibrations" if any(p in self.store.root.parents for p in temporary_roots) else None
+        sweep = {}
+        try:
+            await finish_thread(lambda: sweep.update(calibration_temp.sweep(parent or tempfile.gettempdir(), "software-workflows-admission-")))
+        finally:
+            self.store.event("admission/temp-sweep", binding, sweep)
         directory = tempfile.mkdtemp(prefix="software-workflows-admission-", dir=parent)
-        self.store.event("admission/calibrating", binding, {"state": "running", "fixture": fixture})
-        calibration = await self.check({"scratch": directory, "probes": list(PROBES) + (["projects"] if fingerprint.get("project") else [])})
-        if not calibration["completed"]:
-            raise CoordinatorError("ADMISSION_INCOMPLETE", "Required runtime probes did not all complete")
+        calibration, failure, cleanup = None, None, {}
+        lifetime = None
+        try:
+            lifetime = calibration_temp.hold(directory)
+            self.store.event("admission/calibrating", binding, {"state": "running", "fixture": fixture})
+            calibration = await self.check({"scratch": directory, "probes": list(PROBES) + (["projects"] if fingerprint.get("project") else [])})
+            if not calibration["completed"]:
+                raise CoordinatorError("ADMISSION_INCOMPLETE", "Required runtime probes did not all complete")
+        except BaseException as exc:
+            failure = {"error": getattr(exc, "code", type(exc).__name__), "details": getattr(exc, "details", {})}
+            raise
+        finally:
+            try:
+                await finish_thread(lambda: cleanup.update(calibration_temp.remove(directory, lifetime)))
+            finally:
+                evidence = self.store.event("admission/calibrated", binding, {
+                    "fixture": fixture, "calibration": calibration, "failure": failure, "cleanup": cleanup})
         return False, {name: {"capability": None, "fallback": True,
             "error": "CAPABILITY_CONFIGURATION_UNMEASURED",
-            "evidence": calibration["evidence"]} for name in CAPABILITIES}
+            "evidence": {"event": evidence, "kind": "admission/calibrated"}} for name in CAPABILITIES}
 
     async def capabilities(self, scratch, names):
         """Probe the optional capabilities `names` (CAPABILITIES). Each is its probe's "capability" (None where that

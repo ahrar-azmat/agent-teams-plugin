@@ -5,6 +5,7 @@ import re
 
 from .client import CoordinatorError
 from . import native
+from . import push_guard
 from .processes import MCP_SERVER_ENV
 from .store import digest
 
@@ -19,7 +20,7 @@ def related(name, config=None, names=()):
     return any(label in identity for label in ("software-workflows", "codex-oracle")) or {"abraham", "architect_review"} <= set(names)
 
 
-def overlay(config):
+def overlay(config, source=None):
     # Codex's dotted -c parser splits keys before TOML parsing; quoted dotted
     # segments are not portable. Inline TOML tables quote every key safely and
     # merge only these leaves, preserving unrelated servers and secret values.
@@ -48,7 +49,10 @@ def overlay(config):
             if related(plugin + " " + name, settings):
                 overrides.setdefault("plugins", {}).setdefault(plugin, {}).setdefault("mcp_servers", {})[name] = policy(settings)
             mark(("plugins", plugin, "mcp_servers"), name, settings)
-    return overrides
+    result = apply(overrides, push_guard.overlay(config, source))
+    from .services import carry_guard
+    carry_guard(result["shell_environment_policy"]["set"])
+    return result
 
 
 def unmarked(config):
@@ -73,24 +77,26 @@ def servers(config):
     return sorted(names)
 
 
+def merge(config, restrictions):
+    """Merge effective config dictionaries without TOML serialization or mutation."""
+    from copy import deepcopy
+    value = deepcopy(config)
+    for key, item in restrictions.items():
+        value[key] = merge(value[key], item) if isinstance(item, dict) and isinstance(value.get(key), dict) else deepcopy(item)
+    return value
+
+
 def apply(config, restrictions):
     import tomllib
-    # Coalesce existing explicit dotted overrides before adding a table overlay;
-    # two -c assignments to the same table otherwise replace earlier leaves.
-    def merge(target, patch):
-        for key, item in patch.items():
-            if isinstance(item, dict) and isinstance(target.get(key), dict):
-                merge(target[key], item)
-            else:
-                target[key] = item
+    # Normalize explicit command-line overrides only. An effective config/read
+    # dictionary contains nulls and secrets and must never be serialized here.
     # A readmission can contain a coalesced table plus newer dotted leaf
     # overrides. Each native -c assignment is independent; parsing them as one
     # TOML document incorrectly rejects that valid table/leaf combination.
     value = {}
     for key, item in config.items():
-        merge(value, tomllib.loads(key + "=" + native.toml(item)))
-    merge(value, restrictions)
-    return value
+        value = merge(value, tomllib.loads(key + "=" + native.toml(item)))
+    return merge(value, restrictions)
 
 
 async def verify(connection, thread):
@@ -113,6 +119,8 @@ async def verify(connection, thread):
         await asyncio.sleep(.1)
     catalogs, unavailable = [], []
     for server in servers:
+        if server["name"] == "codex_apps" or (server.get("pluginId") and server.get("runtimeStatus") != "disabled"):
+            push_guard.fail("Connected apps or a plugin MCP server escaped the publishing policy", server=server["name"])
         names = {tool.get("name", name).split("__")[-1] for name, tool in server.get("tools", {}).items()}
         down = bool(server.get("toolsError")) or server.get("runtimeStatus") in ("starting", "notStarted", "failed")
         if lead_capable(server, names):
@@ -133,8 +141,9 @@ async def verify(connection, thread):
 
 class CatalogProcess:
     """Basic stdio app-server RPC, independent of native admission facilities."""
-    def __init__(self, process):
+    def __init__(self, process, codex_argv=None):
         self.process, self.counter = process, 0
+        self.codex_argv = codex_argv
 
     async def call(self, method, params=None, timeout=60):
         import asyncio
@@ -163,7 +172,34 @@ class CatalogProcess:
         await self.process.stdin.drain()
 
 
-async def exec_policy(argv0, cwd, config):
+def without_user_config(response):
+    """Conservative parity check for exec --ignore-user-config (no app-server flag).
+
+    config/read layers are highest precedence first. Project trust and managed
+    configuration can depend on the omitted user layer; refuse that ambiguity
+    rather than call a differently configured preflight proof.
+    """
+    layers = response.get("layers")
+    if not isinstance(layers, list):
+        push_guard.fail("Exec config layer inventory unavailable")
+    result = {}
+    for layer in reversed(layers):
+        kind = layer.get("name", {}).get("type")
+        if kind == "user":
+            continue
+        if kind not in ("sessionFlags", "system", "project"):
+            push_guard.fail("Cannot establish --ignore-user-config parity for this configuration layer", layer=kind)
+        if kind == "project" and layer.get("config"):
+            push_guard.fail("Cannot establish project trust parity with --ignore-user-config")
+        if not layer.get("disabledReason"):
+            result = merge(result, layer.get("config") or {})
+    for key, origin in response.get("origins", {}).items():
+        if key.startswith(("shell_environment_policy", "mcp_servers", "plugins")) and origin.get("name", {}).get("type") == "packagedDefaults":
+            push_guard.fail("Packaged launch policy is not exposed in the exec layer inventory")
+    return result
+
+
+async def exec_policy(argv0, cwd, config, *, writer=True, ignore_user_config=False, environment=None):
     """Inspect the actual exec binary/config and prove its thread catalog.
 
     No turns, schemas, hook probes, or model calls. No configuration or environment
@@ -171,15 +207,16 @@ async def exec_policy(argv0, cwd, config):
     """
     import asyncio
     from contextlib import asynccontextmanager
+    launch_env = environment if environment is not None else native.environment(SOFTWARE_WORKFLOWS_ROLE="writer")
 
     @asynccontextmanager
     async def connection(overrides):
         process = await owned.spawn(*argv0, "app-server", "--listen", "stdio://",
-            *native.override_args(overrides), cwd=cwd, env=native.environment(SOFTWARE_WORKFLOWS_ROLE="writer"),
+            *native.override_args(apply(overrides, {"features": {"apps": False}})), cwd=cwd, env=launch_env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
             limit=16 * 1024 * 1024, start_new_session=True)
         try:
-            client = CatalogProcess(process)
+            client = CatalogProcess(process, argv0)
             await client.initialize()
             yield client
         finally:
@@ -187,14 +224,34 @@ async def exec_policy(argv0, cwd, config):
             await terminate(process, group=True)
 
     from .writer_profile import configure, selection, verify as verify_profile, require_valid
-    selected = await selection()
-    require_valid(selected)
+    selected = await selection() if writer else None
+    if writer:
+        require_valid(selected)
+    async def effective_config(client):
+        response = await client.call("config/read", {"cwd": cwd, "includeLayers": ignore_user_config})
+        if ignore_user_config:
+            requirements = (await client.call("configRequirements/read")).get("requirements") or {}
+            if requirements.get("shell_environment_policy"):
+                push_guard.fail("Cannot establish ignored-user parity for managed shell policy")
+            return without_user_config(response)
+        return response["config"]
     async with connection(config) as client:
-        effective = (await client.call("config/read", {"cwd": cwd, "includeLayers": False}))["config"]
-        policy, profile = await configure(client, effective, cwd, selected)
-        restrictions = apply(overlay(effective), policy)
+        effective = await effective_config(client)
+        if writer:
+            policy, profile = await configure(client, effective, cwd, selected)
+            restrictions = apply(overlay(effective, launch_env), policy)
+        else:
+            plugins, unknown = await push_guard.plugin_inventory(client, effective, cwd)
+            restrictions = apply(push_guard.overlay(effective, launch_env),
+                                 push_guard.plugin_restrictions(effective, plugins, unknown))
+            profile = push_guard.plugin_evidence(restrictions, plugins, unknown)
     async with connection(apply(config, restrictions)) as client:
-        verify_profile((await client.call("config/read", {"cwd": cwd, "includeLayers": False}))["config"], profile)
+        effective = await effective_config(client)
+        push_guard.verify(effective, launch_env)
+        push_guard.verify_plugin_policy(effective, restrictions.get("plugins"))
+        if not writer:
+            return restrictions, {"publish_guard": True, "ignore_user_config": ignore_user_config, **profile}
+        verify_profile(effective, profile)
         thread = await client.call("thread/start", {"cwd": cwd, "model": config["model"],
                                    "approvalPolicy": "never", "sandbox": "danger-full-access", "ephemeral": True})
         evidence = await verify(client, thread["thread"]["id"])

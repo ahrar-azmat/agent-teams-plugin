@@ -4,6 +4,7 @@ Only image IDs already present locally are used. Credentials never enter records
 RPC responses or events: the private state files are the authority for secrets.
 """
 import asyncio
+from contextvars import ContextVar
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from . import owned, participants, runtime
 from .client import CoordinatorError
 from .locks import KeyedLocks
 from .store import digest
+from . import push_guard
 
 PREFIX = "software-workflows."
 PORTS = {"minio": 9000, "postgres": 5432, "redis": 6379}
@@ -27,6 +29,20 @@ NAME = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]*\Z")
 DEFAULT_ENV = {"minio": {"endpoint": "S3_ENDPOINT_URL", "namespace": "S3_BUCKET", "username": "AWS_ACCESS_KEY_ID", "password": "AWS_SECRET_ACCESS_KEY"},
                "postgres": {"url": "DATABASE_URL", "namespace": "PGDATABASE", "username": "PGUSER", "password": "PGPASSWORD", "host": "PGHOST", "port": "PGPORT"},
                "redis": {"url": "REDIS_URL", "namespace": "REDIS_KEY_PREFIX", "username": "REDIS_USERNAME", "password": "REDIS_PASSWORD"}}
+
+# admit_listener acquires this mapping before roles.overlay reads the effective
+# policy, then passes it as a whole set-table override. Bind that exact mapping
+# to the admission task so the overlay can coalesce the guard leaves into it.
+# A ContextVar keeps concurrent admissions separate; no credentials enter config.
+LAUNCH_ENVIRONMENT = ContextVar("service_launch_environment", default=None)
+
+
+def carry_guard(values):
+    pending = LAUNCH_ENVIRONMENT.get()
+    LAUNCH_ENVIRONMENT.set(None)
+    if pending is not None and pending[0] is asyncio.current_task():
+        environment = pending[1]
+        environment.update(values)
 
 
 def declaration(value):
@@ -50,6 +66,7 @@ def declaration(value):
         mapping = spec.get("environment", DEFAULT_ENV[spec["kind"]])
         if not isinstance(mapping, dict) or set(mapping) - set(DEFAULT_ENV[spec["kind"]]) or any(not isinstance(v, str) or not VARIABLE.fullmatch(v) for v in mapping.values()):
             raise CoordinatorError("SERVICE_SPEC", "Environment mappings need known fields and shell variable names")
+        push_guard.service_variables(mapping.values())
     return value
 
 
@@ -172,6 +189,7 @@ class Services:
         return item
 
     async def acquire(self, runid, *, private=False, specification=None):
+        LAUNCH_ENVIRONMENT.set(None)
         run = self.store.get(runid)
         unit = self.store.get(run["unit"])
         if unit["state"] != "open":
@@ -240,6 +258,8 @@ class Services:
             finally:
                 if os.path.exists(pending):
                     os.unlink(pending)
+            if not private:
+                LAUNCH_ENVIRONMENT.set((asyncio.current_task(), environment))
             return environment
 
     async def start(self, pool):
@@ -417,6 +437,7 @@ class Services:
                 if variable in environment:
                     raise CoordinatorError("SERVICE_VARIABLE_CONFLICT", "Two services declare the same environment variable", {"variable": variable})
                 environment[variable] = values[field]
+        push_guard.service_variables(environment)
         return environment
 
     async def thread_config(self, actor):
@@ -429,11 +450,26 @@ class Services:
                     pool = self.store.get(lease["pool"])
                     if not pool.get("private"):
                         environment.update(self.environment(pool, lease))
-            return {"shell_environment_policy.set": environment} if environment else {}
-        environment = await self.acquire(actor["run"])
-        return {"shell_environment_policy.set": environment} if environment else {}
+        else:
+            environment = await self.acquire(actor["run"])
+        from .native import environment as native_environment
+        launch = native_environment()
+        values = {"GIT_CONFIG_PARAMETERS": push_guard.PARAMETERS, push_guard.MARKER: launch[push_guard.MARKER]}
+        listener = self.store.get(actor.get("listener"), required=False) if actor.get("listener") else None
+        if listener:
+            from .roles import apply
+            configured = apply(listener.get("config") or {}, {}).get("shell_environment_policy") or {}
+            push_guard.require_parameters((configured.get("set") or {}).get("GIT_CONFIG_PARAMETERS", ""),
+                                          "listener.config/shell_environment_policy.set")
+            # Only our own set leaves were stored at admission. Preserve the
+            # guarded PATH override too when the user's policy had a set PATH.
+            values.update({name: value for name, value in (configured.get("set") or {}).items()
+                           if name == "PATH"})
+        LAUNCH_ENVIRONMENT.set(None)
+        return {"shell_environment_policy.set": {**values, **environment}}
 
     def verify_environment(self, effective, expected):
+        push_guard.verify(effective)
         if not expected:
             return
         observed = (effective.get("shell_environment_policy") or {}).get("set", {})
@@ -451,7 +487,11 @@ class Services:
         names = sorted({variable for lease in self.store.all("service_lease") if lease["run"] == actor["run"] and lease["state"] != "released"
                         for service in self.store.get(lease["pool"])["services"].values()
                         for variable in service["spec"].get("environment", DEFAULT_ENV[service["spec"]["kind"]]).values()})
-        return ("Shared project services are supplied through " + ", ".join(names) + ". Use your assigned namespaces; do not start containers for these services. Ask services_private for tests needing server control.") if names else ""
+        service = ("Shared project services are supplied through " + ", ".join(names) + ". Use your assigned namespaces; do not start containers for these services. Ask services_private for tests needing server control.") if names else ""
+        listener = self.store.get(actor["listener"], required=False) if actor.get("listener") else None
+        profile = (listener or {}).get("writer_profile") or {}
+        plugins = push_guard.plugin_context(profile) if profile.get("mode") != "list" else ""
+        return "\n".join(part for part in (push_guard.INSTRUCTIONS, plugins, service) if part)
 
     def drained(self, runid):
         listeners = [l for l in self.store.all("listener", runid) if l.get("root_thread")]

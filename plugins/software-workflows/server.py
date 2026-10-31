@@ -2216,6 +2216,9 @@ def _build_exec_argv(
     if role_config:
         from coordinator.native import override_args
         argv += override_args(role_config)
+    # Host-owned connected apps are outside both user and plugin MCP profiles.
+    # Keep this final override on fresh exec and resume, including direct callers.
+    argv += ["-c", "features.apps=false"]
     if resume_tid is not None:
         # The caller's nudge rides in ``prompt`` — same slot as a fresh run.
         # (A separate resume_prompt param existed here that no caller ever
@@ -2548,17 +2551,19 @@ async def _exec_codex_once(
     if barrier:
         cmd = ["/bin/sh", "-c", 'read _ok || exit 97; exec "$0" "$@" </dev/null',
                cmd[0], *cmd[1:]]
+    from coordinator.client import CoordinatorError
     try:
+        from coordinator.push_guard import environment as guarded_environment
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=(asyncio.subprocess.PIPE if barrier else asyncio.subprocess.DEVNULL),
             stdout=out_fh,
             stderr=err_fh,
             cwd=workdir or _get_cwd(),
-            env={**_codex_env(), **(extra_env or {}),
+            env=guarded_environment({**_codex_env(), **(extra_env or {}),
                  # Round 16: descendants that setsid() out of our group are
                  # findable/killable only by this inherited marker.
-                 RUN_MARKER_ENV: str(state.get("run_tag") or "")},
+                 RUN_MARKER_ENV: str(state.get("run_tag") or "")}),
             # Own process group so _kill_tree reaps the node shim AND the
             # vendored codex grandchild together (POSIX: setsid + killpg;
             # Windows: its own group, reaped via taskkill /T).
@@ -2568,6 +2573,8 @@ async def _exec_codex_once(
             # this server dies (POSIX; Windows region locks do not inherit).
             **_inherit_lock_kwargs(state, workdir),
         )
+    except CoordinatorError as exc:
+        return "", False, "", exc.code + ": " + str(exc), 1, None, False
     except FileNotFoundError:
         return (
             "", False, "",
@@ -3179,14 +3186,17 @@ async def _run_codex(
         )
     role_config = {}
     catalog = None
-    if holds_tree_lock:
-        try:
-            from coordinator.roles import exec_policy
-            role_config, catalog = await exec_policy(_codex_argv0(), eff_cwd, {
-                "model": model, "model_reasoning_effort": reasoning, "approval_policy": "never",
-                "sandbox_mode": "danger-full-access", "web_search": "live" if web_search else "disabled"})
-        except Exception as exc:
-            return "[Exec writer refused before inference: " + str(getattr(exc, "code", type(exc).__name__)) + "; restricted MCP catalog could not be verified.]"
+    try:
+        from coordinator.roles import exec_policy
+        from coordinator.push_guard import environment as guarded_environment
+        role_config, catalog = await exec_policy(_codex_argv0(), eff_cwd, {
+            "model": model, "model_reasoning_effort": reasoning, "approval_policy": "never",
+            "sandbox_mode": "danger-full-access" if write or infra else "read-only",
+            "web_search": "live" if web_search else "disabled"}, writer=holds_tree_lock,
+            ignore_user_config=not (write or infra),
+            environment=guarded_environment({**_codex_env(), **extra_env}))
+    except Exception as exc:
+        return "[Exec launch refused before inference: " + str(getattr(exc, "code", type(exc).__name__)) + "; publishing guard or MCP policy could not be verified.]"
     if write:
         write_before = _tree_snapshot(eff_cwd)
         if not write_before["ok"]:
@@ -3225,6 +3235,10 @@ async def _run_codex(
         # callers opt in per call and must trust the investigation prompt.
         prompt = INFRA_INSTRUCTIONS + prompt
 
+    from coordinator.push_guard import INSTRUCTIONS as PUBLISH_INSTRUCTIONS, plugin_context
+    publishing = "\n".join(part for part in (PUBLISH_INSTRUCTIONS, plugin_context(
+        (catalog or {}).get("writer_profile") or catalog or {})) if part)
+    prompt = publishing + "\n\n" + prompt
     t0 = time.monotonic()
     # The digest of the tree the model will READ — the run's own tree, which
     # abraham may target below the workspace (architect review: hashing the

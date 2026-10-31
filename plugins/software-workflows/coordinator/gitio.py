@@ -13,7 +13,7 @@ import time
 
 from treedigest import git_argv, git_env, GIT_SAFE_CONFIG, routing_env_names
 from .client import CoordinatorError
-from . import telemetry
+from . import telemetry, calibration_temp
 
 
 @telemetry.measured("git")
@@ -46,14 +46,50 @@ def calibrate(state):
     fingerprint = {"binary": str(binary), "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                    "version": subprocess.run([str(binary), "--version"], capture_output=True, check=True).stdout.decode().strip(),
                    "primitives": hashlib.sha256(Path(__file__).parents[1].joinpath("treedigest.py").read_bytes()).hexdigest(),
-                   "probe": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+                   "probe": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                   "temporary_directories": hashlib.sha256(Path(calibration_temp.__file__).read_bytes()).hexdigest()}
     key = hashlib.sha256(json.dumps(fingerprint, sort_keys=True).encode()).hexdigest()
     cache = Path(state) / "calibrations" / ("git-" + key + ".json")
     if cache.exists():
         value = json.loads(cache.read_text())
         if value.get("completed") is True and value.get("fingerprint") == fingerprint:
             return value
-    directory = Path(tempfile.mkdtemp(prefix="software-workflows-git-")).resolve()
+    value = {"fingerprint": fingerprint, "completed": False, "created": time.time(),
+             "evidence": {"directory": None, "removed": False},
+             "sweep": calibration_temp.sweep(tempfile.gettempdir(), "software-workflows-git-")}
+    directory = None
+    lifetime = None
+    try:
+        directory = Path(tempfile.mkdtemp(prefix="software-workflows-git-")).resolve()
+        lifetime = calibration_temp.hold(directory)
+        value["evidence"]["directory"] = str(directory)
+        value.update(_calibrate_probe(directory))
+        if not value["completed"]:
+            raise CoordinatorError("GIT_LAZY_FETCH_UNSAFE", "Missing-object helper suppression did not calibrate", value)
+    except BaseException as exc:
+        value["error"] = getattr(exc, "code", type(exc).__name__)
+        raise
+    finally:
+        if directory is not None:
+            value["cleanup"] = calibration_temp.remove(directory, lifetime)
+            value["evidence"]["removed"] = value["cleanup"]["directory_removed"]
+        # Failed observations are useful status too, but never a cache hit.
+        fd, pending = tempfile.mkstemp(prefix="git-pending-", dir=cache.parent)
+        try:
+            with os.fdopen(fd, "w") as output:
+                json.dump(value, output, sort_keys=True)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(pending, cache)
+            from .store import fsync_dir
+            fsync_dir(cache.parent)
+        finally:
+            if os.path.exists(pending):
+                os.unlink(pending)
+    return value
+
+
+def _calibrate_probe(directory):
     marker, helper, repo = directory / "helper-ran", directory / "helper.sh", directory / "repo"
     helper.write_text("#!/bin/sh\nprintf 'ran\\n' >> " + shlex.quote(str(marker)) + "\nexit 1\n")
     helper.chmod(0o700)
@@ -73,21 +109,9 @@ def calibrate(state):
     before = marker.read_bytes() if marker.exists() else b""
     green = invoke(["cat-file", "-e", missing], safe=True)
     after = marker.read_bytes() if marker.exists() else b""
-    value = {"fingerprint": fingerprint, "evidence": str(directory), "red_exit": red.returncode,
-             "green_exit": green.returncode, "red_helper_ran": bool(before), "green_helper_ran": after != before,
-             "completed": bool(before) and after == before and red.returncode != 0 and green.returncode != 0,
-             "created": time.time()}
-    if not value["completed"]:
-        raise CoordinatorError("GIT_LAZY_FETCH_UNSAFE", "Missing-object helper suppression did not calibrate", value)
-    fd, pending = tempfile.mkstemp(prefix="git-pending-", dir=cache.parent)
-    with os.fdopen(fd, "w") as output:
-        json.dump(value, output, sort_keys=True)
-        output.flush()
-        os.fsync(output.fileno())
-    os.replace(pending, cache)
-    from .store import fsync_dir
-    fsync_dir(cache.parent)
-    return value
+    return {"red_exit": red.returncode, "green_exit": green.returncode,
+            "red_helper_ran": bool(before), "green_helper_ran": after != before,
+            "completed": bool(before) and after == before and red.returncode != 0 and green.returncode != 0}
 
 
 def text(root, args, **kwargs):

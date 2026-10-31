@@ -91,8 +91,8 @@ def _setup_notice(source):
             "hookEventName": "SessionStart",
             "additionalContext": "software-workflows setup is incomplete on this machine: "
                                  + "; ".join(f"{item}: {detail}" for item, detail in missing)
-                                 + ". Tell the user once, briefly, that /software-workflows:setup fixes "
-                                   "this (it asks before changing any setting)."}}
+                                 + ". Tell the user once, briefly, that /software-workflows:setup explains "
+                                   "these checks and measured coverage limitations (it asks before changing any setting)."}}
 
 
 def main():

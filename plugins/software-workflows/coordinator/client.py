@@ -159,7 +159,7 @@ def venv_fds():
         raise CoordinatorError("VENV_LOCK", "Cannot preserve the launcher's interpreter lifetime lock") from exc
 
 
-def clean_environment(source=None):
+def clean_environment(source=None, *, codex=True):
     """Detach from the launching Claude session and its push gate, keeping user configuration."""
     environment = dict(os.environ if source is None else source)
     for option in ("WRITER_MCP_SERVERS", "WRITER_PARK_IDLE_SECONDS", "MEMORY_WARN_RATIO", "MEMORY_CRITICAL_RATIO",
@@ -187,11 +187,12 @@ def clean_environment(source=None):
                                              if not is_farm(d or ".") and not is_shim(d or "."))
     if environment.get("GIT_EXEC_PATH") and is_farm(environment["GIT_EXEC_PATH"]):
         del environment["GIT_EXEC_PATH"]
-    return environment
+    from . import push_guard
+    return push_guard.environment(environment) if codex else push_guard.detach(environment)
 
 
 def launch_environment():
-    environment = clean_environment()
+    environment = clean_environment(codex=False)
     plugin = str(Path(__file__).resolve().parents[1])
     environment["PYTHONPATH"] = plugin + (os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else "")
     return environment

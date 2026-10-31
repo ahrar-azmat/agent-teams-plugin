@@ -9,6 +9,17 @@ The setup check ran on this machine:
 
 Take the person through it:
 
+The Git capability check creates disposable local repositories, performs successful
+control pushes only to their local bare remotes, then removes them. It retains a
+binary/guard-identity cache in plugin data. SessionStart reads that cache without
+running pushes. A reported limitation is not fixed by setup: explicit push URLs,
+hook bypasses and replaced environments can escape an inherited guard. Report every
+"not covered" and "unverified" result; publishing remains the lead's responsibility.
+The binary is ready when ordinary, path and file-URL pushes are refused; its detail
+still lists measured limitations. SessionStart stays silent for those limitations
+and for a missing or stale cache. It reports a cached ordinary-route failure or a
+missing Codex launch guard.
+
 1. Show the result as a short table: item, ready or not, detail.
 2. Under "Setup can do these itself":
    - **agent-teams**: ask the person with AskUserQuestion whether to turn agent teams on now. Say

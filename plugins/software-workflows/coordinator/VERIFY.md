@@ -1,3 +1,948 @@
+# software-workflows 2.4.28 — legacy calibration safety — 2026-10-31
+
+The remaining finding from follow-up review turn 138 is corrected within the same
+**22 release files**. This remains a two-change release: Codex publishing guards
+and calibration-directory cleanup. This section supersedes the earlier age-only
+treatment of lockless directories below; those earlier deletion observations are
+historical evidence, not the final automatic-sweep policy.
+
+`S` is `/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2428p`.
+The lead independently reported **34/34** route cases in
+`S/lead-routes-green-3.json`, both real-config parts in
+`S/lead-realconfig-both-green-2.json`, its five foreign-parameter sentinel refusals
+from `S/lead_sentinel.py`, and the extended cleanup run in
+`S/lead-item8-working-2.json`. This round changes no publishing implementation and
+makes no push attempt. The existing publishing limitations still apply.
+
+## Automatic sweep policy and one-time legacy cleanup
+
+`calibration_temp.py` now permits an automatic removal only after acquiring an
+existing lifetime lock. A missing `.lifetime.lock` increments both `legacy` and
+`kept`, then returns before the age check or any tree walk. This covers fresh and
+old lockless directories alike: an older calibration may still be running. The
+same result dictionary is retained in `admission/temp-sweep` events and the Git
+calibration cache's `sweep` field. Legacy reporting is count-only; its contents
+are not inspected to calculate bytes.
+
+Owned real directories with a valid, available lock still require an age strictly
+greater than **3,600 seconds** before removal. A held lock remains `active`;
+symlink locks, other owners/prefixes and filesystem errors retain their existing
+preservation/error behavior. A calibration's own finally cleanup remains separate
+from the opportunistic sweep, including cleanup after startup failure or cancellation.
+
+For one-time legacy cleanup, first establish that **no release before 2.4.28 is
+running**, including stopped or suspended calibration processes. Then remove only
+real directories owned by the current UID in `TMPDIR`, with either prefix
+`software-workflows-admission-` or `software-workflows-git-`, and no
+`.lifetime.lock` entry. Preserve symlinks, other prefixes and directories with a
+lock entry. The lead will perform this machine's cleanup after the live switch.
+No live-daemon directory was removed by this round.
+
+## Real paused-2.4.27 red and greens
+
+`review3_legacy.py` uses the server venv Python and the actual installed source at
+`/Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows/2.4.27`.
+The two generations share an isolated `TMPDIR` beneath `/private/tmp/r2428p-*`;
+each has a disposable `~/.cache/r2428p-state-*` state outside both temp roots.
+This exercises the production temp-root choice and real calibrations while keeping
+the known-bad red sweep away from the live daemon's leftovers.
+
+The driver waits for the installed process's first completed probe, sends that
+process `SIGSTOP`, confirms it stopped, verifies its directory is lockless, and
+uses `os.utime` to age it **7,200 seconds**. It then runs a candidate calibration
+and records the directory's existence while the old process remains alive.
+Finally it sends `SIGCONT`, waits for the installed calibration's actual outcome,
+and deletes only its own fixture, states and any installed-run leftovers.
+
+| Observation | Red candidate | Corrected working tree | Independent release |
+|---|---|---|---|
+| Old process stopped after a completed probe | Yes, one probe | Yes, one probe | Yes, one probe |
+| Candidate calibration | **11/11**, exit **0** | **11/11**, exit **0** | **11/11**, exit **0** |
+| Sweep result | `removed=1` | `legacy=1`, `removed=0` | `legacy=1`, `removed=0` |
+| Old directory while installed process is alive | Deleted | Preserved | Preserved |
+| Legacy bytes counted | Red removed **30,478,336 allocated bytes** | **0 logical / 0 allocated** | **0 logical / 0 allocated** |
+| Installed process after `SIGCONT` | Exit **1**, `FileNotFoundError` | **11/11**, exit **0** | **11/11**, exit **0** |
+| Driver and own-fixture cleanup | Exit **0**, complete | Exit **0**, complete | Exit **0**, complete |
+
+Evidence: `review3-legacy-red.json`, `review3-legacy-green-working.json` and
+`review3-legacy-green-release.json`. The red recorder's exit **0** means it
+reproduced the bug, not that the protection passed. Its cleanup-module SHA-256 was
+`aaf345d0b798cecd19c76c45087ceaeaa8fce4752eaf6c60c603866d61335e8d`.
+
+## Combined verification on both source trees
+
+`review3_release.py` completed with exit **0**, **56 checks passed**, `failed=[]`.
+The independent composition is installed **2.4.27 plus only the 22 release files**;
+its protected files match installed code rather than writer 3's future changes.
+Both trees run the paused-installed-process proof, extended `item8_verify.py`,
+real-default-config driver, MCP/service/notice checks and foreign-parameter sentinel cases.
+
+The extended `item8_verify.py` records lifetime-lock status without walking legacy
+trees. Its final assertion is that no old directory with an available lifetime lock
+remains; old lockless directories are deliberately preserved. For both prefixes,
+fresh and two-hour-old lockless fixtures survive with `legacy=2`, `removed=0`
+and zero counted bytes. Held-lock preservation and removal after holder exit **0**
+continue to pass, as does symlink-lock refusal with nonfatal errno **62**.
+
+| Observation | Working tree | Independent release |
+|---|---|---|
+| Real admission calibration | **11/11**, **25.875 s** | **11/11**, **25.870 s** |
+| Own admission directory removed | **102,715,392 allocated bytes**, no errors | **102,514,688 allocated bytes**, no errors |
+| Real-root admission sweep | `legacy=5`, `removed=0` | `legacy=5`, `removed=0` |
+| Git cache-miss sweep | `legacy=1`, `removed=0` | `legacy=1`, `removed=0` |
+| Git calibration miss/hit | Expected child exits **1 / 1**; own directory removed; identical cached outcome | Same |
+| Startup failure | Child **1**, `SCHEMA_GENERATION`, own directory removed | Same |
+| Cancellation | `CancelledError` after removal | Same |
+| Old directories with available lifetime locks remaining | **0**, both prefixes | **0**, both prefixes |
+
+The real-root legacy counts include one fresh fixture per prefix; the driver's
+finally removes its own fixtures. The live daemon's legacy directories are preserved.
+All four foreign-parameter scenarios still refuse `CODEX_PUBLISH_ENV` without a
+sentinel match in argv, listener rows, events, error text, state files or logs.
+The selected-disabled fixture is admitted with the exact guard; service overrides
+carry the constant. These drivers exit **0** on both trees. The prior measurement
+boundary remains: real app-servers and Store serialization, not full supervisor
+admission; deliberately populated disposable input configs are excluded from the
+leak scan and deleted afterward. No user `computer-use` server was started.
+
+All real-default-config preflights pass. Cold/warm seconds:
+
+| Mode | Working | Independent release |
+|---|---:|---:|
+| Native list | 20.590 / 1.363 | 18.049 / 0.784 |
+| Native all | 10.144 / 0.716 | 8.685 / 0.730 |
+| Exec writer | 13.025 / 4.105 | 12.817 / 3.949 |
+| Infra advisor | 9.185 / 0.704 | 9.410 / 0.781 |
+| Ordinary advisor | 8.213 / 0.716 | 9.014 / 0.978 |
+| Abraham analysis | 12.375 / 4.174 | 11.522 / 4.280 |
+| Exec resume preflight | 9.166 / 0.790 | 8.472 / 0.767 |
+
+All **20 login/non-login shell commands** exit **0** with guard parameters, marker
+and resolvable helper. The six exec engine processes exit **0**; native turns complete
+and their four app-servers shut down with exit **0**. Plugin MCP servers remain
+disconnected and `codex_apps` absent. Each tree's nine auxiliary observations pass,
+including a real stdio server, unrelated-secret preservation, service-table merging
+and SessionStart notices. Resume still means preflight and parent-argv verification,
+not a persisted production turn.
+
+Static/package results remain:
+
+- Python **3.15** compiles **95 working / 92 release** sources, exit **0**.
+- Python **3.9.6** compiles **23 hook-reachable** files, imports hook/client/setup
+  modules and runs `hooks.py --check`, exit **0**, in both trees.
+- Both helpers pass sh/Bash/Zsh syntax checks and retain **100755**. Direct refusal
+  helper execution has the expected exit **1** and `LEAD_PUBLISHES`.
+- Ruff command exits are **0**, with **no added findings**: installed **35**,
+  release **35**, working **33**.
+- Strict plugin/marketplace validation and fresh scratch installation exit **0**.
+  Existing icon/directory-submission notices are separate from the passing validation.
+- Version/title, whitespace and unchanged lead-shim-installer checks pass. Valid
+  reclaim options exit **0**; invalid ones retain expected exit **1**.
+
+## Artifacts and final boundary
+
+`review3-static-checks.txt` and `review3-combined-console.txt` retain commands,
+actual exits and output; `review3-static-summary.json` records the 56-check result.
+Additional evidence under `S`:
+`review3-ruff.json`, `review3-plugin-validation.txt`,
+`review3-marketplace-validation.txt`, `review3-working-plugin-validation.txt`,
+`review3-working-marketplace-validation.txt`, `review3-release-files.json`,
+`review3-calibration-working.json`, `review3-calibration-release.json`,
+`review3-real-working.json`, `review3-real-release.json`,
+`review3-aux-working.json`, `review3-aux-release.json`,
+`review3-green-working.json`, `review3-green-release.json`, and the legacy
+red/green files named above. Drivers are `review3_legacy.py`, `review3_release.py`,
+the extended `item8_verify.py`, unchanged `review_real.py`, `review2_aux.py` and
+`review2_verify.py`. `item8_verify-before-legacy.py` retains the previous driver.
+
+`review3_finalize.py` records final documentation validation, hashes, protected-file
+comparison, uncommitted HEAD/status and fixture/process cleanup in
+`review3-final-records.json`, `review3-readback.json` and `review3-cleanup.json`.
+Only documentation changes follow the engine runs. No live plugin installation,
+live coordinator restart, push attempt or Git recording occurred. The publishing
+limitations remain as documented below.
+
+---
+
+# software-workflows 2.4.28 — preceding review corrections — 2026-10-31
+
+The four findings from the lead's blind review (session `01a14eac`, turn 136)
+are corrected within the same **22 release files**. This remains a two-change
+release: Codex publishing guards and calibration-directory cleanup. The lead's
+independent item-8 rerun, `S/lead-item8-working.json`, also exited **0** before
+these corrections; its 11 probes and cleanup outcomes remain earlier evidence.
+
+`S` is `/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2428p`.
+No push attempt, live coordinator restart or live installation was performed in
+this round. All release edits remain uncommitted.
+
+## Reproduced reds and corrected greens
+
+`review2_verify.py` uses real app-server discovery/final configuration with an
+isolated Codex home, the production overlay/profile functions, actual subprocess
+argv and real SQLite `Store` listener/event serialization. It starts no inference
+and never starts the user's disabled `computer-use` server. The fake authorization
+sentinel exists only in disposable input configuration/environment; evidence
+contains names and presence booleans. The scan checks argv, serialized rows/events,
+error strings and disposable files/logs, including SQLite WAL; the deliberately
+populated input `config.toml` files are excluded from that leak scan and deleted.
+
+| Case | Before correction | Corrected working tree and independent release |
+|---|---|---|
+| Foreign launch Git parameters | Admitted; sentinel in argv, listener rows, events and SQLite WAL | `CODEX_PUBLISH_ENV` before an app-server launch; zero sentinel matches |
+| Foreign prefix before an inherited guard | Admitted; same leaked locations | Same location-only refusal and zero matches |
+| Foreign shell-policy set value | Admitted; value silently replaced | `CODEX_PUBLISH_ENV` naming `shell_environment_policy.set`; zero matches |
+| Foreign stdio MCP env value | Admitted; sentinel in argv, rows, events and WAL | `CODEX_PUBLISH_ENV` naming the server env location; zero matches |
+| Explicitly selected, initially disabled fixture stdio server | `CODEX_PUBLISH_ENV`: server lacked guard | Enabled in effective config, guard present, exact guard constant |
+| Service thread override | Baseline constant case retained | Exactly `push_guard.PARAMETERS` |
+
+Each refusal asks the caller to move those settings into a **Git config file**,
+without including any value. A refusal before process creation has no shell exit.
+The red recorder exited **0** because it successfully captured the bad behavior;
+this is not a successful protection result. `review2-red-isolated.json` is the
+independent-case red; `review2-red.json` retains the initial run, where the disabled
+server also caused the parameter cases' later verification to fail. Both green
+drivers exited **0**: `review2-green-working.json` and `review2-green-release.json`.
+
+The lifetime red, `review2-lock-red.json`, also has recorder exit **0**: a separate
+live process held an exclusive lock on an artificially two-hour-old fixture, yet
+the old sweep removed it (`removed=1`) while the holder remained alive. The holder
+then exited **0**. The fixture was removed.
+
+Implementation:
+- `push_guard.py` refuses every nonempty foreign parameter value before forming
+  an override. Only the exact public `PARAMETERS` constant is accepted on guarded
+  re-entry and emitted into the environment. Overlay and verification check the
+  shell set table and each stdio env by location. No user setting is silently lost.
+  Guard leaves are prepared even for disabled stdio servers, before profile enablement.
+- `services.py` emits that exact constant in thread overrides and rejects foreign
+  stored shell-policy parameters before returning configuration.
+- `calibration_temp.py` supplies the lifetime descriptor and nonblocking sweep
+  acquisition. `admission.py` and `gitio.py` acquire it immediately after directory
+  creation and retain it through their own removal, including failure/cancellation.
+  The sweeper uses `O_NOFOLLOW`, verifies a regular owned lock file, and holds an
+  acquired `LOCK_EX | LOCK_NB` lock through removal. Contention increments both
+  `active` and `kept`. Lockless historical leftovers retain the one-hour age rule.
+
+Python 3.9's [flock API](https://docs.python.org/3.9/library/fcntl.html#fcntl.flock)
+and [file-open API](https://docs.python.org/3.9/library/os.html#os.open) were fetched
+with HTTP **200**; `review2-external.json` records the source URLs and available
+constants. The actual macOS lock behavior is measured by separate processes below.
+
+## Complete repeated verification
+
+`review2_release.py` exited **0**, with **54 checks passed**, `failed=[]`.
+It builds installed **2.4.27 plus only the 22 release files**; every protected
+file in that composition matches installed code. Both trees run the extended
+`item8_verify.py`, `review_real.py`, `review2_aux.py` and `review2_verify.py`.
+
+| Observation | Working tree | Independent release |
+|---|---|---|
+| Admission real probes | **11/11**, **25.764 s**, directory removed | **11/11**, **25.328 s**, directory removed |
+| Old directory held by another live process, both prefixes | Kept; `active=1`, `removed=0` | Same |
+| Same directory after holder exit **0** | Removed; `active=0`, `removed=1` | Same |
+| Symlink lifetime lock | Directory/target preserved; nonfatal errno **62** | Same |
+| Git calibration miss / hit | Expected child exits **1 / 1**, helper only in red, removed evidence retained on hit | Same |
+| Real startup failure | Child **1**, `SCHEMA_GENERATION`, directory removed | Same |
+| Cancellation | `CancelledError` after removal | Same |
+| Fresh directories, old symlinks/files, unrelated target | Preserved | Preserved |
+| Actual login/non-login shells | **10 shell exits 0** | **10 shell exits 0** |
+| Real stdio guard, service merge and unrelated-secret sentinel | Passed | Passed |
+| SessionStart missing/stale/full cache and ordinary-failure notices | Passed | Passed |
+
+The working calibration also swept one newly eligible live-daemon leftover:
+**98,504,767 logical / 111,710,208 allocated bytes**, no removal errors. The release
+run found no old admission leftovers to remove. Own-probe allocated bytes removed
+were **101,924,864** and **102,486,016**, respectively. Both runs recorded cleanup
+of their disposable outside-temp `~/.cache/r2428p-state-*` state and fixture root.
+
+All real-default-config preflights passed. Cold/warm seconds:
+
+| Mode | Working | Independent release |
+|---|---:|---:|
+| Native list | 17.959 / 1.203 | 18.341 / 0.589 |
+| Native all | 7.455 / 0.595 | 7.651 / 0.760 |
+| Exec writer | 11.703 / 3.878 | 11.008 / 3.815 |
+| Infra advisor | 7.578 / 0.572 | 7.338 / 0.934 |
+| Ordinary advisor | 6.729 / 0.553 | 7.841 / 0.575 |
+| Abraham analysis | 10.602 / 3.784 | 11.320 / 3.994 |
+| Exec resume preflight | 7.783 / 0.644 | 7.912 / 0.686 |
+
+The three exec engine processes per tree exited **0**; all twenty measured shells
+carried guard parameters, marker and resolvable helper. Native turns completed.
+No plugin MCP server connected and `codex_apps` was absent. The real user's
+`inherit=core`, shell snapshots and plugin configuration remained in use.
+The earlier measurement boundary for resume still applies: preflight and parent
+argv are checked, not a persisted production turn. New sentinel evidence uses
+real listener-shaped SQLite serialization, not a complete supervisor admission.
+
+Static/package checks:
+- Python **3.15** compiles **95 working / 92 release** files, exit **0**.
+- Python **3.9.6** compiles **23 hook-reachable files**, imports the hook/client/setup
+  modules, and runs `hooks.py --check`, exit **0**, in both trees.
+- Both helpers pass sh/Bash/Zsh syntax checks and retain executable mode **100755**.
+  The refusal helper's expected direct exit is **1**, with `LEAD_PUBLISHES`.
+- Ruff exits **0** and adds no findings: installed **35**, release **35**, working
+  **33**. This compares findings; the permissive exit alone is not the proof.
+- Strict plugin and marketplace validation in both trees exits **0**. Existing
+  icon/directory-submission notices remain separate from that successful result.
+- Version/title, whitespace, unchanged lead shim installer and reclaim-option
+  observations pass; invalid reclaim options retain expected exit **1**.
+- Fresh installation into an empty scratch Claude configuration exits **0** and
+  packages the guard, executable helper and all three calibration modules.
+
+## Retained artifacts and limits
+
+`review2-static-checks.txt` retains commands, actual exits and complete output;
+`review2-static-summary.json` retains the 54-check result. Other evidence:
+`review2-ruff.json`, `review2-plugin-validation.txt`,
+`review2-marketplace-validation.txt`, `review2-working-plugin-validation.txt`,
+`review2-working-marketplace-validation.txt`, `review2-release-files.json`,
+`review2-calibration-working.json`, `review2-calibration-release.json`,
+`review2-real-working.json`, `review2-real-release.json`,
+`review2-aux-working.json`, `review2-aux-release.json`, and the red/green files
+named above. Drivers are `review2_release.py`, `review2_verify.py`,
+`review2_lock_red.py`, `review2_aux.py`, the extended `item8_verify.py`, and
+`review_real.py`.
+
+`review2_finalize.py` records final documentation validation, source hashes,
+the protected-file comparison and cleanup in `review2-final-records.json`,
+`review2-readback.json` and `review2-cleanup.json`. Only documentation changes
+follow the final engine runs. No repository test files were added.
+
+The lead's completed push measurements and all publishing limitations below
+remain applicable. This round makes no new push measurement and does not claim
+a universal execution/credential boundary. Live 2.4.27 processes remain unchanged
+until the lead's rollout.
+
+---
+
+# software-workflows 2.4.28 — preceding two-change observations — 2026-10-31
+
+This release contains **Codex publishing guards** and **calibration temporary-directory
+cleanup**. The lead completed the real-configuration push runs below. The writer ran
+the cleanup and non-publishing release checks. All source changes remain uncommitted;
+the live coordinator was not restarted. The absolute publishing property still has
+the explicitly measured limitations recorded below.
+
+`S` is `/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2428p`.
+
+## Completed lead push runs
+
+The lead's `lead_realconfig.py both` produced `lead-realconfig-both-green-1.json`.
+The installed baseline is `lead-realconfig-part2-red-2.4.27.json`. Both retain
+fixture before/after refs and report fixture removal. Script and direct child Git
+exits are distinct from the successful Codex engine exit:
+
+| Real launch under default user configuration | Installed 2.4.27 script/direct exits | Candidate script/direct exits | Candidate remote |
+|---|---|---|---|
+| Native writer daemon configuration path | 0 / 0; published | 128 / 128; `LEAD_PUBLISHES` | Unchanged |
+| Exec writer | 0 / 0; published | 128 / 128; `LEAD_PUBLISHES` | Unchanged |
+| Infra advisor | 0 / 0; published | 128 / 128; `LEAD_PUBLISHES` | Unchanged |
+| Ordinary advisor | 1 / 1; unchanged, no lead refusal | 128 / 128; `LEAD_PUBLISHES` | Unchanged |
+
+Every candidate login/non-login shell reported the guard parameters, marker and
+resolvable helper present; every installed-baseline shell reported them absent.
+All three exec modes' engine exits were **0** in both runs. The native result does
+not supply an engine process exit; its child exits and completed observations are
+the recorded evidence. Lead preflights passed: exec writer **28.90 / 4.71 s**, infra
+**0.80 / 0.71 s**, ordinary **0.68 / 0.69 s** for the two attempts.
+
+`lead-routes-green-2.json` repeats the lead's route matrix on Apple Git **2.50.1**
+and Homebrew Git **2.56.0**. Ordinary/path/file-URL, Python/sh/zsh, ordinary
+`--no-verify` and `--mirror` pushes refuse with exit **128**, lead guidance and
+unchanged remotes; Make exits **2**. Unguarded controls publish with exit **0**.
+Apple explicit pushurl still publishes with **0**; Homebrew refuses it with **1**.
+Explicit pushurl plus `--no-verify` publishes with **0** on both. Fetch, clone,
+status and ls-remote exit **0**. The prior capability matrix's cleared-environment
+and specific-rewrite bypasses remain limitations. This writer made no push attempt.
+
+## Calibration leak and implementation
+
+The lead measured **554 admission directories / 42,885 MB** and **3,757 Git probe
+directories / 279 MB**, then removed older historical leftovers. This writer's
+metadata-only `item8-before.json` confirmed the deliberately retained **41 admission**
+and **118 Git** directories. Exactly **38 admission** directories were then older
+than one hour; three were too recent to sweep. The age threshold was not relaxed.
+
+The actual call paths are `Admission.writer_gate` → `calibrate_writer` → `check`,
+and `Ledger.register` → `_register` / `publication_guards` → `gitio.calibrate`. Admission's
+probe events already contain observations; its report files were used only during
+the check. Git's only retained directory reference was the cache's evidence path.
+Repository searches found no later runtime reader of either calibration tree.
+
+- `admission.py` now sweeps before allocating, always removes its own directory in
+  `finally`, and joins off-loop deletion before cancellation propagates. The new
+  `admission/calibrated` event retains the report/failure and cleanup result; fallback
+  capability evidence points to that event. Per-probe events remain available.
+- `gitio.py` now removes its probe before persisting the outcome. Cached
+  `evidence.removed` and `cleanup` describe the removed directory. Failed observations
+  remain status with `completed=false`, never valid cache hits. The fingerprint also
+  includes the cleanup module identity.
+- Shared `calibration_temp.py` sweeps exactly one supported prefix in the same
+  parent. It selects real directories owned by the current UID with modification
+  time strictly more than **3,600 seconds** old. It skips symlinks, files, other
+  owners/prefixes and fresh directories, checks identity again before deletion,
+  and requires Python's symlink-safe `rmtree`. Filesystem errors are returned as
+  evidence without failing calibration. `removed`, `bytes`, `allocated_bytes`,
+  `kept` and `errors` appear in admission events or Git cache status.
+
+Logical `bytes` and allocated bytes (the sum of `st_blocks * 512`) describe complete
+removed trees. They are not a promise about immediate APFS free-space changes.
+There is no background timer: sweeping occurs before a new probe, not on a cache hit.
+
+## Real cleanup observations
+
+`item8_verify.py` invokes the production methods and the real Codex fixture provider.
+Its disposable state is `~/.cache/r2428p-state-*`, outside both temp roots, so admission
+uses the user's real TMPDIR. It creates fresh matching directories, old symlinks and
+old regular files to observe the sweep boundaries; its `finally` removes those
+fixtures, its runtime directory and its state. No repository test files were added.
+
+| Observation | Actual outcome |
+|---|---|
+| Working-tree admission calibration | All **11 probes passed**, **26.099 s**; directory absent after return; ledger event retained |
+| Independent release admission calibration | All **11 probes passed**, **26.088 s**; **93,562,707 logical / 102,391,808 allocated bytes** removed |
+| Real startup failure through configured `/usr/bin/false` | Child exit **1**, `SCHEMA_GENERATION`; directory removed and failure recorded |
+| Cancellation of a running real admission calibration | `CancelledError` propagated after directory removal; cancellation recorded |
+| Git calibration cache miss | Red/green child exits **1 / 1**; helper ran only in red; directory removed and cached `evidence.removed=true` |
+| Git calibration cache hit | Identical cached observation; removed directory remains absent |
+| Fresh directories, old symlinks and regular files | All preserved during the sweep; symlink target unchanged |
+| Missing sweep root | Nonfatal `FileNotFoundError`, errno **2**, recorded in `errors` |
+
+`item8-working.json` and `item8-release.json` both have driver exit **0**. The first
+attempt is retained as `item8-working-recorder-failure.json`: its real calibration
+passed all 11 probes in **34.730 s** and swept the old admission trees, but the driver
+exited **1** on a textual `/var/folders` versus `/private/var/folders` path comparison.
+The driver was corrected to compare resolved parents. Its own fixture/state cleanup
+had already succeeded; this was not a failed calibration or removal.
+
+| Real stale leftovers removed | Count | Logical bytes | Allocated bytes | Removal errors |
+|---|---:|---:|---:|---:|
+| Admission, first run | **38** | **3,577,401,416** | **3,932,852,224** | **0** |
+| Git lazy-fetch probes, corrected run | **118** | **3,430,762** | **10,543,104** | **0** |
+
+Between the initial inventory and the first run, three additional fresh admission
+directories appeared: the immediate before-count was **44**, with the same **38**
+eligible entries. The corrected run began with **6** recent admission directories
+and **118** Git directories. Its after-inventory contained **7 / 1**, including its
+one intentionally retained fresh fixture per prefix; `finally` then removed those
+fixtures, leaving **6 recent admission / 0 Git** directories. No eligible old directory
+remained at either successful observation. The existing live processes can still
+create old-style leftovers until the lead performs its normal rollout.
+
+## Combined release checks and evidence
+
+`item8_release.py` builds installed **2.4.27 plus only the 22 release files**, with
+all remaining writer 3 files matching installed code. `admission.py` is now part of
+2.4.28 under the lead's handed-back claim. The driver exited **0**, with **37 checks
+passed**. `item8-static-checks.txt` retains commands, real exits and complete output;
+`item8-static-summary.json` records the results and composition cleanup.
+
+- **95** shared-tree and **92** release Python files compile, exit **0**. Python
+  **3.9.6** compiles **23** hook-reachable files and imports the shared cleanup module,
+  exit **0**. `hooks.py --check` exits **0**, compatible `jsonl-v1`.
+- Strict plugin/marketplace validation in both trees exits **0**. The existing icon
+  notice and scratch composition's separate directory-submission README notice
+  remain. Helper syntax checks pass; its executable mode remains **100755**. Direct
+  helper refusal exits **1**, as expected. No chmod was performed.
+- Ruff has **no added findings**: installed **35**, release **35**, shared tree **33**,
+  all command exits **0** using the established permissive command plus comparison.
+- Fresh scratch installation exits **0** and contains the guard, executable helper
+  and all three calibration files. Valid reclaim options exit **0**; invalid options
+  exit **1** with their expected CONFIG refusal.
+- `item8-real-release.json` repeats real-default-configuration preflights and all
+  ten login/non-login shells, driver/shell exits **0**. Guard/marker/helper reach,
+  disabled plugin MCP servers and absent `codex_apps` remain verified. Warm infra
+  and ordinary preflights were **0.650 / 0.586 s**.
+- `item8-aux-release.json` repeats real stdio MCP, sentinel-secret, service-table
+  and SessionStart observations, driver exit **0**. All pass. The earlier measurement
+  boundaries for resume and listener serialization still apply.
+
+Additional retained artifacts: `item8-ruff.json`, `item8-plugin-validation.txt`,
+`item8-marketplace-validation.txt`, `item8-working-plugin-validation.txt`,
+`item8-working-marketplace-validation.txt`, `item8-release-files.json`,
+`item8-readback.json`, `item8-final-records.json` and `item8-cleanup.json`.
+`item8_finalize.py` records final documentation checks, source hashes, the remaining
+protected-file comparison, disposable-state/process cleanup and the 15 GiB floor.
+Only documentation changes follow the final real-engine checks.
+
+---
+
+# software-workflows 2.4.28 — review corrections 1–7 — earlier observations
+
+**The real-configuration acceptance runs below pass. The absolute publishing
+property remains unproved.** This writer made no push attempts or recording Git
+operations during that fix round. The lead subsequently completed the real-config
+push runs recorded above; the commands below remain reproducible recipes. The live coordinator was not
+restarted, and all release changes remain uncommitted.
+
+`S` is `/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2428p`.
+The source is HEAD `8527465432a674fa5800fb2bb113caccc855b48e` plus this release's
+19 files, including the new `coordinator/plugin_catalog.py`. The independent
+release tree is installed **2.4.27** plus only those files; it excludes writer 3's
+2.4.29 work. `review-release-files.json` records the measured source hashes and
+`review-final-records.json` records the final documentation hashes and comparison.
+
+## Review failures and corrections
+
+The lead's `lead-realconfig-part1.json` measured the rejected candidate against
+the real default Codex configuration: both exec-writer preflights raised
+`TypeError: Unsupported TOML override`; infra and ordinary advisors returned
+`CODEX_PUBLISH_ENV` for `codex_app`. Their second attempts took 9.47, 9.17 and
+10.00 seconds. These were preflight outcomes, with no shell process or shell exit.
+The original empty-home observations below did not cover this configuration.
+
+- Effective dictionaries now use a plain deep merge. Null values from
+  `config/read` are not passed to the TOML override serializer.
+- Shell policy carries `GIT_CONFIG_PARAMETERS` and the guard marker through
+  `set`. It adds PATH only when an effective user set table already contains it,
+  appending the helper directory. Nonempty `include_only` adds only the emitted
+  guard names. Inherit, exclusions, filters and unrelated set entries survive.
+- MCP transport overrides contain only guard leaves. User credentials stay in
+  the user's configuration rather than being copied into argv or listener config.
+- Plugin MCP servers are disabled individually, preserving readable plugins and
+  their skills. Evidence/context records names and the reason: **Codex 0.163.0
+  cannot carry the push guard into plugin MCP servers**. An explicitly selected
+  plugin MCP server refuses `CODEX_PUBLISH_ENV`; unavailable metadata disables
+  that plugin and reports why. User-configured infra MCP write tools remain an
+  intentional residual.
+- `features.apps=false` disables connected ChatGPT apps independently of the
+  writer profile. Effective configuration verifies it; evidence/context records
+  `apps_disabled=true`. Native live web search remains available.
+- Names-only plugin metadata is cached by Codex binary identity and installed
+  plugin id/version/localVersion/installedAt/source/enabled. Warm preflights reuse
+  it; optional plugin-data persistence contains no arguments or environment values.
+- Setup readiness requires ordinary/path/file-URL refusals. SessionStart ignores
+  missing/stale caches and documented bypass cases, while reporting an observed
+  ordinary-route failure or missing launch guard.
+
+The lead measured **873** connected-app tools before this correction, including
+GitHub commit/branch/PR publishing and **240** Vercel tools. These are the lead's
+review observations, not a new tool inventory from this writer. The relevant
+primary source was fetched successfully for installed Codex **0.163.0**:
+[Feature::Apps](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/features/src/lib.rs#L1524)
+has key `apps`, stage `Stable` and `default_enabled: true`;
+[host-owned apps selection](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/codex-mcp/src/mcp/mod.rs#L348)
+requires `config.apps_enabled` and ChatGPT authentication, and removes the
+`codex_apps` entry when disabled. The runtime absence is measured below.
+
+Service admission required one additional correction during this round. Codex
+deep-merges user configuration with an override, but a later whole CLI `set`
+assignment replaces an earlier CLI set table. `services.acquire` binds its exact
+returned mapping to the admission task; `roles.overlay` carries the guard leaves
+into that mapping before the protected daemon passes it to Codex. Thread overrides
+also retain the listener's guard/PATH leaves. No service credentials enter stored
+listener config. The first auxiliary run exited **1** at service verification;
+`review-aux-before-service-fix.json` retains the earlier completed observation.
+The corrected real-engine service runs exit **0** below. No protected daemon edit
+or Docker service startup was needed for these environment-composition observations.
+
+## Real configuration and real shells
+
+`review_real.py` uses the default CODEX_HOME through native `config/read`; it never
+opens the user's config.toml or sessions. Its loopback provider overrides do not
+force `features.plugins` or `features.shell_snapshot` off. The effective real
+configuration reports `shell_snapshot=true`, plugins at their normal default,
+and `apps=false`. All inference is loopback fixture inference; threads are
+`ephemeral:true` and exec runs use `--ephemeral`, so these observations persist
+no rollout. Environment evidence contains names and booleans, never secret values.
+
+`review-realconfig-part1.json` is a direct rerun of the lead's part1 template,
+driver exit **0**. `review-real.json` contains the working-tree pass, exit **0**.
+`review-real-release.json` is the final independent-release pass, exit **0**.
+Cold means cleared process and scratch plugin-metadata caches for that mode;
+warm is the immediately following preflight. These are observed times, not bounds.
+
+| Final release preflight | Cold seconds | Warm seconds | Outcome |
+|---|---:|---:|---|
+| Native writer, live list profile | 18.592 | 0.605 | Passed |
+| Native writer, all profile | 8.233 | 0.604 | Passed |
+| Exec writer | 11.135 | 4.436 | Passed |
+| Infra advisor | 7.767 | 0.644 | Passed |
+| Ordinary advisor, ignore user config | 7.720 | 0.706 | Passed |
+| Abraham analysis, writer custody preflight | 10.269 | 4.022 | Passed |
+| Exec resume preflight and parent overrides | 7.205 | 0.647 | Passed |
+
+Native proof runs `writer_profile.configure`, `roles.overlay` and final verify,
+including the live `["MCP_DOCKER","openaiDeveloperDocs"]` selection. The real
+`inherit=core` and all three user set names survive. Exec proof uses production
+`exec_policy`, `_build_exec_argv` and `_codex_env`. The resume row verifies preflight
+and overrides before the resume subcommand; it is not a resumed persisted turn.
+No full two-phase Abraham request or new supervisor/worker lifecycle was run in
+this correction round.
+
+| Actual final release shells | login:true | login:false | Process outcome |
+|---|---|---|---|
+| Native list writer | Guard, marker, helper present; exit 0 | Same; exit 0 | Turn completed; app-server stop 0 |
+| Native all writer | Guard, marker, helper present; exit 0 | Same; exit 0 | Turn completed; app-server stop 0 |
+| Exec writer | Guard, marker, helper present; exit 0 | Same; exit 0 | Codex exit 0 |
+| Exec infra advisor | Guard, marker, helper present; exit 0 | Same; exit 0 | Codex exit 0 |
+| Exec ordinary advisor | Guard, marker, helper present; exit 0 | Same; exit 0 | Codex exit 0 |
+
+Each measurement also confirms that the guard parameters end with the expected
+enabled-hook setting. Individual exits come from native `commandExecution.exitCode`
+or exec `command_execution.exit_code`, not an assumed successful engine exit.
+An intermediate recorder incorrectly looked for a code-mode result field; it
+exited **1** despite successful shell measurements. Its evidence is retained as
+`review-real-release-recorder-failure.json`,
+`review-static-checks-recorder-failure.txt`,
+`review-static-summary-recorder-failure.json` and
+`review-release-files-recorder-failure.json`. The final rerun above fixed only
+the evidence driver, not production code, and captured all ten real shell exits.
+
+Ephemeral `mcpServerStatus/list` catalogs for native list/all and the three exec
+configurations show `codex_app` and `cua_repl` **disabled**, no connected plugin
+server, and **no codex_apps entry**. Ordinary exec itself uses
+`--ignore-user-config`; its status catalog is a companion app-server using the
+same final restrictions, since app-server has no equivalent ignore-user flag.
+The actual ordinary exec shell was measured separately. Explicit selection of
+`codex_app` returns `CODEX_PUBLISH_ENV` before inference; no shell exit applies.
+
+## MCP credentials, services and SessionStart
+
+`review_aux.py` and `review-aux-release.json` use a disposable fake Codex home
+for the sentinel experiment, a real stdio MCP process and a real SQLite Store.
+The driver exits **0**. The server starts and reports guard parameters, marker
+and helper resolution all true. Effective config retains the fake secret key
+and other user keys; only guard leaves appear in overrides. The sentinel value
+is absent from override argv and the serialized listener record. Evidence prints
+only key names and presence booleans. The ledger observation is actual
+`Store.put` listener serialization, not a complete daemon admission.
+
+Both real CLI service-table composition and actual `Services.thread_config`
+composition pass readback verification, retaining two user entries, the service
+entry, PATH and both guard variables. These observations exercise the existing
+daemon's argument ordering without modifying the daemon or starting containers.
+
+The real `_setup_notice` returns **None** for startup/resume with a full cache,
+and for missing or stale caches. Setup marks both binaries ready when the three
+ordinary cases are refused, while its detail lists each measured limitation.
+Changing a cached ordinary case to `not covered` produces a notice; removing the
+ability to construct a guarded launch environment also produces a notice. For
+this reporting-only observation, the lead's existing matrix was copied into a
+disposable current-key cache. It is not a new push calibration; the lead should
+regenerate capability evidence against the final implementation identity.
+
+## Lead-measured push results and residuals
+
+`lead-routes-tree.json`, produced by `lead_routes.py`, records the following on
+Apple **2.50.1 (Apple Git-155)** and Homebrew **2.56.0**. The lead's
+`probe-capabilities-lead.json` additionally records complete before/after refs.
+Both report fixture removal. These measurements precede this configuration fix
+round; the Git environment transformation and helper bytes were preserved.
+
+| Route | Apple exit / outcome | Homebrew exit / outcome |
+|---|---|---|
+| Unguarded control | 0; remote changed | 0; remote changed |
+| Ordinary, path, file URL | 128; refused, unchanged | 128; refused, unchanged |
+| Python subprocess, sh script, zsh login shell | 128; refused, unchanged | 128; refused, unchanged |
+| Make target | 2; child Git 128, unchanged | 2; child Git 128, unchanged |
+| Ordinary `--no-verify`, `--mirror` | 128; refused, unchanged | 128; refused, unchanged |
+| Explicit pushurl | 0; published, **not covered** | 1; hook refusal, unchanged |
+| Explicit pushurl plus `--no-verify` | 0; published, **not covered** | 0; published, **not covered** |
+| More-specific rewrite plus `--no-verify` | 0; published, **not covered** | 0; published, **not covered** |
+| Cleared environment | 0; published, **not covered** | 0; published, **not covered** |
+| Fetch, clone, status, ls-remote | 0 | 0 |
+| Fixture commits with Husky-style hook | 0; hook ran | 0; hook ran |
+
+Every refused push above includes `LEAD_PUBLISHES: the lead (Claude) pushes;
+Codex cannot publish commits.` The hook may run after remote-ref discovery, so
+its refusal is not proof of zero remote contact. Full-access environment removal,
+alternate publishing programs, hidden gh/API calls and remote/container MCP
+descendants remain residual routes. Infra advisors deliberately retain user MCP
+servers with write tools. Lead Bash gating is unchanged; coordinator publication
+and native coordinator-gate A4 still require the separate lead fixture run.
+
+Installed 2.4.27 baseline evidence remains in `red-2.4.27.json`,
+`environment-red.json`, `native-env-red.json` and `gate-red.json`: launch shells
+lacked the guard and visible gh writes were admitted by the classifier. Literal
+A1 inline Python and `sh publish_fixture.sh` were **already refused** by installed
+code. Those refusals must not be relabeled as successful baseline pushes.
+
+## Final checks, source boundary and lead commands
+
+`review_release.py` exits **0**, with **35 checks passed** in
+`review-static-checks.txt` and `review-static-summary.json`. All **94** shared-tree
+and **91** release Python files compile; Python **3.9.6** compiles **22** hook
+files and imports the hook/client/guard/cache/setup modules, exits **0**.
+`coordinator/hooks.py --check` exits **0**, reporting compatible `jsonl-v1`.
+sh, Bash POSIX and Zsh sh syntax checks pass for both helpers, exits **0**.
+The refusal helper runs directly with exit **1** and the expected message.
+Its lead-installed mode remains **100755**, without another chmod.
+
+`review-ruff.json` records no new findings against installed 2.4.27: baseline
+**35**, release **35**, shared tree **33**. All invocations exit **0** using the
+existing permissive `--exit-zero` command; the findings comparison is the check.
+Strict plugin/marketplace validation in both trees exits **0**; outputs are
+`review-plugin-validation.txt`, `review-marketplace-validation.txt`,
+`review-working-plugin-validation.txt` and `review-working-marketplace-validation.txt`.
+The existing icon notice remains, as does the scratch composition's directory
+submission README notice; neither changes the requested strict validation result.
+Fresh scratch marketplace addition and plugin installation exit **0** and include
+the guard module and executable helper. Valid reclaim settings exit **0**;
+0/-1/1.5/invalid exit **1** with the expected CONFIG refusal.
+
+`review-final-records.json` and `review-cleanup.json`, produced by
+`review_finalize.py`, record final documentation validation, source hashes,
+protected-file comparison, read-only Git status, fixture/process cleanup and free
+disk. No code changed after the final real-engine checks. The helper UNKNOWN was
+resolved by the lead's adoption operation `op_502805ba99194a6cacae68769e7b999e`.
+Historical evidence below describes its earlier unresolved state only.
+
+The lead should execute these existing push-attempt drivers from its own
+unguarded environment, **not from Codex**, retaining the output paths shown:
+
+```sh
+P=/Users/ahrar/Documents/agent-teams-plugin/plugins/software-workflows
+S=/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2428p
+PY=/Users/ahrar/.claude/plugins/data/software-workflows-agent-teams/venv/91e1e736a04fad0e/bin/python
+"$PY" -B "$S/lead_realconfig.py" "$P" "$S/lead-realconfig-part2-final.json" part2
+"$PY" -I -B "$S/lead_routes.py" "$P" "$S/lead-routes-final.json"
+```
+
+The lead should also regenerate the full/quick capability matrix under the final
+implementation identity. This command removes its disposable cache on exit:
+
+```sh
+"$PY" -I -B - "$P" "$S/probe-capabilities-final.json" <<'PY'
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from coordinator.push_capabilities import report
+
+with tempfile.TemporaryDirectory(prefix="r2428p-lead-cache-", dir="/private/tmp") as cache:
+    evidence = {"full": report(cache), "quick": report(cache, quick=True)}
+Path(sys.argv[2]).write_text(json.dumps(evidence, indent=2) + "\n")
+PY
+```
+
+Native supervisor/worker A1/A2/A4 and coordinator publication need a
+lead-prepared fixture checkout. No successful outcome for those outstanding runs
+is inferred from this writer's environment proof.
+
+---
+
+# software-workflows 2.4.28 initial candidate — archived observations
+
+**Historical, superseded by the review corrections above.** This section records
+the rejected candidate's empty-home measurements and its then-outstanding work.
+Its plugin/policy refusal behavior, setup notices and helper ownership status do
+not describe the final candidate. Retained artifacts and reds remain useful.
+
+**Partial acceptance, not proof of the absolute publishing property.** The code,
+package checks, real-engine environment reach, and named preflight refusals are
+observed below. No publishing control, guarded push, or coordinator publication
+was executed by this writer. A1/A2, the push portion of A3, native-daemon A4,
+the mutation portion of A5, and A6 still require the lead's local-fixture runs.
+The filenames containing `green` identify the candidate; they do not mean every
+acceptance criterion passed.
+
+## Sources and retained evidence
+
+Baseline: installed **2.4.27** at
+`/Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows/2.4.27`.
+Candidate: HEAD `8527465432a674fa5800fb2bb113caccc855b48e` plus uncommitted edits.
+The release composition copied installed 2.4.27 and overlaid only the files in
+`release-files.json`. Its protected modules match the installed version; writer
+3's compression/retry changes are absent. Working-tree checks also ran separately.
+
+`S` means
+`/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2428p`.
+All retained artifacts and operational drivers for this release are listed here:
+
+- `charter.md`, `git_push_probe.py`: the lead's supplied charter and earlier
+  probe source. The earlier probe was not rerun by this writer.
+- `red-2.4.27.json`, `green-2.4.28.json`, `environment-reach.json`: indexed
+  observations, actual exits, and explicit acceptance gaps.
+- `environment-red.json`, `environment-green.json`, `environment-release.json`:
+  raw Codex exec events; `native-env-red.json`, `native-env-green.json`,
+  `native-env-release.json`: raw native app-server events.
+- `gate-red.json`, `gate-green.json`: shipped classifier observations only,
+  without executing the classified commands.
+- `configuration-observations.json`, `probe-capabilities.json`,
+  `setup-check-codex.txt`, `public-gh-get.txt`: configuration parsing, setup's
+  unverified capability report, and a real public GitHub read.
+- `static-checks.txt`, `static-summary.json`, `ruff.json`,
+  `plugin-validation.txt`, `marketplace-validation.txt`,
+  `working-plugin-validation.txt`, `working-marketplace-validation.txt`:
+  complete commands, exits and output from the established release checks.
+- `release-files.json`, `cleanup.json`: source hashes, composition boundary,
+  protected-file comparison, fixture/process cleanup and disk observations.
+- `engine_reach.py`, `native_environment.py`, `gate_inspection.py`,
+  `configuration_observations.py`, `release_check.py`, `collect_evidence.py`:
+  retained operational drivers. No repository test files were added.
+
+## Real engine reach
+
+The loopback Responses provider is the existing `coordinator.fixture.Provider`.
+Codex **0.163.0** actually launched each measured shell/MCP server. Homes, logs,
+provider state and installations were disposable; neither the real Codex config
+nor its sessions were read. Measurements printed only guard-presence booleans.
+
+| Actual launch | Installed 2.4.27 shell/server | Candidate shell/server | Actual exits |
+|---|---|---|---|
+| Native app-server through `native.environment` and `roles.overlay` | Guard parameters/helper absent | Both present | Shell 0; app-server stop 0; driver 0, both versions |
+| Exec writer builder (`write=True`) | Parameters/helper/marker absent | All present | Codex 0, shell 0, both versions |
+| Infra advisor | Absent | Present | Codex 0, shell 0, both versions |
+| Ordinary advisor, `read-only --ignore-user-config` | Absent | Present | Codex 0, shell 0, both versions |
+| Abraham analysis configuration, infra plus writer preflight | Absent | Present | Codex 0, shell 0, both versions |
+| Infra thread resume, with a second real shell command | Absent | Present | Codex 0, shell 0, both versions |
+| Stdio MCP `reach` tool, started by real exec | Parameters/helper absent | Both present | Codex 0; MCP call completed; a shell exit does not apply |
+| Production `_exec_codex_once`, then a second attempt | Not observed on baseline | Present in each shell | Attempt return 0, shell 0, both attempts |
+
+`environment-release.json` and `native-env-release.json` repeat the candidate
+observations on the independent release composition. `environment-green.json`
+also contains the scratch-user-policy parity observations below. These are
+environment proofs, **not push-refusal proofs**. The native app-server driver did
+not run a supervisor/worker/coordinator lifecycle. The exec writer observation
+used the production builder/environment; it did not exercise the writer's whole
+custody/lock orchestration. Abraham's complete two-phase MCP request and automatic
+retry orchestration were not executed.
+
+An effective `inherit=core`, `inherit=none`, PATH-only `include_only`, PATH-only
+`filters`, replaced Git parameters, a protocol allowlist excluding the helper,
+and an unknown enabled plugin all produced
+`CODEX_PUBLISH_ENV` before inference, with **0 provider requests** and no Codex
+exec/shell exit to report. An unrelated existing `set` table kept the guard and
+ran with Codex/shell exits **0/0**. Replacing parameters in the final extra-env
+merge returned **1** from `_exec_codex_once`, with **0 provider requests** and no
+child process. A scratch user `inherit=core` was refused for infra but ignored
+by the ordinary advisor, whose actual shell retained the guard, exits **0/0**.
+
+## Admission observations and A1 discrepancy
+
+Both classifier-inspection processes exited **0**. These are direct observations
+of the shipped classifier, not native command admission or shell executions.
+
+| Command form | Installed 2.4.27 | Candidate |
+|---|---|---|
+| Literal A1 inline Python subprocess command | Already classified `LEAD_RECORDS` | Still refused; guidance now says the lead (Claude) pushes |
+| `sh publish_fixture.sh` | Already refused | Still refused |
+| Python filename, executable shell filename, Make target | Admitted | Admitted; inherited guard is the intended downstream defense |
+| `gh pr merge`, `release create`, API POST/PUT/DELETE | Admitted | `LEAD_PUBLISHES` |
+| API field/input flags, aliases, extensions | Admitted | `LEAD_PUBLISHES` |
+| Supported wrappers around visible `gh` writes | Admitted | `LEAD_PUBLISHES` |
+| API GET/HEAD, the A4 Accept header, issue view, search issues, PR checks, release download | Admitted | Admitted |
+
+The literal A1 baseline expectation conflicts with the installed parser; it was
+not weakened to manufacture a red. The inspection contains 27 command strings:
+2 refused by installed code, 17 by the candidate. No shell exit is assigned to
+these classifications. A separate **real**
+`gh api repos/cli/cli/contents/README.md -H 'Accept: application/vnd.github.raw+json'`
+returned the public README with process exit **0**, retained in `public-gh-get.txt`.
+The harmless `gh` fixture and real coordinator-gate A4 execution remain unrun.
+
+## Configuration, capabilities and limits
+
+Both `/usr/bin/git` and `/opt/homebrew/bin/git` executed a read-only `config --get`
+under the candidate environment, exit **0**, preserving a synthetic value with
+spaces, an apostrophe and `!`. Environment transformation was idempotent, left
+its input unchanged, and detached back to the original parameters/PATH. No Git
+recording operation was used for these observations. Malformed parameters and a
+protocol allowlist excluding the refusal helper returned `CODEX_PUBLISH_ENV`.
+
+Service declarations accepted `DATABASE_URL` and refused mappings to PATH, the
+guard marker, `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_COUNT`. No service started.
+Plugin policy inspection accepted skills-only/disabled-MCP configurations and
+refused enabled MCP or unknown plugins. Real engine preflight separately proved
+the unknown-plugin refusal. Container/remote MCP environment propagation and
+plugin-transport refusal through a full native daemon remain unverified.
+
+The quick capability report enumerated both Git binaries and reported them
+**unverified** without a cache. Full probing under this Codex process refused
+`CODEX_PUBLISH_ENV` before fixture creation. The setup CLI itself exited **0**
+while visibly reporting that unverified state; its exit is not a coverage claim.
+The full successful-control matrix, Husky marker, fetch/clone/fixture commits,
+lead Bash environment and coordinator seal/review/publication are **unverified
+in this phase**. Claude's `_install_shim` source is unchanged, and coordinator
+environment detachment was observed, but neither substitutes for A5's real runs.
+
+The lead supplied the Apple **2.50.1** explicit-pushurl hole in the charter. The
+source-confirmed Homebrew **2.56.0** explicit-pushurl plus `--no-verify` route,
+longer URL rewrites, environment replacement, hidden `gh`/API calls and arbitrary
+remote/container programs remain residual routes. No numeric push exit or remote
+ref observation is invented for an unrun control. In particular, environment
+propagation cannot prove the absolute PROPERTY under unrestricted execution.
+
+Primary sources checked for the installed versions:
+
+- [Git 2.56.0 URL configuration](https://github.com/git/git/blob/v2.56.0/Documentation/config/url.adoc): longest matching prefix; explicit `pushurl` skips `pushInsteadOf`.
+- [Git push](https://github.com/git/git/blob/v2.56.0/Documentation/git-push.adoc): `--no-verify` bypasses pre-push; [transport implementation](https://github.com/git/git/blob/v2.56.0/transport.c) obtains remote refs before that hook, so hook denial does not prove zero remote contact.
+- [Git configuration hooks](https://github.com/git/git/blob/v2.56.0/Documentation/config/hook.adoc): event/command/enabled semantics; [hook command](https://github.com/git/git/blob/v2.56.0/Documentation/git-hook.adoc) preserves traditional directory hooks alongside configuration hooks.
+- [Codex 0.163.0 policy defaults](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/config/src/shell_environment_policy.rs): inherit `all`, ignore default exclusions `true`, experimental profile `false`; [environment ordering](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/protocol/src/shell_environment.rs) applies `include_only` after `set`.
+- [Codex MCP environment](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/rmcp-client/src/utils.rs): Git parameters are absent from default stdio inheritance. [PluginMcpServerConfig](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/config/src/types.rs) explicitly excludes transport settings; this required refusing enabled plugin MCP rather than the brief's proposed environment overlay.
+- [GitHub CLI 2.103.3 API](https://github.com/cli/cli/blob/v2.103.3/pkg/cmd/api/api.go): GET by default, POST when parameters are supplied; method `-X`/`--method`, payload `-f`/`-F`/`--input`.
+
+## Existing checks and package runs
+
+`release_check.py` exited **0**. The working tree's **93** Python sources and the
+independent release's **90** compiled. Python **3.9.6** compiled **21** hook-reachable
+files and imported all required hook/client/guard/setup modules, exits **0**.
+`coordinator/hooks.py --check` exited **0** with
+`{"compatible": true, "protocol": "jsonl-v1"}`. Both shell helpers passed syntax
+checks under sh, Bash POSIX mode and Zsh sh emulation, all exits **0**. The new
+helper was executable and its direct run exited **1**, printing:
+
+```text
+LEAD_PUBLISHES: the lead (Claude) pushes; Codex cannot publish commits.
+```
+
+Ruff used `--isolated --no-cache --exit-zero --output-format json --select
+F821,F822,F823,F811,F841,F401`. All three invocations exited **0**; comparison,
+rather than that permissive exit flag, found **no additions**: installed 35,
+release 35, shared working tree 33. Whitespace and version/title checks passed.
+The existing reclaim option checks returned **0** for 1/2/4 and **1** with the
+expected CONFIG refusal for 0/-1/1.5/invalid.
+
+`claude plugin validate --strict plugins/software-workflows` and
+`claude plugin validate --strict .` both exited **0** in the real checkout, with
+scratch Claude configuration. The independent composition's two validations also
+exited **0**. Output retains the existing icon notice and, for the composition
+without a `.git` root, the directory-submission README notice. The validator says
+these notices do not change strict validation's result; directory-profile
+submission was not claimed. A fresh empty scratch `CLAUDE_CONFIG_DIR` then ran
+local marketplace addition and plugin installation, both exits **0**. Its cache
+contained version **2.4.28**, the guard module and executable helper.
+
+## Outstanding lead work and cleanup
+
+The writer's developer contract says “Never publish or rewrite Git state: the
+lead records.” Requests for lead-run local controls remain in the lead mailbox.
+PreToolUse also refused creation of a proposed lead fixture driver because its
+text contained recording Git commands. That driver was not created or run; no
+approval or successful control is inferred from an unanswered request.
+
+The concrete lead-only capability entry point is `coordinator.push_capabilities.report`:
+run it from the candidate plugin with a disposable data path under
+`/private/tmp/r2428p-*`, retain its JSON as `S/probe-capabilities.json`, and remove
+the cache afterward. It creates/removes each local fixture in `finally`, includes
+unguarded controls, records both process exits and remote refs, and enumerates
+every discovered binary without an artificial count limit. A separate real
+supervisor/worker/native fixture run is still required for A1/A2/A4 and coordinator
+publication; an app-server-only observation must not be relabeled as that proof.
+That run needs a lead-prepared Git fixture: checkout registration requires Git
+metadata and takes exclusive canonical-checkout ownership. The current live
+checkout already belongs to its coordinator, so it cannot safely substitute for
+the missing fixture even for a harmless `gh` admission observation.
+
+All completed observation drivers reported fixture cleanup. Completed package
+runs remained above the **15 GiB** floor; `cleanup.json` records the final disk and
+process check. Protected writer 3 files are compared byte-for-byte against the
+phase-start hash manifest. The live 2.4.27 coordinator was not restarted or
+installed over. Every release edit remains uncommitted.
+
+One coordinator UNKNOWN requires lead review:
+`unknown_2470dd65f3ff413ea20c075130cbb870`, the new helper's executable-bit change,
+reason `opaque command effects`. The earlier custody.py operation
+`op_3508b241ace2412aa803e0e7ca413313` is verified. The writer did not modify live
+state to resolve that UNKNOWN.
+
+---
+
 # software-workflows 2.4.27 — 2026-10-31
 
 The release implements R1–R4: explicit outage conversion, paced incremental

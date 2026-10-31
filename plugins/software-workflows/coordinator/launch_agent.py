@@ -23,7 +23,7 @@ def settings(root):
     saved = json.loads(path.read_text()) if path.exists() else {}
     if not isinstance(saved, dict) or any(k not in allowed or not isinstance(v, str) for k, v in saved.items()):
         raise CoordinatorError("LAUNCH_SETTINGS", "Retained launch settings are invalid")
-    values = dict(saved, **{k: v for k, v in clean_environment().items() if k in allowed})
+    values = dict(saved, **{k: v for k, v in clean_environment(codex=False).items() if k in allowed})
     if values != saved or not path.exists():
         descriptor, pending = tempfile.mkstemp(prefix="launch-settings-", dir=root)
         try:

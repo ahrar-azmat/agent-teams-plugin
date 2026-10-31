@@ -180,6 +180,63 @@ STARTUP_CODE = {"BASH_ENV", "ENV", "ZDOTDIR", "PROMPT_COMMAND", "PS4", "SHELLOPT
                 "PERL5OPT", "NODE_OPTIONS", "RUBYOPT", "PYTHONSTARTUP", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"}
 
 
+READ_GH = {"pr": {"view", "list", "status", "diff", "checks"},
+           "issue": {"view", "list", "status"}, "release": {"view", "list", "download"},
+           "repo": {"view", "list"}, "run": {"view", "list", "download"},
+           "workflow": {"view", "list"}, "gist": {"view", "list"},
+           "search": {"issues", "prs", "repos", "code", "commits"},
+           "auth": {"status"}, "cache": {"list"}, "ruleset": {"list", "view"}}
+
+
+def gh_read(words):
+    """Only built-in read command paths, never an alias/extension named 'view'."""
+    rest = list(words[1:])
+    while rest and rest[0].startswith("-"):
+        flag = rest.pop(0)
+        if flag in ("--version", "--help", "-h"):
+            return not rest
+        if flag in ("-R", "--repo", "--hostname") and rest:
+            rest.pop(0)
+        elif flag.startswith(("--repo=", "--hostname=")) or flag.startswith("-R") and len(flag) > 2:
+            continue
+        else:
+            return False
+    if not rest:
+        return False
+    if rest[0] != "api":
+        return len(rest) >= 2 and rest[1] in READ_GH.get(rest[0], set())
+    rest = rest[1:]
+    method, endpoints = "GET", 0
+    values = {"--method", "-X", "--header", "-H", "--hostname", "--jq", "-q", "--template", "-t", "--cache", "--preview", "-p"}
+    flags = {"--paginate", "--slurp", "--include", "-i", "--silent", "--verbose"}
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--":
+            endpoints += len(rest)
+            return endpoints == 1 and method in ("GET", "HEAD")
+        if not arg.startswith("-"):
+            endpoints += 1
+            continue
+        key, equal, val = arg.partition("=")
+        if key in ("-f", "-F", "--field", "--raw-field", "--input") or arg.startswith(("-f", "-F")):
+            return False
+        if key in flags and not equal:
+            continue
+        if not equal and arg[:2] in ("-X", "-H", "-q", "-t", "-p") and len(arg) > 2:
+            key, val, equal = arg[:2], arg[2:], True
+        if key not in values:
+            return False
+        if not equal:
+            if not rest:
+                return False
+            val = rest.pop(0)
+        if key in ("--method", "-X"):
+            if val not in ("GET", "HEAD"):
+                return False
+            method = val
+    return endpoints == 1 and method in ("GET", "HEAD")
+
+
 def invocation(words, depth):
     # A plain `git` refuses whatever its environment, and the one accepted form starts with
     # `/usr/bin/env -i`, which clears it: assignments in front cannot make Git out of another
@@ -196,6 +253,8 @@ def invocation(words, depth):
     executable = words[0].rsplit("/", 1)[-1]
     if executable == "git":
         return git_invocation(words)
+    if executable == "gh":
+        return False if gh_read(words) else "LEAD_PUBLISHES"
     if executable in ("command", "exec", "env", "nohup"):
         rest = words[1:]
         if executable == "env":
@@ -226,7 +285,7 @@ def invocation(words, depth):
         rest = words[1:]
         for i, flag in enumerate(rest):
             if flag.startswith("-") and "c" in flag[1:] and set(flag[1:]) <= set("celuxv"):
-                return i + 1 >= len(rest) or recording_command(rest[i + 1], depth + 1)
+                return i + 1 >= len(rest) or _recording_command(rest[i + 1], depth + 1)
             if flag not in ("--noprofile", "--norc", "-l"):
                 break
         return True
@@ -238,7 +297,7 @@ def invocation(words, depth):
     return any(re.search(r"(?:^|[\s/'\"])git(?:$|[\s'\"])", arg) for arg in words[1:])
 
 
-def recording_command(command, depth=0):
+def _recording_command(command, depth=0):
     if not isinstance(command, str) or not command or depth > 16:
         return True
     try:
@@ -252,8 +311,11 @@ def recording_command(command, depth=0):
                 return True
             redirect = True
         elif operator:
-            if redirect or invocation(words, depth):
+            if redirect:
                 return True
+            refused = invocation(words, depth)
+            if refused:
+                return refused
             if value not in (";", "|", "||", "&", "&&", "(", ")"):
                 return True
             words = []
@@ -262,6 +324,16 @@ def recording_command(command, depth=0):
         else:
             words.append(value)
     return False
+
+
+def command_refusal(command, depth=0):
+    refused = _recording_command(command, depth)
+    return "LEAD_PUBLISHES" if refused == "LEAD_PUBLISHES" else "LEAD_RECORDS" if refused else None
+
+
+def recording_command(command, depth=0):
+    # Existing callers consume a Boolean; the admission paths retain the named code.
+    return bool(command_refusal(command, depth))
 
 
 def covered(path, exclusion):
@@ -449,11 +521,17 @@ class Custody:
         from .gitio import safe_shell_git
         return "Supported helper-free example: " + safe_shell_git(["diff", "--no-ext-diff", "--no-textconv"])
 
+    def refuse_recording(self, command):
+        code = command_refusal(command)
+        if code == "LEAD_PUBLISHES":
+            raise CoordinatorError(code, "LEAD_PUBLISHES: the lead (Claude) publishes; Codex cannot perform this operation. Use a built-in gh read command or ask the lead.")
+        if code:
+            raise CoordinatorError(code, "the lead records; unestablished Git execution refused. The lead (Claude) pushes. " + self.git_guidance())
+
     def declare(self, actor, command, reason):
         if not isinstance(command, str) or not command or not isinstance(reason, str) or not reason.strip():
             raise CoordinatorError("DECLARATION", "Shared declaration needs an exact command and a reason")
-        if recording_command(command):
-            raise CoordinatorError("LEAD_RECORDS", "the lead records; unestablished Git execution refused. " + self.git_guidance())
+        self.refuse_recording(command)
         ident = uid("declaration")
         self.store.put("declaration", ident, {"actor": actor["id"], "command": command, "reason": reason,
                        "state": "available", "level": "shared"}, actor["id"])
@@ -462,8 +540,7 @@ class Custody:
     async def reserve(self, actor, command, operation=None, timeout=110):
         if self.store.get(actor["unit"])["state"] != "open":
             raise CoordinatorError("UNIT_FROZEN", "Cannot start a command for a sealed or published unit")
-        if recording_command(command):
-            raise CoordinatorError("LEAD_RECORDS", "the lead records; unestablished Git execution refused. " + self.git_guidance())
+        self.refuse_recording(command)
         declaration = next((d for d in self.store.all("declaration", actor["id"])
                             if d["state"] == "available" and d["command"] == command), None)
         level = "shared" if declaration else "exclusive"
