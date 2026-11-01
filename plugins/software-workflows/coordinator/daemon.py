@@ -3063,9 +3063,7 @@ class Daemon:
             if method == "review/complete":
                 return reviews.complete(self, params)
             if method == "review/jobs":
-                reviews.repair(self)
-                return {"data": [j for j in self.store.all("review_job") if j["dispatch_cwd"] == params["cwd"] and
-                                  (not params.get("run") or j["run"] == params["run"])]}
+                return reviews.jobs(self, params)
         if method == "lead/session":
             from .lead import attach
             return await attach(self, params["checkout"], params["session_id"], params.get("project"), params.get("cwd"), params.get("dispatch_cwd"), params.get("fixture"))

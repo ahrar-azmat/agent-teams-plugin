@@ -3,6 +3,55 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.29] — 2026-11-01
+
+- Exec prompts leave argv for fresh and resumed advisors and writers. Private
+  file input survives the writer execution barrier and parent detachment. Requests
+  above the native single-input limit are retained in full in a private spool
+  file and supplied through a locator for chunked reading.
+- Sealed reviews carry a manifest bound to immutable Git objects and inline
+  patches within a budget derived from the deployed model registry. Oversized
+  paths retain both blob IDs, sizes and inspection instructions. Small patches
+  are selected first. A manifest that itself exceeds the budget stays complete
+  in a private file for paged reading; no path-count cap truncates it. External
+  manifests exist only for overflow and are removed on terminal/abandoned jobs;
+  valid unfinished jobs never expire by age. Active jobs and duplicate-answer
+  recovery use indexes, terminal cleanup happens at transition, and startup
+  removes crash-left orphan files without scanning review history on each RPC.
+- Older MCP servers receive the bounded packet through the legacy `diff` field,
+  using a daemon-measured registry budget and the full stored seal binding.
+  A 2.4.29 server refuses an older daemon with `COORDINATOR_VERSION_SKEW` before
+  requesting a sealed review or sending a provenance handback envelope.
+- Authorized handback transfers revision-specific publication rights to the next
+  claimant, records the lead authorizer and both units, and revokes the source's
+  rights. Revision authorship remains unchanged; repeated transfers create no
+  unit publication dependency cycle. Only receipts carried by completed repository
+  publications count as published. Handback follows effective provenance through
+  restoration and publication boundaries and canonicalizes paths once off the
+  daemon loop, including for large directory-claim sets.
+  Completed groups consume grants even for unchanged participants. A handback
+  with no remaining unpublished ancestry retires the superseded grant while
+  retaining its history. Receipt publication and grant consumption are indexed
+  atomically at completion, with a one-time backfill of older completed records.
+  Concurrent unrelated edits no longer invalidate handback; selected subtrees,
+  including retained and newly inserted siblings, are still rechecked.
+- Unchanged project participants receive identity, branch and base checks only.
+  Changed participants retain publication guards. Check-in and checkout Git
+  conversions must preserve the candidate bytes; harmless attributes and identity
+  filters can pass. Transforming conversions refuse with the repository and path.
+  Handing away one participant's entire scope leaves it pin-only when another
+  participant retains work. Interrupted publication validates inherited prefix
+  receipts and transfer proofs without changing their authorship.
+- The Python 3.9 push gate recognizes the exact completed publication and its
+  passed bound review in a clean clone, naming the seal and review. Its existing
+  ref, history, lease, hook and configuration checks still apply.
+- Hook discovery failure uses `PUBLICATION_HOOK_DISCOVERY`; a discovered hook
+  retains `PUBLICATION_HOOK`. Publication guard details identify the repository
+  and applicable event, hook path, candidate path or configuration key.
+
+Real-run evidence and release-composition checks are in
+[`coordinator/VERIFY.md`](plugins/software-workflows/coordinator/VERIFY.md).
+
 ## [software-workflows 2.4.28] — 2026-10-31
 
 Two changes: Codex publishing guards, and cleanup of leaked calibration

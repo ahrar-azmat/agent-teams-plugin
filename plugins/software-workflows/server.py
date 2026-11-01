@@ -95,6 +95,12 @@ MAX_OUTPUT_CHARS = _env_int("CODEX_ORACLE_MAX_OUTPUT_CHARS", 60000, 2000)
 # and chunk exceed the limit". Set a 4 MiB limit as a safety net.
 SUBPROCESS_BUFFER_LIMIT = 4 * 1024 * 1024  # 4 MiB
 
+# Codex 0.163.0 turn/start rejects a single input over exactly 1,048,576
+# characters (measured input_too_large/max_chars on 2026-11-01). Stdin removes
+# exec's ARG_MAX limit but not that native protocol limit. Larger requests stay
+# complete in a private spool file and enter the turn through a file locator.
+EXEC_STDIN_MAX_CHARS = 1_048_576
+
 # Read chunk size for consuming subprocess output. Using read(chunk_size)
 # instead of readline() avoids LimitOverrunError entirely — read() never
 # searches for a separator so it cannot overflow regardless of line length.
@@ -2224,11 +2230,11 @@ def _build_exec_argv(
         # (A separate resume_prompt param existed here that no caller ever
         # passed, so every resume silently sent the generic nudge and DROPPED
         # the caller's added instructions. One prompt slot, no shadow.)
-        argv += ["resume", resume_tid, prompt or RESUME_NUDGE]
+        argv += ["resume", resume_tid, "-"]
     else:
         # Images already attached right after `exec` (see docstring — the
         # variadic -i must not sit next to the positional prompt).
-        argv.append(prompt if prompt is not None else "")
+        argv.append("-")
     return argv
 
 
@@ -2485,6 +2491,7 @@ async def _exec_codex_once(
     extra_env: dict[str, str] | None = None,
     workdir: str = "",
     request_started: float | None = None,
+    prompt: str = "",
 ) -> tuple[str, bool, str, str, int, str | None, bool]:
     """One codex exec attempt (spawn → stream → reap).
 
@@ -2548,15 +2555,43 @@ async def _exec_codex_once(
     # read fails, and the child exits 97: fail closed, never an unpublished
     # writer racing a bridge that still names a dead server.
     barrier = bool(state.get("write") or state.get("custody_cwd")) and os.name != "nt"
-    if barrier:
-        cmd = ["/bin/sh", "-c", 'read _ok || exit 97; exec "$0" "$@" </dev/null',
-               cmd[0], *cmd[1:]]
     from coordinator.client import CoordinatorError
+    prompt_file = None
     try:
+        # A private, seekable file survives parent detachment without a pipe
+        # writer. The barrier still owns stdin until the spawn is journaled;
+        # its separately inherited descriptor becomes Codex's stdin afterwards.
+        prompt_file = tempfile.TemporaryFile(mode="w+b")
+        prompt_bytes = prompt.encode("utf-8")
+        transport = prompt_bytes
+        prompt_path = None
+        if len(prompt) > EXEC_STDIN_MAX_CHARS:
+            descriptor, filename = tempfile.mkstemp(prefix=output_file.stem + ".prompt-", suffix=".txt", dir=output_file.parent)
+            prompt_path = Path(filename)
+            with os.fdopen(descriptor, "wb") as saved:
+                saved.write(prompt_bytes)
+            transport = ("The complete user request is in the private UTF-8 file " + json.dumps(str(prompt_path)) +
+                         ". Read that file in bounded chunks and carry out the request. It exceeds the native single-input limit; "
+                         "do not load the whole file into one context. No content has been truncated. "
+                         f"Size: {len(prompt_bytes)} bytes; SHA-256: {hashlib.sha256(prompt_bytes).hexdigest()}.\n").encode()
+        prompt_file.write(transport)
+        prompt_file.seek(0)
+        inherited = _inherit_lock_kwargs(state, workdir)
+        launch = {"argv_bytes": sum(len(os.fsencode(arg)) + 1 for arg in cmd),
+                  "prompt_bytes": len(prompt_bytes), "stdin_bytes": len(transport),
+                  "prompt_transport": "private-file-reference" if prompt_path else "private-file", "barrier": barrier}
+        if barrier:
+            descriptor = prompt_file.fileno()
+            inherited["pass_fds"] = tuple(sorted(set(inherited.get("pass_fds", ())) | {descriptor}))
+            cmd = ["/bin/sh", "-c", f'read _ok || exit 97; exec "$0" "$@" <&{descriptor}',
+                   cmd[0], *cmd[1:]]
+        launch["spawn_argv_bytes"] = sum(len(os.fsencode(arg)) + 1 for arg in cmd)
+        state["launch"] = launch
+        emit("Launch: " + json.dumps(launch, sort_keys=True))
         from coordinator.push_guard import environment as guarded_environment
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            stdin=(asyncio.subprocess.PIPE if barrier else asyncio.subprocess.DEVNULL),
+            stdin=(asyncio.subprocess.PIPE if barrier else prompt_file),
             stdout=out_fh,
             stderr=err_fh,
             cwd=workdir or _get_cwd(),
@@ -2571,7 +2606,7 @@ async def _exec_codex_once(
             # A write run's codex INHERITS the tree's lock descriptor: the
             # kernel keeps the tree locked while the child lives, even if
             # this server dies (POSIX; Windows region locks do not inherit).
-            **_inherit_lock_kwargs(state, workdir),
+            **inherited,
         )
     except CoordinatorError as exc:
         return "", False, "", exc.code + ": " + str(exc), 1, None, False
@@ -2593,6 +2628,8 @@ async def _exec_codex_once(
     finally:
         out_fh.close()
         err_fh.close()
+        if prompt_file is not None:
+            prompt_file.close()
 
     pgid = proc.pid
     if os.name != "nt":
@@ -3555,7 +3592,8 @@ async def _run_codex(
              returncode, hung_reason, timed_out) = await _exec_codex_once(
                 cmd, output_file, state, _emit, ctx, model,
                 extra_env=extra_env, workdir=eff_cwd,
-                request_started=request_started)
+                request_started=request_started,
+                prompt=prompt or (RESUME_NUDGE if resume_tid is not None else ""))
         except asyncio.CancelledError:
             _cancelled("")
             raise
@@ -4436,12 +4474,22 @@ async def code_review(
             target = str(Path(cwd or dispatch_cwd or _get_cwd()).resolve())
             if project and (status.get("project") or {}).get("id") != project:
                 return await _coordinator_notice("[Bound review refused: project does not match the pinned unit.]", session_id)
-            job = await _coordinator_call("review/prepare", {"unit": sealed_unit, "cwd": dispatch_cwd or target, "target_cwd": target})
+            await _require_publication_protocol("bounded sealed review")
+            from coordinator.review_packet import context_budget
+            budget = await asyncio.to_thread(context_budget, _get_codex_model(), _codex_argv0())
+            job = await _coordinator_call("review/prepare", {"unit": sealed_unit, "cwd": dispatch_cwd or target,
+                                                           "target_cwd": target, "budget": budget})
+            if not isinstance(job.get("packet"), str):
+                from coordinator.client import CoordinatorError
+                raise CoordinatorError("COORDINATOR_VERSION_SKEW", "The daemon returned a legacy unbounded review response; "
+                                       "switch the daemon to software-workflows 2.4.29 or later and reconnect this MCP server")
             session = "new"
-            code_or_diff = "IMMUTABLE CANDIDATE BINDING\n" + json.dumps(job["binding"], sort_keys=True) + "\n\nOBJECT DIFF\n" + job["diff"]
-            context += "\nReview the bound Git objects and complete object diff. Working-tree contents can belong to other writers. Every finding and verdict must refer to this candidate."
+            code_or_diff = job["packet"]
+            context += "\nReview the bound Git objects, including every non-inlined path in the complete manifest. Working-tree contents can belong to other writers. Every finding and verdict must refer to this candidate."
         except Exception as exc:
-            return await _coordinator_notice("[Bound review refused before inference: " + str(getattr(exc, "code", type(exc).__name__)) + "]", session_id)
+            detail = ("COORDINATOR_VERSION_SKEW: " + str(exc) if getattr(exc, "code", "") == "COORDINATOR_VERSION_SKEW"
+                      else str(getattr(exc, "code", type(exc).__name__)))
+            return await _coordinator_notice("[Bound review refused before inference: " + detail + "]", session_id)
     hits = _detect_anchoring({"context": context, "focus": focus})
 
     prompt_parts = [
@@ -4831,6 +4879,20 @@ async def _native_run_action(method: str, run: str, **params) -> str:
         return await _coordinator_notice(json.dumps(value))
 
 
+async def _require_publication_protocol(action: str) -> None:
+    from coordinator.client import CoordinatorError
+    status = await _coordinator_call("daemon/status", {"brief": True})
+    version = str(status.get("version", "unknown"))
+    try:
+        supported = tuple(int(part) for part in version.split(".")) >= (2, 4, 29)
+    except ValueError:
+        supported = False
+    if not supported:
+        raise CoordinatorError("COORDINATOR_VERSION_SKEW", "Server 2.4.29 cannot request " + action +
+            " from daemon " + version + ". Switch the daemon to 2.4.29 or later, then run /mcp reconnect and retry.",
+            {"server": "2.4.29", "daemon": version, "action": action})
+
+
 async def _lead_request(method: str, params: dict, cwd: str = "", session_id: str = "",
                         own: bool = False, unit: str = "", project: str = "", dispatch_cwd: str = "") -> str:
     """Select from the registered native catalog, refreshing on first use.
@@ -4920,7 +4982,16 @@ async def coordinator_claims(action: str = "list", paths: list[str | dict] | Non
         return await _coordinator_notice("[Unknown claims action: use list, acquire, release or handback.]", session_id)
     if action in ("acquire", "release") and not paths:
         return await _coordinator_notice("[Supply a nonempty paths list for acquire or release. Handback omission selects all eligible claims; [] selects none.]", session_id)
-    return await _lead_request(methods[action], {"paths": paths} if action != "list" else {}, cwd, session_id,
+    request_paths = ({"handback_version": 1, "paths": paths,
+                      "authorizer": {"kind": "lead", "session_id": session_id or _LEAD_SESSION.get()}}
+                     if action == "handback" else paths)
+    if action == "handback":
+        try:
+            await _require_publication_protocol("provenance handback envelope")
+        except Exception as exc:
+            value = exc.envelope() if hasattr(exc, "envelope") else {"code": type(exc).__name__, "message": "Cannot establish handback protocol"}
+            return await _coordinator_notice(json.dumps(value), session_id)
+    return await _lead_request(methods[action], {"paths": request_paths} if action != "list" else {}, cwd, session_id,
                                own=action in ("acquire", "release"), unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
 

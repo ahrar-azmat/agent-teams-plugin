@@ -448,8 +448,11 @@ class Custody:
                                        "; send a message to that holder or the lead, then request lead-authorized handback",
                                        {"conflicts": conflicts, "request": request})
             result = []
+            transferred = []
             with self.store.transaction():
                 for key, values in normalized.items():
+                    from . import transfers
+                    transferred.extend(transfers.acquire(self.store, actor, key, values))
                     held = {c["key"]: c for c in self.claims(key) if c["unit"] == actor["unit"]}
                     for path in values:
                         existing = held.get(path["key"])
@@ -473,7 +476,7 @@ class Custody:
                                                                **({"executor": executor} if executor else {})), actor["unit"])
                             result.append(ident)
                 self.store.event("claim/acquired", actor["id"], {"claims": result})
-            return {"claims": result, **({"outside": outside} if outside else {})}
+            return {"claims": result, "transfers": transferred, **({"outside": outside} if outside else {})}
 
     def release_request(self, actor, paths, cwd=None):
         from .routing import grouped, qualified
@@ -485,18 +488,83 @@ class Custody:
         return {"request": ident, "state": "pending_lead", "message": "Claims stay held until the lead authorizes handback or publication reconciles"}
 
     async def release(self, unit, paths=None, cwd=None):
+        from . import participants, transfers
+        paths, authorizer = transfers.authorizer(paths)
+        async with self.ledger.lifecycle.hold_many(participants.checkout_ids(self.store, unit)):
+            return await self._release(unit, paths, cwd, authorizer)
+
+    async def _release(self, unit, paths, cwd, authorizer):
+        from . import transfers
+        from .participants import checkout_ids
         if self.unit_active(unit["id"]):
             raise CoordinatorError("CUSTODY_HELD", "Reconcile command custody before releasing claims")
-        if paths is not None:
-            if not isinstance(paths, list):
-                raise CoordinatorError("CLAIM_PATHS", "Handback paths must be a list or omitted for all claims")
+        # Snapshot SQL on its owner thread. Routing/canonicalization touches the
+        # filesystem, so run it on a worker using only these immutable records.
+        # Heads already cover every verified mutation; this release needs no Git
+        # mutation_scope scan (nor one full checkout scan per selected claim).
+        claims = list(self.store.all("claim", unit["id"]))
+        checkouts = list(self.store.all("checkout"))
+        members = list(self.store.all("participant", unit["id"]))
+        ids = checkout_ids(self.store, unit)
+        heads = {key: dict(self.store.db.execute("SELECT path,revision FROM heads WHERE checkout=?", (key,))) for key in ids}
+        def plan():
+            from types import SimpleNamespace
             from .routing import grouped
-            actor = dict(unit=unit["id"], checkout=unit["checkout"])
-            paths = grouped(self.store, actor, paths, cwd)
-        released = []
+            records = {r["id"]: r for r in [unit, *checkouts, *members]}
+            def get(ident):
+                if ident not in records:
+                    raise CoordinatorError("PATH_ESCAPE", "Handback root is outside the pinned routing snapshot")
+                return records[ident]
+            snapshot = SimpleNamespace(get=get, all=lambda kind, parent=None: checkouts if kind == "checkout" else members)
+            selected = grouped(snapshot, dict(unit=unit["id"], checkout=unit["checkout"]), paths, cwd) if paths is not None else None
+            normalized = {key: {p: normalize(get(key), p) for p in set(heads[key]) | set((selected or {}).get(key, []))}
+                          for key in ids}
+            planned = []
+            for claim in claims:
+                if claim["state"] == "released":
+                    continue
+                where = claim["checkout"]
+                keys = [claim["key"]] if selected is None else [normalized[where][p]["key"] for p in selected.get(where, [])
+                                                               if overlaps(normalized[where][p]["key"], claim["key"])]
+                if not keys:
+                    continue
+                owned = {p for p in heads[where] if overlaps(normalized[where][p]["key"], claim["key"])}
+                chosen = {p for p in owned if any(overlaps(normalized[where][p]["key"], key) for key in keys)}
+                remainder = [] if any(claim["key"] == key or claim["key"].startswith(key + "/") for key in keys) else [
+                    normalized[where][p] for p in sorted(owned - chosen)]
+                planned.append((claim, chosen, remainder))
+            return selected, planned
+        paths, planned = await finish_thread(plan)
+        # Recheck the selected claim subtrees, not unrelated checkout traffic.
+        # A partial directory release also retains siblings, so its whole claim
+        # subtree matters, including paths inserted while plan ran. key() is a
+        # pure Unicode/case conversion; filesystem normalization stayed off-loop.
+        from .ledger import key as path_key
+        roots = {}
+        for claim, _, _ in planned:
+            roots.setdefault(claim["checkout"], set()).add(claim["key"])
+        ancestors = {where: {"/".join(k.split("/")[:n]) for k in keys for n in range(1, len(k.split("/")))}
+                     for where, keys in roots.items()}
+        def selected_heads(where, values):
+            checkout = next(c for c in checkouts if c["id"] == where)
+            def selected(path):
+                canonical = path_key(checkout, path)
+                return canonical in ancestors[where] or any("/".join(canonical.split("/")[:n]) in roots[where]
+                    for n in range(1, len(canonical.split("/")) + 1))
+            return {p: revision for p, revision in values.items() if selected(p)}
+        expected = {where: selected_heads(where, heads[where]) for where in roots}
+        released, transferred, replacements = [], [], []
         async with self.condition:
+            if self.unit_active(unit["id"]):
+                raise CoordinatorError("CUSTODY_HELD", "Reconcile command custody before releasing claims")
+            if (list(self.store.all("claim", unit["id"])) != claims or
+                    any(selected_heads(where, dict(self.store.db.execute("SELECT path,revision FROM heads WHERE checkout=?", (where,))))
+                        != expected[where] for where in roots)):
+                raise CoordinatorError("HANDBACK_CHANGED", "Claims or revisions changed during handback preparation; retry")
+            for publication in (*self.store.all("publication", unit["id"]), *self.store.all("publication_group", unit["id"])):
+                if publication["phase"] not in ("complete", "abandoned", "superseded"):
+                    raise CoordinatorError("HANDBACK_PUBLICATION", "Finish or abandon publication before handing back its paths", {"publication": publication["id"]})
             from .lead_calls import refuse
-            from .participants import checkout_ids
             for key in checkout_ids(self.store, unit["id"]):
                 if paths is None or key in paths:
                     refuse(self.store, key, None if paths is None else paths[key], code="UNVERIFIED_OPERATION")
@@ -505,15 +573,27 @@ class Custody:
                 if operation["state"] not in ("verified", "reconciled", "denied", "resolved"):
                     raise CoordinatorError("UNVERIFIED_OPERATION", "Cannot release an unreconciled operation's claim",
                                            {"operation": operation["id"]})
+            carried = transfers.publications(self.store)
             with self.store.transaction():
-                for claim in self.store.all("claim", unit["id"]):
-                    if claim["state"] != "released" and (paths is None or claim["path"] in paths.get(claim["checkout"], [])):
-                        released.append({"id": claim["id"], "path": claim["path"], "checkout": claim["checkout"], "root": self.store.get(claim["checkout"])["root"]})
-                        claim["state"] = "released"
-                        self.store.save(claim)
-                self.store.event("claim/released", unit["id"], {"paths": paths})
+                granted = {}
+                for claim, chosen, remainder in planned:
+                    checkout = self.store.get(claim["checkout"])
+                    granted.setdefault(checkout["id"], set()).update(chosen)
+                    released.append({"id": claim["id"], "path": claim["path"], "checkout": checkout["id"], "root": checkout["root"]})
+                    claim["state"] = "released"
+                    self.store.save(claim)
+                    # A directory-minus-path is not a claim shape. Preserve its
+                    # known siblings as exact claims, using the prepared keys.
+                    for path in remainder:
+                        ident = uid("claim")
+                        self.store.put("claim", ident, dict(path, checkout=checkout["id"], root=checkout["root"],
+                            unit=unit["id"], actor=claim["actor"], state="held", split_from=claim["id"]), unit["id"])
+                        replacements.append({"id": ident, "path": path["path"], "checkout": checkout["id"]})
+                for key, chosen in granted.items():
+                    transferred.extend(transfers.release(self.store, unit["id"], key, chosen, authorizer, carried))
+                self.store.event("claim/released", unit["id"], {"paths": paths, "authorizer": authorizer, "transfers": transferred, "replacement_claims": replacements})
             self.condition.notify_all()
-        return {"released": bool(released), "count": len(released), "claims": released,
+        return {"released": bool(released), "count": len(released), "claims": released, "transfers": transferred, "replacement_claims": replacements,
                 "message": "Claims released" if released else "No claims selected or eligible for release"}
 
     @staticmethod

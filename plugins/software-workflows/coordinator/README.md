@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.28 / P1
+# Writer coordinator — software-workflows 2.4.29 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -8,8 +8,147 @@ coordinator. The package does not import `server.py`; the MCP server uses the
 same Python client and JSONL RPC as the CLI. Actual verification results are in
 [VERIFY.md](VERIFY.md).
 
-Version 2.4.28 contains two changes: Codex publishing guards and cleanup of leaked
-calibration directories.
+Version 2.4.29 fixes large reviews, handback provenance and publication guards.
+
+## Review and publication objects
+
+`code_review(sealed_unit=...)` prepares a versioned packet without constructing
+the entire diff in its RPC response. The binding remains authoritative. Each
+repository names its base **commit** and candidate **tree**; a publication commit
+does not exist until publication. The manifest records each changed path's modes,
+status, old/new object IDs, blob sizes, patch size and patch digest. Small patches
+are inlined first. A non-inlined path must be read from those bound objects, never
+from another writer's working-tree files.
+
+The byte allocation is 50% of the model registry's effective context window,
+using one UTF-8 byte per allocated token as a conservative budgeting policy.
+The remaining 50% reserves room for instructions, tools, object inspection and
+output. The deployed 0.163.0 registry measures 272,000 tokens at 95% effective
+capacity, giving a 129,200-byte allocation; 8,192 bytes within that allocation
+are reserved for the review wrapper. This is not a tokenizer measurement.
+The packet records the executable/version, registry source/digest and derivation.
+A cache from another CLI version falls back to that executable's
+`debug models --bundled` command in a private home. Unknown windows refuse
+`REVIEW_CONTEXT_UNKNOWN` instead of guessing.
+
+A finite context cannot contain an unlimited number of path entries. When the
+manifest itself exceeds the allocation, the prompt provides the complete private
+manifest's location and checksum and instructs the reviewer to page through every
+entry. No repository or path is silently omitted. Review completion compares the
+saved binding and manifest digest without reconstructing an unbounded diff;
+already-dispatched older jobs retain their legacy completion check.
+An external manifest is created only for this overflow case. Terminal and
+abandoned jobs remove it; the immutable manifest and binding remain in the
+database as review evidence. A still-valid job never expires by elapsed time:
+collection after an MCP disconnect or a long machine sleep can record its saved
+answer against the same seal. Superseding the seal or its publication rights
+abandons the job. Partial indexes select active jobs for the relevant unit or
+collection cwd/run, without decoding historical manifests and answers. Terminal
+cleanup happens once at transition. Startup, before RPC readiness, repairs
+interrupted transitions and removes terminal or orphan files left by a crash;
+foreground review RPCs do not scan that directory.
+
+Long-lived 2.4.11–2.4.28 MCP servers omit the budget and read `job["diff"]`.
+The daemon serves the same bounded packet in that legacy field. It derives and
+records the budget itself, using the smallest measured effective window in the
+deployed binary's model registry because the caller does not report its model.
+The response uses a compact binding locator, while the saved job retains the
+full seal binding used at completion. These old servers still put their prompt
+on argv, but the sealed packet fits their launch limit. Large non-sealed requests
+still require `/mcp reconnect` to use the new private-file transport.
+Conversely, the 2.4.29 server checks the daemon version before sealed-review
+preparation or sending the internal handback envelope. A pre-2.4.29 daemon
+produces `COORDINATOR_VERSION_SKEW`, naming both versions and instructing the
+lead to switch the daemon and reconnect. Legacy list/omitted handback requests
+remain accepted by the new daemon.
+
+Every exec mode supplies stdin from a private seekable file, including fresh and
+resumed advisors and writers. Writer launches retain their execution barrier and
+inherit a separate input descriptor. Launch logs record argv bytes, original
+prompt bytes, stdin bytes and transport. Codex 0.163.0 also limits a single input
+to 1,048,576 characters. Larger requests are retained in a private `.prompt-*.txt`
+spool file and the turn receives a locator for reading it in chunks.
+
+## Handback and publication rights
+
+Lead-authorized handback records the authorizer, source unit, exact paths and
+unpublished revision identities. The next claimant receives those publication
+rights atomically with its claims. `provenance_transfer` records identify the
+destination actor/unit and previous transfer; `publication_right` records identify
+the current holder. Original revisions and operation authors are never rewritten.
+Seals carry transfer proofs. A handed-away or superseded seal cannot publish;
+reacquisition requires a new seal and review. Transfers contain revisions rather
+than unit-to-unit publication dependencies, so alternating owners cannot create a
+dependency cycle.
+A revision counts as published only when a completed repository publication
+carried that exact sealed receipt. A unit's `published` state is not proof for
+its other revisions: publishing `q` after handing away `p` leaves `p` unpublished.
+The current transfer holder can hand `p` onward without editing it. A completed
+publication carrying the current grant consumes it; a partial group retains the
+grant until a containing group completes. This includes an unchanged participant:
+its validated part consumes the grant at group completion despite needing no
+repository journal. Later writers can then edit the published base normally
+while the complete transfer history remains available. If restoration leaves
+no unpublished ancestry, handback records a retirement linked to the previous
+transfer and clears its ownership in the same transaction as claim release.
+
+Completion writes `published_revision` evidence keyed by exact receipt identity
+and `consumed_transfer` evidence keyed by grant identity. A lookup context shares
+these primary-key reads across each operation; it never reloads all publication
+history for each path. Startup backfills existing completed journals and groups
+once, atomically with the `publication_evidence_v1` marker. A completed repository
+prefix contributes receipt evidence immediately; grant consumption waits for
+full group completion, including recovery through a replacement group.
+
+Handback waits for checkout lifecycle exclusion, refuses active custody,
+unreconciled operations and unfinished publication, and preserves `paths=None`
+for all eligible claims versus `paths=[]` for none. A partial directory handback
+narrows its remaining claim to exact known sibling paths and returns those
+`replacement_claims`; future paths under that directory require a new claim.
+Legacy local control calls without a session record the local lead-control UID
+instead of inventing a session identity.
+Handback walks effective provenance, stopping at carried publication receipts,
+baseline bytes and restoration boundaries. A resolved UNKNOWN in overwritten
+history is not inherited; an unresolved UNKNOWN in the transferred segment
+still refuses. Head and claim snapshots are canonicalized once per checkout in a
+worker thread, then rechecked before the short release transaction. Changes in
+the selected claim subtrees, including inserted paths and retained siblings,
+refuse with `HANDBACK_CHANGED`. Verified edits elsewhere do not invalidate that
+plan. The recheck uses pure Unicode/case keys, without filesystem work on the
+event loop.
+
+## Publication guards and push recognition
+
+An unchanged participant receives only repository identity, branch and base
+pinning checks and receives no commit or publication journal. Changed participants
+retain hooks, signing, helper and index guards. Git check-in conversion
+(`hash-object --path`) and checkout conversion (`cat-file --filters --path`) must
+both preserve each candidate regular-file blob. Candidate-tree attributes and
+normal local/info/global configuration apply. LF-only `text=auto eol=lf` content
+and identity filters can pass; CRLF normalization and transforming clean or smudge
+filters refuse with the repository, path and conversion direction. Deletions have
+no candidate bytes to convert.
+This includes a participant whose entire scope was handed away: the unit is
+empty only if no participant retains publication scope. Recovery of an installed
+prefix validates its pinned receipt identities and transfer proofs regardless of
+the receipts' original authors. The replacement group review covers the full
+vector, including reused prefix journals.
+
+`PUBLICATION_HOOK` means a hook was discovered; `PUBLICATION_HOOK_DISCOVERY`
+means discovery failed. Details name the root, event, hook location and discovery
+exit code. Other guards name the root and relevant path or configuration key.
+
+The push gate reads completed publication evidence through SQLite `mode=ro`,
+without starting a coordinator or migrating its store. The actual pushed commit
+must be the recorded publication commit, its tree must equal the reviewed
+candidate, its destination branch must match, and any containing publication
+group must be complete. The review must remain valid, passed and bound to that
+seal. A recovered prefix uses the completing group's replacement review, not the
+superseded group's review. Existing routing, consistency, history, lease, hook, signing and program
+checks still apply. A qualifying push names the seal and review and needs no
+acknowledgement. An extra commit (including an empty one), different ref, or
+missing/failed proof retains the existing gate. The Codex `LEAD_PUBLISHES` guard
+is unchanged.
 
 ## Calibration directory lifetime
 
@@ -531,15 +670,19 @@ base, candidate or unchanged marker, provenance, dependencies and validation
 digest. UNKNOWN overlapping mutation scope or recorded reads in any participant
 blocks the whole seal. Unrelated UNKNOWN remains non-blocking. Unchanged
 participants do not manufacture empty commits. `unit/diff` retains a combined
-`diff` and adds root-labelled `participants`; review preparation binds its complete
-digest before inference. Bound `code_review` always starts a fresh independent
-session and rechecks the complete vector when recording the answer.
+`diff` and adds root-labelled `participants` for callers requesting a full diff.
+Review preparation instead binds a complete object manifest and creates a bounded
+packet, with large patches read separately from the bound objects. Bound
+`code_review` always starts a fresh independent session and rechecks the complete
+vector when recording the answer.
 
 `unit/seal.publication_order`, when supplied, is a complete permutation of
 participant checkout IDs. The default is native root order deduplicated by
 checkout. Changing the order changes the binding and requires a new review.
-Publication preflights **every** participant, including unchanged ones, before
-any ref update, creates the group/repository journals and owns every required
+Publication checks every participant's repository identity, branch and base before
+any ref update. Commit guards apply only to changed participants; unchanged
+participants get no repository journal. Publication creates the group and changed
+repository journals and owns every required
 index lock first, then publishes in the recorded order. Commits retain the
 existing deterministic metadata and compare-and-swap ref/index recovery.
 The group and unit persist `publication_state:"publishing"` before repository
@@ -1378,9 +1521,12 @@ match the selected base. A moved branch is revalidated: existing seals refuse
 
 The complete mutation scope comes from operations, including add/delete and both
 move endpoints. An UNKNOWN head or another unit's later revision cannot make a
-path disappear. Every scoped path must still have this unit's final exact receipt,
-the same current revision identity, matching bytes and mode. Seal, publication and
-publication recovery rederive that scope, including for pre-existing seals.
+path disappear. Authorized handback explicitly removes the source's publication
+rights and adds inherited paths to the next claimant's scope. Every scoped path
+must have this unit's final exact receipt or an original verified receipt covered
+by its current transfer proof, with the same current revision identity, matching
+bytes and mode. Seal, publication and publication recovery rederive that scope,
+including for pre-existing seals. Transfer grants do not change receipt authors.
 It builds a private index outside the checkout from the base tree and **receipt
 bytes**, including explicit deletions. The resulting candidate is immutable.
 
@@ -1398,10 +1544,11 @@ Validation entries require `command`, `exit_code`, `inputs`, and `scope` equal t
 Running a command in a mixed checkout does not validate a frozen candidate in
 isolation.
 
-Review uses exactly the object diff:
+Review uses the frozen object manifest and bounded inline patches. Non-inlined
+patches are inspected from the same bound objects, for example:
 
 ```text
-git diff --no-ext-diff --no-textconv <base-oid> <candidate-tree-oid>
+git --literal-pathspecs diff --no-ext-diff --no-textconv <base-oid> <candidate-tree-oid> -- <path>
 ```
 
 `unit/diff.binding` supplies `repository`, `unit`, `base`, `candidate`, `seal`,
@@ -1422,9 +1569,12 @@ nonempty strings. The values are journaled before `commit-tree`, making a replay
 after commit creation deterministic. Dates use a format accepted by Git.
 
 The journal phases are `prepared`, `commit_created`, `ref_updated`, `index_pending`,
-`index_updated`, and `complete`. Normal commit hooks, conversion/filter attributes,
-signing, filesystem-monitor helpers and unsupported index extensions are refused.
-Hooks are discovered with the real `git hook list`, without masking hooksPath.
+`index_updated`, and `complete`. Changed participants refuse normal commit hooks,
+signing, filesystem-monitor helpers and unsupported index extensions. Conversion
+and filter settings refuse only if actual check-in or checkout conversion changes
+a candidate's bytes, or Git cannot establish the result. Hooks are discovered
+with the real `git hook list`, without masking hooksPath; a discovered hook and
+failed discovery have distinct codes and repository/event/location details.
 
 Installed Git 2.56 rejects the proposed transaction combining `symref-verify HEAD`
 and a named-branch update. C1 instead prepares an update through HEAD, acquiring

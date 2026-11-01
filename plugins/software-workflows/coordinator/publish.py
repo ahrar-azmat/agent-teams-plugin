@@ -8,12 +8,13 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import time
 
 from .locks import finish, finish_thread
 from .client import CoordinatorError
-from . import gitio, processes, native
+from . import gitio, processes, native, transfers
 from .ledger import read_path
 from .store import digest, uid, fsync_dir
 
@@ -130,7 +131,10 @@ class Publisher:
             return None  # the bytes registration found there, or absence where it found nothing
         holders = self.store.db.execute("SELECT * FROM revisions WHERE checkout=? AND path=? AND attribution='exact' AND blob IS ? "
                                         "AND mode IS ? ORDER BY rowid", (row["checkout"], row["path"], row["blob"], row["mode"])).fetchall()
-        if any(not h["unit"] or h["unit"] == unitid or self.store.get(h["unit"])["state"] == "published" for h in holders):
+        carried = transfers.publications(self.store, row["checkout"])
+        if any(not h["unit"] or transfers.published(self.store, h, carried) or h["unit"] == unitid and
+               (not (right := transfers.right(self.store, h["checkout"], h["path"], carried)) or right.get("owner") == unitid)
+               for h in holders):
             return None
         return holders[0] if holders else row
 
@@ -141,11 +145,18 @@ class Publisher:
         unit or replaces the receipt with the path's current head.
         """
         proofs, unpublished = [], []
+        carried = transfers.publications(self.store)
         for row in rows:
             if row["attribution"] == "UNKNOWN":
                 raise CoordinatorError("UNKNOWN_DEPENDENCY", "Dependency has unexplained provenance", {"path": row["path"]})
             source = self.provenance(row, unitid)
-            if not source or not source["unit"] or source["unit"] == unitid or self.store.get(source["unit"])["state"] == "published":
+            grant = transfers.proof(self.store, unitid, row, carried)
+            if grant:
+                proofs.append(grant)
+                continue
+            current = transfers.right(self.store, row["checkout"], row["path"], carried)
+            if (not source or not source["unit"] or transfers.published(self.store, source, carried)
+                    or source["unit"] == unitid and (not current or current.get("owner") == unitid)):
                 continue
             checkout = self.store.get(row["checkout"])
             base = bases.get(checkout["id"])
@@ -241,9 +252,12 @@ class Publisher:
     async def scope_rows(self, unit, seal=None, sealing=False):
         checkout = self.store.get(unit["checkout"])
         self.daemon.ledger.require_owned(checkout)
-        paths = self.daemon.ledger.mutation_scope(unit["id"], unit["checkout"])
-        if not paths:
-            raise CoordinatorError("UNIT_EMPTY", "Unit has no mutation scope")
+        carried = transfers.publications(self.store)
+        paths = transfers.scope(self.daemon.ledger, unit["id"], unit["checkout"], carried)
+        transfers.check_scope(self.store, unit["id"], unit["checkout"], seal["paths"] if seal else paths, carried)
+        if seal and transfers.snapshot(self.store, unit["id"], unit["checkout"], paths, carried) != seal.get("transfer_proofs", []):
+            raise CoordinatorError("PUBLICATION_RIGHTS_TRANSFERRED", "Seal predates the current publication rights", {"checkout": unit["checkout"]})
+        transfers.require_nonempty(self.store, unit["id"], paths)
         await self.daemon.ledger.reconcile(checkout, paths)
         unknowns = self.store.unresolved(checkout["id"], paths)
         if unknowns:
@@ -252,7 +266,7 @@ class Publisher:
                                    {"paths": paths, "unknowns": [u["id"] for u in unknowns]})
         rows = [self.store.head(checkout["id"], path) for path in paths]
         for path, row in zip(paths, rows):
-            if not row or row["unit"] != unit["id"] or row["attribution"] != "exact":
+            if not row or row["attribution"] != "exact" or (row["unit"] != unit["id"] and not transfers.proof(self.store, unit["id"], row, carried)):
                 raise CoordinatorError("PROVENANCE_INCOMPLETE", "Every scoped path needs this unit's final exact receipt", {"path": path})
             operation = self.store.get(row["operation"])
             if operation["state"] != "verified" or operation.get("revisions", {}).get(path) != row["id"]:
@@ -300,11 +314,12 @@ class Publisher:
             metadata = await finish_thread(self.repository_identity, checkout)
             if metadata["branch"] != unit["branch"] or metadata["base"] != unit["base"]:
                 raise CoordinatorError("STALE_BASE", "Branch changed while freezing; reseal against its new base")
-            provenance = digest([{k: row[k] for k in ("id", "path", "previous", "operation", "blob", "mode")} for row in rows])
+            grants = transfers.snapshot(self.store, unitid, checkout["id"], paths)
+            provenance = digest({"rows": [{k: row[k] for k in ("id", "path", "previous", "operation", "blob", "mode")} for row in rows], "transfers": grants})
             sealid = uid("seal")
             seal = {"repository": checkout["repository"], "unit": unitid, "base": unit["base"], "branch": unit["branch"],
                     "candidate": candidate, "paths": paths, "entries": entries, "rows": rows, "provenance": provenance,
-                    "dependency_proofs": proofs,
+                    "dependency_proofs": proofs, "transfer_proofs": grants,
                     "validation": validation, "validation_digest": digest(validation), "created": time.time(), "seal": sealid}
             with self.store.transaction():
                 self.store.put("seal", sealid, seal, unitid)
@@ -361,6 +376,7 @@ class Publisher:
         for key, value in binding(seal).items():
             if evidence.get(key) != value:
                 raise CoordinatorError("REVIEW_BINDING", "Review evidence does not match sealed " + key)
+        transfers.validate_seal(self.store, seal)
         if evidence.get("verdict") != "pass" or evidence.get("completed") is not True or not evidence.get("review_identity"):
             raise CoordinatorError("REVIEW_INCOMPLETE", "A completed, identified passing review is required")
         answer = evidence.get("answer")
@@ -382,47 +398,97 @@ class Publisher:
         result = await finish_thread(gitio.git, checkout["root"], ["diff", "--no-ext-diff", "--no-textconv", seal["base"], seal["candidate"]])
         return {"binding": {key: seal[key] for key in BINDING}, "diff": result.stdout.decode("utf-8", "strict")}
 
-    def publication_guards(self, checkout, seal):
+    def publication_pin(self, checkout, seal):
         self.repository_identity(checkout)
+        root = checkout["root"]
+        if gitio.text(root, ["symbolic-ref", "HEAD"]) != seal["branch"]:
+            raise CoordinatorError("BRANCH_CHANGED", "Symbolic HEAD no longer names the reviewed branch", {"root": root, "branch": seal["branch"]})
+        if gitio.text(root, ["rev-parse", seal["branch"]]) != seal["base"]:
+            raise CoordinatorError("STALE_BASE", "Branch tip changed; reseal and review against its new base", {"root": root, "branch": seal["branch"], "base": seal["base"]})
+
+    def publication_guards(self, checkout, seal):
+        self.publication_pin(checkout, seal)
         root = checkout["root"]
         gitio.calibrate(self.store.root)
         if gitio.text(root, ["for-each-ref", "--format=%(refname)", "refs/replace/"]):
-            raise CoordinatorError("PUBLICATION_REPLACE_REFS", "Replacement objects change normal Git interpretation")
-        if gitio.text(root, ["symbolic-ref", "HEAD"]) != seal["branch"]:
-            raise CoordinatorError("BRANCH_CHANGED", "Symbolic HEAD no longer names the reviewed branch")
-        if gitio.text(root, ["rev-parse", seal["branch"]]) != seal["base"]:
-            raise CoordinatorError("STALE_BASE", "Branch tip changed; reseal and review against its new base")
+            raise CoordinatorError("PUBLICATION_REPLACE_REFS", "Replacement objects change normal Git interpretation", {"root": root, "ref": "refs/replace/"})
         hooks = ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "reference-transaction", "post-index-change")
         for event in hooks:
             result = gitio.git(root, ["hook", "list", "-z", event], normal_config=True, check=False)
-            if result.returncode not in (0, 1) or result.stdout:
-                raise CoordinatorError("PUBLICATION_HOOK", "Normal publication would run a hook or hook discovery failed", {"event": event})
+            path = gitio.text(root, ["rev-parse", "--path-format=absolute", "--git-path", "hooks/" + event], normal_config=True)
+            details = {"root": root, "event": event, "path": path, "exit_code": result.returncode}
+            if result.returncode not in (0, 1):
+                raise CoordinatorError("PUBLICATION_HOOK_DISCOVERY", "Could not discover publication hooks", details)
+            if result.stdout:
+                details["hooks"] = result.stdout.decode("utf-8", "replace").rstrip("\0").split("\0")
+                # Configured hooks have friendly names, not necessarily an
+                # executable pathname. Report only names and origins; command
+                # values can contain credentials and are deliberately omitted.
+                locations = gitio.git(root, ["config", "--null", "--show-origin", "--name-only", "--get-regexp", r"^hook\..*\.(command|event)$"], normal_config=True, check=False)
+                fields = locations.stdout.decode("utf-8", "replace").rstrip("\0").split("\0")
+                origins = {key: origin for origin, key in zip(fields[::2], fields[1::2])}
+                details["hook_sources"] = [({"name": name, "path": path} if name == "hook from hookdir" else
+                    {"name": name, "config_key": "hook." + name + ".command", "origin": origins.get("hook." + name + ".command", "configuration origin unavailable")})
+                    for name in details["hooks"]]
+                if "hook from hookdir" not in details["hooks"]:
+                    details.pop("path")
+                raise CoordinatorError("PUBLICATION_HOOK", "Normal publication would run a hook", details)
         settings = {}
         for key in ("commit.gpgSign", "core.autocrlf", "core.eol", "core.fsmonitor", "core.splitIndex", "index.sparse", "core.untrackedCache"):
             result = gitio.git(root, ["config", "--get", key], normal_config=True, check=False)
             if result.returncode not in (0, 1):
-                raise CoordinatorError("GIT_CONFIG", "Could not inspect publication configuration")
+                raise CoordinatorError("GIT_CONFIG", "Could not inspect publication configuration", {"root": root, "config_key": key, "exit_code": result.returncode})
             settings[key] = result.stdout.decode().strip()
         false = ("", "false", "no", "off", "0")
         if settings["commit.gpgSign"].lower() not in false:
-            raise CoordinatorError("PUBLICATION_SIGNING", "Configured commit signing requires a supported normal-signing path")
-        if settings["core.autocrlf"].lower() not in false:
-            raise CoordinatorError("PUBLICATION_CONVERSION", "core.autocrlf could transform receipt bytes")
+            raise CoordinatorError("PUBLICATION_SIGNING", "Configured commit signing requires a supported normal-signing path", {"root": root, "config_key": "commit.gpgSign"})
         if settings["core.fsmonitor"].lower() not in false:
-            raise CoordinatorError("PUBLICATION_HELPER", "Normal Git publication has a configured filesystem monitor")
+            raise CoordinatorError("PUBLICATION_HELPER", "Normal Git publication has a configured filesystem monitor", {"root": root, "config_key": "core.fsmonitor"})
         for key in ("core.splitIndex", "index.sparse", "core.untrackedCache"):
             if settings[key].lower() not in false:
-                raise CoordinatorError("INDEX_EXTENSION", "Unsupported real-index behavior: " + key)
-        paths = b"".join(p.encode() + b"\0" for p in seal["paths"])
-        for source in (seal["base"], seal["candidate"], None):
-            args = ["check-attr", "-z"] + (["--source=" + source] if source else [])
-            args += ["--stdin", "filter", "text", "eol", "crlf", "ident", "working-tree-encoding"]
-            attrs = gitio.git(root, args, data=paths, normal_config=True).stdout.split(b"\0")
-            for i in range(0, len(attrs) - 1, 3):
-                if attrs[i + 2] not in (b"unspecified", b"unset"):
-                    raise CoordinatorError("PUBLICATION_ATTRIBUTES", "Normal publication might transform frozen bytes",
-                                           {"path": attrs[i].decode(), "attribute": attrs[i + 1].decode(), "source": source})
+                raise CoordinatorError("INDEX_EXTENSION", "Unsupported real-index behavior: " + key, {"root": root, "config_key": key})
+        settings["conversion"] = self.conversion_proof(checkout, seal)
         return digest(settings)
+
+    def conversion_proof(self, checkout, seal):
+        """Compare actual check-in AND checkout conversion with frozen bytes.
+
+        GIT_ATTR_SOURCE selects the candidate's .gitattributes; Git still honors
+        info/global attributes and the real filter configuration. No -w is used.
+        Deletions and symlinks do not undergo regular-file conversion.
+        """
+        root = checkout["root"]
+        env = {"GIT_ATTR_SOURCE": seal["candidate"], "GIT_LITERAL_PATHSPECS": "1"}
+        filters = gitio.git(root, ["config", "--null", "--get-regexp", r"^filter\."], normal_config=True, check=False)
+        if filters.returncode not in (0, 1):
+            raise CoordinatorError("PUBLICATION_ATTRIBUTES", "Could not inspect conversion configuration", {"root": root, "config_key": "filter.*", "exit_code": filters.returncode})
+        evidence = {"filter_config_digest": hashlib.sha256(filters.stdout).hexdigest(), "paths": []}
+        for path in seal["paths"]:
+            entry = seal["entries"].get(path)
+            if not entry or entry["mode"] not in ("100644", "100755"):
+                continue
+            details = {"root": root, "path": path, "candidate_blob": entry["oid"], "source": seal["candidate"]}
+            try:
+                data = gitio.git(root, ["cat-file", "blob", entry["oid"]]).stdout
+                attrs = gitio.git(root, ["check-attr", "-z", "--stdin", "filter", "text", "eol", "crlf", "ident", "working-tree-encoding"],
+                                  data=path.encode() + b"\0", normal_config=True, extra_env=env).stdout
+                details["direction"] = "check-in"
+                clean = gitio.text(root, ["hash-object", "--path=" + path, "--stdin"], data=data, normal_config=True, extra_env=env)
+                if clean != entry["oid"]:
+                    raise CoordinatorError("PUBLICATION_ATTRIBUTES", "Check-in conversion changes frozen bytes", dict(details, converted_blob=clean))
+                details["direction"] = "checkout"
+                smudge = gitio.git(root, ["cat-file", "--filters", "--path=" + path, entry["oid"]], normal_config=True, extra_env=env).stdout
+                converted = gitio.blob_oid(smudge, checkout["object_format"])
+                if converted != entry["oid"]:
+                    raise CoordinatorError("PUBLICATION_ATTRIBUTES", "Checkout conversion changes frozen bytes", dict(details, converted_blob=converted))
+                evidence["paths"].append({"path": path, "blob": clean, "attributes_digest": hashlib.sha256(attrs).hexdigest()})
+            except CoordinatorError as exc:
+                if exc.code == "PUBLICATION_ATTRIBUTES":
+                    raise
+                raise CoordinatorError("PUBLICATION_ATTRIBUTES", "Git conversion failed", dict(details, cause=exc.code)) from exc
+            except (OSError, TimeoutError, subprocess.TimeoutExpired) as exc:
+                raise CoordinatorError("PUBLICATION_ATTRIBUTES", "Git conversion could not finish", dict(details, cause=type(exc).__name__)) from exc
+        return evidence
 
     async def publish(self, unitid, reviewid, metadata):
         unit = self.store.get(unitid)
@@ -534,6 +600,7 @@ class Publisher:
                             self.store.save(claim)
                     publication["phase"] = "complete"
                     self.store.save(publication)
+                    transfers.record_publication(self.store, publication)
                     self.store.event("publication/complete", publication["id"], {"commit": publication["commit"]})
                 self.daemon.custody.condition.notify_all()
         return publication
@@ -549,7 +616,7 @@ class Publisher:
     def repository_identity(self, checkout):
         metadata = self.daemon.ledger._metadata(checkout["root"])
         if metadata["identity"] != checkout["identity"] or metadata["repository"] != checkout["repository"]:
-            raise CoordinatorError("CHECKOUT_IDENTITY_CHANGED", "Publication repository identity changed; explicit recovery required")
+            raise CoordinatorError("CHECKOUT_IDENTITY_CHANGED", "Publication repository identity changed; explicit recovery required", {"root": checkout["root"]})
         return metadata
 
     async def abandon(self, unitid, publication=None):

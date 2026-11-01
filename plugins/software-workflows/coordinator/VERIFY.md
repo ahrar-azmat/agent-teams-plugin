@@ -1,3 +1,812 @@
+# software-workflows 2.4.29 — publication fixes — 2026-11-01
+
+## Fix round 2 — review turn 141
+
+This section records the current candidate. The round-1 and initial sections below
+are historical evidence; in particular, their 24-hour review abandonment policy
+has been removed. A recoverable bound review now has **no age expiry**.
+
+Evidence is in `/private/tmp/r2429p-fix2-evidence-20261101` (**F2** below). New reds
+use the lead's read-only export of tree
+`e4733090df37d2ec3fedfdff1a373b1d2d20fcff` at
+`/private/tmp/r2429p-lead-comp2/marketplace/plugins/software-workflows`. Greens use
+the actual release composition at
+`/private/tmp/r2429p-composition-znaopfhi/marketplace/plugins/software-workflows`:
+installed 2.4.28 plus the **15 release files**, with both writer-3 patches
+reverse-applied. No working-tree blob-store implementation enters that composition.
+
+`daemon.py` carries exactly **one 2.4.29 hunk**: the `review/jobs` route delegates
+to `reviews.jobs(self, params)`. The lead explicitly authorized that exception in
+`msg_1624c3a4995049789d2b720287c74110`; its claim was acquired before editing.
+Startup is unchanged. The final audit compares the composed daemon with installed
+2.4.28 plus only that routing replacement. All 16 writer-3 daemon hunks remain
+byte-identical and reverse-apply with `--fuzz=0`. Patch SHA-256 values are:
+
+- Shared publish/operations/tools patch:
+  `d4f95b11719f0e27f90338d1f25ffb6136e62fed125705e4a6fab12e0407bab8`.
+- Writer-3 daemon patch:
+  `f3062d83333cbb363cfcb942b6d4441a8afd877277e2f3b31e31afc5a017ab94`.
+
+The other protected working files retain their recorded starting hashes.
+`F2/composition.json` identifies the tested code hashes;
+`F2/final-checks.json` checks them again before documentation sync and export.
+`F2/release.patch` and `F2/release-files.json` contain the complete 15-file release
+diff and both release/working hashes. All repository changes remain uncommitted.
+
+### Six new red/green observations
+
+Every final recorder in this table exited **0**. Recorder success means that the
+real run finished recording: a deliberate refusal is still a negative operation
+result. Each run used its own private fixture directory, created with mode
+**0o700**, including under caller umask 022. Real supervisors, workers, Codex exec,
+native writers where required, and Git produced the receipts and commits.
+
+| Finding | Red report in F2 | Green report in F2 and observed result |
+|---|---|---|
+| 1. Unchanged participant consumes inherited grant | `red2d-unchanged_consumption.json`: after A edits/reverts p and hands it to B, B's completed project publication leaves the grant live; C's p seal refuses `UNIT_EMPTY` | `green2d-unchanged_consumption.json`: the completed group's validated unchanged root consumes the grant; C seals, receives a bound passing review, and publishes p |
+| 2. Empty effective ancestry retires old right | `red2-retired_baseline.json`: A → B, UNKNOWN, real baseline restoration, B handback, C edit still yields `UNIT_EMPTY` | `green2-retired_baseline.json`: handback writes a linked retired transfer/right in the same transaction, retains the old history, and C seals/reviews/publishes |
+| 3. Late collection stays recoverable | `red2-late_review.json`: collecting a completed real review with the review clock advanced 48 hours abandons the job and removes its manifest | `green2-late_review.json`: job and manifest survive late collection; completion records `pass` bound to the seal, then removes the terminal manifest |
+| 4. Unrelated edit during handback planning | `red2b-interleaving.json`: a real verified edit to unrelated q during the paused p plan causes `HANDBACK_CHANGED` | `green2b-interleaving.json`: the same p handback succeeds; a changed retained sibling and a newly inserted sibling inside the selected subtree each still refuse `HANDBACK_CHANGED` |
+| 5. Review history cost | `red2c-review_history.json`: review preparation decodes growing completed-job history; collection decodes 75 records / 5,244,762 bytes | `green2c-review_history.json`: preparation decodes 6 records regardless of completed history; collection with no active jobs decodes 0 records / 0 bytes |
+| 6. Publication history cost | `red2c-publication_history.json`: sealing eight inherited paths decodes 124 → 1,348 → 3,796 records as completed publications grow | `green2c-publication_history.json`: the same seal decodes 88 → 88 → 88 records; publication decodes 71 records throughout all 24 real publications |
+
+Finding 1 uses **three repositories**. A real ref lock interrupts the two changed
+participants after the first commit has landed: journal phases are `complete`
+and `commit_created`, and the group is `partially_published`. Both red and green
+retain the grant at this point (**0 consumed-transfer records**). After recovery
+completes the group, green has **1** consumption record, red still **0**. This
+proves that an applied prefix does not consume the unchanged participant early.
+
+The late-review probe uses a fixture-only offset on `reviews.time`, not a system
+clock change or a 48-hour wall-clock wait. The review itself is a completed real
+Codex exec. Its overflowing 300-path manifest exists before and after delayed
+collection on green, and disappears only when completion records the verdict.
+
+`F2/green2-backfill.json` upgrades a genuine completed old-candidate fixture:
+one changed participant journal and one group with an unchanged transferred path.
+It stops only its own daemon, starts the candidate on the same disposable state,
+and observes receipt/consumption/backfill-marker counts **0/0/0 → 1/1/1**. A second
+restart leaves **1/1/1** and the exact same marker. The next unit seals p. No live
+ledger was copied, migrated or modified.
+
+### Measured history work and responsiveness
+
+The final history measurements count JSON decoding in the individual RPC's
+context, excluding concurrent background work. The fixture retains a fixed path
+inventory and eight inherited paths. Historical reviews/publications are created
+by actual review execs and publication calls, not synthetic database rows.
+
+| Measured operation | History sizes | Red decoded records | Green decoded records | Red decoded bytes | Green decoded bytes |
+|---|---|---|---|---|---|
+| Review prepare | 0 / 8 / 24 completed reviews | 6 / 14 / 30 | 6 / 6 / 6 | 3,141 / 562,584 / 1,681,465 | 3,155 / 3,155 / 3,155 |
+| Seal eight inherited paths | 0 / 8 / 24 publications | 124 / 1,348 / 3,796 | 88 / 88 / 88 | 95,932 / 1,352,306 / 3,865,178 | 88,076 / 88,106 / 88,091 |
+| Handback before those seals | 0 / 8 / 24 publications | 34 / 59 / 107 | 35 / 36 / 36 | 15,148 / 40,294 / 89,566 | 15,295 / 15,815 / 15,814 |
+| Publish | 0 / 7 / 23 prior publications | 67 / 130 / 274 | 71 / 71 / 71 | 43,201 / 107,870 / 255,686 | 42,361 / 42,350 / 42,368 |
+
+The extra first handback record is a checkout-record difference; the 8/24 samples
+are flat. Small byte differences reflect record IDs/timestamps. Review-prepare
+elapsed seconds were red **0.039104 / 0.038062 / 0.033943**, green
+**0.035485 / 0.039465 / 0.033058**. Seal elapsed seconds were red
+**0.654044 / 0.515402 / 0.542455**, green **0.571889 / 0.549081 / 0.524100**.
+Git work and scheduling dominate these elapsed measurements; the red elapsed
+times do not increase monotonically. The decoded work establishes the removed
+history scan. Collection after 25 completed reviews was **0.005037 s** red versus
+**0.000061 s** green, with no active jobs.
+
+The 4,864-path / 120-claim handback responsiveness case was also repeated alone,
+after other probes finished. `round1-final-red-responsiveness.json` measured a
+worst status-RPC gap of **18.911104 s** and handback **18.940326 s**.
+`composition-final-responsiveness.json` measured **0.141390 s** and **0.336700 s**.
+The earlier overlapping samples remain in the catalog, but these isolated runs
+are the final responsiveness evidence.
+
+### Every earlier acceptance group repeated
+
+`F2/earlier-reruns.json` records the exact commands, durations and process exits
+for the 35-command batch; all exited **0**. Three additional round-1 skew reds
+and the two isolated responsiveness runs also exited **0**. Original reds use
+installed **2.4.28**; round-1 reds use the read-only **944fb4a5** export. Every green
+below uses the new composition, except that the reverse-skew case deliberately
+runs the installed 2.4.28 daemon with the candidate server.
+
+| Group | Red report(s) in F2 | Green report(s) in F2 and result |
+|---|---|---|
+| D1 public sealed/non-sealed review | `installed-rerun-api.json`, `installed-rerun-api_default.json`: E2BIG, exec 1, no bound verdict | `composition-api.json`, `composition-api_default.json`: 3 MB sealed fixture omits JSON explicitly and inlines the small patch; bound pass. Full 1.5 MB non-sealed request is read; all execs 0 |
+| D1 fresh/resume modes | `installed-rerun-launch.json`: prompt on argv | `composition-launch.json`: advisor, infra advisor and writer, fresh and persisted resume, all six execs 0 with prompt off argv |
+| D1 default real configuration | `installed-rerun-real_home.json` | `composition-real_home.json`: config/read and all three fresh launches succeed with the loopback provider; nonexistent resume IDs launch and exit 1, `no rollout found` |
+| D2 native cancelled writer handback | `installed-rerun-native.json`: B seal refuses `UNPUBLISHED_DEPENDENCY` | `composition-native.json`: B seals; A's later seal refuses `PUBLICATION_RIGHTS_TRANSFERRED` |
+| D2 alternating ownership | `installed-rerun-alternate.json`: dependency refusals | `composition-alternate.json`: real A → B → A → B edits seal without a cycle; final bound review/publication and later ordinary edit succeed |
+| D3 unchanged/changed root hook | `installed-rerun-group.json`: unchanged root blocks child | `composition-group.json`: child publishes with unchanged hooked root; changed root still refuses `PUBLICATION_HOOK` |
+| D4 conversion and D6 diagnostics | `installed-rerun-guards.json`, `installed-rerun-hook_location.json` | `composition-guards.json`, `composition-hook_location.json`: LF-only and identity filter publish; CRLF and transforming clean/smudge filters refuse with path/direction; hook existence/discovery use distinct codes and repository/event/path or configuration origin |
+| D5 push from clean clone | `installed-rerun-push.json`: STALE/acknowledgement | `composition-push.json`: Python 3.9 hook accepts the exact published commit, names seal/review; extra empty and changed commits still deny/ask |
+| Round 1: receipt publication/current transfer owner | `round1-red-rerun-revision_publication.json` | `composition-revision_publication.json`: native C's unpublished-p dependency refuses; B's unedited onward handback reaches D and D seals, retaining original authorship |
+| Round 1: effective ancestry boundaries | `round1-red-rerun-boundaries.json` | `composition-boundaries.json`: published/baseline/restoration boundaries allow the valid handbacks; unresolved dependent UNKNOWN still refuses |
+| Round 1: empty participant | `round1-red-rerun-participant_empty.json` | `composition-participant_empty.json`: handed-away participant is pin-only; retained participant seals/publishes |
+| Round 1: inherited prefix recovery | `round1-red-rerun-prefix_recovery.json` | `composition-prefix_recovery.json`: actual interrupted two-participant publish recovers using inherited pinned receipts; reseal/review/completion succeed |
+| Round 1: manifests | `round1-red-rerun-manifest_lifecycle.json` | `composition-manifest_lifecycle.json`: small review creates 0 files; overflow has 1 while active, 0 terminal/superseded. Orphan remains during foreground collection and is removed at startup |
+| Round 1: cached 2.4.11/2.4.28 servers | `round1-red-skew11-skew.json`, `round1-red-skew28-skew.json`: preparation refuses | `composition-skew11-skew.json`, `composition-skew28-skew.json`: real old servers complete 3 MB sealed reviews, bound pass, exec 0 |
+| Round 1: candidate server → old daemon | `round1-red-skew-old-daemon-skew.json`: KeyError/raw `CLAIM_PATHS` | `composition-skew-old-daemon-skew.json`: both public tools refuse `COORDINATOR_VERSION_SKEW`, no inference/job, daemon remains 2.4.28 |
+
+The prefix-recovery probe invokes the real read-only `published_review.lookup`
+under Python **3.9.6**, exit **0**. It identifies inherited commit
+`4c459ee02230d8b024e2ee91d4199e1446fb9cc8` with replacement seal
+`seal_bdf81e2133c644579793b480616acacf` and review
+`review_06a14beeb661499782b4e535e7a7c674` from the completing group.
+
+Measured argv bytes use `sum(len(os.fsencode(arg)) + 1 for arg in argv)`.
+For the sealed/non-sealed API pair, installed argv was **3,009,873 / 1,508,893**
+bytes; candidate argv was **1,073 / 1,073**, with prompts **10,364 / 1,507,824**
+bytes off argv. Default-advisor installed argv was **3,009,379 / 1,508,399**;
+candidate argv **1,421 / 1,421**, prompts **9,522 / 1,506,982**.
+Fresh/resume inner argv was advisor **1,401/1,446**, infra **1,387/1,432**, writer
+**1,749/1,794**; writer barrier argv **1,801/1,846**. Default-home inner argv was
+**3,094/3,127**, **9,855/9,888**, **11,323/11,356** respectively; writer barrier
+argv **11,375/11,408**. Each launch's own measurement is retained in its report.
+
+Old servers still put their prompt on argv, so daemon compatibility supplies a
+bounded packet in legacy `job["diff"]` and records daemon-derived registry budget
+provenance. Their full argv was **10,883** bytes (2.4.11) and **11,728** (2.4.28),
+with prompts **10,437 / 10,656** bytes. Their completions still bind through the
+saved jobs. Large non-sealed input through an unreconnected old server retains
+that server's transport limitation; use `/mcp reconnect` for the new transport.
+The reverse-skew tools name the server and daemon versions and refuse before
+requesting a packet or handback envelope. Unicode character-count input limits
+and the checkout-direction conversion policy remain unchanged.
+
+The exact push command evaluated by the Python 3.9 PreToolUse hook was:
+
+```sh
+git push --force-with-lease=refs/heads/main:47e02077c4e5d3b822821be0af054e39b72f32b4 origin HEAD:refs/heads/main
+```
+
+The fixture's clean clone was `/private/tmp/r2429p-composition-qmb0igjm/clean-clone`;
+published commit `749bc9d62f986fc848f33176bae096174d348498`, seal
+`seal_3ff1870d71e54084a7481e66f2caff19`, review
+`review_433f051a6b134746bd57cf63ddca72a7`. The actual payload is
+`F2/composition-clean-clone-payload.json`. All three hook processes exited **0**;
+their JSON decisions distinguish acceptance from the two expected denials.
+The writer did **not** execute a push. Recreate a retained fixture with the
+command below; its report gives the new exact `push_command`, `lead_push_cwd`
+and `lead_state` for the lead's real push.
+
+### Commands, static checks and complete run inventory
+
+```sh
+F2=/private/tmp/r2429p-fix2-evidence-20261101
+PY=/Users/ahrar/.claude/plugins/data/software-workflows-agent-teams/venv/91e1e736a04fad0e/bin/python
+RED2=/private/tmp/r2429p-lead-comp2/marketplace/plugins/software-workflows
+OLD=/Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows/2.4.28
+"$PY" -B "$F2/static.py"
+# C is the plugin path written to F2/composition.json. Run each case separately.
+"$PY" -B "$F2/probe.py" "$RED2" repeat-red unchanged_consumption
+"$PY" -B "$F2/probe.py" "$C" repeat-green unchanged_consumption
+# Repeat for retired_baseline, late_review, interleaving, review_history,
+# publication_history. Backfill starts old, then restarts the same fixture as C:
+"$PY" -B "$F2/probe.py" "$RED2" repeat-upgrade backfill "$C"
+"$PY" -B "$F2/batch.py"
+# Run responsiveness alone; the catalog has exact red/green commands.
+"$PY" -B "$F2/static-recheck.py"
+R2429P_KEEP_FIXTURE=1 "$PY" -B "$F2/probe.py" "$C" lead-repeat push
+# Evaluate the generated payload while the retained fixture exists:
+/usr/bin/python3 -B "$C/hooks/push_gate.py" < "$F2/lead-repeat-clean-clone-payload.json"
+"$PY" -B "$F2/finalize.py"
+"$PY" -B "$F2/cleanup.py"
+```
+
+`batch.py` reads the current composition metadata. `real-runs.json` is the
+complete inventory of **63 recorder invocations**, with exact argv, source,
+fixture path, recorder exit and per-operation results. **61 exited 0**.
+The two initial `red2-interleaving.json` / `green2-interleaving.json` attempts
+exited **1**, `plan fault not reached`: the external interleaving instrumentation
+was installed in the supervisor but not its worker. The recorder was corrected
+before the final `red2b` / `green2b` runs. These failures are retained and are not
+claimed as product evidence.
+
+Preliminary `red2`/`green2` unchanged-consumption reports completed with exit 0;
+the final `red2d`/`green2d` pair adds a committed partial prefix. Preliminary
+`red2`/`green2` review-history reports and `red2`/`green2` plus `red2b`/`green2b`
+publication-history reports also exited 0. The final `red2c`/`green2c` versions
+keep path inventory fixed and isolate counters per RPC. The batch responsiveness
+reports (`round1-red-rerun-responsiveness.json`, `composition-responsiveness.json`)
+are retained alongside the later isolated measurements. Matching metrics JSONL,
+server subprocess reports and hook payloads are supporting artifacts, not extra
+acceptance invocations.
+
+`F2/static-final-checks.json` records actual command arrays, stdout/stderr and
+exit codes for the final code. All checks exited **0**:
+
+- Python **3.15.2**: **98 working / 95 composition** files compiled; changed
+  modules/server and coordinator imports succeeded.
+- Python **3.9.6**: **77 hook-closure files** compiled and **67 coordinator
+  modules** explicitly imported plus `plugin_setup`, on working and composition.
+- `coordinator/hooks.py --check`: both printed
+  `{"compatible": true, "protocol": "jsonl-v1"}`.
+- Ruff selection `F821,F822,F823,F811,F841,F401`: installed **35**, working
+  **31**, composition **33** findings. Relative-path/code/message counter
+  comparison added **0** findings; `--exit-zero` alone was not used as proof.
+- `claude plugin validate --strict`: plugin and marketplace, working and
+  composition, all printed `Validation passed`. Existing `ICON_MISSING` remains;
+  the disposable composition's separate directory-submission profile reports
+  `README_MISSING` because it has no `.git` root. Strict manifest validation passes.
+
+`F2/final-checks.json` records repeated strict validation after documentation sync,
+both writer-3 patch reverse applications, exact composition equality, the
+daemon-only routing change, other protected hashes, whitespace, manifest version
+**2.4.29**, unchanged HEAD **bbad80f1f85b3245e47b8d7ef7423b0cd5261181**, and the
+free-space floor. `F2/cleanup.json` records removal of enumerated owned fixture
+repositories/states and the composition after release export, remaining-process
+checks and final free space. Evidence directories and both read-only lead exports
+are retained. `F2/artifact-index.json` supplies artifact hashes.
+
+All six new findings and every earlier acceptance group have final evidence.
+Limits remain explicit: the writer did not push, resume a real user's saved
+session, wait 48 wall-clock hours, or mutate the live coordinator. Default-home
+resume proves launch only; successful resume completion is covered by the
+disposable-home matrix. History measurements cover 24 completed publications and
+25 completed reviews, not an infinite history. Fixture-provider runs establish
+transport, provenance and publication behavior, not a model's review quality.
+
+## Fix round 1 — review turn 140
+
+The seven findings against release tree
+`944fb4a5c4d14d8b17e86deefea7b0e6713649af` were reproduced using the lead's
+read-only export at `/private/tmp/r2429p-lead-comp/marketplace`. The new evidence
+directory is `/private/tmp/r2429p-fix1-evidence-20261101` (**F** in this section).
+The historical initial-implementation evidence below remains in its original
+directory (**E**); it does not stand in for these new composition runs.
+
+The revised release still contains **14 files**. The acceptance composition was
+`/private/tmp/r2429p-composition-ekbzu1hn/marketplace`, built from installed
+2.4.28 plus the release files, with writer 3's shared hunks reverse-applied.
+`F/composition-acceptance.json` records its code hashes. Final documentation is
+synced into that composition without changing those tested Python bytes.
+`F/release.patch` and `F/release-files.json` contain the complete release diff
+and hashes, excluding writer 3. Nothing was committed or pushed by this writer.
+
+### New red/green observations
+
+All final recorders in this table exited **0**. As before, this means recording
+completed; the actual operation result distinguishes an expected refusal from
+a successful operation. Every daemon used a separate disposable state.
+
+| Finding | Red evidence in F: reviewed candidate | Green evidence in F: release composition |
+|---|---|---|
+| 1. Receipt-specific publication | `red2-revision_publication.json`: A publishes only q, but native C's read of unpublished p incorrectly seals; B's unedited onward handback leaves D with `UNIT_EMPTY` | `composition-revision_publication.json`: C refuses `UNPUBLISHED_DEPENDENCY` on p; B transfers the unedited grant, D acquires and seals it; original revision author remains A |
+| 2. Cached 2.4.11 server → new daemon | `red-skew11-skew.json`: `REVIEW_CONTEXT_UNKNOWN`, no launch | `composition-skew11-skew.json`: actual cached server reviews the 3 MB fixture, exec **0**, job `recorded`, verdict `pass`, full saved seal binding; argv **10,883 bytes** |
+| 2. Cached 2.4.28 server → new daemon | `red-skew28-skew.json`: same preparation refusal | `composition-skew28-skew.json`: exec **0**, recorded bound pass; argv **11,728 bytes** |
+| 2. New server → installed 2.4.28 daemon | `red3-skew-new-skew.json`: sealed review reports `KeyError`; a raw handback envelope is rejected as `CLAIM_PATHS` | `composition-skew-new-skew.json`: both public tools return actionable `COORDINATOR_VERSION_SKEW`, naming 2.4.29 and 2.4.28; no inference or job; daemon remains 2.4.28 |
+| 3. Effective provenance boundaries | `red3-boundaries.json`: restored history blocks both published and unpublished sequences with `UNKNOWN_BLOCKS_HANDBACK` | `composition-boundaries.json`: UNKNOWN → baseline restore → verified edit → publication → later edit → handback succeeds; the direct unpublished restore sequence also succeeds; unresolved transferred UNKNOWN still refuses |
+| 4. Handback responsiveness | `red-responsiveness.json`: **4,864 heads, 120 directory claims**, worst status-RPC delay **18.034789 s**, handback **18.082286 s** | `composition-responsiveness.json`: identical layout/counts, worst status-RPC delay **0.130920 s**, handback **0.335349 s**; no other probe ran during this measurement |
+| 5. Empty participant after handback | `red2-participant_empty.json`: handing away X's only path causes `PUBLICATION_RIGHTS_TRANSFERRED` while sealing retained Y | `composition-participant_empty.json`: seal and Y publication succeed; X remains pin-only and receives no journal |
+| 6. Inherited published prefix | `red2-prefix_recovery.json`: a real second-repository ref lock interrupts publication after the inherited first receipt commits; reopen succeeds, reseal refuses `PREFIX_PUBLISHED` | `composition-prefix_recovery.json`: same interruption; reopen, reseal, replacement bound review and group completion succeed |
+| 7. Manifest lifetime | `red3-manifest_lifecycle.json`: small prepared review writes a file; terminal/abandoned files remain; four files accumulate; aged orphan remains | `composition-manifest_lifecycle.json`: small reviews create **0** files; overflowing prepared review has **1** file; completion and abandonment leave **0**; aged orphan is removed |
+
+The prefix run also invokes the actual read-only `published_review.lookup` under
+**Python 3.9.6**. It returns the inherited first commit with the completing
+group's replacement review, `review_1a56d11411c4445d86f7fc2fd8833a0f`, and
+seal `seal_1548342edb16493c92e6f78c729f96d8`; exit **0**. This exercises recovery
+without selecting receipts by their destination unit or reviving the old review.
+
+The published-state audit covered dependency proofs, legacy restoration matching,
+transfer ownership/release, publication scope, prefix recovery and push proof
+lookup. Remaining unit-state checks in `publish.py`, `lead.py` and
+`observations.py` govern lifecycle, lead-unit selection or status presentation;
+they do not establish that a revision was published. Publication recognition now
+uses the completed repository journal's exact saved seal rows and path entries.
+
+### Version skew and manifest retention
+
+Both old-server green runs used the real cached server files and actual Codex
+exec. Their full prompts were **10,437 / 10,656 bytes** respectively, with the
+prompt still on argv as those releases implement it. The daemon's bounded packet
+was **2,396 bytes** in both cases. It saved the complete binding, manifest and
+budget with `derived_by="daemon (legacy server supplied no budget)"`.
+The budget came from native **codex-cli 0.163.0**, `debug models --bundled`,
+registry SHA-256
+`69af12f94a39dabd1a1ded8f5257b4884d2118902ea2b5b9cffbf4a1925dfa65`.
+The smallest measured catalog window was **272,000 × 95%**, with **50%** allocated
+using the conservative one-byte-per-token policy: **129,200 bytes**. No guessed
+window or model name is substituted when the caller omits its budget/model.
+
+The new daemon supplies the packet as legacy `diff` as well as `packet`; the old
+server's completion binds through the saved job. The later handback in these
+fixtures invalidates the completed review, as it should; its recorded completion
+remains evidence of the successful bound review. Old list-form handbacks also
+succeed against the new daemon.
+
+In the new-server/old-daemon red, the old implementation's public handback path
+automatically switched **that disposable** daemon during client `ensure` and
+then succeeded. It did not prove envelope support in 2.4.28. The separate raw
+RPC observation establishes `CLAIM_PATHS` there. The fixed public tool checks the
+version before `ensure` or envelope dispatch and refuses without switching it.
+Large non-sealed requests through an unreconnected old server remain subject to
+that server's old transport; use `/mcp reconnect` for the new transport.
+
+External manifests are now created only for overflow. Terminal jobs remove them
+immediately; preparation, dispatch, completion, collection and startup sweep
+superseded jobs and unfinished jobs older than **24 hours**. Database manifests
+and bindings remain as evidence. The orphan probe aged only its own disposable
+manifest file to 25 hours and invoked the real job-collection path; it did not
+change the system clock. Terminal and superseded-job cleanup were observed
+directly. A real 24-hour inference was not run.
+
+### Original acceptance groups repeated on the revised composition
+
+| Recorder/report in F | Observed result |
+|---|---|
+| `composition-api.json` | 3 MB sealed review and 1.5 MB non-sealed input: both exec **0**; bound pass for sealed review; both argv **1,073 bytes**; prompts **10,364 / 1,507,824 bytes**, off argv; full oversized request read through private file |
+| `composition-api_default.json` | Both public API calls in the default advisor mode: exec **0**; argv **1,421 bytes**; prompts **9,522 / 1,506,982 bytes**; sealed bound pass and full non-sealed request read |
+| `composition-native.json` | Real native A edits and is cancelled; handback; Abraham B edits with `allow_dirty`; B seals; A's later seal refuses `PUBLICATION_RIGHTS_TRANSFERRED` |
+| `composition2-alternate.json` | Actual A → B → A → B edits: all three subsequent seals succeed, final bound review and publication succeed, later ordinary edit seals against the published base |
+| `composition-group.json` | Unchanged root with hook + changed child publishes; changed root still refuses `PUBLICATION_HOOK` with root/event/path |
+| `composition-guards.json` | LF-only and identity filter publish; CRLF and transforming clean/smudge conversions refuse with path/direction; hook existence and discovery failure use distinct codes with repository details |
+| `composition-push.json` | Python 3.9 hook accepts exact reviewed commit in clean clone and names seal/review; extra empty and changed commits still deny/ask; all hook processes exit **0** |
+| `composition-launch.json` | Advisor, infra advisor and writer: all six fresh/persisted-resume execs exit **0**, prompt off argv |
+| `composition-real_home.json` | Actual default-home config/read and launches: all three fresh execs **0**; deliberately nonexistent resume IDs launch then exit **1**, `no rollout found`; no user session read or account inference |
+| `composition-hook_location.json` | Configured hook refuses with `PUBLICATION_HOOK`, repository root, friendly name, config key and origin |
+
+The launch matrix measured inner argv bytes **1,401/1,446** for advisor,
+**1,387/1,432** for infra and **1,749/1,794** for writer (fresh/resume).
+Writer outer barrier argv was **1,801/1,846**. Default-home inner argv was
+**3,094/3,127**, **9,855/9,888**, **11,323/11,356** respectively; writer outer
+argv was **11,375/11,408**. Successful resume completion is proved in the
+disposable-home matrix; the default-home nonexistent IDs prove startup only.
+The Unicode character limit and checkout-direction conversion policy were not changed.
+
+The exact accepted push command in the new recorded fixture was:
+
+```sh
+git push --force-with-lease=refs/heads/main:2f6ce9ae71e31ab581385f59afdff4c2bd67cad1 origin HEAD:refs/heads/main
+```
+
+Its published commit is `bba5089b33eef101b0bb68ca4efc51b3cb337746`, tree
+`98373bb6a47d62e260110cdfc67dcdb0beb1d964`, seal
+`seal_f9df2286d59d492b9fd4f730f36d14d6`, review
+`review_16b58e6e9c044af8933e735d1f1d53cf`. The actual PreToolUse input is
+`F/composition-clean-clone-payload.json`; the recorder feeds it to
+`/usr/bin/python3 -B <composition>/plugins/software-workflows/hooks/push_gate.py`.
+The writer never executes that push. Recreate a retained fixture with
+`R2429P_KEEP_FIXTURE=1` and the `push` case below; its report supplies the new
+`lead_push_cwd`, `lead_state` and exact `push_command` for the lead to execute.
+
+### Reproduction, static checks and retained preliminary runs
+
+```sh
+F=/private/tmp/r2429p-fix1-evidence-20261101
+PY=/Users/ahrar/.claude/plugins/data/software-workflows-agent-teams/venv/91e1e736a04fad0e/bin/python
+RED=/private/tmp/r2429p-lead-comp/marketplace/plugins/software-workflows
+OLD=/Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows/2.4.28
+SERVER11=/Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows/2.4.11
+"$PY" -B "$F/static.py"
+# C is the new plugin path written to F/composition.json by static.py.
+"$PY" -B "$F/probe.py" "$RED" repeat-red revision_publication
+"$PY" -B "$F/probe.py" "$C" repeat-green revision_publication
+# Repeat both commands for boundaries, responsiveness, participant_empty,
+# prefix_recovery and manifest_lifecycle. Run responsiveness on its own.
+"$PY" -B "$F/probe.py" "$RED" repeat-red11 skew "$SERVER11"
+"$PY" -B "$F/probe.py" "$C" repeat-green11 skew "$SERVER11"
+"$PY" -B "$F/probe.py" "$RED" repeat-red28 skew "$OLD"
+"$PY" -B "$F/probe.py" "$C" repeat-green28 skew "$OLD"
+"$PY" -B "$F/probe.py" "$OLD" repeat-red-new skew "$RED"
+"$PY" -B "$F/probe.py" "$OLD" repeat-green-new skew "$C"
+# Rerun each original case: api api_default native alternate group guards
+# push launch real_home hook_location. Each is a separate disposable state.
+"$PY" -B "$F/probe.py" "$C" repeat-original api
+R2429P_KEEP_FIXTURE=1 "$PY" -B "$F/probe.py" "$C" lead-repeat push
+```
+
+`F/static-checks.json` records real commands, stdout/stderr and exit codes:
+
+- Python **3.15.2** compile: **98 working / 95 composition** files, exit **0**;
+  changed-module and coordinator imports exit **0**.
+- Python **3.9.6** hook closure: **77 files compiled**, **67 coordinator modules
+  explicitly imported** plus `plugin_setup`, on working and composition, exit **0**.
+- `coordinator/hooks.py --check`: both exit **0**, `compatible:true`, `jsonl-v1`.
+- Ruff selection `F821,F822,F823,F811,F841,F401`: installed **35**, working
+  **31**, composition **33** findings. Counter comparisons by relative path,
+  code and message add **0** findings; all commands/delta checks exit **0**.
+- Strict plugin and marketplace validation: working and composition all exit
+  **0**, `Validation passed`. The existing missing-icon warning remains. The
+  composition lacks a `.git` root, so the validator's separate directory profile
+  also reports `README_MISSING`; the requested strict manifest validation passes.
+
+`F/final-checks.json` records final documentation validation, unchanged protected
+working-file hashes, reverse application of the exact writer-3 patch with
+`--fuzz=0`, equality to tested release bytes, whitespace, version **2.4.29** and
+unchanged HEAD. `F/cleanup.json` records removal of owned fixture repositories,
+states and the composition after evidence export, remaining process checks and
+free space. Evidence directories and the lead's read-only export are retained.
+
+Additional working-candidate observations are retained as
+`working-{revision_publication,boundaries,responsiveness,participant_empty,prefix_recovery,manifest_lifecycle}.json`
+and `working-skew{11,28,-new}-skew.json`; all recorders exited **0** and showed
+the corrected outcomes. Working handback's worst status delay was **0.112219 s**.
+`red2-boundaries.json`, `red2-manifest_lifecycle.json` and `red-skew-new-skew.json`
+also exited **0** with the same original defects; the `red3` runs add the direct
+unpublished restoration, aged orphan and raw old-daemon envelope observations.
+Matching `*-server.json` files retain each skew subprocess's actual result.
+
+Two preliminary recorders exited **1**: `red-revision_publication.json` had a
+fixture-provider route-order error, and `red-boundaries.json` used the wrong
+UNKNOWN-list response key. Both recorder errors were corrected before the
+retained red/green runs; no production result was manufactured.
+`composition-alternate.json` exited **0** as a recorder but two seal operations
+refused `LISTENER_UNAVAILABLE` during native parking, so it is **not** a green
+acceptance result. The external recorder now records/retries only that existing
+quiescence refusal, like its existing reopen handling. The isolated
+`composition2-alternate.json` run completed every required seal/publication;
+native resume admission waits are retained in the report.
+
+No newly fixed acceptance item remains unproved. Scope limits remain explicit:
+the writer did not perform a real push (the lead must repeat it), did not resume
+a real user session, did not run 24 hours of inference, and did not inspect or
+mutate the prohibited live projects. Real-loopback-provider results establish
+the transport, binding and publication mechanisms, not a model's review quality.
+
+## Initial implementation evidence — reviewed candidate, before fix round 1
+
+This release changes **14 files**: `server.py`, five existing coordinator/hook
+modules (`custody.py`, `publish.py`, `group_publish.py`, `reviews.py`,
+`hooks/push_gate.py`), three new coordinator modules (`transfers.py`,
+`review_packet.py`, `published_review.py`), and the five requested
+documentation/version files. All changes remain uncommitted. Writer 3's protected
+files and shared hunks are excluded from this release.
+
+Evidence and the retained real-engine recorder are in
+`/private/tmp/r2429p-evidence-20261101` (**E** below). These are actual local
+Codex/Git/coordinator runs, not mocked publication results. Red runs import the
+installed **2.4.28** directory, never a reconstructed baseline. Every daemon has
+its own disposable state. Native writers use the production supervisor, worker,
+app-server and code-mode tools with the loopback fixture model provider; their
+first action is an exec cell. No real-account inference or `git push` was run.
+
+## Reproduce the runs
+
+Use the server's actual Python environment:
+
+```sh
+E=/private/tmp/r2429p-evidence-20261101
+PY=/Users/ahrar/.claude/plugins/data/software-workflows-agent-teams/venv/91e1e736a04fad0e/bin/python
+OLD=/Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows/2.4.28
+P=/Users/ahrar/Documents/agent-teams-plugin/plugins/software-workflows
+"$PY" -B "$E/probe.py" "$OLD" repeat-red api
+"$PY" -B "$E/probe.py" "$P" repeat-green api
+"$PY" -B "$E/probe.py" "$P" repeat-green api_default
+"$PY" -B "$E/probe.py" "$OLD" repeat-red native
+"$PY" -B "$E/probe.py" "$P" repeat-green native
+"$PY" -B "$E/probe.py" "$OLD" repeat-red alternate
+"$PY" -B "$E/probe.py" "$P" repeat-green alternate
+"$PY" -B "$E/probe.py" "$OLD" repeat-red group
+"$PY" -B "$E/probe.py" "$P" repeat-green group
+"$PY" -B "$E/probe.py" "$OLD" repeat-red guards
+"$PY" -B "$E/probe.py" "$P" repeat-green guards
+"$PY" -B "$E/probe.py" "$OLD" repeat-red push
+"$PY" -B "$E/probe.py" "$P" repeat-green push
+"$PY" -B "$E/probe.py" "$OLD" repeat-red launch
+"$PY" -B "$E/probe.py" "$P" repeat-green launch
+"$PY" -B "$E/probe.py" "$P" repeat-green real_home
+"$PY" -B "$E/probe.py" "$P" repeat-green hook_location
+```
+
+Each invocation writes `E/<label>-<case>.json`. A recorder exit **0** means it
+finished recording; expected red refusals and negative green cases also have
+recorder exit 0. Judge the recorded operation result, Codex exit, or hook JSON
+decision. The final acceptance recorders below exited **0**. Failed preliminary
+attempts are listed separately, without relabelling them green.
+
+## D1 — bounded reviews and prompt transport
+
+The public `server.code_review` API was invoked for both a sealed unit and a
+1,500,000-character non-sealed `code_or_diff`. The API runs include the real
+wrapper, model configuration, dispatch and review-completion paths.
+
+| Input / measurement | Installed 2.4.28 | Working candidate | Release composition |
+|---|---|---|---|
+| Evidence | `red-api.json` | `working-api.json` | `composition-api.json` |
+| Sealed launch argv bytes | 3,009,861 | 1,058 | 1,073 |
+| Sealed full prompt bytes | 3,008,804 | 10,304 | 10,312 |
+| Sealed result | Codex exit **1**, E2BIG, no passed bound verdict | Exit **0**, passed bound verdict | Exit **0**, passed bound verdict |
+| Non-sealed argv bytes | 1,508,881 | 1,058 | 1,073 |
+| Non-sealed full prompt bytes | 1,507,824 | 1,507,824 | 1,507,824 |
+| Non-sealed result | Codex exit **1**, E2BIG | Exit **0**, status ok | Exit **0**, status ok; complete private request read observed |
+| Prompt on argv | Yes | No | No |
+
+The composition's object packet is **2,244 bytes**. Its complete manifest records
+`large.json` as **not inlined**, new blob
+`3002cf8c538767c33878b692b814449e04efbb28`, **3,000,013 bytes**, old blob
+`0ade7bbf6f8fe3ff6ff296165f2d5b0b924f4ac9`, **13 bytes**, and a **3,000,141-byte**
+patch. `small.py` is inlined: its patch is **127 bytes**. Both paths and the
+diffstat appear in the prompt. Review completion records `verdict=pass`,
+`state=recorded`, and seal `seal_ff03d67dc2e641f4b4c31158514dea43`.
+The evidence JSON retains the full binding, manifest, patch digests and budget.
+
+Measured registry: native executable
+`/opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex`,
+**codex-cli 0.163.0**, `debug models --bundled`, SHA-256
+`69af12f94a39dabd1a1ded8f5257b4884d2118902ea2b5b9cffbf4a1925dfa65`.
+For `gpt-6-astra`, **272,000 × 95% = 258,400 effective tokens**;
+**50% = 129,200 bytes** is the deliberately conservative one-UTF-8-byte-per-token
+packet policy, with another **8,192 bytes** reserved for wrappers. This is a
+documented allocation policy, not a tokenizer measurement. The other half of
+the effective window remains available for instructions, tools, inspection and
+output. A cache from a different CLI version is not trusted.
+
+The native engine also rejects a single input longer than **1,048,576
+characters**. Merely moving the 1.5 MB request to stdin therefore failed during
+development. The final implementation saves the complete request in a unique
+private file and sends a bounded locator, length and digest through stdin.
+The composition's non-sealed stdin was **430 bytes**. The fixture provider
+directed the real exec engine to read that file; the next real request contained
+the observed complete byte count and `contains code True`.
+`composition-api_default.json` repeats both public API calls in the default
+read-only advisor mode: argv **1,421 bytes**, sealed/unsealed prompts
+**9,470 / 1,506,982 bytes**, both exec exits **0**, bound pass and complete-request
+read observed. Provider overrides in this case only select the loopback provider.
+
+All three exec modes were also run fresh and resumed from actual persisted
+fixture sessions. Every Codex execution below exited **0**. Bytes are measured
+as `sum(len(os.fsencode(arg)) + 1 for arg in argv)`; environment values and
+argument values are not logged.
+
+| Mode | Installed argv, fresh / resume | Working argv, fresh / resume | Composition argv, fresh / resume | Composition outer spawn argv |
+|---|---:|---:|---:|---:|
+| Ordinary advisor | 1,420 / 1,459 | 1,386 / 1,431 | 1,401 / 1,446 | 1,401 / 1,446 |
+| Infra advisor | 1,406 / 1,445 | 1,372 / 1,417 | 1,387 / 1,432 | 1,387 / 1,432 |
+| Writer | 1,768 / 1,807 | 1,734 / 1,779 | 1,749 / 1,794 | 1,801 / 1,846 |
+
+Evidence: `red-launch.json`, `working-launch.json`,
+`composition-launch.json`. The installed prompts are on argv; every candidate
+prompt is off argv. The writer's larger outer argv is the existing launch
+barrier, which now inherits the private prompt descriptor. Working outer writer
+argv was **1,786 / 1,831 bytes**. `red2-launch.json` adds direct observation of
+the installed outer spawn argv: advisor **1,421 / 1,460**, infra **1,407 / 1,446**,
+writer **1,827 / 1,866** (inner writer argv **1,769 / 1,808**). All six execs
+exited **0**. The one-byte differences from the first red run are fixture-path
+lengths. `red-real_home.json` supplies the installed default-configuration
+launch measurements.
+
+Default `CODEX_HOME` was exercised through `config/read` and actual launches,
+with the unauthenticated loopback provider. Fresh launches were ephemeral and
+exited **0**. No user config file or session file was opened by the recorder.
+The resume probes used the deliberately nonexistent fixture ID
+`00000000-0000-0000-0000-000000000000`: they launched, then exited **1** with
+`no rollout found`. These prove startup/configuration/transport only; successful
+resume completion is established by the disposable-home matrix above.
+
+| Mode | Installed default-home argv, fresh / resume | Working default-home argv, fresh / resume | Composition default-home argv, fresh / resume |
+|---|---:|---:|---:|
+| Advisor | 3,117 / 3,180 | 3,079 / 3,112 | 3,094 / 3,127 |
+| Infra | 9,752 / 9,815 | 9,642 / 9,675 | 9,855 / 9,888 |
+| Writer | 11,220 / 11,283 | 11,110 / 11,143 | 11,323 / 11,356 |
+
+Evidence: `working-real_home.json`, `composition-real_home.json`.
+Composition writer outer spawn argv was **11,375 / 11,408 bytes**. The engine
+reported its existing ignored `sandbox_danger_full_access` setting; no
+configuration was changed. Installed writer outer argv was **11,278 / 11,341**;
+its fresh/resume exits were also **0 / 1**, with the prompt still on argv.
+
+## D2 — handback provenance and alternating native writers
+
+| Acceptance item | Installed evidence/result | Working evidence/result | Composition evidence/result |
+|---|---|---|---|
+| A edits, is cancelled, lead hands back; B uses Abraham with `allow_dirty=true` and edits | `red2-native.json`: B seal `UNPUBLISHED_DEPENDENCY` | `working-native.json`: B seal succeeds | `composition-native.json`: B seal succeeds |
+| A later seals the handed-back path | `red2-native.json`: `PROVENANCE_INCOMPLETE` | `working-native.json`: `PUBLICATION_RIGHTS_TRANSFERRED` | `composition-native.json`: `PUBLICATION_RIGHTS_TRANSFERRED` |
+| A → B → A → B actual edits on f | `red-alternate.json`: all three subsequent seals `UNPUBLISHED_DEPENDENCY` | `working2-alternate.json`: all seals and final publication succeed | `composition2-alternate.json`: all seals and final publication succeed |
+| Later ordinary edit after publication consumes the grant | Not a baseline defect probe | `working2-alternate.json`: seal succeeds | `composition2-alternate.json`: seal succeeds |
+
+The cancellation fixture records
+`transfer_aa6c28ec574e4734b76a4224c74c23aa`, authorizer
+`{"kind":"lead","session_id":"release-fixture"}`, source
+`unit_0fe8fc8b76b84347a6fcc5f1cb8a8788`, destination
+`unit_9811f2151c5b49ddbfbea383d2538cbb`, path `f`, and inherited revision
+`rev_8edc28f662624946b9c3e299c758167a`. Original verified operations and their
+unit IDs are retained in the reports. No successful patch or receipt was
+manufactured. The alternating case records three successive transfer identities
+and validates the actual bytes after every native edit, then publishes B's final
+bytes. These grants are revision proofs, not unit-to-unit publication edges.
+
+## D3, D4 and D6 — publication participants and conversion diagnostics
+
+| Acceptance item | Installed 2.4.28 | Candidate / composition |
+|---|---|---|
+| Root has pre-commit hook, unchanged; child changed | `red-group.json`: `PUBLICATION_HOOK` | `working2-group.json`, `composition-group.json`: publish succeeds; root HEAD unchanged and no root publication journal |
+| Root also changed | `red-group.json`: `PUBLICATION_HOOK` | Same working/composition reports: still refused, naming root/event/path |
+| `* text=auto eol=lf`, LF candidate | `red2-guards.json`: `PUBLICATION_ATTRIBUTES` | `working-guards.json`, `composition-guards.json`: publish succeeds |
+| Same attributes, CRLF candidate | Refused | Refused; names `f`, root, candidate/converted IDs, check-in direction |
+| Transforming clean filter | Refused | Refused; check-in conversion names `f` |
+| Transforming smudge filter | Refused | Refused; checkout conversion names `f` |
+| Identity clean filter | Refused by attribute presence | Publishes, because conversion preserves the bytes |
+| Executable pre-commit hook | `PUBLICATION_HOOK`, only event detail | `PUBLICATION_HOOK`, root/event/absolute hook path, discovery exit **0** |
+| Fatal hook discovery configuration | Same `PUBLICATION_HOOK`, only event detail | `PUBLICATION_HOOK_DISCOVERY`, root/event/location, discovery exit **128** |
+
+The CRLF candidate blob is `d2eb92c3f437753a118e0fb686bbc3d3bba96b63`;
+Git's check-in result is `3e757656cf36eca53338e520d134963a44f793f8`.
+Both transforming-filter cases change that latter blob to
+`5ea2ed416fbd4a4cbe227b75fe255dd7fa6bd4d6`.
+These are real `hash-object --path --stdin` and `cat-file --filters --path`
+results under the candidate attribute tree. No info-attributes workaround,
+hook disabling, or CR-only heuristic is used by publication.
+
+The discovery fixture sets the invalid friendly hook name
+`hook.pre-commit.event=pre-commit` after sealing/reviewing, so the refusal is
+specifically in publication discovery. `composition-hook_location.json` also
+runs a valid named hook: details include `fixture-check`,
+`hook.fixture-check.command`, `file:.git/config` and the absolute repository
+root, without exposing the configured command value.
+
+## D5 — the actual Python 3.9 push hook
+
+The fixture publishes a reviewed unit while another unit leaves unrelated dirty
+bytes in its dispatch checkout. A clean clone contains the exact published
+commit. `red-push.json` records the installed hook's **STALE / deny**
+acknowledgement result. `working-push.json`, `composition-push.json` and
+`composition2-push.json` record automatic acceptance naming the seal and review.
+An additional empty commit (same tree) and an additional content commit both
+still return **deny**. All hook processes exit **0**; the decision is in their
+PreToolUse JSON, not the process exit status.
+
+Final composition evidence:
+commit `52df450f4b7d310fdc4fb51330450d19b79808aa`,
+tree `98373bb6a47d62e260110cdfc67dcdb0beb1d964`,
+seal `seal_f6b120c59b084b8b8ac39c688eacc9dc`,
+review `review_24edfa9a0bd64413a6e28475603926c9`.
+The exact command represented by the positive PreToolUse payload was:
+
+```sh
+git push --force-with-lease=refs/heads/main:c4c247b4ecbd4fe3a83a364bef89e04c43272d77 origin HEAD:refs/heads/main
+```
+
+The installed red command used base
+`c2b6b4fa9d5f11fee28a959e9f190a8d3e799a62`; its full command and payload are in
+`red-push.json` and `red-clean-clone-payload.json`. Final green payloads are
+`composition2-clean-clone-payload.json`,
+`composition2-extra-empty-commit-payload.json` and
+`composition2-extra-changed-commit-payload.json`. The recorder executes:
+
+```sh
+/usr/bin/python3 -B "$P/hooks/push_gate.py" < <payload.json>
+```
+
+with the payload's real cwd, transcript and session, and the disposable
+`SOFTWARE_WORKFLOWS_STATE`. It never executes the push. The original fixtures
+are removed after verification. To create a fresh positive clone for the lead's
+actual push, retain this one explicitly:
+
+```sh
+R2429P_KEEP_FIXTURE=1 "$PY" -B "$E/probe.py" "$P" lead push
+```
+
+Read `E/lead-push.json`: `lead_push_cwd` names the positive clone,
+`lead_state` its disposable evidence state, and `push_command` is the fully
+substituted command to run there. Set `SOFTWARE_WORKFLOWS_STATE` to that
+`lead_state` when exercising the gate. The extra commits are made in a separate
+negative clone. The lead owns the real push and cleanup of this retained repeat.
+The independent writer `LEAD_PUBLISHES` prohibition remains intact.
+
+## Release composition and existing checks
+
+`static.py` builds installed **2.4.28 plus the release files** under
+`/private/tmp/r2429p-composition-aiv_x5vq/marketplace`.
+It reverse-applies the saved writer-3 shared patch using
+`patch -R -p1 --fuzz=0`, exit **0**, in that disposable composition only.
+All protected files match installed 2.4.28 (including expected absence of the
+future blob modules); `operations.py` and `tools.py` also match installed
+bytes after reversal. The working protected-file starting hashes remain
+unchanged. Shared patch SHA-256:
+`d4f95b11719f0e27f90338d1f25ffb6136e62fed125705e4a6fab12e0407bab8`.
+
+All six acceptance groups above were repeated against this composition.
+`composition-acceptance.json` preserves its file hashes and exclusions.
+The final `composition.json` also includes the completed documentation: its nine
+production-file hashes must equal that accepted composition before final strict
+validation. Only documentation changed after the engine runs.
+`static-checks.json` records exact commands, stdout, stderr and exit codes.
+
+| Existing check | Working tree | Release composition |
+|---|---|---|
+| Python **3.15.2** compile | **98 files**, exit **0** | **95 files**, exit **0** |
+| Python **3.15.2** changed modules/server imports | Exit **0** | Exit **0** |
+| Python **3.9.6** hook-reachable compile | **26 files**, exit **0** | **26 files**, exit **0** |
+| Python **3.9.6** hook closure imports | Exit **0** | Exit **0** |
+| `coordinator/hooks.py --check` | Exit **0**, `{"compatible":true,"protocol":"jsonl-v1"}` | Same |
+| Ruff against installed baseline | **31**, no added findings | **33**, no added findings |
+| Strict plugin validation | Exit **0**, `Validation passed` | Same |
+| Strict marketplace validation | Exit **0**, `Validation passed` | Same |
+
+Ruff's installed baseline has **35** findings. The exact selection is:
+
+```sh
+ruff check --isolated --no-cache --exit-zero --output-format json \
+  --select F821,F822,F823,F811,F841,F401 <plugin>
+```
+
+The JSONs are `ruff-final-{installed,working,composition}.json`. Comparison is
+by relative filename/code/message with multiplicity; `--exit-zero` alone is
+not considered a pass. The composition removes two unused-import findings.
+The working tree also contains writer 3's two separate unused-import removals.
+
+Validation used `/Users/ahrar/.local/bin/claude` (**2.1.316**) and fresh
+disposable `CLAUDE_CONFIG_DIR` directories:
+
+```sh
+/Users/ahrar/.local/bin/claude plugin validate --strict <plugin>
+/Users/ahrar/.local/bin/claude plugin validate --strict <marketplace-root>
+```
+
+The validator separately warns about the existing missing plugin icon. Its
+nonfatal directory-profile check cannot discover the marketplace-root README
+in a composition without a `.git` directory and reports `README_MISSING`;
+the requested strict manifest checks still exit **0**, `Validation passed`.
+No directory-profile certification is claimed. Final documentation sync,
+whitespace/version/hash verification and repeated strict validation are recorded
+in `final-checks.json`.
+
+## Preliminary runs and explicit limits
+
+These earlier runs are retained to make failed attempts visible:
+
+- `red-d1.json` reproduced E2BIG for sealed/non-sealed argv
+  **3,002,152 / 1,501,408 bytes**. `working-d1.json` passed the sealed case,
+  then exposed the native single-input limit and an error-path recorder
+  `KeyError('last_message')`; recorder exit **1**. `working2-d1.json` passed
+  both after the private-file fallback, argv **1,383 / 1,385 bytes**. The later
+  public-API runs above are the final D1 evidence.
+- The first red native probe did not persist its JSON because its cleanup path
+  failed; it is not used as proof. `red2-native.json` is the saved cancellation
+  red. `working2-native.json` and `working3-native.json` passed cancellation
+  handback but attempts to reuse the cancelled writer hit
+  `WRITER_START_PENDING` / `RUN_DEADLINE`; these are not alternating-edit
+  passes. The separate `red-alternate.json`, `working-alternate.json`,
+  `working2-alternate.json` use actual completed writers and check each edit.
+  The second working run adds the post-publication ordinary-edit check.
+- `red-guards.json` set fatal hook configuration too early and failed before
+  publication, recorder exit **1**. `red2-guards.json` puts it at the correct
+  boundary and records both D6 red cases.
+- `working-group.json` failed, exit **1**, because the first fixture registered
+  only the root and crossed an unregistered nested Git boundary.
+  `working2-group.json` registers root and child through native
+  `project/create` and passes.
+- `composition-alternate.json` failed, exit **1**, during the existing native
+  parking transition (`LISTENER_UNAVAILABLE`, unable to enumerate descendants).
+  The recorder now waits only for that specific transition; the independent
+  `composition2-alternate.json` completes all edits, seals and publication.
+- The first static run could not resolve `claude` from its restricted PATH.
+  The rerun uses the absolute executable above; all recorded final static
+  checks pass. No production workaround was added for that recorder issue.
+- The original working/composition push runs already passed their assertions.
+  `composition2-push.json` additionally verifies the retained-positive-clone
+  arrangement used by the lead reproduction command.
+
+Two design qualifications are explicit. Existing seals bind a **candidate tree**
+and a **base commit**; the packet names those types accurately rather than
+inventing a candidate commit. Also, unlimited path metadata cannot fit a finite
+prompt: if the complete manifest itself exceeds the measured allocation, the
+prompt contains its private path/digest and requires paged reading of **every**
+entry. There is no path-count cap or truncation. The three-megabyte acceptance
+has both entries inline in its manifest; the arbitrarily-large-path-count paging
+branch was inspected but was not separately exercised by a real model run.
+
+The fixture provider proves real-engine transport, native operations, binding
+and publication mechanics; it is not an independent model-quality assessment.
+Default-home resume completion, a real network push and cross-model advisory
+review were not performed. Successful disposable-home resumes and exact hook
+decisions are recorded above. The configured cross-model review tools were
+unavailable.
+
+The final cleanup audit is `E/cleanup.json`: it enumerates only this run's
+known fixture roots and compositions, verifies process identities before any
+SIGTERM, records removal/remaining-process results and free disk space.
+Compact evidence and the repeat drivers remain in E; repositories, states,
+large payloads and release compositions are removed. No live coordinator state,
+user configuration, unrelated project or Git history is changed.
+The initial cleanup removed **39** directories, found one already removed and
+no remaining probe processes, and left **280.64 GiB** free; its record is retained
+as `cleanup-initial.json`. The final audit also covers the documentation-only
+composition. `release.patch` and `release-files.json` preserve the exact
+14-file release diff and hashes, with writer 3's hunks excluded.
+
+---
+
 # software-workflows 2.4.28 — legacy calibration safety — 2026-10-31
 
 The remaining finding from follow-up review turn 138 is corrected within the same

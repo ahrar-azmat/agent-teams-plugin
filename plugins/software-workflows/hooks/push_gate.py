@@ -2460,7 +2460,7 @@ def _evaluate(data):
     if accepted:
         return json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "additionalContext": ACK_ACCEPTED_NOTE,
+            "additionalContext": reason or ACK_ACCEPTED_NOTE,
         }})
     return _deny(reason)
 
@@ -2555,6 +2555,14 @@ def _decide(command, cwd, tool_name, transcript, nonce, direct, semantic=None, h
     # then refuses the push if the remote moved).
     lease_ok = kind != "push" or _lease_binds(info.get("leases") or [], info.get("dst", ""), tracking_oid)
     verified = bool(lone and consistent and range_ok and lease_ok and not hooks and not programs and not signing)
+    if kind == "push" and verified:
+        rc, objects = _git_capped(cwd, ("rev-parse", "HEAD", "HEAD^{tree}"), 4096)
+        ids = objects.decode("ascii", "replace").split() if rc == 0 else []
+        if len(ids) == 2:
+            proof = _coordinator_module("published_review").lookup(ids[0], ids[1], "refs/heads/" + info["dst"])
+            if proof:
+                return True, ("Coordinator publication reviewed: seal " + proof["seal"] + "; review " + proof["review"] +
+                              "; exact published commit " + proof["commit"] + ". No acknowledgement required.")
     tracking = f"refs/remotes/{info.get('remote', '')}/{info.get('dst', '')}" if kind == "push" else ""
     # REVIEW EVIDENCE FIRST (round 38): the wording class and the evidence
     # it rests on are inputs of the decision the token binds.
@@ -3234,7 +3242,7 @@ def _argv_main(real_git, args):
     except Exception as exc:
         accepted, reason = False, EVAL_FAILED_REASON.format(why=f"{type(exc).__name__}: {exc}")
     if accepted:
-        print(ARGV_ACCEPTED_NOTE.format(command=command), file=sys.stderr, flush=True)
+        print(reason or ARGV_ACCEPTED_NOTE.format(command=command), file=sys.stderr, flush=True)
         os.environ.pop(ACK_ENV, None)
         run_git()
     text = ARGV_HEADER.format(command=command, cwd=cwd0) + opaque + "\n" + reason

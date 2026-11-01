@@ -3,7 +3,7 @@ from pathlib import Path
 import time
 
 from .locks import finish, finish_all, finish_thread
-from . import gitio, participants
+from . import gitio, participants, transfers
 from .client import CoordinatorError
 from .publish import Publisher, binding
 from .store import digest, uid
@@ -102,7 +102,7 @@ class GroupPublisher:
             metadata = await finish_thread(self.repo.repository_identity, checkout)
             if metadata["branch"] != member["branch"]:
                 raise CoordinatorError("BRANCH_CHANGED", "Participant branch changed", {"root": checkout["root"]})
-            paths = self.daemon.ledger.mutation_scope(unit["id"], checkout["id"])
+            paths = transfers.scope(self.daemon.ledger, unit["id"], checkout["id"])
             rows, base = [], member["base"]
             if checkout["id"] in prefix:
                 saved = prefix[checkout["id"]]
@@ -124,6 +124,9 @@ class GroupPublisher:
                     base = metadata["base"]
             selected[checkout["id"]] = (metadata, paths, rows)
             bases[checkout["id"]] = base
+        # A handed-away participant is pin-only. Empty is a unit-wide decision,
+        # after collecting every participant (including an installed prefix).
+        transfers.require_nonempty(self.store, unit["id"], [p for _, paths, _ in selected.values() for p in paths])
         operation_proofs = await self.repo.dependency_check(unit, operations, bases)
         read_proofs = {key: await self.check_dependencies(unit["id"], key, values, bases[key])
                        for key, values in dependencies.items()}
@@ -138,11 +141,15 @@ class GroupPublisher:
                 # bytes remain UNKNOWN, but cannot replace its immutable receipt
                 # vector or prevent publication of the writable remainder.
                 await self.daemon.ledger.reconcile(checkout, paths)
-                scope = set(paths)
-                latest = {row["path"]: dict(row) for row in self.store.db.execute(
-                    "SELECT * FROM revisions WHERE checkout=? AND unit=? ORDER BY rowid", (checkout["id"], unit["id"]))
-                    if row["path"] in scope}
-                if paths != part["paths"] or [latest.get(path) for path in paths] != part["rows"]:
+                receipts = [self.store.db.execute("SELECT * FROM revisions WHERE id=?", (row["id"],)).fetchone()
+                            for row in part["rows"]]
+                changed = any(self.store.db.execute(
+                    "SELECT 1 FROM revisions WHERE checkout=? AND path=? AND unit=? AND attribution='exact' "
+                    "AND rowid>(SELECT rowid FROM revisions WHERE id=?) LIMIT 1",
+                    (checkout["id"], row["path"], unit["id"], row["id"])).fetchone() for row in part["rows"])
+                grants = transfers.snapshot(self.store, unit["id"], checkout["id"], part["paths"])
+                if (paths != part["paths"] or [dict(row) if row else None for row in receipts] != part["rows"]
+                        or changed or grants != part.get("transfer_proofs", [])):
                     raise CoordinatorError("PREFIX_PUBLISHED", "Verified work changed in an already published participant; it cannot be omitted",
                                            {"root": checkout["root"], "checkout": checkout["id"], "commit": journal["commit"]})
                 if not await finish_thread(self.repo.installed_tip, checkout, part, journal, metadata["base"]):
@@ -157,10 +164,11 @@ class GroupPublisher:
                     self.store.root / "indexes" / (partid + ".index"))
                 if candidate == await finish_thread(gitio.text, checkout["root"], ["rev-parse", base + "^{tree}"]):
                     candidate = None
-            provenance = digest([{k: row[k] for k in ("id", "path", "previous", "operation", "blob", "mode")} for row in rows])
+            grants = transfers.snapshot(self.store, unit["id"], checkout["id"], paths)
+            provenance = digest({"rows": [{k: row[k] for k in ("id", "path", "previous", "operation", "blob", "mode")} for row in rows], "transfers": grants})
             part = dict(repository=checkout["repository"], checkout=checkout["id"], root=checkout["root"], identity=checkout["identity"],
                         unit=unit["id"], base=base, branch=member["branch"], candidate=candidate, unchanged=candidate is None,
-                        paths=paths, rows=rows, entries=entries, provenance=provenance, validation=validation,
+                        paths=paths, rows=rows, entries=entries, provenance=provenance, transfer_proofs=grants, validation=validation,
                         dependencies=dependencies[checkout["id"]], dependency_digest=digest(dependencies[checkout["id"]]),
                         dependency_proofs=read_proofs[checkout["id"]] + [p for p in operation_proofs if p["checkout"] == checkout["id"]],
                         validation_digest=digest(validation), seal=partid, created=time.time())
@@ -207,6 +215,9 @@ class GroupPublisher:
 
     async def preflight(self, unit, item, publication=None):
         checkout, part = self.store.get(item["checkout"]), self.store.get(item["seal"])
+        if item["unchanged"]:
+            await finish_thread(self.repo.publication_pin, checkout, part)
+            return {"config_digest": None, "base_index_entries": {}}
         config = await finish_thread(self.repo.publication_guards, checkout, part)
         await self.check_dependencies(unit["id"], checkout["id"], part.get("dependencies", []), part["base"])
         # Recheck operation dependencies against the same sealed vector, never a
@@ -322,6 +333,7 @@ class GroupPublisher:
             async with self.daemon.custody.condition:
                 with self.store.transaction():
                     self.progress(group, final=True)
+                    transfers.record_group(self.store, group)
                     for claim in self.store.all("claim", unit["id"]):
                         if claim["state"] != "released":
                             claim["state"] = "released"

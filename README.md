@@ -1,9 +1,35 @@
 # agent-teams-plugin
 
-A Claude Code plugin marketplace, **`agent-teams`**, with one plugin, **`software-workflows`** (2.4.28).
-This release adds Codex publishing guards and fixes leaked calibration directories;
-the measured coverage and cleanup behavior are recorded in
+A Claude Code plugin marketplace, **`agent-teams`**, with one plugin, **`software-workflows`** (2.4.29).
+This release fixes large sealed reviews, handback provenance, publication guards,
+and recognition of published reviews when pushing from a clean clone. The actual
+verification results and limitations are recorded in
 [coordinator/VERIFY.md](plugins/software-workflows/coordinator/VERIFY.md).
+Exec prompts use private files and stdin. Sealed reviews use a context-budgeted
+object manifest: small patches are inlined, and large paths retain their blob IDs,
+sizes and instructions for inspecting the bound objects. Handback transfers
+publication rights while preserving the original revision authors. Unchanged
+repositories receive pin checks; repositories receiving a commit retain hook and
+signing guards and must prove that Git conversion preserves their bytes.
+A push of the exact coordinator-published commit can use its passed bound review
+without acknowledgement, provided the existing branch, history, lease and hook
+checks also pass. Codex still cannot push; the lead publishes.
+
+Sessions still running older MCP servers receive bounded sealed-review packets
+from the 2.4.29 daemon, with their full review binding retained by the daemon.
+The new server refuses a pre-2.4.29 daemon for sealed reviews and provenance
+handback with `COORDINATOR_VERSION_SKEW`; switch the daemon, then use
+`/mcp reconnect`. Older servers still use their original exec transport, so
+reconnect before sending them large non-sealed requests. Publication evidence is
+receipt-specific: publishing one path never publishes another handed-away path.
+An empty repository scope after handback is pin-only if the unit retains work
+elsewhere, and interrupted publication can recover inherited receipts.
+Completed groups also consume grants in unchanged participants. Restoring a
+baseline retires any superseded grant at handback, preserving its history.
+Receipt and grant evidence is indexed at completion and older publications are
+backfilled once. Review collection selects active jobs; a valid bound review
+never expires merely because an MCP call was disconnected or the machine slept.
+
 Foreign `GIT_CONFIG_PARAMETERS` in Codex launch, shell-policy or stdio MCP environments
 refuses with `CODEX_PUBLISH_ENV`; move those settings into a Git config file. Explicitly
 selected user stdio servers receive the guard even when initially disabled. Calibration
@@ -519,8 +545,11 @@ design in `caller_hypothesis`.
 
 ### Push gate
 
-Every `git commit` and `git push` Claude runs is **denied once**, with the review state in the
-reason and a one-shot token. Re-run the same command with the token in front to go ahead:
+The gate automatically accepts a push of an exact coordinator-published commit with a valid,
+passed review bound to its seal, provided the destination branch, tree, history, lease and
+configuration checks below pass. It names the seal and review; no acknowledgement is needed.
+Other `git commit` and `git push` commands Claude runs are **denied once**, with the review state
+in the reason and a one-shot token. Re-run the same command with the token in front to go ahead:
 
 ```text
 CODEX_PUSH_ACK=<token> git push …                  # Bash
@@ -543,7 +572,7 @@ works in all of them. The review states are:
 - **STALE.** The tree changed after the review.
 - **PENDING / none.** No completed review covers this change.
 
-The acknowledgement is always yours to make. The token binds the whole decision: command, content,
+When acknowledgement is required, it is yours to make. The token binds the whole decision: command, content,
 HEAD, index, branch, configuration, tracking ref, environment and review evidence.
 
 **In a checkout the writer coordinator has registered**, a `git commit` that would take another live
