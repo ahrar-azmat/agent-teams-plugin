@@ -478,6 +478,39 @@ class Custody:
                 self.store.event("claim/acquired", actor["id"], {"claims": result})
             return {"claims": result, "transfers": transferred, **({"outside": outside} if outside else {})}
 
+    async def acquire_pending(self, unitid):
+        """A seal may carry pending grants only for its open unit's held claims."""
+        from . import participants, transfers
+        from .ledger import key
+        async with self.condition:
+            unit = self.store.get(unitid)
+            if unit["state"] != "open":
+                return []
+            planned = []
+            carried = transfers.publications(self.store)
+            for checkoutid in participants.checkout_ids(self.store, unit):
+                claims = self.claims(checkoutid)
+                if not any(c["unit"] == unitid for c in claims):
+                    continue
+                checkout = self.store.get(checkoutid)
+                for current in self.store.all("publication_right", checkoutid):
+                    if current.get("owner") is not None or not transfers.right(self.store, checkoutid, current["path"], carried):
+                        continue
+                    covering = [c for c in claims if transfers.covers(c["key"], key(checkout, current["path"]))]
+                    owners = {c["unit"] for c in covering}
+                    if unitid not in owners:
+                        continue
+                    if owners != {unitid}:
+                        raise CoordinatorError("CLAIM_CONFLICT", "Pending publication right has multiple covering units",
+                                               {"path": current["path"], "units": sorted(owners)})
+                    actor = self.store.get(covering[0]["actor"])
+                    if actor["unit"] != unitid:
+                        raise CoordinatorError("PUBLICATION_RIGHT_PROOF", "Covering claim and actor do not agree",
+                                               {"claim": covering[0]["id"], "actor": actor["id"]})
+                    planned.append((actor, current))
+            with self.store.transaction():
+                return [transfers.grant(self.store, actor, current) for actor, current in planned]
+
     def release_request(self, actor, paths, cwd=None):
         from .routing import grouped, qualified
         resolved = grouped(self.store, actor, paths, cwd)
@@ -506,6 +539,7 @@ class Custody:
         checkouts = list(self.store.all("checkout"))
         members = list(self.store.all("participant", unit["id"]))
         ids = checkout_ids(self.store, unit)
+        rights = transfers.owned(self.store, unit["id"], ids)
         heads = {key: dict(self.store.db.execute("SELECT path,revision FROM heads WHERE checkout=?", (key,))) for key in ids}
         def plan():
             from types import SimpleNamespace
@@ -517,8 +551,12 @@ class Custody:
                 return records[ident]
             snapshot = SimpleNamespace(get=get, all=lambda kind, parent=None: checkouts if kind == "checkout" else members)
             selected = grouped(snapshot, dict(unit=unit["id"], checkout=unit["checkout"]), paths, cwd) if paths is not None else None
-            normalized = {key: {p: normalize(get(key), p) for p in set(heads[key]) | set((selected or {}).get(key, []))}
+            right_paths = {key: {r["path"] for r in rights if r["checkout"] == key} for key in ids}
+            normalized = {key: {p: normalize(get(key), p) for p in set(heads[key]) | right_paths[key] | set((selected or {}).get(key, []))}
                           for key in ids}
+            selected_rights = {key: {p for p in values if selected is None or any(
+                overlaps(normalized[key][p]["key"], normalized[key][s]["key"]) for s in selected.get(key, []))}
+                for key, values in right_paths.items()}
             planned = []
             for claim in claims:
                 if claim["state"] == "released":
@@ -533,8 +571,8 @@ class Custody:
                 remainder = [] if any(claim["key"] == key or claim["key"].startswith(key + "/") for key in keys) else [
                     normalized[where][p] for p in sorted(owned - chosen)]
                 planned.append((claim, chosen, remainder))
-            return selected, planned
-        paths, planned = await finish_thread(plan)
+            return selected, planned, selected_rights
+        paths, planned, selected_rights = await finish_thread(plan)
         # Recheck the selected claim subtrees, not unrelated checkout traffic.
         # A partial directory release also retains siblings, so its whole claim
         # subtree matters, including paths inserted while plan ran. key() is a
@@ -543,6 +581,10 @@ class Custody:
         roots = {}
         for claim, _, _ in planned:
             roots.setdefault(claim["checkout"], set()).add(claim["key"])
+        for where, values in selected_rights.items():
+            if values:
+                checkout = next(c for c in checkouts if c["id"] == where)
+                roots.setdefault(where, set()).update(path_key(checkout, p) for p in values)
         ancestors = {where: {"/".join(k.split("/")[:n]) for k in keys for n in range(1, len(k.split("/")))}
                      for where, keys in roots.items()}
         def selected_heads(where, values):
@@ -557,10 +599,10 @@ class Custody:
         async with self.condition:
             if self.unit_active(unit["id"]):
                 raise CoordinatorError("CUSTODY_HELD", "Reconcile command custody before releasing claims")
-            if (list(self.store.all("claim", unit["id"])) != claims or
+            if (list(self.store.all("claim", unit["id"])) != claims or transfers.owned(self.store, unit["id"], ids) != rights or
                     any(selected_heads(where, dict(self.store.db.execute("SELECT path,revision FROM heads WHERE checkout=?", (where,))))
                         != expected[where] for where in roots)):
-                raise CoordinatorError("HANDBACK_CHANGED", "Claims or revisions changed during handback preparation; retry")
+                raise CoordinatorError("HANDBACK_CHANGED", "Claims, rights or revisions changed during handback preparation; retry")
             for publication in (*self.store.all("publication", unit["id"]), *self.store.all("publication_group", unit["id"])):
                 if publication["phase"] not in ("complete", "abandoned", "superseded"):
                     raise CoordinatorError("HANDBACK_PUBLICATION", "Finish or abandon publication before handing back its paths", {"publication": publication["id"]})
@@ -575,7 +617,7 @@ class Custody:
                                            {"operation": operation["id"]})
             carried = transfers.publications(self.store)
             with self.store.transaction():
-                granted = {}
+                granted = {key: set(values) for key, values in selected_rights.items() if values}
                 for claim, chosen, remainder in planned:
                     checkout = self.store.get(claim["checkout"])
                     granted.setdefault(checkout["id"], set()).update(chosen)
@@ -593,8 +635,9 @@ class Custody:
                     transferred.extend(transfers.release(self.store, unit["id"], key, chosen, authorizer, carried))
                 self.store.event("claim/released", unit["id"], {"paths": paths, "authorizer": authorizer, "transfers": transferred, "replacement_claims": replacements})
             self.condition.notify_all()
-        return {"released": bool(released), "count": len(released), "claims": released, "transfers": transferred, "replacement_claims": replacements,
-                "message": "Claims released" if released else "No claims selected or eligible for release"}
+        return {"released": bool(released or transferred), "count": len(released), "rights_count": len(transferred),
+                "claims": released, "transfers": transferred, "replacement_claims": replacements,
+                "message": "Claims released" if released else "Publication rights released" if transferred else "No claims selected or eligible for release"}
 
     @staticmethod
     def git_guidance():

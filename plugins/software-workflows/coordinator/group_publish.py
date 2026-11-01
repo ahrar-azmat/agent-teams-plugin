@@ -65,6 +65,8 @@ class GroupPublisher:
 
     async def seal(self, unitid, validation, order):
         unit = self.store.get(unitid)
+        from .runs import refuse_empty_seal
+        refuse_empty_seal(self.daemon, unit)
         if unit["state"] not in ("open", "sealed") or self.current(unitid):
             raise CoordinatorError("UNIT_FROZEN", "Reopen the remaining publication before resealing")
         members = participants.members(self.store, unit)
@@ -77,6 +79,10 @@ class GroupPublisher:
                 raise CoordinatorError("VALIDATION_EVIDENCE", "Validation requires command, exit_code, actual inputs and scope")
             if item["scope"] not in ("mixed-checkout", "candidate-objects"):
                 raise CoordinatorError("VALIDATION_SCOPE", "Validation must identify its actual scope")
+        await self.daemon.custody.acquire_pending(unitid)
+        unit = self.store.get(unitid)
+        if unit["state"] not in ("open", "sealed") or self.current(unitid):
+            raise CoordinatorError("UNIT_FROZEN", "Reopen the remaining publication before resealing")
         attemptid, sealid = uid("seal_attempt"), uid("seal")
         self.store.put("seal_attempt", attemptid, {"unit": unitid, "state": "started", "generation": self.store.generation,
                        "prior_state": unit["state"], "prior_seal": unit.get("seal"), "created": time.time()}, unitid)

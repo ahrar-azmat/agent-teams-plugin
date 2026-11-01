@@ -3,6 +3,28 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.31] — 2026-11-01
+
+- Return publication acquisitions when native admission ends before production.
+  The original pending right and transfer are restored in the same transaction
+  as claim release, with a return event; revision authorship and the transfer
+  chain remain intact. Listener cleanup follows that durable compensation.
+- Repair older preproduction owners that have no covering held claim at startup,
+  before readiness. Indexed pages exhaust the right population; each return and
+  its durable total commit together. Empty and repeated scans write no repair
+  records or events. Daemon status reports scanned, returned, total and elapsed
+  seconds.
+- Let authorized handback release live rights even when their owner has no
+  claim, retaining custody, operation and publication guards and the lead
+  authorizer. An open unit's normal seal acquires pending rights covered solely
+  by that unit's held claims, including project seals.
+- Refuse resume of a terminal native run that explicitly never started
+  production with non-retryable `RUN_NOT_STARTED`, and seal with non-retryable
+  `UNIT_EMPTY`, before native recovery or descendant enumeration. The seal is
+  refused only while the unit has nothing to publish: a lead's receipts made
+  through `lead/attach`, owned rights and pending rights covered by its held
+  claims still seal the normal way.
+
 ## [software-workflows 2.4.30] — 2026-11-01
 
 - Store beneficial receipt content in versioned `.zlib-blocks-v1` containers:

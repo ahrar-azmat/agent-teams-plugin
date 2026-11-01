@@ -137,6 +137,7 @@ class Daemon:
         self.loop_lag = {"last_seconds": 0.0, "max_seconds": 0.0, "samples": 0}
         self.birth = processes.identity(os.getpid())["birth"]
         self.writer_status = {}
+        self.publication_right_repair = None
         from .dormancy import Dormancy
         self.dormancy = Dormancy(self)
         from .parking import Parking
@@ -370,6 +371,7 @@ class Daemon:
                 "birth": self.birth, "state_root": str(self.store.root),
                 "endpoint": getattr(self, "endpoint", None),
                 "event_loop_lag": dict(self.loop_lag),
+                "publication_right_repair": self.publication_right_repair,
                 "services": {name: dict(state) for name, state in self.services.items()},
                 "project_services": self.broker.status(),
                 "checkout_scans": self.ledger.scans.status(),
@@ -545,30 +547,47 @@ class Daemon:
             return {"run": ident, "unit": unitid, "attempt": attemptid, "actor": actorid,
                     "policy": self.store.get(actorid).get("policy"), **participants.surface(self, unitid)}
         except BaseException as exc:
-            self.check_native_stop()
             run = self.store.get(ident)
             if run.get("production_started"):
+                self.check_native_stop()
                 self.store.event("workflow/dispatch_detached", ident, {"code": getattr(exc, "code", type(exc).__name__)})
                 return {"run": ident, "unit": unitid, "actor": actorid, "state": run["state"], "reconcile_required": True}
             async def rollback(reason):
-                run.update(state="refused", refusal=reason)
-                self.store.save(run)
+                from . import transfers
+                # Commit compensation before any fallible native cleanup. Cancellation or
+                # a stopped native intake cannot strand the claims' acquired grants.
+                async with self.custody.condition:
+                    with self.store.transaction():
+                        current = self.store.get(ident)
+                        if current.get("production_started") is not False:
+                            raise CoordinatorError("RUN_PRODUCTION_STARTED", "Cannot return rights after possible production")
+                        current.update(state="refused", refusal=reason)
+                        returned = transfers.return_acquisitions(self.store, unitid, current, snapshots, reason)
+                        released = []
+                        for claim in self.store.all("claim", unitid):
+                            if claim["state"] == "held":
+                                claim["state"] = "released"
+                                self.store.save(claim)
+                                released.append(claim["id"])
+                        self.store.event("run/admission_rolled_back", ident, {"reason": reason, "claims": released, "transfers": returned})
+                    self.custody.condition.notify_all()
                 for listener in list(self.store.all("listener", ident)):
                     await self.stop_listener(listener)
                 for checkoutid in snapshots:
-                    for claim in self.custody.claims(checkoutid):
-                        if claim["unit"] == unitid:
-                            claim["state"] = "released"
-                            self.store.save(claim)
                     await self.release_lease(checkoutid)
             from .locks import finish
-            await finish(rollback(getattr(exc, "code", type(exc).__name__)))
+            cleanup = {}
+            try:
+                await finish(rollback(getattr(exc, "code", type(exc).__name__)))
+            except BaseException as failure:
+                cleanup = {"cleanup_error": {"code": getattr(failure, "code", type(failure).__name__), "message": str(failure)}}
+                self.store.event("run/startup_cleanup_failed", ident, cleanup)
             if isinstance(exc, asyncio.CancelledError):
                 raise
             if isinstance(exc, CoordinatorError):
-                raise CoordinatorError(exc.code, str(exc), dict(exc.details, safe_to_fallback=not bool(revision), run=ident), exc.operational) from exc
-            raise CoordinatorError("NATIVE_START_" + type(exc).__name__, "Native startup failed before production execution; resources were released",
-                                   {"safe_to_fallback": not bool(revision), "run": ident}, True) from exc
+                raise CoordinatorError(exc.code, str(exc), dict(exc.details, safe_to_fallback=not bool(revision or cleanup), run=ident, **cleanup), exc.operational) from exc
+            raise CoordinatorError("NATIVE_START_" + type(exc).__name__, "Native startup failed before production execution",
+                                   {"safe_to_fallback": not bool(revision or cleanup), "run": ident, **cleanup}, True) from exc
 
     def hook_config(self):
         command = shlex.join([sys.executable, "-B", str(Path(__file__).with_name("hooks.py")), "--state", str(self.store.root)])
@@ -3040,6 +3059,13 @@ class Daemon:
                 return await admissions.dispatch(self, params["payload"])
         if not self.ready:
             raise CoordinatorError("RECOVERING", "Coordinator is reconciling durable state before admitting work", operational=True)
+        # These terminal preproduction refusals need no native history or recovery wait.
+        if method == "run/resume":
+            from .runs import refuse_unstarted
+            refuse_unstarted(self.runs.get(params["run"], params.get("cwd")))
+        elif method == "unit/seal":
+            from .runs import refuse_empty_seal
+            refuse_empty_seal(self, self.store.get(params["unit"]))
         if self.recovering:
             from .recovery import recovered
             await recovered(self, method, params)  # a call for a writer, unit or checkout still reconciling waits
@@ -3614,6 +3640,8 @@ class Daemon:
             plan = await recover(self)
             from .reviews import repair
             repair(self)
+            from . import transfers
+            self.publication_right_repair = transfers.repair(self.store)
             from .registry import publish
             publish(self.store)
             self.ready = True

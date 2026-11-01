@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.30 / P1
+# Writer coordinator — software-workflows 2.4.31 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -8,8 +8,53 @@ coordinator. The package does not import `server.py`; the MCP server uses the
 same Python client and JSONL RPC as the CLI. Actual verification results are in
 [VERIFY.md](VERIFY.md).
 
-Version 2.4.30 changes content storage and permanent writer-failure retries.
-Version 2.4.29's review and publication behavior remains in force.
+Version 2.4.31 returns publication rights taken by a run that fails before
+production. Version 2.4.30's content storage and permanent writer-failure retry
+behavior and 2.4.29's review bindings remain in force.
+
+## Publication rights after an admission failure
+
+Claim acquisition can carry unpublished revisions from an authorized handback.
+If native startup fails while `production_started` is explicitly false, the
+coordinator restores those original pending grants and releases the unit's
+claims in one transaction. Each returned transfer records
+`provenance/acquisition_returned`, with its run, previous owner and reason.
+The transfer identity, revision set, authorizer, head and predecessor are
+preserved. Native listener cleanup happens after the transaction, so a failed
+shutdown cannot strand these rights. A durable true production flag retains
+ownership even if the production submission's reply was lost.
+
+Before announcing readiness, startup repairs live rights whose native owner
+explicitly never produced and has no held claim covering the right's path.
+The scan uses indexed pages and indexed unit/receipt lookups, without reading
+event history. Daemon status exposes `publication_right_repair` with `scanned`,
+`returned`, `total_returned` and measured `seconds`. Empty scans and subsequent
+starts do not rewrite repair totals or emit duplicate return events. Consumed
+and retired rights, produced owners and owners with covering claims are retained.
+
+An open unit that already holds the sole covering claim acquires a pending right
+when sealed, before entering `sealing`. This applies to both single-checkout
+and project seals. Coverage uses the checkout's canonical path keys: a directory
+claim covers its descendants, while a descendant claim cannot carry an ancestor's
+right. Cross-unit overlapping claims are refused. A unit must be reopened before
+it can acquire further rights; diff, scope and snapshot reads never acquire them.
+
+Lead-authorized `claim/handback` also selects live owned rights without claims,
+under the same custody, operation and publication guards. Its `count` still
+counts released claims; `rights_count` counts returned publication grants, and
+`released` is true when either is nonzero. The lead authorizer is recorded on
+the normal handback transfer.
+
+Resume of a terminal native run with explicit `production_started:false`
+returns `RUN_NOT_STARTED`, `retryable:false`, its actual acquisition-return count
+and guidance to dispatch a new run. Its seal returns `UNIT_EMPTY`,
+`retryable:false`, before creating a seal attempt or requesting native history,
+while its unit has nothing to publish in any participant checkout: no receipt,
+no live right it owns and no pending right its held claims cover. `lead/attach`
+accepts such an open unit, so a unit holding a lead's receipts or carried rights
+is sealed the normal way.
+A bootstrap thread ID does not establish production. Missing legacy flags and
+admitted idle runs are not classified as never-started terminal runs.
 
 ## Content representations and installation
 

@@ -13,6 +13,26 @@ from .writer import TERMINAL
 from . import processes, participants, rollout, native
 
 
+def refuse_unstarted(run, seal=False):
+    from .transfers import never_produced
+    if never_produced(run) and run["state"] in TERMINAL:
+        details = {"run": run["id"], "unit": run["unit"], "retryable": False,
+                   "acquisitions_returned": run.get("acquisitions_returned", 0), "next_action": "Dispatch a new run"}
+        if seal:
+            raise CoordinatorError("UNIT_EMPTY", "This run ended before production and has nothing to seal", details)
+        raise CoordinatorError("RUN_NOT_STARTED", "No production continuation exists to resume; dispatch a new run. "
+                               "Returned publication acquisitions: " + str(details["acquisitions_returned"]), details)
+
+
+def refuse_empty_seal(daemon, unit):
+    """refuse_unstarted for a seal, only while the unit has nothing to publish. lead/attach accepts a never-started
+    run's open unit, so its lead receipts and carried rights still go through a normal seal."""
+    from .transfers import never_produced, publishable
+    run = daemon.store.get(unit["run"])
+    if never_produced(run) and run["state"] in TERMINAL and not publishable(daemon.ledger, unit):
+        refuse_unstarted(run, seal=True)
+
+
 class Runs:
     def __init__(self, daemon):
         self.daemon, self.store = daemon, daemon.store
@@ -914,6 +934,7 @@ class Runs:
         return run["state"] == "submission_uncertain" and Runs.resendable(run)
 
     async def resume(self, run, text, deadline=None, images=None):
+        refuse_unstarted(self.store.get(run["id"]))
         from .writer import image_paths, IMAGES_NUDGE
         images = image_paths(images)
         if images and not text:
@@ -926,6 +947,7 @@ class Runs:
             raise CoordinatorError("RUN_DEADLINE", "A resumed turn requires a fresh deadline within the supported runtime budget")
         generation = self.store.get(run["id"]).get("cancel_generation", 0)
         async with self.daemon.writer.locks.hold(run["id"]):
+            refuse_unstarted(self.store.get(run["id"]))
             from .recovery import reconcile_listener
             if self.store.get(run["unit"])["state"] != "open":
                 raise CoordinatorError("UNIT_FROZEN", "Reopen a sealed unit before resuming; published units cannot resume")

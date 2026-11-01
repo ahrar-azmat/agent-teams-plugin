@@ -213,9 +213,15 @@ class Publisher:
 
     async def seal(self, unitid, validation, order=None):
         unit = self.store.get(unitid)
+        from .runs import refuse_empty_seal
+        refuse_empty_seal(self.daemon, unit)
         if unit.get("project_revision"):
             from .group_publish import GroupPublisher
             return await GroupPublisher(self.daemon).seal(unitid, validation, order)
+        if unit["state"] not in ("open", "sealed"):
+            raise CoordinatorError("UNIT_FROZEN", "Unit cannot be sealed in its current state")
+        await self.daemon.custody.acquire_pending(unitid)
+        unit = self.store.get(unitid)
         if unit["state"] not in ("open", "sealed"):
             raise CoordinatorError("UNIT_FROZEN", "Unit cannot be sealed in its current state")
         attemptid = uid("seal_attempt")

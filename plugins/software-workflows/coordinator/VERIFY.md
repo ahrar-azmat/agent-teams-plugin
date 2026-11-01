@@ -1,3 +1,254 @@
+# software-workflows 2.4.31 — publication rights after failed admission — 2026-11-01
+
+Base is **cd3042c25a77a09d8b7013be42da92b3ea1fee15** (2.4.30).
+Evidence root (**W**) is
+`/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2431/writer`.
+All repository changes remain uncommitted. Recorders live outside the repository;
+there are no new repository test files. Publication runs were executed by the
+lead, using the real supervisor, worker, app-server and loopback fixture provider.
+
+Each row below names a directory containing `summary.json`. Every listed
+recorder exited **0**, recorded every expected check, stopped its owned processes
+and removed its disposable state and fixture repository. A red recorder's PASS
+means it observed the old defect, not that the refused operation succeeded.
+
+| Case directory | Fixture | Checks | Observed result |
+|---|---:|---:|---|
+| `red-30-admission-2` | 272 | 12 | Installed 2.4.30: B refused before production, zero claims but two owned rights; C seal `UNIT_EMPTY`; B handback selects nothing; B resume retryable `WRITER_HISTORY_READ_FAILED`; B seal `LISTENER_UNAVAILABLE`. |
+| `green-admission-2` | 274 | 21 | B owns zero rights and holds zero claims. Right and transfer payloads exactly match their pre-acquisition values, excluding internal revision counters; exactly two return events. B resume `RUN_NOT_STARTED` and seal `UNIT_EMPTY`, both non-retryable and without native continuation. C seals both transfer proofs, receives a real bound review and publishes commit `b2e4e943`. |
+| `upgrade-29` | 275 | 39 | Installed 2.4.29 produces the stuck state with migrations 1–4 and C already holding both claims. Candidate startup returns exactly two rights; C seals, is reviewed and publishes both paths at `4b94ae97`, without a ledger edit. |
+| `upgrade-30` | 277 | 39 | Same supported repair, seal, review and publication from installed 2.4.30. |
+| `upgrade-29-crash-2` | 282 | 40 | Disposable worker exits after committing both returns and before C acquires. Replacement and second startup return zero, retain total two and produce no duplicate return events. C seals, is reviewed and publishes both paths at `4b94ae97`. |
+| `red-30-rights-only` | 278 | 8 | A produced owner with an explicitly injected lost-claims precondition retains two rights; installed handback reports `released:false`, `count:0`. |
+| `green-rights-only-2` | 285 | 14 | Startup retains the produced owner. Lead handback reports `released:true`, `count:0`, `rights_count:2`, preserves the authorizer and says `Publication rights released`. A sealed covering claimant acquires nothing; reopening then sealing acquires both rights. This state-guard case uses a lead-mode claimant. |
+| `green-smoke` | 280 | 18 | Normal handback/claim and A → B → A publish at `eab55387`. Overlapping cross-unit claims refuse `CLAIM_CONFLICT`; no held covering claim acquires nothing; sealed acquisition is refused or acquires nothing; a refusal that took no rights returns zero. |
+| `green-old-hooks` | 281 | 12 | Actual Pre/Post from installed 2.4.11, 2.4.26, 2.4.29 and 2.4.30 each exits zero under Python 3.9.6, coordinates successfully and introduces no UNKNOWN records. |
+| `green-restored-baseline-2` | 287 | 11 | Supported lead restore of a known baseline retires the old grant honestly. The next writer seals without the retired grant. |
+
+Both upgrade cases preserve the exact preexisting `published_revision` and
+`consumed_transfer` payloads, including prior publication `2f980389`, and retain
+the three review indexes. Ordinary compressible content writes produce migration
+5; the final migration set is **1–5**, without manufacturing migration rows.
+The repair's second start preserves rights, transfers, events and durable totals
+exactly. No new schema migration is introduced by 2.4.31.
+
+## Review fix round 1 — code_review turn 145
+
+**Finding.** The blind review (session 01a14eac, turn 145) reported one MEDIUM
+and confirmed the lead's hypothesis. The pre-fix seal refusal treated "native
+production never started" as "nothing to publish", but `lead/attach` accepts
+such a run's open unit. A lead edit then adds a verified receipt without
+touching `production_started`, so the dispatch pre-check and both seal paths
+answered `UNIT_EMPTY` for a unit whose `Ledger.mutation_scope` was not empty.
+Installed 2.4.30 seals that unit, so the refusal was a 2.4.31 regression.
+
+**Fix (written by the lead).**
+- `runs.refuse_empty_seal(daemon, unit)` applies the early refusal only while
+  `transfers.publishable(ledger, unit)` is false. That means no `scope()` path
+  in any participant checkout (receipts of the unit's patches, lead edits and
+  restores, plus live rights it owns) and no pending live right covered by one
+  of its held claims.
+- The dispatch pre-check, `Publisher.seal` and `GroupPublisher.seal` all call
+  it. Resume keeps `RUN_NOT_STARTED`.
+- The check runs only for terminal native runs with explicit
+  `production_started:false`, and asks git nothing when the unit has no
+  receipts.
+
+**Recorder.** `leadscope_case.py` is derived from the reviewed `run_case.py` by
+`prepare_leadscope.py`:
+1. A lead unit holds `a.txt`.
+2. Native B, claiming `a.txt`, is refused by `CLAIM_CONFLICT` before any
+   listener exists.
+3. The lead attaches to B's unit and edits `c.txt`, and B is sealed.
+4. A second refused run, E, with no receipt, is sealed too.
+
+| Case directory | Tree | Fixture | Checks | Observed result |
+|---|---|---:|---:|---|
+| `lfix-red-leadscope` | pre-fix 2.4.31 (`53048557`) | 291 | 12 | B answers `UNIT_EMPTY`, `retryable:false`, despite its verified receipt. B resume `RUN_NOT_STARTED`; E `UNIT_EMPTY`, `retryable:false`. |
+| `lfix-calib-30-leadscope` | installed 2.4.30 | 292 | 9 | B seals. B resume `UNIT_FROZEN`; E `UNIT_EMPTY` ("Unit has no retained publication scope"). |
+| `lfinal2-green-leadscope` | fixed 2.4.31 (`ca7992d3`) | 310 | 16 | B seals with paths `[c.txt]`, receives a real bound review and publishes commit `0a3d0821`. B resume `RUN_NOT_STARTED`, `retryable:false`. E `UNIT_EMPTY`, `retryable:false`, with no seal attempt. |
+
+**Lead's final re-runs.** Every case runs on a frozen `git archive` composition
+with fresh fixtures and full cleanup.
+
+Before the fix, on tree `53048557`, all ten final cases passed, 214 checks,
+under the `lfinal-*` directories on fixtures 300–309.
+
+After the fix, on tree `ca7992d3`, `lfinal2-*` ran on fixtures 310–320:
+- `green-leadscope` passed with 16 checks.
+- `green-admission` passed with 21.
+- `upgrade-29-crash` passed with 40.
+- `upgrade-30` passed with 39.
+- `red-30-admission` passed with 12.
+- `red-30-rights-only` passed with 8.
+- `green-rights-only` passed with 14.
+- `green-smoke` passed with 18.
+- `green-old-hooks` passed with 12.
+- `green-restored-baseline` passed with 11.
+- `lfinal2-upgrade-29` exited 1 while installed 2.4.29 was still running,
+  before the candidate started. Its old-version check seals C right after C's
+  run completes. The seal met the park/seal race described below:
+  `NATIVE_RPC` "thread not found" on `thread/backgroundTerminals/list`, in place
+  of the expected `UNIT_EMPTY`.
+- Its fresh re-run, `lfinal2-upgrade-29-r2` on fixture 293, passed 39/39.
+  Startup returned 2 rights in 0.0008 s and the second start returned 0. C
+  published at `9c384adb`.
+
+Static gates on composition 2 all passed:
+- Python 3.15 compile of 98 files.
+- Python 3.9 hook closure, plus hook-runtime imports with codecs blocked.
+- `hooks.py --check`.
+- Ruff delta 31/31, none added.
+- Strict plugin and marketplace validation.
+- Version 2.4.31.
+
+## Startup repair measurements
+
+These are individual real runs on a shared host, not latency guarantees.
+`seconds` measures the repair itself; restart includes supervisor/worker startup.
+
+| Shape | Rights scanned | Returned / total | Repair seconds | Restart seconds |
+|---|---:|---:|---:|---:|
+| Empty candidate ledger | 0 | 0 / 0 | 0.000030 | 0.729323 |
+| 2.4.29 first candidate start | 3 | 2 / 2 | 0.000857 | 1.025307 |
+| Same ledger, second candidate start | 3 | 0 / 2 | 0.000082 | 1.148048 |
+| 2.4.30 first candidate start | 3 | 2 / 2 | 0.000733 | 0.834525 |
+| Same ledger, second candidate start | 3 | 0 / 2 | 0.000100 | 0.763723 |
+| Replacement after intentional committed-return crash | 3 | 0 / 2 | 0.000095 | 1.818714 |
+| Same crash ledger, second candidate start | 3 | 0 / 2 | 0.000084 | 0.667427 |
+| Produced owner without claims | 2 | 0 / 0 | 0.000120 | 1.016897 |
+
+The empty scan creates no repair record or return event. Each case retains
+`EXPLAIN QUERY PLAN` output: rights use `record_kind (kind=? AND id>?)`, owner
+claims use `record_children (parent=? AND kind=?)`, and exact record/receipt
+lookups use `sqlite_autoindex_records_1 (id=?)`. A page holds 256 records; all
+pages are exhausted, so 256 is a memory bound, not a repair limit.
+
+The final read-only computation in `live-census-final.json` at **23:09:16 IST** opened
+the live ledger with SQLite `mode=ro`, without importing daemon machinery or
+running a copied ledger. Of 254 rights, 93 had a covering held claim, 122 were
+unowned/retired, 37 were consumed and exactly **two** were owned without a
+covering claim. Both belong to native refused `unit_462e474c…`, whose run
+explicitly has `production_started:false`. Their right/transfer pairs agree.
+The sole covering claimant is open `unit_9282aa56…`, for
+`.github/workflows/ci.yml` and `tests/test_money_seam.py`.
+Startup return followed by that unit's ordinary seal is the intended route;
+there is no additional repair command or ledger edit. Actual live seal/review/
+publication is deliberately not part of these disposable proofs.
+
+## Repeat commands
+
+Use fresh lead-prepared fixture repositories, one per run. The original numbers
+above have been removed. Run serially and retain at least 15 GiB free. Any
+`--publish` command belongs to the lead. The recorder cleans up its own daemon,
+provider, state and fixture, including failure paths.
+
+```sh
+P=/Users/ahrar/Documents/agent-teams-plugin/plugins/software-workflows
+S=/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad
+W="$S/r2431/writer"
+OLD=/Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows
+PY=/opt/homebrew/bin/python3.15
+
+# Set CASE, FIXTURE, SOURCE, SCENARIO for the selected row; OUTPUT must be new.
+"$PY" -B "$W/run_case.py" --plugin "$SOURCE" --candidate "$P" \
+  --repo "$S/r2425/fixture-repos/repo-$FIXTURE" --scenario "$SCENARIO" \
+  --output "$W/$CASE"
+
+# Lead-only publication variant; add --crash for the committed-return crash.
+"$PY" -B "$W/run_case.py" --plugin "$SOURCE" --candidate "$P" \
+  --repo "$S/r2425/fixture-repos/repo-$FIXTURE" --scenario "$SCENARIO" \
+  --output "$W/$CASE" --publish
+
+# Rights-only state guard and restore compatibility use these recorder copies.
+"$PY" -B "$W/rights_case.py" --plugin "$P" --candidate "$P" \
+  --repo "$S/r2425/fixture-repos/repo-$FIXTURE" --scenario rights-only \
+  --output "$W/$CASE"
+"$PY" -B "$W/restore_case.py" --plugin "$P" --candidate "$P" \
+  --repo "$S/r2425/fixture-repos/repo-$FIXTURE" --scenario restore \
+  --output "$W/$CASE"
+
+# Read-only live census and final static/package checks.
+"$PY" -I -B "$W/live_census.py" "$W/live-census-final.json"
+"$PY" -B "$W/static_checks.py" "$W/static-final"
+```
+
+For admission reds use `SOURCE="$OLD/2.4.30"`, `SCENARIO=admission`; the
+candidate green uses `SOURCE="$P"` and `--publish`. Upgrade uses
+`SOURCE="$OLD/2.4.29"` or `"$OLD/2.4.30"`, `SCENARIO=upgrade`, `--publish`,
+and optionally `--crash`. Rights-only red uses installed 2.4.30 and
+`SCENARIO=rights-only`. Smoke uses the candidate, `SCENARIO=smoke` and
+`--publish`; old hooks use the candidate and `SCENARIO=hooks`.
+
+The import injector fails B inside the real admission call, after its bootstrap
+listener and claims exist. It does not fabricate an admission result. The
+rights-only case explicitly seeds lost claims after real production; ordinary
+startup must leave that owner alone. Review uses the plugin's installed Python
+venv, which supplies `mcp`; daemon/RPC use Homebrew Python 3.15.2.
+
+The pre-manifest static run exited **0** (`static-before-manifest/checks.json`):
+all 98 Python files compiled under 3.15; the 18-file Python 3.9 hook closure
+compiled and imported with `zlib`, `bz2`, `lzma`, `_bz2`, `_lzma` blocked;
+`hooks.py --check` reported `compatible:true`, `jsonl-v1`; sh/bash/zsh syntax
+checks passed. Ruff had **31 old / 31 candidate**, **zero added** findings
+against installed 2.4.30. Strict plugin and marketplace validation both exited
+zero with `Validation passed`. The final command above repeats these checks
+after the last manifest edit and requires version **2.4.31**; its exact results
+are retained in `static-final/checks.json` and the release report.
+
+Earlier failed recorder attempts remain in the evidence: initial endpoint
+startup (`red-30-admission`), missing review interpreter dependency
+(`green-admission`), status racing the intentional worker exit
+(`upgrade-29-crash`), and native rather than lead authorization for restore
+(`green-restored-baseline`). Each was corrected and rerun on a fresh fixture.
+
+## Native reseal calibration: existing lifecycle defect
+
+`red-30-native-reseal` (fixture 286, recorder exit 1) did not reproduce the
+suspected error: installed 2.4.30 successfully sealed and immediately resealed
+a native unit without rights. The recorder intentionally preserved that
+different result. `candidate-native-reseal-observed` (288, exit 0, 6/6) likewise
+passed plain seal/reseal. Neither plain run establishes safety against parking.
+
+`candidate-rights-native-observed` (289, exit 1, 13/14) retained the exact
+native-C sequence and explained the failure. Relative to A's handback:
+
+| Seconds | Observation |
+|---:|---|
+| 58.898 | C seal starts. |
+| 59.097 / 59.126 | C listener enters `park_fenced` / `park_unloading` during the seal. |
+| 59.149 | C's first seal completes. |
+| 59.203 | B hands back both publication rights. |
+| 59.211 / 59.215 | C listener enters `park_stopping` / detaches. |
+| 59.270 / 59.271 | Reseal returns `LISTENER_UNAVAILABLE`; `seal/interrupted` invalidates the prior seal and reopens C. |
+| 59.273 | Listener becomes dormant. |
+| 60.321 / 60.700 | Recorder retry acquires both rights for the now-open C, then seals. |
+
+`quiescent()` treats a parking listener as connected until dormancy; a failed
+reseal's existing `interrupt_seal()` reopens the unit. The original
+`green-rights-only` (279) instead received `NATIVE_RPC: thread not found` from
+`thread/backgroundTerminals/list`, consistent with the earlier unloaded-but-
+connected interval. Its events were not retained.
+
+The supplemental `old-claimed-native-observed` run (290, installed 2.4.30,
+exit 1, 3/4 checks) directly reproduced that exact `NATIVE_RPC: thread not found`
+subtype on C's first seal, before reaching B's claimed handback or reseal.
+Relative to the failed seal response, `park_fenced` occurred at −0.026 s,
+`park_preverify` at −0.013 s, `seal/started` at −0.012 s, `park_unloading` at
+−0.009 s and `seal/interrupted` at −0.004 s. The recorder retained native call
+timings, listener/native events before retention, and supervisor/worker and
+native logs. This installed-baseline red directly establishes the park/seal
+race independently of 2.4.31. The lead queued it for 2.4.32; no product change
+was made for it in this release.
+
+The observed failure is not acquisition by a sealed unit: the first failed
+reseal acquired nothing, then the existing interruption reopened it. The
+successful `green-rights-only-2` uses lead-mode C to exercise the state guard
+without native parking. Native calls, pre-stop ledger events and listener
+records for the observed runs remain in their evidence directories. Native
+log retention removed raw listener logs before end-of-run copying; this limit
+is recorded rather than claiming those logs were preserved.
+
 # software-workflows 2.4.30 — fix round 1 — 2026-11-01
 
 This section records the final candidate after review findings R1–R5. It
