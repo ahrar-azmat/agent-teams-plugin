@@ -31,15 +31,24 @@ class Publisher:
     def __init__(self, daemon):
         self.daemon, self.store = daemon, daemon.store
 
-    async def quiescent(self, unit, allow_quarantined=False):
+    async def quiescent(self, unit, allow_quarantined=False, *, history=True):
+        if history:
+            from .dormancy import unresolved
+            gaps = [g["id"] for g in self.daemon.dormancy.gaps(unit["run"]) if unresolved(g)]
+            if gaps:
+                raise CoordinatorError("HISTORY_GAP", "Saved history needs comparison or lead settlement", {"gaps": gaps})
         listeners = {actor["listener"] for actor in self.store.all("actor", unit["id"]) if actor.get("listener")}
         dormant = set()
         for listenerid in listeners:
             listener = self.store.get(listenerid)
             if listener["state"] == "dormant":
-                self.daemon.dormancy.require_quiet(listener)
+                self.daemon.dormancy.require_quiet(listener, history=history)
                 dormant.add(listenerid)
                 continue
+            if not history and listener.get("owner_sequence") and listener.get("pid") and processes.exit_evidence(listener):
+                if listener.get("family_gone") or await self.daemon.unheld_family_exit(listener):
+                    dormant.add(listenerid)
+                    continue
             connection = self.daemon.connections.get(listenerid)
             if not connection or connection.closed:
                 raise CoordinatorError("LISTENER_UNAVAILABLE", "Cannot enumerate every descendant before sealing")
@@ -56,6 +65,8 @@ class Publisher:
                 if reason or actor.get("active_turn"):
                     raise CoordinatorError("ACTIVE_TURN", "Root or descendant is not quiescent", {"actor": actor["id"]})
                 await self.daemon.settle_actor(actor)
+                if response["thread"].get("status", {}).get("type") == "notLoaded":
+                    continue  # This native inventory exists only for loaded threads.
                 terminals = await connection.call("thread/backgroundTerminals/list", {"threadId": actor["thread"]})
                 if terminals["data"] or terminals.get("nextCursor"):
                     raise CoordinatorError("BACKGROUND_TERMINAL", "Background terminal inventory is not empty")
@@ -227,6 +238,7 @@ class Publisher:
         attemptid = uid("seal_attempt")
         attempt = {"unit": unitid, "generation": self.store.generation, "state": "started",
                    "prior_state": unit["state"], "prior_seal": unit.get("seal"), "intended_base": unit["base"],
+                   "prior_review_required": unit.get("review_required", True),
                    "validation_digest": digest(validation), "created": time.time(),
                    "index": str(self.store.root / "indexes" / (attemptid + ".index"))}
         with self.store.transaction():
@@ -244,15 +256,25 @@ class Publisher:
     def interrupt_seal(self, unitid, reason):
         unit = self.store.get(unitid)
         with self.store.transaction():
-            if unit.get("seal"):
-                unit["previous_seal"] = unit.pop("seal")
             attempt = self.store.get(unit.get("seal_attempt"), required=False)
+            if attempt and attempt["state"] == "completed":
+                return
+            retained = bool(attempt and attempt.get("prior_state") == "sealed" and attempt.get("prior_seal")
+                            and self.store.get(attempt["prior_seal"], required=False))
             if attempt and attempt["state"] != "completed":
                 attempt.update(state="interrupted", reason=reason, recovered_generation=self.store.generation)
                 self.store.save(attempt)
-            unit.update(state="open", review_required=True)
+            if retained:
+                unit.update(state="sealed", seal=attempt["prior_seal"],
+                            review_required=attempt.get("prior_review_required", True))
+            else:
+                if unit.get("seal"):
+                    unit["previous_seal"] = unit.pop("seal")
+                unit.update(state="open", review_required=True)
             self.store.save(unit)
-            self.store.event("seal/interrupted", unitid, {"reason": reason, "invalidated_seal": unit.get("previous_seal")})
+            self.store.event("seal/interrupted", unitid, {"reason": reason,
+                "retained_seal": unit.get("seal") if retained else None,
+                "invalidated_seal": None if retained else unit.get("previous_seal")})
 
     async def scope_rows(self, unit, seal=None, sealing=False):
         checkout = self.store.get(unit["checkout"])
@@ -335,9 +357,17 @@ class Publisher:
                 self.store.save(attempt)
             return self.store.get(sealid)
         except BaseException:
-            unit["state"] = "open"
-            self.store.save(unit)
             raise
+
+    def reopen(self, unit, *, abandon=False):
+        with self.store.transaction():
+            for review in self.store.all("review", unit["id"]):
+                review.update(valid=False, invalidation="seal abandoned" if abandon else "unit reopened")
+                self.store.save(review)
+            unit.update(state="open", previous_seal=unit.pop("seal", None), review_required=True)
+            self.store.save(unit)
+            self.store.event("unit/reopened", unit["id"], {"invalidated_seal": unit["previous_seal"], "abandonment": abandon})
+        return {"unit": unit["id"], "state": "open", "review_required": True}
 
     async def verify_working(self, checkout, rows):
         for row in rows:
@@ -628,6 +658,10 @@ class Publisher:
         """Abandon only a provably unapplied journal, under native ref locks."""
         unit = self.store.get(unitid)
         publications = [publication] if publication else [p for p in self.store.all("publication", unitid) if p["phase"] != "abandoned"]
+        if publication is None:
+            await self.quiescent(unit, allow_quarantined=True, history=False)
+            if not publications and unit["state"] == "sealed":
+                return self.reopen(unit, abandon=True)
         if len(publications) != 1:
             raise CoordinatorError("PUBLICATION_ABANDON", "Exactly one active publication journal is required")
         publication = publications[0]
@@ -677,6 +711,8 @@ class Publisher:
             # the journal's phase, before deciding whether abandonment is legal.
             return await self.reconcile(publication)
         await self.cleanup_anchor(publication)
+        if not unit.get("project_revision"):
+            self.reopen(self.store.get(unitid), abandon=True)
         return publication
 
     def installed_tip(self, checkout, seal, publication, tip):

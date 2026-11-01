@@ -149,6 +149,59 @@ class Messages:
             self.store.event("message/cancelled", message["id"], {"reason": "recipient run cancelled", "run": run["id"]})
         return True
 
+    def eligibility(self, message):
+        """One decision for dispatch, drain and status; it never starts work."""
+        if message["state"] in ("entered_context", "acknowledged") or self.daemon.lead_mail(message):
+            return {"state": "terminal", "reason": "recipient_context_or_lead_inbox"}
+        if message["delivery"] in ("submitting", "submitted", "uncertain", "injecting"):
+            return {"state": "in_flight", "reason": "native_outcome_pending"}
+        if message.get("withdrawal") or message["delivery"] in ("cancelled", "turn_ended"):
+            return {"state": "terminal", "reason": "withdrawn" if message.get("withdrawal") else message["delivery"]}
+        reason = None
+        actor = self.store.get(message["recipient"], required=False)
+        if message["delivery"] != "pending":
+            reason = "delivery_" + message["delivery"]
+        elif not actor or not actor.get("listener"):
+            reason = "writer_not_bound"
+        else:
+            unit, run = self.store.get(actor["unit"]), self.store.get(actor["run"])
+            if unit["state"] != "open":
+                reason = "unit_" + unit["state"]
+            elif run.get("cancel_requested") or run["state"] in ("blocked", "failed", "refused", "cancelled", "interrupted", "cancelling", "admitting"):
+                reason = "run_" + run["state"]
+            elif self.daemon.runs.awaiting_lead(run):
+                reason = "run_awaiting_lead"
+            elif self.daemon.held_by_retry(run["id"]):
+                reason = "writer_retry_held"
+            elif message["wake"] == "none" and not actor.get("active_turn"):
+                reason = "wake_not_requested"
+        return {"state": "waiting", "reason": reason} if reason else {"state": "runnable", "reason": "writer_can_accept"}
+
+    async def withdraw_unsent(self, ident, session_id):
+        """The sender relinquishes pending mail; no recipient acknowledgement."""
+        from .lead import owners
+        async with self.locks.hold(ident):
+            message = self.store.get(ident)
+            sender = self.store.get(message.get("sender"), required=False)
+            authorized = bool(sender and session_id and (
+                sender.get("_kind") == "lead_mailbox" and sender.get("session_id") == session_id or
+                sender.get("_kind") == "actor" and sender.get("kind") == "lead" and
+                any(owner["session_id"] == session_id for owner in owners(self.store, sender["id"]))))
+            if not authorized:
+                raise CoordinatorError("MESSAGE_SENDER", "Only the original lead sender's session can withdraw this message")
+            if message.get("withdrawal"):
+                return message
+            attempts = [self.store.get(key, required=False) for key in message.get("attempts", [])]
+            if (message["state"] in ("entered_context", "acknowledged") or
+                    any(not attempt or attempt.get("state") not in ("withdrawn", "refused") for attempt in attempts) or
+                    message["delivery"] not in ("pending", "cancelled", "refused")):
+                raise CoordinatorError("MESSAGE_DELIVERY_POSSIBLE", "Native delivery is possible or already proved; withdrawal requires proof it was never delivered")
+            with self.store.transaction():
+                message.update(delivery="cancelled", withdrawal={"session_id": session_id, "sender": sender["id"], "time": time.time()})
+                self.store.save(message)
+                self.store.event("message/sender_withdrew", ident, message["withdrawal"])
+            return message
+
     async def deliver(self, ident):
         if self.daemon.recovery_barrier:
             return
@@ -170,6 +223,8 @@ class Messages:
                 # Absence after an uncertain RPC is not proof it was never submitted: settled by reads in the thread's
                 # order, or by what its app-server saved once it has exited, which needs no connection (runs.py).
                 await self.daemon.runs.settle_delivery(message, actor)
+                return
+            if self.eligibility(message)["state"] != "runnable":
                 return
             listener = self.store.get(actor["listener"])
             if (listener["state"] in ("dormant", "parking") or listener.get("park_resume_required")) and self.daemon.delivery_owed(message):
@@ -230,6 +285,8 @@ class Messages:
                     self.store.get(target["id"])["listener"] != listener["id"] or connection.closed or
                     self.store.get(listener["id"]).get("recovery_state") in ("reconciling", "failed")):
                 return
+            if self.eligibility(message)["state"] != "runnable":
+                return
             params = {"threadId": target["thread"], "input": [{"type": "text", "text": text}], "clientUserMessageId": native_id}
             if active:
                 params["expectedTurnId"] = active
@@ -238,6 +295,7 @@ class Messages:
             message["delivery"] = "submitting"
             with self.store.transaction():
                 params["input"] = self.prefix_held(target, native_id, params["input"])
+                params["input"] = self.daemon.dormancy.notice(target, params["input"])
                 self.store.save(message)
                 self.store.put("delivery", attempt, {"message": ident, "method": method, "actor": target["id"], "listener": listener["id"],
                                "client_id": native_id, "state": "submitting", "created": time.time()}, ident)
@@ -259,7 +317,11 @@ class Messages:
                         target = self.store.get(target["id"])
                         message = self.store.get(ident)
                         message["delivery"] = "pending"
-                        self.store.save(message)
+                        with self.store.transaction():
+                            record = self.store.get(attempt)
+                            record.update(state="refused", error=exc.code, reason=str(exc))
+                            self.store.save(record)
+                            self.store.save(message)
                 return
             record = self.store.get(attempt)
             record.update(state="submitted", result=response)
@@ -692,6 +754,8 @@ class Messages:
     async def retry_requested(self, ident):
         async with self.locks.hold(ident):
             message = self.store.get(ident)
+            if message.get("withdrawal"):
+                raise CoordinatorError("MESSAGE_WITHDRAWN", "A sender-withdrawn message cannot be retried; send a new message")
             _, actor = self.recipient(message["recipient"])
             if actor:
                 run = self.store.get(actor["run"])

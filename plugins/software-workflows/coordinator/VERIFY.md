@@ -1,4 +1,421 @@
-# software-workflows 2.4.31 — publication rights after failed admission — 2026-11-01
+# software-workflows 2.4.32 — sealed units, history gaps and the writer command gate — 2026-11-02
+
+Base is **e008d07620f48e0c6d1298fb5d6f427dd4f3b99f** (2.4.31). The release has
+two changes. The Codex writer (run_78c49ab7) wrote Change 1, sealed units and
+history gaps. The lead wrote Change 2, the writer command gate in `custody.py`,
+and the release edits (manifest, title, changelog date). The review rounds
+(code_review turns 147 and 148) and the lead's re-runs on the frozen release
+compositions follow the Change 2 section.
+
+## Change 1 — sealed units and history gaps
+
+Evidence root (**W**) is
+`/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2432/writer`.
+Recorders are outside the repository and use the real supervisor, worker,
+app-server, code-mode tools and loopback fixture provider. No repository test
+files were added. All publication recorders were reviewed and executed by the
+lead after a READY message.
+
+Each directory below contains a complete `summary.json`. Every listed recorder
+exited **0**, recorded the listed checks, stopped its owned processes and removed
+its state and fixture services. The lead removes the used fixture repositories.
+A red recorder's PASS means it observed the expected installed-2.4.31 defect.
+
+| Case directory | Checks | Observed result |
+|---|---:|---|
+| `old-calibration-321` | 5 | Original native command/MCP notifications and saved items captured. Sorted MCP receipts produce representation-only differences; a retained-content mutation remains detectable. |
+| `candidate-calibration-322` | 5 | Exact native projection matches command, simple MCP and nested-metadata MCP items, with Unicode, escaping and structured content. All three retained-content mutations still differ. |
+| `old-lifecycle-323` | 12 | Gapped sealed unit cannot reopen or abandon. Settlement/withdrawal are unsupported; pending wake mail holds drain; failed reseal opens the unit. |
+| `candidate-lifecycle-328` | 23 | Gapped reopen and no-journal abandonment succeed. Settlement survives restart/recover; changed saved content creates a new gap. Resume warns the writer; sealed/blocked mail does not hold drain. Sender withdrawal preserves recipient acknowledgement state. |
+| `upgrade-329` | 26 | Installed 2.4.31 creates a sealed unit with gapped dormant listeners, a blocked run and wake=start mail. Candidate startup matches the representation gap, retains the injected content gap and message, then completes the lifecycle/settlement checks. |
+| `old-park-335` | 9 | Reseal paused after real native unload fails `NATIVE_RPC` and loses the prior seal. |
+| `candidate-park-336` | 15 | Same unload window refuses retryably with named `PARK_IN_PROGRESS`; prior seal/review survive. Retry seals after park. Raw receipt archival and interrupted-reseal recovery also pass. |
+| `old-park-337` | 9 | Reseal paused after real detach fails `LISTENER_UNAVAILABLE` and opens the unit. |
+| `candidate-park-338` | 15 | Same detach window preserves the binding/review and names the active park. Actual archive recovery and worker restart retain the prior seal. |
+| `old-publication-339` | 7 | Publication refuses `HISTORY_GAP`; the reviewed unit stays sealed with two gaps. Lead executed. |
+| `candidate-publication-340` | 9 | Only the injected gap remains. Its settlement survives restart/recover and the original reviewed candidate publishes at `ed365e70`. Lead executed. |
+| `candidate-continuation-342` | 28 | Settlement is visible through real `run/events`. Waiting mail actually enters a turn after reopen; blocked-run mail enters after explicit resume. Withdrawal of already accepted mail refuses `MESSAGE_DELIVERY_POSSIBLE`. |
+| `candidate-project-343` | 19 | A two-repository project reopens with gaps, publishes its first prefix, abandons the unapplied remainder despite a new gap, restarts, reseals against the retained prefix and publishes the remainder without replacing the first commit. Lead executed. |
+| `old-project-345` | 8 | Project reopen and abandonment both refuse `HISTORY_GAP` and leave the unit sealed. Lead executed. |
+| `candidate-publication-guards-347` | 15 | Settlement does not waive a stale review (`REVIEW_BINDING`) or an unattributed edit (`UNKNOWN_BLOCKS_PUBLICATION`). The general observer leaves `received_verified` at 0 below settled receipt 60; reopen invalidates the replacement review. Lead executed. |
+| `candidate-message-proofs-348` | 9 | A real native stale-turn refusal is recorded durably and permits sender withdrawal. An actual lost connection retains possible-delivery evidence and withdrawal refuses `MESSAGE_DELIVERY_POSSIBLE`. |
+| `candidate-revalidation-350` | 10 | An installed-2.4.31 content gap is changed again before upgrade. First restart preserves and versions the old evidence and records a new gap; second restart adds no history-indexing event and preserves both records exactly. Empty raw objects remain valid versioned JSON. |
+
+The park recorders pause after actual unload or detach and retain the **first**
+seal response. They neither fabricate quiescence nor retry away the old defect.
+The interrupted-reseal cases deliberately exit their own worker after the
+durable attempt record; its real supervisor starts the replacement. Archive
+checks compare original receipt text, checksum and recovered item projection.
+The project prefix hold occurs after the first real publication completes;
+ordinary ref/journal checks decide whether the remainder can be abandoned.
+
+The fixture admission probe uses the existing repository instead of creating a
+new Git history. The fixture MCP server returns controlled large content; the
+recorder mutates a saved fixture command item explicitly to calibrate a real
+content discrepancy. Reviews use the installed plugin venv Python (with `mcp`);
+supervisor/worker/RPC use Python 3.15.2. Native notifications, item-list replies,
+provider requests, review results and worker logs remain beside each summary.
+
+### Read-only production census
+
+`W/live_census.py` reads the original **298** live gap IDs and native saved items
+using SQLite `mode=ro`, plus the hot/cold receipt merger. It never starts daemon
+machinery on live data or a copy. All 298 original received/saved hashes match;
+the 112 referenced archives pass checksum verification (281 distinct receipts).
+The calibrated candidate projection gives **293 exact matches**: 233 command
+items and 60 MCP items. **Five legacy observations remain unverified**.
+
+Those five share thread `01a18ecb-72f5-7e81-8fa8-b60fca991b3c` and turn
+`01a18ecb-e7dd-7ce2-b7b2-16d1ba84e742`. They are the observations whose gap
+hashes begin `1e2f748261103ac6`, `5ed5c5de445b690a`, `78a3f0d7e7b54cd6`,
+`83448ef7662c96c0` and `b5df47013db29ae2`. Each old journal sorted nested
+`_meta.raw_messages`, `_meta.error` and `_meta._codex_apps` keys before the
+comparison could reproduce native's serialized preview. Original order is no
+longer available. They are unresolved evidence gaps, **not five proven content
+differences**. `live-gap-census.json` names every original ID, native item and
+individual classification/reason. No live unit, message, review or gap changed.
+
+The lead's independent read-only startup census found 46 current dormant
+listeners requiring this one-time revalidation: 35 Sales_Profiler,
+5 agent-teams-plugin, 4 Smartpay_Backend and 2 SmartPay_Frontend. Their runs are
+23 completed, 15 cancelled and 8 blocked; none has a recovery error. All 298
+observations are reachable through current listeners' predecessor chains
+(112 hot, 186 archived), and all saved digests are unchanged. Past live startup
+recoveries took 10–83 seconds for 11–36 runs; this is context, not a timing
+guarantee for the upgrade. The candidate has not been run against live state.
+
+### Reproduction and static gates
+
+Run `W/calibrate.py`, `W/lifecycle.py`, `W/continuation.py` or `W/park.py` with
+`--plugin <installed-2.4.31-or-candidate> --candidate <working-tree-plugin>`
+and a fresh authorized fixture repository. Supply the recorded `--scenario`,
+`--repo` and `--output`; park runs select the unload window by default and the
+detach window with `--crash`. `W/message_proofs.py` and `W/revalidate.py` cover
+the final refusal/transport and double-restart checks. `W/publication.py`,
+`W/publication_guards.py` and `W/project.py` require the lead's `--publish`
+invocation. The exact invocations and returned evidence are in
+`W/final-report.md`; each successful publication has a corresponding lead log
+under `r2432/lead/`.
+
+`/opt/homebrew/bin/python3.15 -B W/static_checks.py W/static-final` runs the
+existing release checks: Python 3.15 compilation of all 98 plugin Python files;
+the 18-file Python 3.9.6 hook closure, including imports with `zlib`, `bz2`,
+`lzma`, `_bz2` and `_lzma` blocked; `hooks.py --check` (`compatible:true`,
+`jsonl-v1`); shell shim syntax; Ruff delta for `F821,F822,F823,F811,F841,F401`
+against installed 2.4.31; strict plugin and marketplace validation with isolated
+scratch configuration; changed-file whitespace and unchanged 2.4.31 manifest.
+The final exit codes and output are in `W/static-final/checks.json`. Patch
+reconstruction and before/after hashes are in `patch-verification.json` and
+`release-files.json`; `release.patch` excludes the lead's Change 2 in custody.py.
+
+Earlier failed recorder attempts are retained and excluded from the passing
+table: content-fault targeting/watermark selection (324), an assertion about an
+absent optional review field (325), joining a legitimate cold-start retry
+(326/327), entering the intended park window before automatic parking
+(330–334), accepting a recipient's immediate acknowledgement (341), and waiting
+for scoped startup recovery after the daemon begins accepting calls (349).
+They were corrected and rerun on fresh fixtures. The final audit also covered
+the general history observer: a settled observation must not advance
+`received_verified`, just as in dormant recovery and parking.
+
+The lead's final diff review found that a changed or missing saved item could
+leave an older observation at projection version 0 forever. Comparison now
+versions every revisited observation in the same transaction as its outcome,
+without changing its original received/saved evidence or settlement. The
+double-restart case proves the upgrade does not repeat on every start. The
+same review found an empty-object raw-receipt splice edge case; actual Store
+events for `{}`, `{ }` and surrounding whitespace now decode correctly.
+
+## Change 2 — the writer command gate
+
+The lead wrote this change, in `custody.py` only. Reds are on installed 2.4.31, greens on the candidate. The scripts
+are in `r2432/` of the same session scratchpad as **W**.
+
+- **Gate table** (`gate_table.py`, 154 commands: 64 to admit, 90 to refuse): the candidate matches every wanted
+  outcome. Installed 2.4.31 differs on 71: it refuses 38 that are admitted now, and admits 33 that are refused now.
+  The full table, with each code and reason, follows this list. Its last 16 command rows came with the turn-147 and
+  turn-148 review rounds (next sections).
+- **Bypass probes** (`probe_holes.py`, 27 commands that run Git in a real shell): 2.4.31 admits 18. The candidate
+  refuses all 27, each with a named reason.
+- **Real daemon** (`lead/gate_case.py`): a native fixture writer ran the commands through each daemon's gate.
+  - Installed 2.4.31 (repo-361, eight commands): `nice sh -c "true&&git … commit --allow-empty -qm gate-bypass"`
+    and `{git,commit} --allow-empty -qm brace-bypass` were admitted, and the writer committed (main be0479fc →
+    83d57ad8). The four false positives were refused, each with the same unnamed message.
+  - Candidate (repo-362; a `git archive` of e008d07 with only custody.py changed): the four false positives ran,
+    the four refusals each named their reason in the hook feedback the writer received, and main stayed at
+    be0479fc.
+  - Installed 2.4.31 again (repo-366, fourteen commands, after the turn-147 fix): `nice /usr/bin/GIT …
+    commit --allow-empty -qm case-bypass` was admitted as well as the two above, and the writer committed (main
+    454560cf → 1b5912c9). The heredoc-expansion and continuation forms and the quoted-delimiter control were
+    refused, each with the same unnamed message; 29/29 checks. The fourteen-command green runs in every final
+    re-run (below).
+- **Production scale** (`census_gate.py`, `census_join.py`): the live ledger read with mode=ro and the gate run as a
+  pure function, with no daemon machinery.
+  - 31,041 distinct writer commands (34,942 operations). 2.4.31 refuses 1,385 and the candidate 1,032.
+  - 375 are admitted now (393 operations).
+  - 22 are refused now. One runs the dashed `git-remote-sw-codex-no-push` program directly, three are
+    `python3.15 -c` scripts that call a `git(root, "commit", …)` helper, and 18 are interpreter `-c` scripts
+    whose text names Git with a capital letter, which the gate now reads in any letter case.
+  - The 741 commands that were admitted live but both versions refuse are the helper-free form naming a Homebrew
+    Cellar git path that has since been upgraded; the form must name the current binary.
+  - No live writer command is refused for an expansion or a continuation line in a heredoc body.
+
+| command | 2.4.31 | 2.4.32 | 2.4.32 reason |
+|---|---|---|---|
+| `python3 x.py 2>&1` | LEAD_RECORDS | admitted |  |
+| `python3 x.py > log 2>&1` | LEAD_RECORDS | admitted |  |
+| `python3 x.py >&2` | LEAD_RECORDS | admitted |  |
+| `python3 x.py 2>&-` | LEAD_RECORDS | admitted |  |
+| `python3 x.py 3<&0` | LEAD_RECORDS | admitted |  |
+| `python3 x.py &> log` | admitted | admitted |  |
+| `python3 x.py &>> log` | admitted | admitted |  |
+| `python3 x.py >\| log` | LEAD_RECORDS | admitted |  |
+| `python3 x.py 2>>err.log` | admitted | admitted |  |
+| `python3 - <<'EOF'\nprint(1)\nEOF` | LEAD_RECORDS | admitted |  |
+| `python3 - <<"EOF"\nprint('$HOME')\nEOF` | LEAD_RECORDS | admitted |  |
+| `python3 - <<EOF\nprint(1)\nEOF` | LEAD_RECORDS | admitted |  |
+| `cat > out.txt <<'EOF'\ngit commit is text here\nEOF` | LEAD_RECORDS | admitted |  |
+| `cat <<-EOF\n	indented $HOME\n	EOF` | LEAD_RECORDS | LEAD_RECORDS | expansion in an unquoted heredoc body read by cat (quote its delimiter: <<'EOF') |
+| `python3 - <<'A' && echo done\nprint(1)\nA` | LEAD_RECORDS | admitted |  |
+| `python3 x.py <<< 'print(1)'` | LEAD_RECORDS | admitted |  |
+| `grep -n git README.md` | LEAD_RECORDS | admitted |  |
+| `rg git src` | LEAD_RECORDS | admitted |  |
+| `cat a/git` | LEAD_RECORDS | admitted |  |
+| `head -5 git.log` | admitted | admitted |  |
+| `ls .git` | admitted | admitted |  |
+| `echo git` | admitted | admitted |  |
+| `jq .git f.json` | admitted | admitted |  |
+| `python3 x.py 2> err` | admitted | admitted |  |
+| `sort git.txt \| uniq -c` | admitted | admitted |  |
+| `shasum -a 256 .git/HEAD` | admitted | admitted |  |
+| `wc -l *.py` | admitted | admitted |  |
+| `git status` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+| `git status 2>/dev/null` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+| `git commit -m x` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+| `sh -c "git commit"` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+| `bash <<'EOF'\necho hi\nEOF` | LEAD_RECORDS | LEAD_RECORDS | a shell (bash) reading a script or its standard input |
+| `find . -exec git add {} ;` | LEAD_RECORDS | LEAD_RECORDS | find with an argument that mentions Git (its semantics are not established) |
+| `awk 'BEGIN{system("git")}'` | LEAD_RECORDS | LEAD_RECORDS | awk with an argument that mentions Git (its semantics are not established) |
+| `python3 - <<'EOF'\nimport subprocess; subprocess.run(['git', 'commit'])\nEOF` | LEAD_RECORDS | LEAD_RECORDS | python3 reading a heredoc or here-string that mentions Git (its semantics are not established) |
+| `python3 - <<EOF\nprint($(whoami))\nEOF` | LEAD_RECORDS | LEAD_RECORDS | expansion in an unquoted heredoc body read by python3 (quote its delimiter: <<'EOF') |
+| `python3 - <<EOF\n$X\nEOF` | LEAD_RECORDS | LEAD_RECORDS | expansion in an unquoted heredoc body read by python3 (quote its delimiter: <<'EOF') |
+| `` python3 - <<EOF\nprint(`id`)\nEOF `` | LEAD_RECORDS | LEAD_RECORDS | expansion in an unquoted heredoc body read by python3 (quote its delimiter: <<'EOF') |
+| `python3 x.py <<< 'git commit'` | LEAD_RECORDS | LEAD_RECORDS | python3 reading a heredoc or here-string that mentions Git (its semantics are not established) |
+| `python3 - <<'EOF'\nprint(1)` | LEAD_RECORDS | LEAD_RECORDS | an unterminated heredoc (no line equal to its delimiter) |
+| `E=/tmp/x; python3 "$E/a.py"` | LEAD_RECORDS | LEAD_RECORDS | parameter expansion |
+| `python3 $(echo x.py)` | LEAD_RECORDS | LEAD_RECORDS | command substitution |
+| `cat <(ls)` | LEAD_RECORDS | LEAD_RECORDS | process substitution |
+| `rg --pre git x` | LEAD_RECORDS | LEAD_RECORDS | rg --pre, which runs a program for each file |
+| `rg --pre=git x` | admitted | LEAD_RECORDS | rg --pre, which runs a program for each file |
+| `sort --compress-program=git x` | admitted | LEAD_RECORDS | sort --compress-program, which runs a program |
+| `gh pr create` | LEAD_PUBLISHES | LEAD_PUBLISHES | LEAD_PUBLISHES |
+| `xargs git add` | LEAD_RECORDS | LEAD_RECORDS | xargs, which runs code this reading never sees |
+| `python3 x.py 2>&1 \| sh` | LEAD_RECORDS | LEAD_RECORDS | a shell (sh) reading a script or its standard input |
+| `BASH_ENV=x python3 y.py` | LEAD_RECORDS | LEAD_RECORDS | the startup-code variable BASH_ENV |
+| `env git status` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+| `cat a > git` | admitted | admitted |  |
+| `python3 x.py > /tmp/git` | admitted | admitted |  |
+| `python3 x.py 2>&1>out.log` | LEAD_RECORDS | admitted |  |
+| `echo \<<EOF` | admitted | admitted |  |
+| `python3 - <<'EOF'\nprint(1)\nEOF\ngit commit -m x` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+| `python3 - <<EOF\ngi\\nt\nEOF` | LEAD_RECORDS | LEAD_RECORDS | a line continuation in an unquoted heredoc body (quote its delimiter: <<'EOF') |
+| `cat <<A; python3 - <<B\ntext\nA\nimport os; os.system('git push')\nB` | LEAD_RECORDS | LEAD_RECORDS | python3 reading a heredoc or here-string that mentions Git (its semantics are not established) |
+| `cat <<A; python3 - <<B\ngit text\nA\nprint(2)\nB` | LEAD_RECORDS | admitted |  |
+| `bash -c 'python3 -' <<'EOF'\nimport os; os.system('git push')\nEOF` | LEAD_RECORDS | LEAD_RECORDS | bash reading a heredoc or here-string that mentions Git (its semantics are not established) |
+| `sh -c "python3 - <<'X'\nprint(1)\nX"` | LEAD_RECORDS | admitted |  |
+| `exec 3>&1` | LEAD_RECORDS | admitted |  |
+| `python3 x.py <<` | LEAD_RECORDS | LEAD_RECORDS | a redirection without its target |
+| `python3 x.py >` | LEAD_RECORDS | LEAD_RECORDS | a redirection without its target |
+| `python3 x.py > >(cat)` | LEAD_RECORDS | LEAD_RECORDS | process substitution |
+| `rg -- --pre x` | admitted | admitted |  |
+| `sort --co=git x` | admitted | LEAD_RECORDS | sort --compress-program, which runs a program |
+| `python3 - <<\EOF\nprint('$x')\nEOF` | LEAD_RECORDS | admitted |  |
+| `echo 'import os; os.system("git push")' \| python3 -` | admitted | admitted |  |
+| `command -v docker kubectl aws gcloud node` | LEAD_RECORDS | admitted |  |
+| `command -V git` | LEAD_RECORDS | admitted |  |
+| `command -pv ruff` | LEAD_RECORDS | admitted |  |
+| `bash -n scripts/run_all_tests.sh` | LEAD_RECORDS | admitted |  |
+| `/bin/bash --version` | LEAD_RECORDS | admitted |  |
+| `sh -n x.sh` | LEAD_RECORDS | admitted |  |
+| `env -u NO_COLOR python3 x.py` | LEAD_RECORDS | admitted |  |
+| `env -u A -uB --unset=C X=1 python3 y.py` | LEAD_RECORDS | admitted |  |
+| `exec >log 2>&1` | LEAD_RECORDS | admitted |  |
+| `python3 x.py \\n2>&1` | LEAD_RECORDS | admitted |  |
+| `python3 x.py > >(cat)` | LEAD_RECORDS | LEAD_RECORDS | process substitution |
+| `command -p git commit` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+| `bash -n -c 'git commit'` | LEAD_RECORDS | LEAD_RECORDS | a shell (bash) reading a script or its standard input |
+| `env -u X git commit` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+| `env -uX sh -c 'git commit'` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+| `{git,commit} -m x` | admitted | LEAD_RECORDS | a pattern (glob or brace expansion) in the command position |
+| `/usr/bin/g?t commit -m x` | admitted | LEAD_RECORDS | a pattern (glob or brace expansion) in the command position |
+| `g[i]t commit -m x` | admitted | LEAD_RECORDS | a pattern (glob or brace expansion) in the command position |
+| `/usr/bin/gi* commit -m x` | admitted | LEAD_RECORDS | a pattern (glob or brace expansion) in the command position |
+| `nice {git,commit} -m x` | admitted | LEAD_RECORDS | nice with an argument that mentions Git (its semantics are not established) |
+| `nice sh -c "true;git commit"` | admitted | LEAD_RECORDS | nice with an argument that mentions Git (its semantics are not established) |
+| `nice sh -c "(git commit)"` | admitted | LEAD_RECORDS | nice with an argument that mentions Git (its semantics are not established) |
+| `timeout 60 sh -c "cd x&&git commit -m y"` | admitted | LEAD_RECORDS | timeout with an argument that mentions Git (its semantics are not established) |
+| `/Library/Developer/CommandLineTools/usr/libexec/git-core/git-commit -m x` | admitted | LEAD_RECORDS | a Git command |
+| `git-commit -m x` | admitted | LEAD_RECORDS | a Git command |
+| `echo git commit \| {fd}>out xargs` | admitted | LEAD_RECORDS | xargs, which runs code this reading never sees |
+| `{fd}>out git commit -m x` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+| `\\n {git,commit} -m x` | admitted | LEAD_RECORDS | a pattern (glob or brace expansion) in the command position |
+| `builtin eval "true;git commit"` | admitted | LEAD_RECORDS | eval, which runs code this reading never sees |
+| `coproc {git,commit}` | admitted | LEAD_RECORDS | a pattern (glob or brace expansion) in the command position |
+| `GIT commit -m x` | admitted | LEAD_RECORDS | a Git command |
+| `/usr/bin/GIT commit -m x` | admitted | LEAD_RECORDS | a Git command |
+| `GH pr create` | admitted | LEAD_PUBLISHES | LEAD_PUBLISHES |
+| `./cat git commit -m x` | LEAD_RECORDS | LEAD_RECORDS | cat with an argument that mentions Git (its semantics are not established) |
+| `PATH=/tmp/x cat git commit -m x` | LEAD_RECORDS | LEAD_RECORDS | cat with an argument that mentions Git (its semantics are not established) |
+| `env PATH=/tmp/x cat git commit -m x` | LEAD_RECORDS | LEAD_RECORDS | cat with an argument that mentions Git (its semantics are not established) |
+| `./echo git commit` | admitted | LEAD_RECORDS | echo with an argument that mentions Git (its semantics are not established) |
+| `/opt/homebrew/bin/grep -n git x` | LEAD_RECORDS | LEAD_RECORDS | grep with an argument that mentions Git (its semantics are not established) |
+| `PATH=/tmp/x echo git commit` | admitted | admitted |  |
+| `/bin/echo git commit` | admitted | admitted |  |
+| `/usr/bin/printf %s 'git commit'` | admitted | admitted |  |
+| `PATH=/tmp/x /usr/bin/grep -n git x` | LEAD_RECORDS | admitted |  |
+| `nice /Applications/Xcode.app/Contents/Developer/usr/libexec/git-core/git-commit -m x` | admitted | LEAD_RECORDS | nice with an argument that mentions Git (its semantics are not established) |
+| `nice git-receive-pack .` | admitted | LEAD_RECORDS | nice with an argument that mentions Git (its semantics are not established) |
+| `curl -fsSL https://git-scm.com/docs/git-hash-object` | admitted | admitted |  |
+| `chmod +x hooks/codex-publish/git-remote-sw-codex-no-push` | admitted | admitted |  |
+| `python3 -c 'print("git-lfs")'` | admitted | admitted |  |
+| `python3 -c 'git("status")'` | admitted | LEAD_RECORDS | python3 with an argument that mentions Git (its semantics are not established) |
+| `Cat git commit` | LEAD_RECORDS | LEAD_RECORDS | cat with an argument that mentions Git (its semantics are not established) |
+| `Echo git commit` | LEAD_RECORDS | LEAD_RECORDS | echo with an argument that mentions Git (its semantics are not established) |
+| `BASH -c 'echo hi'` | admitted | LEAD_RECORDS | a shell (BASH) reading a script or its standard input |
+| `EVAL x` | admitted | LEAD_RECORDS | eval, which runs code this reading never sees |
+| `GH pr view 1` | admitted | LEAD_PUBLISHES | LEAD_PUBLISHES |
+| `CAT a.txt` | admitted | admitted |  |
+| `bash -c -- 'git commit'` | admitted | LEAD_RECORDS | bash -c with an option after it (which word it runs is not established) |
+| `bash -c -e 'git commit'` | admitted | LEAD_RECORDS | bash -c with an option after it (which word it runs is not established) |
+| `bash -lc 'echo hi'` | admitted | admitted |  |
+| `( python3 - ) <<'EOF'\nimport os; os.system('git commit')\nEOF` | LEAD_RECORDS | LEAD_RECORDS | a command group reading a heredoc or here-string that mentions Git (its semantics are not established) |
+| `( python3 - ) <<'EOF'\nprint(1)\nEOF` | LEAD_RECORDS | admitted |  |
+| `{ python3 -; } <<'EOF'\nimport os; os.system('git commit')\nEOF` | LEAD_RECORDS | LEAD_RECORDS | a command group reading a heredoc or here-string that mentions Git (its semantics are not established) |
+| `exec <<'EOF'\nimport os; os.system('git commit')\nEOF\npython3 -` | LEAD_RECORDS | LEAD_RECORDS | exec reading a heredoc or here-string that mentions Git (its semantics are not established) |
+| `exec 3<<'EOF'\nimport os; os.system('git commit')\nEOF\npython3 /dev/fd/3` | LEAD_RECORDS | LEAD_RECORDS | exec reading a heredoc or here-string that mentions Git (its semantics are not established) |
+| `if X=1 /usr/bin/g?t commit -m x; then :; fi` | admitted | LEAD_RECORDS | a pattern (glob or brace expansion) in the command position |
+| `PATH=/tmp/x sh -c 'cat git commit'` | LEAD_RECORDS | LEAD_RECORDS | cat with an argument that mentions Git (its semantics are not established) |
+| `sh -c 'cat git commit'` | LEAD_RECORDS | admitted |  |
+| `cat <<EOF\n$(git commit --allow-empty -qm probe-a)\nEOF` | LEAD_RECORDS | LEAD_RECORDS | expansion in an unquoted heredoc body read by cat (quote its delimiter: <<'EOF') |
+| `cat <<true\ntr\\nue\ngit commit --allow-empty -qm probe-b\ntrue` | LEAD_RECORDS | LEAD_RECORDS | a line continuation in an unquoted heredoc body (quote its delimiter: <<'EOF') |
+| `nice /usr/bin/GIT commit --allow-empty -qm probe-c` | admitted | LEAD_RECORDS | nice with an argument that mentions Git (its semantics are not established) |
+| `cat <<'true'\ntr\\nue\ngit commit --allow-empty -qm probe-d\ntrue` | LEAD_RECORDS | admitted |  |
+| `` printf %s <<EOF\n`git commit --allow-empty -qm probe-e`\nEOF `` | LEAD_RECORDS | LEAD_RECORDS | expansion in an unquoted heredoc body read by printf (quote its delimiter: <<'EOF') |
+| `echo hi <<EOF\n$(git commit --allow-empty -qm probe-f)\nEOF` | LEAD_RECORDS | LEAD_RECORDS | expansion in an unquoted heredoc body read by echo (quote its delimiter: <<'EOF') |
+| `command -v ls <<EOF\n$(git commit --allow-empty -qm probe-g)\nEOF` | LEAD_RECORDS | LEAD_RECORDS | expansion in an unquoted heredoc body read by command (quote its delimiter: <<'EOF') |
+| `cat <<-true\n	tr\\nue\ngit commit --allow-empty -qm probe-h\ntrue` | LEAD_RECORDS | LEAD_RECORDS | a line continuation in an unquoted heredoc body (quote its delimiter: <<'EOF') |
+| `cat <<EOF \| sort\n$(git commit)\nEOF` | LEAD_RECORDS | LEAD_RECORDS | expansion in an unquoted heredoc body read by cat (quote its delimiter: <<'EOF') |
+| `( cat ) <<EOF\n$(git commit)\nEOF` | LEAD_RECORDS | LEAD_RECORDS | expansion in an unquoted heredoc body read by a command group (quote its delimiter: <<'EOF') |
+| `cat <<EOF\nplain text\nEOF` | LEAD_RECORDS | admitted |  |
+| `cat <<EOF\na literal backslash \\\nEOF` | LEAD_RECORDS | admitted |  |
+| `nice /usr/bin/Git commit -m x` | admitted | LEAD_RECORDS | nice with an argument that mentions Git (its semantics are not established) |
+| `python3 -c 'GIT("status")'` | admitted | LEAD_RECORDS | python3 with an argument that mentions Git (its semantics are not established) |
+| `/bin/bash -n +n -c 'git commit --allow-empty -m bypass'` | LEAD_RECORDS | LEAD_RECORDS | a shell (bash) reading a script or its standard input |
+| `bash -n --norc x.sh` | LEAD_RECORDS | admitted |  |
+| the helper-free form (`gitio.safe_shell_git`) of `git status --short` | admitted | admitted |  |
+| the helper-free form (`gitio.safe_shell_git`) of `git status --short 2>&1` | LEAD_RECORDS | admitted |  |
+| the helper-free form (`gitio.safe_shell_git`) of `git status --short 2>/dev/null \| head -5` | admitted | admitted |  |
+| the helper-free form (`gitio.safe_shell_git`) of `git commit --short` | LEAD_RECORDS | LEAD_RECORDS | a Git command |
+
+## Review fix round — code_review turn 147
+
+The blind review of the staged release (session 01a14eac, turn 147) found three HIGH defects, all in the Change 2
+gate. The lead measured each in real shells before fixing it. `lead/shell_probe.py` gives each command a fresh
+disposable repository with one commit, runs it with `-c` in /bin/bash, /bin/sh and /bin/zsh, and reads whether HEAD
+gained a commit (24 runs). Gate columns: installed 2.4.31, comp2 (the reviewed code) and the fixed working tree.
+
+| form | bash, sh, zsh | 2.4.31 | comp2 | fixed |
+|---|---|---|---|---|
+| A: `cat <<EOF`, a body holding `$(git commit …)` | commits | refused | admitted | refused |
+| B: `cat <<true`, the delimiter split as `tr\` + `ue`, then a `git commit …` line | commits | refused | admitted | refused |
+| C: `nice /usr/bin/GIT commit …` | commits | admitted | admitted | refused |
+| D: B with a quoted delimiter (`<<'true'`), the control | no commit | refused | admitted | admitted |
+| E: `printf %s <<EOF`, a body holding a backticked `git commit …` | commits | refused | admitted | refused |
+| F: `echo hi <<EOF`, a body holding `$(git commit …)` | commits | refused | admitted | refused |
+| G: `command -v ls <<EOF`, a body holding `$(git commit …)` | commits | refused | admitted | refused |
+| H: B with `<<-` and a tab before the split delimiter | commits | refused | admitted | refused |
+
+- **Expansion in a heredoc read by an admitted command** (A, E, F, G). The shell expands an unquoted body before
+  the command that reads it starts, whatever that command is. comp2 checked the body only on the way to an
+  interpreter's answer, so a data-only tool, `echo`, `printf` or `command -v` admitted it. `heredoc_expansion` now
+  runs before any answer that admits, and for a group's or `exec`'s heredoc.
+- **A delimiter split across lines** (B, H). In an unquoted body the shell joins a line ending in an escaping
+  backslash to the next line before it compares the delimiter, so `tr\` + `ue` ends a `<<true` heredoc and the
+  lines after it run as commands. comp2 compared the lines unjoined and read those commands as body text. Such a
+  line in an unquoted body now refuses, naming it. A quoted body joins nothing and is read as before. The old
+  joining of escaped newlines in `stdin_refusal` is gone: the refusal covers it.
+- **Upper-case Git behind a wrapper** (C, an old hole). `GIT_WORD` matched only lower case, so an argument naming
+  `/usr/bin/GIT`, which runs git on the default case-insensitive macOS file system, passed an unknown wrapper. It
+  now matches in any case, as the command position already did. The cost is the census's 18 interpreter `-c`
+  scripts whose prose names Git with a capital letter.
+- Re-measured on the fixed tree: the gate table (14 rows added; `cat <<-EOF` with `$HOME` in an unquoted body is
+  now wanted refused), the 27 probes, the census and the real-daemon red, all in the Change 2 section above. The
+  Python 3.9.6 interpreter compiles the fixed custody.py.
+
+## Review round — code_review turn 148
+
+The follow-up review (same session, turn 148) confirmed the three turn-147 fixes against the shell measurements;
+none remains open. It found three more HIGH gate findings, each a counterexample derived from shell and tool
+sources, not executed by the reviewer.
+
+- **A 2.4.32 regression, fixed.** The `-n` syntax-check exemption, new in 2.4.32, read a shell's options only up
+  to the first word not starting with `-`. An option starting with `+` (`+n` turns `-n` off), and everything after
+  it, went unread. The exemption now reads every leading option word, `+` ones included, and holds only when no
+  option but `--noprofile` or `--norc` stands beside `-n`. This only narrows what is admitted. The reviewer's
+  counterexample and a control are the gate table's last two command rows. The live census is unchanged on the
+  31,042 commands both reads hold, and the Python 3.9.6 interpreter compiles the file.
+- **Two limits already in 2.4.31, shipped as known limits.** This follows the project's rule for guardrail findings
+  already present in a released version: document them and plan the fix for the next release, with no further
+  review round. A pattern in a wrapper's program argument is not refused, since patterns are refused only in the
+  command position. A zsh glob qualifier, which can run code while the shell expands a filename, is not recognized.
+  The README lists both under the gate's known limits.
+
+## Lead review fix and final re-runs
+
+**Review fix (lead, after delivery).** Change 1 added two reads of every listener record: `dormancy.refresh` (each
+settlement, park completion and dormant recovery) and `parking.seal_guard` (each seal and publication). On the live
+ledger (mode=ro) its 4,624 listener records, 73.8 MB, take 0.355 s to read and decode, on the event loop. Both now
+select by index with the same predicate: a run's listeners by their parent (each listener is stored under its run), a
+unit's by the `retention_listener_unit` partial index. On the live ledger both selections equal the full scans for
+all 178 units and 178 runs, at 0.13–0.15 ms each.
+
+**Final re-runs.** The lead re-ran every accepted Change 1 recorder and the Change 2 real-daemon case on frozen
+`git archive` compositions of the staged release tree, each on a fresh fixture repository; the upgrade cases start
+on installed 2.4.31.
+
+| Composition | Tree | Cases | Checks | Result |
+|---|---|---:|---:|---|
+| comp1, before the review fix | `e3827d15` | 12 | 197/197 | every recorder exit 0 |
+| comp2, the code reviewed at turn 147 | `cdd91d9c` | 12 | 197/197 | every recorder exit 0 (project: see below) |
+| comp3, after the turn-147 fix | `591dc47e` | 12 | 214/214 | every recorder exit 0 |
+| comp4, after the turn-148 fix, the release code | `9808f082` | 12 | 214/214 | every recorder exit 0 |
+
+- comp2's first project run (repos 357/358) failed its first check. Its seal, sent as the run completed, met the
+  finished writer's automatic park 0.27 s in (step `fenced`), and the candidate refused it with retryable
+  `PARK_IN_PROGRESS`, naming the listener, run and step. That is the Change 1 contract; the writer's recorder seals
+  once without retrying. The lead's `W/project_seal_retry.py` (project.py with its three seals retried on
+  `PARK_IN_PROGRESS`, each refusal recorded) then passed 19/19 on repos 331/332 with no retry needed. The comp3
+  and comp4 project cases seal through it; no seal met a park.
+- The comp3 and comp4 gate cases (repos 365 and 367) each ran the fourteen commands, 40 checks. The eight
+  Git-running forms and the parameter expansion were refused, each naming its reason in the writer's hook
+  feedback. The five others ran, the quoted-delimiter control among them, and main did not move.
+- Static gates on comp2, comp3 and comp4, with the same results, all exit 0 except the informational codec-blocked
+  full closure:
+  - Python 3.15 compile of 98 files;
+  - the Python 3.9.6 hook closure compiles and imports (custody.py, dormancy.py and messages.py are among its
+    coordinator modules);
+  - the hook-runtime modules import under 3.9 with codecs blocked;
+  - `hooks.py --check`;
+  - Ruff delta against 2.4.31: 31/31, none added;
+  - strict plugin and marketplace validation;
+  - version 2.4.32.
+- Evidence: `r2432/lead/final1/` to `final4/` (results.json and a log per case). Each case's summary is under
+  `W/final1-*` to `W/final4-*`, and `r2432/lead/final*-gate-*` for the gate case.
+- The turn-148 fix was verified by these re-runs and the gate table, not by another review round, under the rule
+  stated in the turn-148 section.
+- The committed tree differs from comp4 only in this section.
+
+## Historical 2.4.31 — publication rights after failed admission — 2026-11-01
 
 Base is **cd3042c25a77a09d8b7013be42da92b3ea1fee15** (2.4.30).
 Evidence root (**W**) is

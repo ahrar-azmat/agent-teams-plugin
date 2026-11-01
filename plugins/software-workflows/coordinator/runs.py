@@ -114,11 +114,13 @@ class Runs:
         keep, read in SQL rather than decoded whole. A dormant listener's record is ~100 KB; the profiles were 130 of
         the 420 KiB of one run/list answer (10-29, 91 runs)."""
         row = self.store.db.execute("SELECT json_extract(data,'$.state'), json_extract(data,'$.dormant_at'), "
-                                    "json_extract(data,'$.dormant_reason'), json_extract(data,'$.history_gaps') "
+                                    "json_extract(data,'$.dormant_reason'), json_extract(data,'$.history_gaps'), "
+                                    "json_extract(data,'$.history_settled') "
                                     "FROM records WHERE id=?", (ident,)).fetchone()
-        state, dormant_at, reason, gaps = row if row else (None, None, None, None)
+        state, dormant_at, reason, gaps, settled = row if row else (None, None, None, None, None)
         return {"state": state, "dormant_at": dormant_at, "dormant_reason": reason,
-                "history_gaps": json.loads(gaps) if gaps is not None else None}
+                "history_gaps": json.loads(gaps) if gaps is not None else None,
+                "history_settled": json.loads(settled) if settled is not None else None}
 
     async def listing(self, cwd, limit=50):
         """run/list, which the Codex Office asks for every 2 s and gives up on after 2 s (office.py NATIVE_TIMEOUT_S).
@@ -161,6 +163,7 @@ class Runs:
         subjects.update(row["id"] for row in self.store.db.execute(
             "SELECT id FROM records WHERE kind='message' AND json_extract(data,'$.unit')=?", (run["unit"],)))
         subjects.update(r["id"] for r in self.store.all("listener", run["id"]))
+        subjects.update(r["id"] for r in self.store.all("history_gap", run["id"]))
         from . import archive
         from .locks import finish_thread
         rows = await archive.page(self.store, subjects, cursor, limit + 1)
@@ -978,7 +981,7 @@ class Runs:
             if self.store.unresolved(run["checkout"]):
                 raise CoordinatorError("RECOVERY_UNKNOWN", "Resolve UNKNOWN before resuming")
             from .publish import Publisher
-            await Publisher(self.daemon).quiescent(self.store.get(run["unit"]))
+            await Publisher(self.daemon).quiescent(self.store.get(run["unit"]), history=False)
             # Read after the awaits above. A cancel requested since this resume began (run/interrupt does not wait for
             # this lock) is the newer request and stands. Nothing awaits between this read and the save.
             run = self.store.get(run["id"])

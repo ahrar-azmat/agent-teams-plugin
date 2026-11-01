@@ -120,7 +120,8 @@ class Writer:
         connection = self.daemon.connections.get(listener["id"])
         self.daemon.check_native_stop()
         if (run.get("cancel_requested") or phase["state"] != "prepared" or phase["input_id"] != input_id
-                or self.unbound(listener) or self.daemon.hook_stale(listener)):
+                or self.unbound(listener) or self.daemon.hook_stale(listener)
+                or self.store.get(run["unit"])["state"] != "open"):
             return
         # Validate again after acquiring custody, before persisting a submitting
         # state. A lost RPC after that state remains uncertain, never replayed.
@@ -129,6 +130,7 @@ class Writer:
         run.update(production_started=True, state="running")
         with self.store.transaction():
             phase["input"] = self.daemon.messages.prefix_held(actor, input_id, phase["input"])
+            phase["input"] = self.daemon.dormancy.notice(actor, phase["input"])
             phase["input_digest"] = digest(phase["input"])
             self.store.save(run)  # Durable before the RPC, including held mail.
         self.starting.add(input_id)

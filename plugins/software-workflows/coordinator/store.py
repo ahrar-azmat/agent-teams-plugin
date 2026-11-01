@@ -610,9 +610,20 @@ class Store:
                 self.db.execute("PRAGMA fullfsync=" + str(prior))
 
     @telemetry.measured("sql_work", False)
-    def event(self, kind, subject, data):
+    def event(self, kind, subject, data, *, native_json=None):
+        # Native MCP persistence previews contain serialized JSON. Sorting the
+        # original notification destroys evidence needed to reproduce them.
+        # Keep its raw subvalues (including number spelling), in raw-v2 archives
+        # as well as the hot journal. Ordinary record identities stay canonical.
+        if native_json is not None:
+            if kind != "native" or not native_json.lstrip().startswith("{"):
+                raise ValueError("Raw receipts must be native JSON objects")
+            body = native_json.lstrip()[1:]
+            payload = '{"_coordinator_receipt_version":2' + ("" if body.lstrip().startswith("}") else ",") + body
+        else:
+            payload = encoded(data)
         sequence = self.db.execute("INSERT INTO events(time,kind,subject,data) VALUES(?,?,?,?)",
-                                   (time.time(), kind, subject, encoded(data))).lastrowid
+                                   (time.time(), kind, subject, payload)).lastrowid
         if self.retention_wake and kind in ('native', 'listener/park_abandoned'):
             self.retention_wake()
         return sequence
@@ -633,7 +644,7 @@ class Store:
                 self.watched[written[0][0]] += 1
             if kind in {"run", "unit", "actor", "listener", "checkout", "claim", "custody", "message", "claim_request",
                         "release_request", "custody_request", "participant", "publication", "publication_group", "project_revision", "resolution",
-                        "writer_retry", "writer_retirement"}:
+                        "writer_retry", "writer_retirement", "history_gap"}:
                 self.status_epoch += 1
             self.puts[kind] += 1
         if kind == "listener":

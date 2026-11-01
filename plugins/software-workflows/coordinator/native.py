@@ -508,7 +508,7 @@ class Journal:
                     oldest_seconds=max(0, time.monotonic() - oldest) if oldest is not None else 0,
                     failed=self.error is not None)
 
-    async def put(self, message, size):
+    async def put(self, message, size, raw=None):
         self.received += 1
         ordinal, arrived = self.received, time.monotonic()
         self.metrics["received_bytes"] += size
@@ -527,7 +527,7 @@ class Journal:
             if size > JOURNAL_QUEUE_BYTES:
                 self.metrics["oversized_messages"] += 1
             self.bytes += size
-            self.queue.append((ordinal, message, size, arrived))
+            self.queue.append((ordinal, message, size, arrived, raw))
             queued = True
             self.metrics["max_queue_bytes"] = max(self.metrics["max_queue_bytes"], self.bytes)
             self.metrics["max_queue_count"] = max(self.metrics["max_queue_count"], self.received - self.committed)
@@ -542,7 +542,7 @@ class Journal:
                 # too. Hand off that one extra message before joining the owner;
                 # no more frames can be read. Forced stop keeps crash semantics.
                 self.bytes += size
-                self.queue.append((ordinal, message, size, arrived))
+                self.queue.append((ordinal, message, size, arrived, raw))
                 self.metrics["max_queue_bytes"] = max(self.metrics["max_queue_bytes"], self.bytes)
                 self.metrics["max_queue_count"] = max(self.metrics["max_queue_count"], self.received - self.committed)
                 self.ready.set()
@@ -850,7 +850,8 @@ class Connection:
                     metrics["messages"] += 1
                     metrics["max_json_bytes"] = max(metrics["max_json_bytes"], size)
                 began = time.perf_counter()
-                message = json.loads(b"".join(chunks).decode("utf-8"))
+                raw = b"".join(chunks).decode("utf-8")
+                message = json.loads(raw)
                 decode_seconds = time.perf_counter() - began
                 chunks, fragmented = [], False
                 method = self.request_methods.pop(message.get("id"), None) if "method" not in message else None
@@ -872,7 +873,7 @@ class Connection:
                             self.response_ordinals[message["id"]] = self.intake.received
                         future.set_result(message)
                 elif self.intake is not None:
-                    await self.intake.put(message, size)
+                    await self.intake.put(message, size, raw)
                 else:
                     # Callback only journals/enqueues. Never await a hook/tool here.
                     if before_event := getattr(self, "before_event", None):

@@ -210,7 +210,7 @@ class History:
                                 raise
                         else:
                             cp = self.checkpoint(actor)
-                            if cp and not compared["gaps"]:
+                            if cp and not compared["gaps"] and not compared.get("unverified"):
                                 cp["received_verified"] = compared["through"]
                                 self.store.save(cp)
                                 self.daemon.retention.request(listener["id"])

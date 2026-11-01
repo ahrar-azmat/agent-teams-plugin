@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.31 / P1
+# Writer coordinator — software-workflows 2.4.32 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -8,9 +8,83 @@ coordinator. The package does not import `server.py`; the MCP server uses the
 same Python client and JSONL RPC as the CLI. Actual verification results are in
 [VERIFY.md](VERIFY.md).
 
-Version 2.4.31 returns publication rights taken by a run that fails before
-production. Version 2.4.30's content storage and permanent writer-failure retry
-behavior and 2.4.29's review bindings remain in force.
+Version 2.4.32 lets a sealed unit whose saved history has gaps reopen or be
+abandoned, lets the lead settle named gaps with a recorded reason, and reads
+writer shell commands at a stricter gate that names every refusal. Version
+2.4.31's return of publication rights taken by a run that fails before
+production, 2.4.30's content storage and permanent writer-failure retry
+behavior, and 2.4.29's review bindings remain in force.
+
+## Sealed units and history gaps (2.4.32 Change 1)
+
+`coordinator_unit(action="reopen", unit=...)` and
+`coordinator_unit(action="abandon", unit=...)` leave a sealed candidate even
+when its saved history is incomplete or differs from received evidence. An
+exited writer's independently established process-family exit is sufficient for
+this lifecycle transition. Execution, custody and in-flight operation checks
+still apply. Abandonment accepts a seal with no publication journal; an existing
+journal must still be proved unapplied. Project units retain any installed
+publication prefix. Reopening invalidates the old review and requires a new one.
+
+Sealing and publication continue to require saved-history evidence. Their other
+checks are unchanged: UNKNOWN, verified receipts, publication rights, current
+working content, repository/base identity, review binding and publication-journal
+state. A history settlement supplies none of these proofs.
+
+Native receipts now retain the original notification JSON, marked
+`_coordinator_receipt_version: 2`. Projection version **2** keeps every item
+field and accepts only the native 0.163.0 persistence forms:
+
+| Native item | Allowed representation change |
+|---|---|
+| `commandExecution` | Only `aggregatedOutput`: exact UTF-8 middle truncation to **65,536 bytes**, including `\n... command output truncated for persistence ...\n`. |
+| `mcpToolCall` | Only `result`: exact native preview and wrapper within **65,536 serialized bytes**. Original nested JSON ordering is retained; native's omitted `isError` has the three exact alternatives absent, false and true. |
+| Every other item type | Full equality; no fields are dropped. |
+
+The projection is calibrated with actual code-mode command/MCP notifications
+and `thread/items/list`, including Unicode, escaping, structured content and
+nested metadata. A retained-content change still produces a gap. Older receipts
+recursively sorted object keys. The measured simple text-block ordering can be
+reconstructed and accepted only by exact equality; arbitrary lost nested order
+is reported as `legacy_serialization_unverified`, not asserted to be a content
+difference. Raw-v2 event archives preserve the new representation unchanged.
+
+Gap records have `unresolved`, `matched` or `settled` state. Upgrade and recovery
+revisit legacy observations, including already-dormant listeners and receipts
+before old verification watermarks. Exact matches retire old active gaps while
+retaining their evidence. Missing or unreadable evidence remains unresolved.
+An attached lead can call
+`coordinator_unit(action="settle-history", unit=..., gaps=[...], reason="...")`
+with explicit gap IDs and a nonblank reason. All IDs must belong to that unit.
+The durable decision records its lead actor, reason, time and exact observation
+fingerprint, and emits `history/settled`. Repeating it is idempotent. A changed
+saved item creates a new unresolved observation. Settlement does not advance
+receipt-verification watermarks or permit retention to delete unverified receipts.
+
+Unit status includes all history observations; run/listener status lists active
+and settled gap IDs, and daemon status counts them separately. Explicit resume
+and message-triggered input include `C1_HISTORY_GAPS` with affected threads and
+whether the observations remain unresolved or were settled. Descendant evidence
+is included in the writer-family warning.
+
+Seal and publication reserve the unit against a new park before awaiting native
+quiescence. An existing park refuses with retryable `PARK_IN_PROGRESS`, naming
+the run, listener and stage; retry after it finishes. A failed replacement seal
+retains the prior sealed binding and review, including when startup recovers an
+interrupted attempt. Retaining a seal does not bypass publication's current
+content checks. Loaded-thread terminal APIs are not requested for an unloaded
+thread.
+
+Message delivery, draining and status use the same eligibility decision. Pending
+mail for a sealed/frozen unit, blocked run, lead decision or held retry stays
+durable without holding drain; submitted or uncertain delivery still holds it
+until reconciled. Unit status names `waiting_messages` with message IDs and
+reasons such as `unit_sealed` and `run_blocked`. Reopen permits completed writers
+to receive waiting mail; a blocked writer additionally needs an explicit resume.
+`coordinator_withdraw(message=...)` lets the original lead sender's session
+withdraw mail only when every delivery attempt is proved not delivered. It
+preserves text and attempts, records `message/sender_withdrew`, and does not
+acknowledge on the recipient's behalf. `message/retry` refuses withdrawn mail.
 
 ## Publication rights after an admission failure
 
@@ -395,8 +469,8 @@ the lead will do it on this machine after the live switch.
 
 ## Codex publishing policy
 
-The lead (Claude) publishes. Codex leaves edits uncommitted. Native writers still
-refuse unestablished Git commands at the coordinator gate. Their visible `gh`
+The lead (Claude) publishes. Codex leaves edits uncommitted. Native writers'
+shell commands pass the coordinator's command gate (below). Their visible `gh`
 mutation commands now refuse with `LEAD_PUBLISHES`; known built-in read paths and
 API GET/HEAD without field/input flags remain available. The gate reads command
 text, so an arbitrary program can hide a `gh` invocation.
@@ -477,6 +551,56 @@ hashes. Their unexplained changes are UNKNOWN and block publication. One
 exception rests on timing: a lead Bash command whose armed window stays globally
 quiet is recorded as `lead-command` throughout its reconciliation reach (see the
 Bash contract below and its known limits).
+
+### The writer command gate (2.4.32 Change 2)
+
+Every native writer shell command is read before it runs
+(`custody.command_refusal_reason`). The gate admits only what it can read as never
+running Git, and every refusal names its reason, so a writer can fix the command.
+
+- **Git.** `git` or a dashed Git program (`git-commit`) at a command position
+  refuses `LEAD_RECORDS` ("a Git command"), in any letter case. The one admitted Git
+  form is the helper-free read form that the refusal prints (`gitio.safe_shell_git`);
+  redirections after it do not change that.
+- **Command positions.** The gate reads the command word of each simple command,
+  after assignments and keywords, and through `command`, `exec`, `env`, `nohup`,
+  `builtin`, `coproc` and `sh -c` (the word right after its option cluster; an option
+  after it refuses). A glob or brace expansion there refuses. `eval`, `source`, `.`,
+  `xargs`, `sudo`, `time`, `alias` and `function` refuse, as does a shell reading a
+  script or its standard input (excepted: `--version`, and its `-n` syntax check
+  with no other option than `--noprofile` or `--norc`).
+- **Data.** A redirection and its target are never a command. A heredoc or
+  here-string given to an interpreter is checked like its arguments, as is one given
+  to a group (`( … )`, `{ …; }`, `done`, `fi`, `esac`) or to `exec` without a
+  command, whose commands read it. An unquoted heredoc body with `$` or a backtick
+  refuses whatever command reads it: the shell expands it before that command
+  starts. So does a line in such a body that ends in an escaping backslash, which
+  the shell joins to the next line before it looks for the delimiter. Quoting the
+  delimiter (`<<'EOF'`) makes the body plain text.
+- **Data-only tools.** grep, rg, cat, head, tail, wc, ls, stat, file, diff, cmp,
+  sort, uniq, cut, tr, shasum and sha256sum never run their arguments, so any words
+  are admitted there, except `rg --pre` and `sort --compress-program`. The trust is
+  by exact name: the shell's own lookup with nothing in front, or a tool in /bin or
+  /usr/bin. The `echo` and `printf` builtins are admitted the same way when named
+  without a path, or from /bin or /usr/bin.
+- **Anything else.** Another program is admitted unless an argument or its heredoc
+  mentions Git, in any letter case, as a word of its own: a path's last part, a
+  shell word, an option's value, a call, or a command in text that an inner shell
+  may run.
+- **Expansions.** Parameter, command and arithmetic expansion refuse: the gate never
+  evaluates shell text.
+
+**Known limits:** the gate reads command text. It does not establish code that an
+interpreter runs from a file, `-c` text that builds a Git command without naming it,
+text piped into an interpreter (`echo … | python3 -`), a program planted under a
+trusted name or a copy of Git under another name, or an alias or function that a
+shell startup file defines (Codex runs writer commands in the user's login shell,
+`zsh -lc` here, which reads its login startup files). Two limits found by the
+2.4.32 review were already in 2.4.31; a fix is planned for the next release. A
+pattern (glob or brace) is refused only in the command position, so one in a
+wrapper's program argument is not refused. A zsh glob qualifier, which can run
+code while the shell expands a filename, is not recognized. The push guard above
+stays in place as a separate layer, with its own limits.
 
 ## Start and discover
 

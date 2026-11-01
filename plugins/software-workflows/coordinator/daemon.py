@@ -350,7 +350,7 @@ class Daemon:
                                       required=False) or {}
             writers.append({"run": run["id"], "unit": unit["id"], "task": run["task"], "state": self.runs.reported(run)[0],
                             "capabilities": listener.get("capabilities"),
-                            "listener": {**{k: listener.get(k) for k in ("state", "dormant_at", "dormant_reason", "history_gaps", "writer_profile",
+                            "listener": {**{k: listener.get(k) for k in ("state", "dormant_at", "dormant_reason", "history_gaps", "history_settled", "history_projection", "writer_profile",
                                 "recovery_state", "recovery_error", "recovery_retryable", "recovery_version")},
                                 "quarantined": listener.get("recovery_state") == "failed",
                                 "retirement": self.parking.intent(listener.get("id", "")),
@@ -363,7 +363,8 @@ class Daemon:
                             **participants.surface(self, unit),
                             "pending_requests": [r for kind in ("claim_request", "release_request", "custody_request")
                                                  for r in self.store.all(kind, unit["id"]) if r["state"] in ("pending", "pending_lead", "waiting")],
-                            "messages": [m for m in messages if m.get("unit") == unit["id"] and m["state"] != "acknowledged"]})
+                            "messages": [dict(m, eligibility=self.messages.eligibility(m)) for m in messages
+                                         if m.get("unit") == unit["id"] and m["state"] != "acknowledged"]})
         if rebuild:
             self.writer_status[checkout] = (epoch, writers)
         return {"ready": self.ready, "generation": self.store.generation, "pid": os.getpid(),
@@ -629,9 +630,7 @@ class Daemon:
     def delivery_owed(self, message):
         """A native turn can still start for this message, or a native delivery of it is still to be settled: one in
         flight (submitting, submitted, uncertain) or pending with a wake. Never a lead's mail (lead_mail)."""
-        if message["state"] in ("entered_context", "acknowledged") or self.lead_mail(message):
-            return False
-        return message["delivery"] in ("submitting", "submitted", "uncertain") or message["delivery"] == "pending" and message["wake"] != "none"
+        return self.messages.eligibility(message)["state"] in ("runnable", "in_flight")
 
     def writer_owed(self, unitid):
         """Work that only the unit's writer can start or settle: its run is unfinished, the unit is not quiet (a turn,
@@ -1342,7 +1341,7 @@ class Daemon:
                 # SQLite closes, including after the forced-stop intake fence.
                 self.store.event("native/close_escalated", ident, message["params"])
                 return
-            inbound_batch([(0, message, 0, time.monotonic())])
+            inbound_batch([(0, message, 0, time.monotonic(), None)])
 
         def inbound_batch(entries):
             if self.native_intake_closed:
@@ -1354,10 +1353,10 @@ class Daemon:
             # notification worker is behind; a live request is still owned by this
             # generation even before its handler has been scheduled.
             with self.store.transaction():
-                for _, message, _, _ in entries:
+                for _, message, _, _, raw in entries:
                     trace = self.completion_trace(listener, message)
                     with telemetry.using([trace]):
-                        sequence = self.store.event("native", ident, message)
+                        sequence = self.store.event("native", ident, message, native_json=raw)
                         if "id" in message:
                             self.store.put("native_obligation", "native_obligation:" + str(sequence),
                                 {"sequence": sequence, "generation": self.store.generation, "state": "pending"}, ident)
@@ -2917,8 +2916,7 @@ class Daemon:
             # A lead reads its mail through its inbox, so no native turn starts for it: unread lead mail is no
             # delivery in flight, and a stop never waits for it. Nor for mail not yet sent to a writer the retry
             # policy holds (held_by_retry).
-            "deliveries": sum(self.delivery_owed(m) and not (m["delivery"] == "pending" and self.held_by_retry(
-                (self.store.get(m["recipient"], required=False) or {}).get("run"))) for m in self.store.all("message")),
+            "deliveries": sum(self.delivery_owed(m) for m in self.store.all("message")),
             "lead_hooks": len(hooks), "lead_operations": len(lead_operations),
             "external_editors": len(pending_executors(self.store)),
             "other_operations": len(operations) - len(lead_operations),
@@ -3297,6 +3295,8 @@ class Daemon:
             return {"message": message["id"], "wake": message["wake"]}
         if method == "message/retry":
             return await self.messages.retry_requested(params["message"])
+        if method == "message/withdraw":
+            return await self.messages.withdraw_unsent(params["message"], params.get("session_id", ""))
         if method == "message/ack":
             # A lead acknowledges as `lead`, its mailbox, its session or a lead actor; a writer only through its own
             # native call (tools.py), never by naming its actor here.
@@ -3324,11 +3324,21 @@ class Daemon:
         raise CoordinatorError("METHOD", "Unknown coordinator method", {"method": method})
 
     async def unit_dispatch(self, method, params):
+        if method in ("unit/seal", "unit/publish"):
+            with self.parking.seal_guard(params["unit"]):
+                return await self._unit_dispatch(method, params)
+        return await self._unit_dispatch(method, params)
+
+    async def _unit_dispatch(self, method, params):
         from .publish import Publisher
         publisher = Publisher(self)
         if method == "unit/status":
             unit = self.store.get(params["unit"])
             return {"unit": unit, "run": self.runs.summary(self.store.get(unit["run"])),
+                    "history": self.dormancy.gaps(unit["run"]),
+                    "waiting_messages": [{"message": m["id"], **self.messages.eligibility(m)}
+                        for m in self.store.all("message") if m.get("unit") == unit["id"]
+                        and self.messages.eligibility(m)["state"] == "waiting"],
                     "unknown": self.store.unresolved(unit["checkout"]),
                     "publications": list(self.store.all("publication", unit["id"])), **participants.surface(self, unit)}
         if method == "unit/recover":
@@ -3350,11 +3360,10 @@ class Daemon:
                 return await GroupPublisher(self).reopen(unit["id"])
             if unit["state"] != "sealed" or any(p["phase"] != "abandoned" for p in self.store.all("publication", unit["id"])):
                 raise CoordinatorError("UNIT_REOPEN", "Only a sealed unit without a publication journal can reopen")
-            await publisher.quiescent(unit, allow_quarantined=True)
-            unit.update(state="open", previous_seal=unit.pop("seal"))
-            self.store.save(unit)
-            self.store.event("unit/reopened", unit["id"], {"invalidated_seal": unit["previous_seal"]})
-            return {"unit": unit["id"], "state": "open", "review_required": True}
+            await publisher.quiescent(unit, allow_quarantined=True, history=False)
+            return publisher.reopen(self.store.get(unit["id"]))
+        if method == "unit/settle-history":
+            return self.dormancy.settle(params["unit"], params.get("actor"), params.get("gaps"), params.get("reason"))
         if method == "unit/seal":
             return await publisher.seal(params["unit"], params.get("validation", []), params.get("publication_order"))
         if method == "unit/review-record":
@@ -3449,7 +3458,7 @@ class Daemon:
                     except CoordinatorError as exc:
                         answer = {"error": exc.envelope()}
                     if key:
-                        if (answer.get("error") or {}).get("code") in ("WRITER_START_FAILED", "WRITER_START_PENDING", "RESOURCE_PAUSED", "RESOURCE_EXHAUSTED"):
+                        if (answer.get("error") or {}).get("code") in ("WRITER_START_FAILED", "WRITER_START_PENDING", "RESOURCE_PAUSED", "RESOURCE_EXHAUSTED", "PARK_IN_PROGRESS"):
                             # No input was submitted by this refusal. Its separate durable
                             # start operation remains joinable, including with the same key.
                             self.store.db.execute("DELETE FROM idempotency WHERE key=?", (key,))

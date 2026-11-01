@@ -21,18 +21,35 @@ READ_GIT = {"status", "diff", "show", "log", "rev-parse", "ls-files", "ls-tree",
             "merge-base", "rev-list", "check-attr", "check-ignore", "grep", "blame", "version"}
 
 
+REDIRECTIONS = ("<<<", "<<-", ">>", ">&", ">|", "<<", "<&", "<>", ">", "<")
+
+
 def shell_words(command):
     """Small conservative lexer; retain quoted punctuation as ordinary arguments.
 
-    Expansions, heredocs and unsupported grammar refuse, rather than pretending
-    shlex is a complete shell parser. No shell text is ever evaluated here.
+    Yields (value, kind): kind False for a word, True for a control operator, "redirect" for a
+    redirection operator, then what it reads or writes: a "target" (a file or a descriptor), a
+    "herestring", or a "heredoc" ({"body", "quoted"}; the body is read from the lines after its
+    command line). A descriptor number in front of an operator is no argument. Expansions and
+    unsupported grammar raise ValueError naming the construct, rather than pretending this is a
+    complete shell parser. No shell text is ever evaluated here.
     """
-    tokens, word, present, quote, i = [], [], False, None, 0
+    tokens, word, present, quoted, quote, i = [], [], False, False, None, 0
+    pending, target = [], None  # heredocs whose lines are still to come; the redirection awaiting its word
     def flush():
-        nonlocal word, present
+        nonlocal word, present, quoted, target
         if present:
-            tokens.append(("".join(word), False))
-        word, present = [], False
+            value = "".join(word)
+            if target in ("<<", "<<-"):
+                heredoc = {"delimiter": value, "strip": target == "<<-", "quoted": quoted, "body": None}
+                pending.append(heredoc)
+                tokens.append((heredoc, "heredoc"))
+            elif target:
+                tokens.append((value, "herestring" if target == "<<<" else "target"))
+            else:
+                tokens.append((value, False))
+            target = None
+        word, present, quoted = [], False, False
     while i < len(command):
         char = command[i]
         if quote == "'":
@@ -43,33 +60,55 @@ def shell_words(command):
         elif char == "\\" and quote != "'":
             i += 1
             if i == len(command):
-                raise ValueError("trailing escape")
+                raise ValueError("a trailing escape")
             escaped = command[i]
-            if escaped != "\n":
+            if escaped != "\n":  # An escaped newline only joins two lines: it quotes nothing and makes no word.
                 if quote == '"' and escaped not in '$`"\\':
                     word.append("\\")
                 word.append(escaped)
-            present = True
+                present = quoted = True
         elif char == quote:
             quote = None
-        elif char in "$`":
-            raise ValueError("executable or parameter expansion")
+        elif char == "`" or char == "$" and command[i + 1:i + 2] == "(":
+            raise ValueError("arithmetic expansion" if command.startswith("$((", i) else "command substitution")
+        elif char == "$":
+            raise ValueError("parameter expansion")
         elif quote:
             word.append(char)
         elif char in "'\"":
-            quote, present = char, True
+            quote, present, quoted = char, True, True
         elif char == "#" and not present:
             end = command.find("\n", i)
             i = len(command) if end < 0 else end - 1
-        elif char in ";|&()<>\n":
+        elif char in "<>" or command.startswith("&>", i):
+            if char in "<>" and command[i + 1:i + 2] == "(":
+                raise ValueError("process substitution")
+            if target and not present:
+                raise ValueError("a redirection without its target")
+            if char in "<>" and present and not quoted and not target and re.fullmatch(
+                    r"[0-9]+|\{[A-Za-z_][A-Za-z_0-9]*\}", "".join(word)):
+                word, present = [], False  # A descriptor: the 2 of 2>&1, or the {name} that is to hold a new one.
+            else:
+                flush()
+            operator = ("&>>" if command.startswith("&>>", i) else "&>") if char == "&" else next(
+                o for o in REDIRECTIONS if command.startswith(o, i))
+            tokens.append((operator, "redirect"))
+            target = operator
+            i += len(operator) - 1
+        elif char in ";|&()\n":
             flush()
+            if target:
+                raise ValueError("a redirection without its target")
             operator = ";" if char == "\n" else char
-            if i + 1 < len(command) and char in "|&<>" and command[i + 1] == char:
+            if i + 1 < len(command) and char in "|&" and command[i + 1] == char:
                 operator += char
                 i += 1
-            if operator in ("<<",) or char in "<>" and i + 1 < len(command) and command[i + 1] == "(":
-                raise ValueError("unsupported shell input")
+            elif command.startswith("|&", i):
+                i += 1  # |& also pipes standard error.
             tokens.append((operator, True))
+            if char == "\n" and pending:
+                i = heredoc_bodies(command, i + 1, pending) - 1
+                del pending[:]
         elif char.isspace():
             flush()
         else:
@@ -77,9 +116,36 @@ def shell_words(command):
             present = True
         i += 1
     if quote:
-        raise ValueError("unterminated quote")
+        raise ValueError("an unterminated quote")
     flush()
+    if target:
+        raise ValueError("a redirection without its target")
+    if pending:
+        raise ValueError("an unterminated heredoc (no line equal to its delimiter)")
     return tokens
+
+
+def heredoc_bodies(command, start, pending):
+    """Read each pending heredoc's lines from `start` up to its delimiter line; return where the command goes on."""
+    for heredoc in pending:
+        lines = []
+        while True:
+            if start >= len(command):
+                raise ValueError("an unterminated heredoc (no line equal to its delimiter)")
+            end = command.find("\n", start)
+            end = len(command) if end < 0 else end
+            line = command[start:end].lstrip("\t") if heredoc["strip"] else command[start:end]
+            start = end + 1
+            # In an unquoted body the shell joins a line that ends in an escaping backslash to the next one before it
+            # looks for the delimiter (bash, zsh: measured 11-02), so a delimiter split across lines ends the heredoc
+            # and the lines after it run as commands. A quoted body joins nothing.
+            if not heredoc["quoted"] and (len(line) - len(line.rstrip("\\"))) % 2:
+                raise ValueError("a line continuation in an unquoted heredoc body (quote its delimiter: <<'EOF')")
+            if line == heredoc["delimiter"]:
+                break
+            lines.append(line)
+        heredoc["body"] = "\n".join(lines)
+    return start
 
 
 # Explicit read-option contracts. Unknown/abbreviated/helper options refuse.
@@ -237,93 +303,196 @@ def gh_read(words):
     return endpoints == 1 and method in ("GET", "HEAD")
 
 
-def invocation(words, depth):
+GIT_COMMAND = "a Git command"
+MENTIONS_GIT = "that mentions Git (its semantics are not established)"
+# `git` as a word of its own: a path's last part, a shell word, an option's value, a call, or a command inside text
+# that an inner shell may run (`sh -c "cd x&&git commit"`, `{git,commit}`); a word naming a dashed Git program
+# (git-receive-pack); or Git's own program directory (libexec/git-core/git-commit). In any letter case: on the
+# default case-insensitive macOS file system `nice /usr/bin/GIT commit` runs git (measured 11-02).
+GIT_WORD = re.compile(r"(?:^|[\s/'\"`;|&(){},=\\!<>])git(?:$|[\s'\"`;|&(){},<>])|(?:^|\s)git-[a-z]|/git-core/", re.IGNORECASE)
+# The command word is a glob or a brace expansion: what runs is whatever it expands to.
+COMMAND_PATTERN = re.compile(r"[*?]|\[.*\]|\{.*(?:,|\.\.).*\}")
+# The system's own tool directories (read-only on macOS): a tool there is the one its name says.
+SYSTEM_TOOL = re.compile(r"/(?:usr/)?bin/[^/]+")
+# A closed list of read-only tools that never execute their arguments or their input.
+DATA_ONLY = {"grep", "rg", "cat", "head", "tail", "wc", "ls", "stat", "file", "diff", "cmp", "sort", "uniq", "cut", "tr",
+             "shasum", "sha256sum"}
+
+
+def data_exec(executable, words):
+    """The option of a data-only tool that runs another program: rg --pre, and sort --compress-program, which GNU
+    getopt also takes abbreviated."""
+    for word in words[1:]:
+        if word == "--":
+            break
+        name = word.split("=", 1)[0]
+        if executable == "rg" and name == "--pre":
+            return "rg --pre, which runs a program for each file"
+        if executable == "sort" and len(name) > 3 and "--compress-program".startswith(name):
+            return "sort --compress-program, which runs a program"
+    return False
+
+
+def heredoc_expansion(reader, stdin):
+    """The shell expands an unquoted heredoc body before the command that reads it starts, whatever that command is:
+    a `$(…)` or a backtick there runs, even in a body given to cat, echo or command -v (measured 11-02)."""
+    for body in stdin:
+        if not body["quoted"] and re.search(r"[$`]", body["body"] or ""):
+            return "expansion in an unquoted heredoc body read by " + reader + " (quote its delimiter: <<'EOF')"
+    return False
+
+
+def stdin_refusal(executable, stdin):
+    """An interpreter's standard input is read like its arguments: it may be code."""
+    expanded = heredoc_expansion(executable, stdin)
+    if expanded:
+        return expanded
+    for body in stdin:
+        if GIT_WORD.search(body["body"] or ""):
+            return executable + " reading a heredoc or here-string " + MENTIONS_GIT
+    return False
+
+
+def invocation(words, depth, stdin=(), lookup=True):
+    """Why this simple command must be refused (a reason naming it, or LEAD_PUBLISHES); False when admitted.
+    lookup is False once something in front of the command (an assignment, an env option) may change what its name
+    finds."""
     # A plain `git` refuses whatever its environment, and the one accepted form starts with
     # `/usr/bin/env -i`, which clears it: assignments in front cannot make Git out of another
     # command. Refusing them refused `PYTHONPATH=. python -m …` as Git execution (measured, 2.3.0).
     # Except the ones that make a shell or interpreter run code this reading never sees.
-    while words and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", words[0]):
-        if words[0].split("=", 1)[0] in STARTUP_CODE:
-            return True
+    # Keywords and assignments may follow each other (`if X=1 cmd`): neither is the command.
+    while words and (words[0] in ("!", "if", "then", "elif", "else", "while", "until", "do", "{", "coproc")
+                     or re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", words[0])):
+        if "=" in words[0]:
+            if words[0].split("=", 1)[0] in STARTUP_CODE:
+                return "the startup-code variable " + words[0].split("=", 1)[0]
+            lookup = False
         words = words[1:]
-    while words and words[0] in ("!", "if", "then", "elif", "else", "while", "until", "do", "{"):
-        words = words[1:]
-    if not words:
-        return False
-    executable = words[0].rsplit("/", 1)[-1]
-    if executable == "git":
-        return git_invocation(words)
+    if not words or words in (["}"], ["done"], ["fi"], ["esac"]):
+        # A heredoc after `)`, `}`, done, fi or esac is the standard input of every command the group runs.
+        return stdin_refusal("a command group", stdin)
+    if COMMAND_PATTERN.search(words[0]):
+        return "a pattern (glob or brace expansion) in the command position"
+    # What is refused matches in any case: on the default case-insensitive macOS file system, GIT finds and runs git.
+    # What is trusted must be spelled exactly: on a case-sensitive one, Cat need not be cat.
+    name = words[0].rsplit("/", 1)[-1]
+    executable = name.lower()
+    exact = name == executable
+    by_name = exact and lookup and "/" not in words[0]  # The shell's own lookup of this name, nothing in front changing it.
+    # Before any answer that admits: the shell runs what a heredoc expands before this command starts.
+    expanded = heredoc_expansion(executable, stdin)
+    if expanded:
+        return expanded
+    if executable == "git" or executable.startswith("git-"):
+        return (executable != "git" or git_invocation(words)) and GIT_COMMAND
     if executable == "gh":
-        return False if gh_read(words) else "LEAD_PUBLISHES"
-    if executable in ("command", "exec", "env", "nohup"):
+        return False if exact and gh_read(words) else "LEAD_PUBLISHES"
+    if executable in ("eval", "source", ".", "alias", "function", "xargs", "sudo", "time"):
+        return executable + ", which runs code this reading never sees"
+    if executable in ("sh", "bash", "dash", "zsh", "ksh") and not exact:
+        return "a shell (" + name + ") reading a script or its standard input"
+    if exact and executable in ("command", "exec", "env", "nohup", "builtin"):
         rest = words[1:]
         if executable == "env":
             isolated = bool(rest) and rest[0] == "-i"
             assignments = []
             rest = rest[1:] if isolated else rest
+            while not isolated and rest and (rest[0] in ("-u", "--unset") and len(rest) > 1 or re.fullmatch(
+                    r"(?:-u|--unset=)[A-Za-z_][A-Za-z_0-9]*", rest[0])):
+                rest = rest[2:] if rest[0] in ("-u", "--unset") else rest[1:]  # Unsetting a variable runs nothing.
+                lookup = False
             while rest and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", rest[0]):
                 if rest[0].split("=", 1)[0] in STARTUP_CODE:
-                    return True
+                    return "the startup-code variable " + rest[0].split("=", 1)[0]
                 assignments.append(rest.pop(0))
+                lookup = False
             if isolated and rest and rest[0].rsplit("/", 1)[-1] == "git":
                 from .gitio import SHELL_GIT_ENV, shell_git_binary, shell_env_binary
                 return (words[0] != shell_env_binary() or set(assignments) != set(SHELL_GIT_ENV) or len(assignments) != len(SHELL_GIT_ENV)
-                        or rest[0] != shell_git_binary() or git_invocation(rest, isolated=True))
+                        or rest[0] != shell_git_binary() or git_invocation(rest, isolated=True)) and GIT_COMMAND
+            if isolated:
+                lookup = False
             if rest and rest[0] == "--":
                 rest = rest[1:]
             if not rest:
                 return False  # `env` alone prints the environment.
             if rest[0].startswith("-"):
-                return True
+                return "an env option this reading cannot establish"
         else:
             while rest and rest[0] in ("--", "-p"):
                 rest = rest[1:]
+            if executable == "command" and rest and re.fullmatch(r"-[pvV]+", rest[0]) and set(rest[0]) & set("vV"):
+                return False  # command -v/-V only says what a name would run.
             if rest and rest[0].startswith("-"):
-                return True
-        return not rest or invocation(rest, depth + 1)
+                return ("an " if executable == "exec" else "a ") + executable + " option this reading cannot establish"
+        # Without a command, each of them runs nothing; exec only applies its redirections, and the commands after it
+        # read a heredoc it gives the shell.
+        return invocation(rest, depth + 1, stdin, lookup) if rest else stdin_refusal(executable, stdin)
     if executable in ("sh", "bash", "dash", "zsh", "ksh"):
         rest = words[1:]
+        if rest == ["--version"]:
+            return False
+        # Every leading option word, + ones too: another option (+n turns -n off) may run what -n would only read.
+        flags = rest[:next((i for i, word in enumerate(rest) if not word.startswith(("-", "+"))), len(rest))]
+        if "-n" in flags and set(flags) <= {"-n", "--noprofile", "--norc"}:
+            return False  # -n reads the commands and executes none of them: a syntax check.
         for i, flag in enumerate(rest):
             if flag.startswith("-") and "c" in flag[1:] and set(flag[1:]) <= set("celuxv"):
-                return i + 1 >= len(rest) or _recording_command(rest[i + 1], depth + 1)
+                if i + 1 >= len(rest):
+                    return executable + " -c without its command"
+                if rest[i + 1].startswith(("-", "+")):  # The shell runs the first word after its options (-c -- cmd).
+                    return executable + " -c with an option after it (which word it runs is not established)"
+                return _recording_command(rest[i + 1], depth + 1, lookup) or stdin_refusal(executable, stdin)
             if flag not in ("--noprofile", "--norc", "-l"):
                 break
-        return True
-    if executable in ("eval", "source", ".", "alias", "function", "xargs", "sudo", "time"):
-        return True
-    if executable in ("printf", "echo"):
+        return "a shell (" + executable + ") reading a script or its standard input"
+    # A tool trusted by its name is trusted only where that name finds it: a path elsewhere, or an assignment in
+    # front, may make it another program. Builtins (echo, printf) ignore PATH.
+    system = exact and SYSTEM_TOOL.fullmatch(words[0])
+    if exact and executable in ("printf", "echo") and ("/" not in words[0] or system):
         return False  # Literal text is not an executable position.
+    if executable in DATA_ONLY and (by_name or system):
+        return data_exec(executable, words)
     # Unknown wrappers/interpreters that mention Git have unestablished semantics.
-    return any(re.search(r"(?:^|[\s/'\"])git(?:$|[\s'\"])", arg) for arg in words[1:])
+    if any(GIT_WORD.search(arg) for arg in words[1:]):
+        return executable + " with an argument " + MENTIONS_GIT
+    return stdin_refusal(executable, stdin)
 
 
-def _recording_command(command, depth=0):
-    if not isinstance(command, str) or not command or depth > 16:
-        return True
+def _recording_command(command, depth=0, lookup=True):
+    """Why the command must be refused (a reason naming it, or LEAD_PUBLISHES); False when admitted. lookup is
+    False for a shell's command text run with assignments in front of that shell (see invocation)."""
+    if not isinstance(command, str) or not command:
+        return "an empty command"
+    if depth > 16:
+        return "commands nested more than 16 deep"
     try:
         tokens = shell_words(command)
-    except ValueError:
-        return True
-    words, redirect = [], False
-    for value, operator in tokens + [(";", True)]:
-        if operator and value in (">", ">>", "<"):
-            if redirect:
-                return True
-            redirect = True
-        elif operator:
-            if redirect:
-                return True
-            refused = invocation(words, depth)
+    except ValueError as exc:
+        return str(exc)
+    words, stdin = [], []
+    for value, kind in tokens + [(";", True)]:
+        if kind is True:
+            refused = invocation(words, depth, stdin, lookup)
             if refused:
                 return refused
             if value not in (";", "|", "||", "&", "&&", "(", ")"):
-                return True
-            words = []
-        elif redirect:
-            redirect = False
-        else:
+                return "the shell operator " + value
+            words, stdin = [], []
+        elif kind == "heredoc":
+            stdin.append(value)
+        elif kind == "herestring":
+            stdin.append({"body": value, "quoted": True})
+        elif kind is False:
             words.append(value)
+        # A redirection and its target (a file or a descriptor) are never an executable position.
     return False
+
+
+def command_refusal_reason(command, depth=0):
+    """The named reason the gate refuses a command (LEAD_PUBLISHES for gh publication), or None."""
+    return _recording_command(command, depth) or None
 
 
 def command_refusal(command, depth=0):
@@ -645,11 +814,16 @@ class Custody:
         return "Supported helper-free example: " + safe_shell_git(["diff", "--no-ext-diff", "--no-textconv"])
 
     def refuse_recording(self, command):
-        code = command_refusal(command)
-        if code == "LEAD_PUBLISHES":
-            raise CoordinatorError(code, "LEAD_PUBLISHES: the lead (Claude) publishes; Codex cannot perform this operation. Use a built-in gh read command or ask the lead.")
-        if code:
-            raise CoordinatorError(code, "the lead records; unestablished Git execution refused. The lead (Claude) pushes. " + self.git_guidance())
+        reason = command_refusal_reason(command)
+        if reason == "LEAD_PUBLISHES":
+            raise CoordinatorError(reason, "LEAD_PUBLISHES: the lead (Claude) publishes; Codex cannot perform this operation. Use a built-in gh read command or ask the lead.")
+        if reason and (reason == GIT_COMMAND or reason.endswith(MENTIONS_GIT)):
+            raise CoordinatorError("LEAD_RECORDS", "the lead records; unestablished Git execution refused (" + reason + "). The lead (Claude) pushes. "
+                                   + self.git_guidance(), {"reason": reason})
+        if reason:
+            raise CoordinatorError("LEAD_RECORDS", "LEAD_RECORDS: the command gate refused " + reason + ": it admits only what it can read "
+                                   "as never running Git. Rewrite the command without it, for example as a script file run by its interpreter.",
+                                   {"reason": reason})
 
     def declare(self, actor, command, reason):
         if not isinstance(command, str) or not command or not isinstance(reason, str) or not reason.strip():

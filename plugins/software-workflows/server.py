@@ -4948,6 +4948,8 @@ async def _lead_request(method: str, params: dict, cwd: str = "", session_id: st
                 raise CoordinatorError("UNIT_REQUIRED", "Supply a unit or the actual Claude session_id")
             params["unit"] = unit
         if method.startswith("message/") and session_id:
+            if method == "message/withdraw":
+                params["session_id"] = session_id
             box_unit = unit or (mapping or {}).get("unit")
             if not unit and method in ("message/inbox", "message/ack"):
                 params["session_id"] = session_id
@@ -5005,6 +5007,17 @@ async def coordinator_send(recipient: str, text: str, wake: str = "none", cwd: s
 
 
 @_lead_tool()
+async def coordinator_withdraw(message: str, cwd: str = "", session_id: str = "", project: str = "",
+                               dispatch_cwd: str = "", unit: str = "") -> str:
+    """Withdraw this lead session's message only when it was never delivered.
+    Pending mail is retained as withdrawn; uncertain/submitted native delivery
+    cannot be withdrawn without proof it never entered a turn.
+    """
+    return await _lead_request("message/withdraw", {"message": message}, cwd, session_id,
+                               unit=unit, project=project, dispatch_cwd=dispatch_cwd)
+
+
+@_lead_tool()
 async def coordinator_inbox(acknowledge: list[str] = [], cursor: str = "", limit: int = 100,
                             cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "", unit: str = "") -> str:
     """Read lead messages with a cursor. Only IDs explicitly supplied in
@@ -5022,11 +5035,15 @@ async def coordinator_inbox(acknowledge: list[str] = [], cursor: str = "", limit
 @_lead_tool()
 async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "",
                            paths: list[str] | None = None, unknown: str = "", revision: str = "",
-                           revisions: dict[str, str | None] | None = None, custody: str = "") -> str:
+                           revisions: dict[str, str | None] | None = None, custody: str = "",
+                           gaps: list[str] | None = None, reason: str = "") -> str:
     """Inspect status/object diff/UNKNOWN, reconcile effects or custody, restore a
     known revision, narrow a checkout-wide UNKNOWN, reopen a seal, recover
     publication, or abandon an unapplied publication. Actions: status, diff,
-    unknown, reconcile, restore, narrow, reopen, recover, abandon. restore
+    unknown, reconcile, restore, narrow, reopen, recover, abandon, settle-history.
+    settle-history needs explicit gap IDs and a nonblank reason. It records the
+    lead's decision about that exact history observation; publication still
+    requires valid receipts, rights, provenance, review and repository proofs. restore
     writes the UNKNOWN's path again: revision names a known revision of it, or
     "baseline" (what the branch commit and the index both hold there), and
     revisions {path: null} removes a path both lack. A restore found at the
@@ -5046,7 +5063,7 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
     methods = {"status": "unit/status" if unit or session_id else "run/status", "diff": "unit/diff",
                "unknown": "unknown/list", "reconcile": "custody/reconcile" if custody else "checkout/reconcile",
                "restore": "unknown/restore", "narrow": "unknown/narrow", "reopen": "unit/reopen",
-               "recover": "unit/recover", "abandon": "unit/recover"}
+               "recover": "unit/recover", "abandon": "unit/recover", "settle-history": "unit/settle-history"}
     if action not in methods:
         return await _coordinator_notice("[Unsupported unit action.]", session_id)
     params = {}
@@ -5060,7 +5077,9 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
         params = {"unknown": unknown}
     if action == "abandon":
         params["action"] = "abandon"
-    return await _lead_request(methods[action], params, cwd, session_id, own=action in ("restore", "narrow"), unit=unit, project=project, dispatch_cwd=dispatch_cwd)
+    if action == "settle-history":
+        params.update(gaps=gaps, reason=reason)
+    return await _lead_request(methods[action], params, cwd, session_id, own=action in ("restore", "narrow", "settle-history"), unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
 
 @_lead_tool()

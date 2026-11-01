@@ -168,7 +168,7 @@ async def _registered_reconcile(daemon, listener, advance, invocation, demand, s
                                        {"retryable": not permanently_failed(daemon, listener), "run": run["id"]}, True)
             return
         if listener["state"] == "dormant" and not demand:
-            if not listener.get("dormant_proof"):
+            if not listener.get("dormant_proof") or daemon.dormancy.needs_revalidation(listener):
                 async with capacity(daemon):
                     await daemon.dormancy.recover(listener)
             return
@@ -1181,7 +1181,8 @@ async def recover(daemon):
     recoverable = [l for l in store.all("listener") if l["run"] not in permanent and
                    (recoverable_listener(l) or l.get("root_thread") and
                     store.get(l["actor"]).get("listener") == l["id"] and
-                    (l["state"] == "dead" and daemon.dormancy.eligible(l) or daemon.dormancy.pending(l["run"])))]
+                    (l["state"] == "dead" and daemon.dormancy.eligible(l) or daemon.dormancy.pending(l["run"])
+                     or l["state"] == "dormant" and daemon.dormancy.needs_revalidation(l)))]
     for checkoutid in sorted({key for l in recoverable if l.get("root_thread") for key in participants.checkout_ids(store, l["unit"])}):
         try:
             await daemon.ensure_lease(checkoutid)
@@ -1455,7 +1456,7 @@ async def recover_writers(daemon, plan):
 # it names while startup recovery reconciles it (recovered). A run's cancel does not wait: it is recorded at once,
 # and its settlement waits for the writer as it does for any reconcile.
 RUN_CALLS = ("run/resume", "run/terminate-terminal")
-UNIT_CALLS = ("unit/recover", "unit/reopen", "unit/seal", "unit/review-record", "unit/publish")
+UNIT_CALLS = ("unit/recover", "unit/reopen", "unit/seal", "unit/review-record", "unit/publish", "unit/settle-history")
 UNKNOWN_CALLS = ("unknown/restore", "unknown/narrow")
 
 

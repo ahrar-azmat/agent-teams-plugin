@@ -3,6 +3,71 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.32] — 2026-11-02
+
+### Change 1 — sealed units and history gaps
+
+- Reopen or abandon a sealed candidate without requiring saved-history equality.
+  Execution, custody and unapplied-publication checks still apply; publication
+  retains its history, review, content, provenance and repository checks.
+- Preserve native notification JSON in versioned receipts. Compare command and
+  MCP results using the exact native persistence transformations, including nested
+  JSON order. Revalidate old gaps on upgrade; retain legacy serialization
+  uncertainty when the original representation cannot be reconstructed.
+- Let an attached lead settle explicitly named history observations with a
+  recorded reason. Settlement survives recovery and restart, appears in status
+  and events, and cannot waive a later changed observation or verify receipts.
+  Resumed and message-woken writers receive a history-gap warning.
+- Reserve sealing against parking. An existing park returns retryable
+  `PARK_IN_PROGRESS` with its listener and stage. An interrupted or unsuccessful
+  reseal retains the previous seal and review, including after restart.
+- Pending messages to sealed units or blocked writers wait without holding a
+  draining stop. Status names their waiting condition. The original lead sender
+  can withdraw mail proved never delivered; uncertain or accepted delivery
+  cannot be withdrawn, and withdrawal cannot be undone by retry.
+
+### Change 2 — the writer command gate
+
+- Read redirections and heredocs as data. Descriptor redirections (`2>&1`,
+  `>&2`, `2>&-`, `3<&0`, `>|`, `{fd}>file`) and their targets are never a
+  command, and a heredoc's or here-string's text is checked the way an
+  interpreter's arguments are. An unquoted heredoc body with `$` or a backtick
+  refuses whatever command reads it, since the shell expands it before that
+  command starts. So does a line in such a body that ends in an escaping
+  backslash: the shell joins it to the next line before it looks for the
+  delimiter, so a delimiter split across two lines ends the heredoc early.
+- Admit a closed list of data-only tools (grep, rg, cat, head, tail, wc, ls,
+  stat, file, diff, cmp, sort, uniq, cut, tr, shasum, sha256sum) whatever words
+  their arguments hold, when the shell finds the tool by its exact name with
+  nothing in front, or in /bin or /usr/bin. `rg --pre` and
+  `sort --compress-program` (any abbreviation) refuse. `command -v`/`-V`,
+  `env -u NAME`, a shell's `--version`, and its `-n` syntax check with no other
+  option than `--noprofile` or `--norc`, are admitted.
+- Name every refusal: a Git command, an argument or heredoc that mentions Git,
+  an expansion (parameter, command or arithmetic), or a construct the gate does
+  not read (process substitution, an unterminated quote or heredoc, a
+  redirection without its target). `LEAD_RECORDS` carries the reason as
+  `details.reason`.
+- Refuse command-position bypasses that 2.4.31 admitted: a glob or brace
+  expansion as the command (`{git,commit}`, `/usr/bin/g?t`), dashed Git
+  programs (`git-commit`, `…/git-core/…`), upper-case names as the command or in
+  an argument (`GIT` and `nice /usr/bin/GIT commit` run git on the default
+  case-insensitive macOS file system), `builtin`, `coproc`, an
+  assignment after a keyword (`if X=1 cmd`), a line continuation before the
+  command, a shell's `-c` followed by an option (`bash -c -- cmd` runs cmd), and
+  Git in text that an inner shell runs through an unknown wrapper
+  (`nice sh -c "true&&git commit"`). On installed 2.4.31 a native fixture
+  writer committed through three of them. A heredoc given to a group
+  (`( python3 - ) <<'EOF'`) or to `exec` without a command is checked like an
+  interpreter's.
+- Of the live ledger's 31,041 distinct writer commands (read-only), 375 that
+  2.4.31 refused are admitted, and 22 that it admitted are refused: a dashed Git
+  program run directly, three scripts that call a `git(...)` helper, and 18
+  interpreter `-c` scripts whose text names Git with a capital letter.
+- Known limits, already in 2.4.31, with a fix planned for the next release: a
+  pattern in a wrapper's program argument, and zsh glob qualifiers
+  (coordinator/README.md).
+
 ## [software-workflows 2.4.31] — 2026-11-01
 
 - Return publication acquisitions when native admission ends before production.

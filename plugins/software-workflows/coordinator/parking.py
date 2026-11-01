@@ -1,5 +1,6 @@
 """Demand-driven, verified unload of idle native writer families."""
 import asyncio
+from contextlib import contextmanager
 import math
 import os
 import time
@@ -71,8 +72,32 @@ class Parking:
         self.timers, self.tasks, self.activity = {}, {}, {}
         self.queued, self.blockers = {}, {}
         self.joining = set()
+        self.sealing = set()
         self.attempted = self.completed = 0
         self.abandoned, self.durations = {}, []
+
+    @contextmanager
+    def seal_guard(self, unitid):
+        """Reserve before any await; never wait while holding a unit lock."""
+        bound = {a.get("listener") for a in self.store.all("actor", unitid)}
+        # The unit's listeners by index: decoding every listener record held the event loop 0.36 s per seal or
+        # publication on the user's 4,624-listener ledger (11-02).
+        for listener in self.store.selected("SELECT * FROM records INDEXED BY retention_listener_unit WHERE kind='listener' "
+                                            "AND json_extract(data,'$.unit')=? ORDER BY id", (unitid,)):
+            if listener["state"] == "dormant" and listener.get("dormant_proof"):
+                continue
+            if listener["id"] not in bound and listener["id"] not in self.tasks and processes.exit_evidence(listener):
+                continue  # A replaced, exited incarnation cannot still own a park.
+            if (listener["id"] in self.tasks or listener.get("park_stop") or
+                    listener["state"] == "parking" or listener.get("park_resume_required")):
+                raise CoordinatorError("PARK_IN_PROGRESS", "Retry after the writer's park finishes",
+                    {"retryable": True, "listener": listener["id"], "run": listener["run"],
+                     "park": listener.get("park") or {"step": "queued"}}, True)
+        self.sealing.add(unitid)
+        try:
+            yield
+        finally:
+            self.sealing.discard(unitid)
 
     def touch(self, listenerid):
         self.activity[listenerid] = time.monotonic()
@@ -194,6 +219,8 @@ class Parking:
     def eligible(self, listener, *, fenced=False, retiring=False):
         daemon, store = self.daemon, self.store
         run = store.get(listener["run"])
+        if listener["unit"] in self.sealing:
+            return "seal_in_progress"
         if not listener.get("root_thread") or (not retiring and listener["state"] != ("parking" if fenced else "connected")):
             return "not_connected"
         if store.get(run["root_actor"]).get("listener") != listener["id"]:
@@ -413,6 +440,7 @@ class Parking:
                 listener = store.get(listenerid)
                 listener["park_stop"] = {"members": members, "actors": [a["id"] for a in actors],
                     "through": {a["id"]: costs[a["thread"]]["through"] for a in actors},
+                    "unverified": [a["id"] for a in actors if costs[a["thread"]].get("unverified")],
                     "idle_seconds": listener["park"]["idle_seconds"]}
                 store.save(listener)
                 self.stage(listenerid, "stopping")
@@ -439,13 +467,14 @@ class Parking:
         with store.transaction():
             for actorid in proof["actors"]:
                 cp = daemon.history.checkpoint(store.get(actorid))
-                if cp:
+                if cp and actorid not in proof.get("unverified", []):
                     cp["received_verified"] = proof["through"][actorid]
                     store.save(cp)
             listener = store.get(listenerid)
             listener.pop("park_stop", None)
             listener.pop("park_observed", None)
-            listener.update(state="dormant", recovery_state="reconciled", dormant_at=time.time(), history_gaps=[],
+            listener.update(state="dormant", recovery_state="reconciled", dormant_at=time.time(),
+                history_gaps=daemon.dormancy.refresh(listener["run"]),
                 dormant_reason="parked after " + str(round(proof["idle_seconds"], 3)) + " s idle",
                 dormant_proof={"exit": {"members": proof["members"], "observed": time.time()}, "read_only": True,
                                "descendants_enumerated": True, "actors": proof["actors"]})

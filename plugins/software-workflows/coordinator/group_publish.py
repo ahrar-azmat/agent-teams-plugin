@@ -85,7 +85,8 @@ class GroupPublisher:
             raise CoordinatorError("UNIT_FROZEN", "Reopen the remaining publication before resealing")
         attemptid, sealid = uid("seal_attempt"), uid("seal")
         self.store.put("seal_attempt", attemptid, {"unit": unitid, "state": "started", "generation": self.store.generation,
-                       "prior_state": unit["state"], "prior_seal": unit.get("seal"), "created": time.time()}, unitid)
+                       "prior_state": unit["state"], "prior_seal": unit.get("seal"),
+                       "prior_review_required": unit.get("review_required", True), "created": time.time()}, unitid)
         unit.update(state="sealing", seal_attempt=attemptid)
         self.store.save(unit)
         try:
@@ -355,7 +356,7 @@ class GroupPublisher:
 
     async def reopen(self, unitid, abandon=False):
         unit = self.store.get(unitid)
-        await self.repo.quiescent(unit, allow_quarantined=True)
+        await self.repo.quiescent(unit, allow_quarantined=True, history=False)
         group = self.current(unitid)
         prefix = dict(unit.get("published_prefix", {}))
         if group:

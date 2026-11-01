@@ -1,22 +1,32 @@
 """Exited writers recover without loading threads; explicit demand owns one start."""
 import asyncio
+from contextlib import nullcontext
 import json
 import time
 
 from .client import CoordinatorError
 from .locks import finish, finish_thread
 from .store import digest
-from .item_projection import receipt_digests
+from .item_projection import PROJECTION_VERSION, receipt_digests, receipt_result
 from . import native, participants, processes
 
 
 def completed_receipt(data):
-    params = json.loads(data)["params"]
-    return params.get("threadId"), params["turnId"], params["item"]["id"], receipt_digests(params["item"]), len(data.encode())
+    message = json.loads(data)
+    params = message["params"]
+    legacy = message.get("_coordinator_receipt_version") != 2
+    item = params["item"]
+    evidence = "legacy_serialization_unverified" if legacy and item.get("type") == "mcpToolCall" else "content_difference"
+    return (params.get("threadId"), params["turnId"], item["id"],
+            receipt_digests(item, receipt_result(data), legacy=legacy), len(data.encode()), evidence)
+
+
+def unresolved(gap):
+    return gap.get("state", "unresolved") == "unresolved"
 
 
 def view(listener):
-    return {**{key: listener.get(key) for key in ("state", "dormant_at", "dormant_reason", "history_gaps", "writer_profile",
+    return {**{key: listener.get(key) for key in ("state", "dormant_at", "dormant_reason", "history_gaps", "history_settled", "history_projection", "writer_profile",
                                                 "recovery_state", "recovery_error", "recovery_retryable", "recovery_version")},
             "quarantined": listener.get("recovery_state") == "failed"}
 
@@ -56,23 +66,70 @@ class Dormancy:
         listener = self.store.get(self.store.get(run["root_actor"])["listener"])
         return permanently_failed(self.daemon, listener)
 
-    def require_quiet(self, listener):
+    def gaps(self, runid):
+        return list(self.store.all("history_gap", runid))
+
+    def refresh(self, runid):
+        gaps = self.gaps(runid)
+        active = [g["id"] for g in gaps if unresolved(g)]
+        settled = [g["id"] for g in gaps if g.get("state") == "settled"]
+        # The run's incarnations only (a listener's parent is its run): decoding every listener record held the event
+        # loop 0.36 s on the user's 4,624-listener ledger (11-02).
+        for listener in list(self.store.all("listener", runid)):
+            listener.update(history_gaps=active, history_settled=settled)
+            self.store.save(listener)
+        return active
+
+    def needs_revalidation(self, listener):
+        return any(g.get("projection_version", 0) < PROJECTION_VERSION for g in self.gaps(listener["run"]))
+
+    def settle(self, unitid, actorid, ids, reason):
+        actor = self.store.get(actorid, required=False)
+        if not actor or actor.get("kind") != "lead" or actor.get("unit") != unitid:
+            raise CoordinatorError("LEAD_REQUIRED", "History settlement requires a lead attached to this unit")
+        if not isinstance(reason, str) or not reason.strip() or not isinstance(ids, list) or not ids or any(not isinstance(i, str) for i in ids):
+            raise CoordinatorError("HISTORY_SETTLEMENT", "Supply explicit gap IDs and a nonblank reason")
+        runid = self.store.get(unitid)["run"]
+        gaps = [self.store.get(key) for key in dict.fromkeys(ids)]
+        if any(g.get("_kind") != "history_gap" or g.get("run") != runid for g in gaps):
+            raise CoordinatorError("HISTORY_SCOPE", "Every gap must belong to the selected unit")
+        with self.store.transaction():
+            for gap in gaps:
+                if gap.get("state") in ("matched", "settled"):
+                    continue
+                observation = digest([gap["thread"], gap["turn"], gap["item"], gap["sequence"], gap["received"], gap.get("saved")])
+                gap.update(state="settled", settlement={"reason": reason.strip(), "actor": actorid,
+                           "time": time.time(), "observation": observation})
+                self.store.save(gap)
+                self.store.event("history/settled", gap["id"], {"unit": unitid, **gap["settlement"]})
+            self.refresh(runid)
+        return {"unit": unitid, "gaps": [self.store.get(g["id"]) for g in gaps]}
+
+    def notice(self, actor, inputs):
+        gaps = [g for g in self.gaps(actor["run"]) if g.get("state") != "matched"]
+        if not gaps or any(i.get("type") == "text" and i.get("text", "").startswith("C1_HISTORY_GAPS\n") for i in inputs):
+            return inputs
+        lines = [g["id"] + " (" + g.get("state", "unresolved") + ", thread " + g["thread"] + ")" for g in gaps]
+        warning = "C1_HISTORY_GAPS\nSaved history for this writer family has gaps. Do not assume missing history proves an action or its absence.\n" + "\n".join(lines)
+        return [{"type": "text", "text": warning}] + inputs
+
+    def require_quiet(self, listener, *, history=True):
         """A dormant state is not itself proof that its family is quiescent."""
         proof = listener.get("dormant_proof") or {}
-        if (listener["state"] != "dormant" or not proof.get("exit") or not proof.get("read_only")
-                or not proof.get("descendants_enumerated")):
+        if (listener["state"] != "dormant" or not proof.get("exit") or history and
+                (not proof.get("read_only") or not proof.get("descendants_enumerated"))):
             raise CoordinatorError("DORMANT_UNVERIFIED", "Dormant writer needs exit and saved-family evidence")
-        if listener.get("history_gaps"):
+        gaps = [g["id"] for g in self.gaps(listener["run"]) if unresolved(g)]
+        if history and gaps:
             raise CoordinatorError("HISTORY_GAP", "Saved writer history differs from received evidence",
-                                   {"gaps": listener["history_gaps"]})
-        if self.pending(listener["run"]):
+                                   {"gaps": gaps})
+        if history and self.pending(listener["run"]):
             raise CoordinatorError("WRITER_START_PENDING", "Dormant writer has a pending demand start", {"retryable": True}, True)
         actors = [a for a in self.store.all("actor", listener["unit"]) if a.get("listener") == listener["id"]]
-        if any(a.get("active_turn") or a["id"] not in proof.get("actors", []) for a in actors):
+        if history and any(a.get("active_turn") or a["id"] not in proof.get("actors", []) for a in actors):
             raise CoordinatorError("DORMANT_UNVERIFIED", "Dormant proof does not cover every bound actor")
         recipients = {a["id"] for a in actors}
-        if any(m.get("recipient") in recipients and m["state"] not in ("entered_context", "acknowledged")
-               and m.get("delivery") not in ("cancelled", "turn_ended") for m in self.store.all("message")):
+        if history and any(m.get("recipient") in recipients and self.daemon.delivery_owed(m) for m in self.store.all("message")):
             raise CoordinatorError("PENDING_DELIVERY", "Dormant writer still has mail or a notice to settle")
 
     def eligible(self, listener):
@@ -96,6 +153,11 @@ class Dormancy:
         end = archive.highwater(self.store)
         after = {actor["thread"]: (self.daemon.history.checkpoint(actor) or {}).get("received_verified", 0)
                  for actor in actors}
+        # Revisit named observations even if an older incarnation advanced its
+        # watermark. Settled observations are compared again, never a wildcard.
+        for gap in self.gaps(listener["run"]):
+            if gap["thread"] in after and gap.get("state") != "matched":
+                after[gap["thread"]] = min(after[gap["thread"]], max(0, gap["sequence"] - 1))
         receipts = {thread: {} for thread in after}
         costs = {thread: {"after": value, "through": end, "items": 0, "pages": 0, "bytes": 0, "gaps": []}
                  for thread, value in after.items()}
@@ -105,10 +167,10 @@ class Dormancy:
             async for row in archive.events(self.store, [incarnation["id"]], min(after.values(), default=end),
                                              kind="native", method="item/completed", through=end):
                 rows_seen += 1
-                thread, turn, ident, digests, size = await finish_thread(completed_receipt, row["data"])
+                thread, turn, ident, digests, size, evidence = await finish_thread(completed_receipt, row["data"])
                 if thread not in after or row["seq"] <= after[thread]:
                     continue
-                value = (row["seq"], digests)
+                value = (row["seq"], digests, evidence)
                 wanted = receipts[thread].setdefault(turn, {})
                 # The newest receipt wins if a reconnect repeated an item.
                 if ident not in wanted or wanted[ident][0] < row["seq"]:
@@ -150,21 +212,53 @@ class Dormancy:
                     turns.update(value["id"] for value in page["data"])
                 if turn in turns:
                     raise
-            for ident, (sequence, received) in wanted.items():
+            for ident, (sequence, received, evidence) in wanted.items():
                 cost["items"] += 1
-                if seen.get(ident) in (received if isinstance(received, list) else [received]):
+                previous = [g for g in self.gaps(actor["run"]) if g["thread"] == actor["thread"]
+                            and g["turn"] == turn and g["item"] == ident]
+                matches = seen.get(ident) in (received if isinstance(received, list) else [received])
+                if matches and not previous:
                     continue
-                if pending:
-                    raise CoordinatorError("PERSISTENCE_PENDING", "Received item is not yet saved in its native representation",
-                                           {"thread": actor["thread"], "turn": turn, "item": ident, "retryable": True}, True)
-                gap = {"code": "HISTORY_GAP", "thread": actor["thread"], "turn": turn, "item": ident,
-                       "sequence": sequence, "received": received, "saved": seen.get(ident), "run": actor["run"]}
-                key = "history_gap:" + actor["id"] + ":" + digest([turn, ident, received])
-                if record and not self.store.get(key, required=False):
-                    with self.store.transaction():
+                # Version every observation we revisited, including a changed or
+                # missing saved item. Commit this with its outcome so a crash cannot
+                # mark the upgrade done before recording the new discrepancy.
+                with self.store.transaction() if record else nullcontext():
+                    if record:
+                        for old in previous:
+                            if old.get("projection_version") != PROJECTION_VERSION:
+                                old["projection_version"] = PROJECTION_VERSION
+                                self.store.save(old)
+                    if matches:
+                        if record:
+                            for old in previous:
+                                if old.get("state") != "matched":
+                                    old.update(state="matched", matched_at=time.time())
+                                    self.store.save(old)
+                                    self.store.event("history/matched", old["id"], {"sequence": sequence, "saved": seen[ident]})
+                        continue
+                    # Same receipt and saved digest retains the lead's decision,
+                    # even when a new projection adds another exact alternative.
+                    settled = next((g for g in previous if g.get("state") == "settled" and
+                                    g["sequence"] == sequence and g.get("saved") == seen.get(ident)), None)
+                    if settled:
+                        cost.setdefault("unverified", []).append(settled["id"])
+                        continue
+                    if pending:
+                        raise CoordinatorError("PERSISTENCE_PENDING", "Received item is not yet saved in its native representation",
+                                               {"thread": actor["thread"], "turn": turn, "item": ident, "retryable": True}, True)
+                    gap = {"code": "HISTORY_GAP", "thread": actor["thread"], "turn": turn, "item": ident,
+                           "sequence": sequence, "received": received, "saved": seen.get(ident), "run": actor["run"],
+                           "state": "unresolved", "projection_version": PROJECTION_VERSION,
+                           "evidence": evidence if seen.get(ident) is not None else "saved_item_missing"}
+                    old = next((g for g in previous if unresolved(g) and g["sequence"] == sequence and g.get("saved") == seen.get(ident)), None)
+                    key = old["id"] if old else "history_gap:" + actor["id"] + ":" + digest([turn, ident, sequence, received, seen.get(ident)])
+                    if record and old:
+                        old.update(evidence=gap["evidence"])
+                        self.store.save(old)
+                    if record and not self.store.get(key, required=False):
                         self.store.put("history_gap", key, gap, actor["run"])
                         self.store.event("history/gap", actor["run"], gap)
-                cost["gaps"].append(key)
+                    cost["gaps"].append(key)
         cost["seconds"] = round(time.monotonic() - began, 6)
         if record:
             self.store.event("history/received_compared", actor["id"], cost)
@@ -201,7 +295,7 @@ class Dormancy:
                     comparison = await self.compare(actor, connection, receipts[actor["thread"]], costs[actor["thread"]])
                     observed = await daemon.history.observe(listener, actor, connection)
                     cp = daemon.history.checkpoint(actor)
-                    if not comparison["gaps"]:
+                    if not comparison["gaps"] and not comparison.get("unverified"):
                         cp["received_verified"] = comparison["through"]
                         store.save(cp)
                     threads.append(dict(observed, received=comparison))
@@ -213,7 +307,7 @@ class Dormancy:
         await finish_all(*(daemon.ledger.reconcile(store.get(key), ignore_pending=False, preserve_leads=True,
                            reason="dormant recovery snapshot") for key in participants.checkout_ids(store, root["unit"])))
         daemon.check_native_stop()
-        gaps = [g["id"] for g in store.all("history_gap", listener["run"])]
+        gaps = self.refresh(listener["run"])
         history = {"completed": time.time(), "threads": threads, "read_only": True}
         with store.transaction():
             store.event("recovery/history", listener["id"], dict(history, run=listener["run"]))
@@ -223,6 +317,7 @@ class Dormancy:
                 listener["family_gone"] = receipt["exit_evidence"]
             listener.update(state="dormant", recovery_state="reconciled", dormant_at=time.time(),
                             dormant_reason="exited terminal writer recovered read-only", history_gaps=gaps,
+                            history_projection=PROJECTION_VERSION,
                             dormant_proof={"exit": {"pid": listener.get("pid"), "birth": listener.get("birth"),
                                                    "observed": time.time()}, "read_only": True,
                                            "descendants_enumerated": True, "actors": [a["id"] for a in actors]})
@@ -406,7 +501,10 @@ class Dormancy:
             starts = list(self.store.all("writer_start"))
             self.counts = (key, {
                 "dormant": states.get("dormant", 0), "running": states.get("connected", 0),
-                "history_gaps": self.store.db.execute("SELECT count(*) FROM records WHERE kind='history_gap'").fetchone()[0],
+                "history_gaps": self.store.db.execute("SELECT count(*) FROM records WHERE kind='history_gap' "
+                    "AND coalesce(json_extract(data,'$.state'),'unresolved')='unresolved'").fetchone()[0],
+                "history_settled": self.store.db.execute("SELECT count(*) FROM records WHERE kind='history_gap' "
+                    "AND json_extract(data,'$.state')='settled'").fetchone()[0],
                 "demand_starts": sum(r["attempts"] for r in starts),
                 "start_failures": sum(r.get("failures", int(r["state"] == "failed")) for r in starts)})
         values = sorted(self.cold)
