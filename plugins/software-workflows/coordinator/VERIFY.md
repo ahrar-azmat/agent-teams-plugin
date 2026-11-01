@@ -1,3 +1,509 @@
+# software-workflows 2.4.30 — fix round 1 — 2026-11-01
+
+This section records the final candidate after review findings R1–R5. It
+supersedes the initial 2.4.30 candidate's measurements below where the code
+changed. Base remains **4f475bc**, the manifest remains **2.4.30**, and all
+repository edits remain uncommitted. The fix touches `blob_storage.py`,
+`blob_conversion.py`, `store.py` and the daemon startup call, plus docs; the
+C2 repair policy and empty production repair registry are unchanged.
+
+Evidence root (**F1**):
+`/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2430/writer/fix1`.
+The pre-fix candidate is the lead's read-only composition at
+`/private/tmp/r2430-lead-comp/marketplace/plugins/software-workflows`.
+It was never edited. Fresh lead-prepared repositories 193–233 were used once
+each; the cross-checkout cases each used two repositories.
+
+## Review findings: observed reds and greens
+
+| Item | Pre-fix red | Fixed green |
+|---|---|---|
+| R1: reuse before temporary allocation | `red-reconcile`: a cold daemon reconciling a known, unchanged 40,000,000-byte revision attempted a temporary copy. The injected ENOSPC after 128 KiB surfaced after 196,608 bytes / three writes. | `green-reconcile`: the real `Ledger.reconcile` completed, scanned one path and preserved the same revision with zero temporary files, writes or bytes. Installed 2.4.29 also reused without a temporary in `installed-reconcile`. |
+| R1: verified corrupt republication | `red-fix1` and `installed-fix1`: both large and small known-content republications refused `BLOB_CORRUPT`. | `green-reconcile`: verified replacement bytes repaired both representations, cold reads matched, two `blob/repaired` events were present and status counted two repairs. Reads before replacement still refused corruption. `green-extra` also exercised a corrupt container replaced by verified raw content. |
+| R2: transient inventory error | `red-fix1`: a 0.5-second header-open EMFILE window ended the converter; it remained stopped after the fault cleared. | `green-reconcile`: the converter remained alive, retried and reached zero backlog. `green-extra` separately injected one EIO in discovery, refresh, stat and conversion; every worker recovered and became idle, and only explicit close made it stopped. |
+| R3: abandoned private files | `red-crash-temp_written`, `red-crash-before_migration`, `red-crash-after_migration` and `red-crash-candidate_synced`: restart retained an unpublished `pending-blocks-*` file. | All seven `final-crash-*` cases verified both logical digests and asserted zero abandoned store temporaries after restart. `green-reconcile` also proved ordinary Store construction preserved four seeded temporaries and an unexpected entry; daemon startup removed only the four temporaries. |
+| R4: single-allocation-unit content | `red-fix1`: a tiny foreground write and raw conversion invoked encoding twice despite having no possible allocation saving. | `green-reconcile`: both encode counts were zero on this 4,096-byte-unit filesystem; content remained raw and status counted it as kept raw. The production restart comparison below measures this across the actual corpus. |
+| R5: configurable background reserve | `red-reserve.json`: negative, nonnumeric and empty values all started successfully because the setting was ignored. | `green-reserve.json`: all three invalid values refused `INVALID_SETTING`, CLI exit 3. A 17 GiB value started with exactly 18,253,611,008 bytes in status; the default is 16,106,127,360 bytes. Foreground work still has no reserve threshold. |
+
+The unchanged-revision reconciliation RPC took **0.119615 s** on the fixed
+candidate versus **0.105857 s** on installed 2.4.29. The recorded path scan took
+**0.052400 / 0.032506 s**, respectively. These are fresh-daemon samples on a
+shared host, not cold filesystem-cache or latency guarantees.
+
+The four seeded abandoned files totalled **68 logical bytes / 16,384 allocated
+bytes**. Startup reported exactly four reclaimed files and one preserved
+unexpected entry in both status and a `blob/temporaries_reclaimed` event. Cleanup is called only after exclusive worker ownership;
+normal Store/Storage construction does not sweep. Logical hash names,
+containers and unexpected files remain outside the temporary-name rule.
+
+`green-extra` additionally proved that a seekable source changed between hashing
+and publication refuses `UNSTABLE_READ`, and nonseekable input uses bounded
+reads of at most **65,536 bytes**.
+
+An additional fault run exposed an overdue retry spinning during pressure:
+`red-paused-retry` recorded **609,749** pressure checks and **1.376124 CPU s**
+during a **6.227508 s** hold. After the final four-line wait/stop correction,
+`green-paused-retry` recorded **2** checks and **0.136562 CPU s** during
+**6.202064 s**, then converted successfully after pressure cleared. The full
+regression and lead publication runs below used this final product code.
+
+## Final regression runs
+
+Every recorder in `final-regressions-results.json` exited **0** on the final
+product. Their individual `summary.json` files retain operation refusals and
+results, and every `cleanup.json` is an empty process list. An expected refusal
+is not a successful operation merely because its recorder completed.
+
+| Recorder | Wall seconds | Checked result |
+|---|---:|---|
+| `final-c1` | 30.345226 | Missing/corrupt later images refuse before any working-path change; valid restore/edit succeeds. |
+| `final-cross` | 32.934641 | The later project checkout cannot partially mutate an earlier checkout on blob refusal. |
+| `final-edges` | 40.143242 | Container boundaries, malformed input, error classification, reader/converter overlap, cancellation and foreground/background space behavior. |
+| `final-load` | 64.726549 | Exact dynamic replay, old hooks, bounded binary-version evidence, foreground work and caught-up idle behavior. |
+| `final-pressure` | 66.881165 | Pressure pause/resume, a real healthy demand admission, conversion and join-before-lease-release drain. |
+| `final-crash-*`, all seven | 31.391514–31.808208 each | Both logical images verify after restart; no abandoned store temporary remains. |
+| `final-c2-green` | 56.675158 | Permanent failure stays suppressed across release/binary changes and nonmatching repairs; capacity defers; one matching repair attempt and explicit resume remain correct. |
+
+The C2 launch/resume counts were **34/1** through release change, binary change,
+oscillation, a nonmatching declaration and capacity deferral; **36/2** after the
+matching repair and its restart; **38/3** after explicit resume. The fixture also
+retained an old release-keyed claim without a relaunch or startup error.
+
+The final load run replayed the completed `receipt_range` response at offset
+**1,048,568**, length **23,601**, byte-for-byte after conversion. Its sent/replayed
+SHA-256 was
+`009028a2c95356aec215db115d8c067d3fe0316dc53f268f71851a7ff0102156`.
+Installed **2.4.11, 2.4.26 and 2.4.29** hooks each completed Pre/Post with exit 0,
+armed attribution and no UNKNOWNs under Apple Python 3.9.6. A sleeping owned
+version executable returned unknown version with a known digest in
+**1.107694 s** and was reaped.
+
+The 93,932,119-byte background image converted in **0.767068 s**, at
+**122,456,125 logical bytes/s**. Maximum loop gap was **4.373 ms**. During the
+five-second caught-up interval, CPU time changed **7.33 → 7.37 s**, RSS
+**248,544 → 248,528 KiB**, and converter scan/header counters stayed **2/4 → 2/4**.
+There was no recurring caught-up directory scan or container-header read.
+
+Under pressure, eight images totalling **751,456,952 bytes** converted in
+**5.494155 s** of completed processing (**136,773,892 bytes/s**); backlog, overlap
+and failures were zero afterward. Maximum loop gap was **6.167 ms** and daemon
+peak RSS **69,615,616 bytes**. A healthy writer's demand admission completed in
+**26.552599 s** while conversion paused and resumed around recovery. As in the
+initial release evidence, the 20-second RPC wait returned `WRITER_START_PENDING`
+before the persisted demand became complete. Calibration latency is unchanged
+in scope.
+
+Drain during an active candidate returned in **0.117255 s**. At stopping lease
+release, the recorded converter thread was already stopped. Restart verified
+all **14** fixture logical blobs and migrations **1–5**.
+
+`startup-compat/results.json` records four actual CLI refusals, each exit **3**:
+installed 2.4.28 and 2.4.29 returned `SCHEMA_VERSION`; missing and broken codec
+support returned `BLOB_CODEC_UNAVAILABLE`. The compatibility recorder exited
+0 in **2.259740 s** and left no owned process.
+
+## Lead-recorded upgrade and dependency proof
+
+The lead reran both byte-identical calibrated Git recorders after the final
+product edit, with exit **0**. No product file changed afterward.
+
+- `upgrade/r2430-fix1-final-upgrade-backfill.json`: installed 2.4.29 → candidate
+  → second start retained receipt/consumed-transfer/marker counts **1/1/1**,
+  migrations **1–5**, and all three required indexes. The next unit sealed and
+  completed publication `publication_group_cba350019cba4ea0a22ed295c9f0a197`.
+- `upgrade/r2430-fix1-final-base-base_dependency.json`: the source unit remained
+  open; the seal retained one dependency proof against lead-recorded base
+  `3648d055b5591c85437eafe0907fa6b349cab03f`. Publication completed at commit
+  `77a30a575196ceeaee51e56335df60897c074779`.
+
+The lead stopped the owned processes and removed both fixtures after the
+recorders returned. `measurements.json` independently records that both fixture
+paths are absent. Lead logs are
+`scratchpad/r2430/lead/fix1-final-upgrade.log` and `fix1-final-base.log`;
+the product freeze snapshot is `frozen-1211.json` in that directory.
+
+## Production clone and restart-pass comparison
+
+`production.json`, `production.log`, `restart-before.json` and
+`restart-after.json` record the actual run, exit **0**. Only the live blobs
+directory was cloned with `cp -cR`; the ledger was newly created in scratch.
+Source and scratch were the same verified APFS volume, `disk3s5`, UUID
+`A0F10490-4FE0-4B70-AA67-6C6E258E2DCD`.
+
+| Measurement | Final value |
+|---|---:|
+| Logical identities / bytes | 16,914 / 2,422,026,283 |
+| Allocated bytes before / after | 2,459,172,864 / 836,591,616 |
+| Allocated bytes saved | 1,622,581,248 (65.98%) |
+| Encoded / retained raw / overlap | 12,399 / 4,515 / 0 |
+| Conversion wall / CPU | 245.926449 s / 51.304795 s |
+| All logical hashes verified | 16,914; 6.650374 s |
+| Full comparison/conversion/verification wall | 402.482698 s |
+| Parent-process CPU / peak RSS | 177.245013 s / 74,432,512 bytes |
+| Minimum free volume space | 285,149,634,560 bytes |
+| New 93,932,119-byte foreground publication | 0.879097 s |
+| Final migrations / immediate clone removal | 1–5 / confirmed |
+
+The restart comparison opened a separate fresh Store for each version and ran
+the actual conversion path against the **same converted clone**. It measures
+the raw-backlog pass with a cold Store cache, not total daemon startup or a cold
+OS page cache. Both passes preserved all 4,515 raw files and converted zero.
+
+| Restart pass | Encode attempts | Single-unit encodes | Wall / CPU seconds | Peak RSS |
+|---|---:|---:|---:|---:|
+| Pre-fix composition | 4,515 | 4,415 | 6.524217 / 4.810819 | 43,286,528 B |
+| Fixed candidate | 100 | **0** | 4.359042 / 3.809294 | 43,073,536 B |
+
+The remaining 100 raw images exceed one allocation unit and still receive the
+normal allocation comparison. The fix does not add a size exclusion.
+
+The actual-format block comparison again supports the **1 MiB** default:
+
+| Block bytes | Retained allocation | Warm range medians on the three largest images |
+|---:|---:|---:|
+| 262,144 | 842,825,728 B | 0.163–0.169 ms |
+| **1,048,576** | **836,591,616 B** | **0.676–0.729 ms** |
+| 4,194,304 | 835,203,072 B | 3.004–3.234 ms |
+
+After conversion, cold Store range reads took **91.466 / 96.074 / 90.637 ms**;
+warm medians were **0.744 / 0.718 / 0.775 ms**. All **108** ranges matched logical
+bytes and sizes, including cross-block, EOF and sequential 23,646-byte pages.
+Parent CPU above excludes the two restart subprocesses, whose CPU is recorded
+separately. Allocation is `st_blocks × 512`; APFS clone sharing means these
+figures are not exclusive live-volume bytes reclaimed.
+
+## Checks, artifacts and repeat commands
+
+Final command results are recorded in `checks-final/checks.json`,
+`checks-final.log` and `final-packaging.json`. The checks cover Python 3.15
+in-memory compilation, the complete Python 3.9 hook dependency closure with
+codec imports denied, hook protocol checking, shell syntax, Ruff's delta versus
+installed 2.4.29, both strict plugin validations, whitespace/newlines, settings,
+and an isolated fresh marketplace installation. The live installation is never
+replaced.
+
+The final runner exited **0**, with no failed checks: **98** Python 3.15 files
+compiled; **18** Python 3.9 hook files compiled and imported, including codec
+denial; hook checking reported `compatible: true`, protocol `jsonl-v1`.
+All three shell syntax checks exited 0. Ruff reported **31 versus 33** existing
+findings, **zero added**. Both strict validations exited 0 with `Validation
+passed`; all 19 release files passed whitespace and version/title consistency.
+The isolated marketplace add and install each exited **0**, installed **2.4.30**,
+and matched all three new module files byte-for-byte. Its configuration was
+removed; free space afterward was **285,854,175,232 bytes**. The settings
+negative checks intentionally exited 1 with the expected CONFIG refusal.
+
+`release.patch` contains the complete **19-file** release against **4f475bc**.
+`release-files.json` records its SHA-256 and every file digest.
+`patch-verification.json` records reconstruction of every file from that base
+and patch in memory. `measurements.json` collects the final run measurements,
+the actual cleanup/repair event rows, process-cleanup reports and clone absence.
+
+The fix-round recorder additions and all fault injection live only under F1.
+No repository test file was added. Repeat with newly prepared fixture repositories
+and fresh output paths; the batch JSON files record the exact used inputs:
+
+```sh
+python3.15 -B "$F1/batch.py" "$F1/reds.json"
+python3.15 -B "$F1/batch.py" "$F1/reconcile-reds.json"
+python3.15 -B "$F1/batch.py" "$F1/final-first-green.json"
+FIX1_ASSERT_CLEANUP=1 python3.15 -B "$F1/batch.py" "$F1/final-regressions.json"
+python3.15 -B "$F1/startup_compat.py"
+python3.15 -B "$F1/production.py"
+python3.15 -B "$F1/finalize.py"
+python3.15 -B "$F1/export_release.py"
+python3.15 -B "$F1/patch_check.py"
+```
+
+The separate reserve recorder's invocation is
+`python3.15 -B "$F1/reserve_probe.py" "$PLUGIN" "$LABEL"`.
+The `extra-green.json` batch contains the source-stability, nonseekable and
+four transient-phase cases. Only the lead runs `upgrade/probe.py`, using the
+same commands documented in the initial release section with the final labels
+`r2430-fix1-final-upgrade` and `r2430-fix1-final-base`.
+
+No runtime fix-round run remains unperformed. Hardware power loss was not
+physically exercised; the crash evidence concerns real process exits.
+The exact private extent ownership of APFS clone files and full cold-OS startup
+latency are not established by these measurements. Live state was read or
+cloned only at the blobs-directory level, and all owned probe processes stopped.
+
+---
+
+# software-workflows 2.4.30 — initial verification before fix round 1 — 2026-11-01
+
+This is the C1/C2 release, rebased by the lead onto **4f475bc** (2.4.29).
+The earlier 2.4.28 charter's release number was changed to 2.4.30 by the resume
+brief. Only the two chartered changes are included. The production repair
+registry is empty. No logical blob is deleted, and no retention window or owner
+graph is added. All release edits remain uncommitted.
+
+Evidence root (**E**):
+`/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2430/writer`.
+`release.patch` is the complete release diff against 4f475bc;
+`release-files.json` records every delivered path and SHA-256.
+The manifest was still 2.4.29 during candidate daemon runs and changed to 2.4.30
+only after all probe processes stopped. Candidate means the working tree with
+the C1/C2 edits, not installed 2.4.29.
+
+## C1: installed reds and candidate greens
+
+Each successful recorder exited **0** and recorded no remaining owned processes
+in `cleanup.json`. Expected RPC refusals exit **3**. A recorder's successful exit
+does not turn an expected negative RPC into a successful operation.
+
+| Case/report under E | Real observation |
+|---|---|
+| `c1-red-29` → `c1-green-30` | Installed 2.4.29's later missing restore image changed a.txt and b.txt (`BLOB_MISSING`). A later corrupt lead-edit image changed a.txt, b.txt, delete.txt, newdir and newdir/new.txt (`BLOB_CORRUPT`). The candidate returned the same refusal classes with every working path and directory entry unchanged. Reinstating the image allowed the old known-revision restore and subsequent exact edit to complete. |
+| `cross-red-29` → `cross-green-30` | A missing image in the later project checkout changed both checkouts on installed 2.4.29. Both remained byte-for-byte unchanged on the candidate. |
+| `edges-green-30` | Empty and 65,535/65,536/65,537/1,048,575/1,048,576/1,048,577/2,097,152-byte images read correctly, including bounded decoder output, cross-block and EOF ranges. Small and 150 KB incompressible content stayed raw; beneficial content used the versioned container. |
+| `edges-green-30` | Bad index digest, logical length, physical offset, truncation and trailing data all refused `BLOB_CORRUPT`. EACCES/EIO/ENOTDIR became `BLOB_MISSING`; ENOSPC/EMFILE retained native resource errors. Injected one-byte free space allowed foreground write/staging but refused optional background conversion with `RESOURCE_EXHAUSTED`. |
+| `edges-green-30` | Concurrent full/range readers, conversion and identical-content writes preserved hashes and did not recreate raw content. Cancellation waited for the active conversion worker before returning. A corrupt raw blob failed once, did not retry during the two-second observation, and converted after its corrected stamp was notified. |
+| `load-compat-30b` | A completed native `read_file` response recorded a `receipt_range` at offset 1,048,568, length 23,601. Raw-to-container conversion and cold replay reproduced the actual sent response exactly: SHA-256 `4ab90bc680d1a0db614f515dfe5baad9b730a3155a2c96251fc0d737d55a8043`. `unknown/narrow` completed. |
+| `startup-compat/results.json` | Installed 2.4.28 and 2.4.29 refused migration-5 state with `SCHEMA_VERSION`, exit 3. Missing zlib and a broken codec round trip each produced structured `BLOB_CODEC_UNAVAILABLE`, exit 3, without an import traceback. |
+| `load-compat-30b` | Installed 2.4.11, 2.4.26 and 2.4.29 lead hooks ran under Apple Python 3.9.6 against the candidate: all Pre/Post exits 0, Pre armed, Post attributed without UNKNOWNs. Pre times were 0.269/0.174/0.200 s; Post times 0.080/0.075/0.097 s. |
+
+The seven publication-crash recorders used actual worker process exit at the
+injected boundary, supervisor recovery, and full digest verification after
+restart. All exited 0, recovered both logical blobs, and cleaned up their own
+processes:
+
+| Boundary | Report directory | Durable state observed at interruption |
+|---|---|---|
+| Temporary complete | `crash-temp` | Migrations 1–4; raw plus unpublished temporary. |
+| Before migration | `crash-before_migration` | Migrations 1–4; raw plus unpublished temporary. |
+| After migration | `crash-after_migration` | Migrations 1–5; raw plus unpublished temporary. |
+| Candidate synchronized | `crash-candidate_synced` | Migrations 1–5; raw plus unpublished temporary. |
+| Renamed | `crash-renamed` | Migrations 1–5; raw and encoded overlap. |
+| Before raw unlink | `crash-before_raw_unlink` | Migrations 1–5; raw and encoded overlap. |
+| After raw unlink | `crash-after_raw_unlink` | Migrations 1–5; encoded only. |
+
+The crash image was 3,900,000 logical bytes and its container 11,901 bytes.
+Unpublished temporaries were never readable authority. These are process-crash
+observations, not physical power-loss experiments.
+
+## Publication, dependency proof and upgrade
+
+The lead executed the Git-writing cases from the copied real-engine recorder in
+`E/upgrade`; the writer did not record Git changes.
+
+- `r2430-upgrade-backfill.json`: installed 2.4.29 completed a real project
+  publication after a provenance handback. Candidate startup and a second startup
+  retained published-revision/consumed-transfer/marker counts **1/1/1**, migrations
+  **1–5**, and indexes `active_review_cwd`, `active_review_unit`,
+  `bound_review_answer`. A subsequent 2 MiB edit sealed, answered `unit/diff`,
+  received a bound passing review and completed publication
+  `publication_aab97861`. Recorder exit 0, 19 s.
+- `r2430-base-proof-base_dependency.json`: A remained open and unpublished while
+  the lead recorded A's exact compressed receipt bytes as base commit
+  `8503e1fe993e14fac801dd695b42045522c05c25`. C read that receipt and edited another
+  path. C's seal retained p's dependency proof, revision/source_revision
+  `rev_07bdf038`, mode 100644, and entry OID prefix `6d52b19b`; review
+  `review_01ffa886` and publication for `seal_92f2bccd` completed.
+  Recorder exit 0, 36 s.
+
+All three real reviews kept their prompts off argv. The lead reported no leftover
+processes or open files and removed both publication fixtures. Console logs:
+`scratchpad/r2430/lead-upgrade.log` and `lead-base-proof.log`.
+
+## C2: actual launch and resume attempts
+
+Counts below are **successful app-server bootstrap launches / injected failing
+thread-resume calls**, not status-only decisions. A repair admission has two
+app-server launches (discovery and trusted writer), but consumes one logical
+opportunity.
+
+| Case/report | Counts and outcome |
+|---|---|
+| Historical `scratchpad/r2428/writer/c2-red-3`, installed 2.4.25 → 2.4.26 | Permanent failure 34/1 → 38/3 after the release change. |
+| `c2-red-28-29`, installed 2.4.28 → 2.4.29 | 34/1 → 38/3; recorder exit 0, 46.691 s. |
+| `c2-green-30`: release change, different binary, version oscillation, nonmatching declaration | Each remained **34/1**. |
+| Same case: matching declaration while capacity closed | Still **34/1**, opportunity unconsumed. |
+| Same case: capacity reopens and matching declaration is present | **36/2**, exactly one logical attempt; restart and version oscillation remained **36/2**. |
+| Same case: explicit resume | **38/3**, preserving the explicit user override. Recorder exit 0, 56.945 s. |
+| `c2-legacy-30b`: old-format release claim present at candidate start | **34/1 unchanged**, no startup error or automatic relaunch; exit 0, 41.452 s. |
+| `c2-claim-before-b`: crash before durable claim | No claim at interruption; restart permitted exactly one attempt, **34/1 → 36/2**; exit 0. |
+| `c2-claim-after`: crash immediately after durable claim | Claim persisted; restart remained **34/1** despite no successful bootstrap evidence; exit 0. |
+
+The real permanent refusal was native `NATIVE_RPC`, code **-32600**, method
+`thread/resume`. Fixture declarations and crash/capacity faults were injected
+only in disposable states. No production repair was added.
+
+The candidate's measured failed-demand start was **0.684631 s**. Installed
+2.4.28/2.4.29 samples were **0.920589/1.068789 s**; these shared-host runs are not a
+paired latency guarantee. Evidence capture cost **0.115362 s** on its first
+binary stamp, versus **0.000130–0.000184 s** on cache hits. A real owned executable
+whose `--version` slept 10 s returned unknown version in **1.112380 s** and was
+reaped. Its digest remained known.
+
+## Conversion measurements
+
+`production.json` and `production.log` record the production Store run,
+exit **0**. Source and scratch were the same APFS volume
+(`disk3s5`, UUID `A0F10490-4FE0-4B70-AA67-6C6E258E2DCD`). The recorder used
+`cp -cR` on **only** the live blobs directory, with a fresh disposable ledger.
+
+| Measurement | Actual value |
+|---|---:|
+| Logical identities / bytes | 16,807 / 2,414,692,328 |
+| Allocated bytes before | 2,451,578,880 |
+| Allocated bytes after | 834,281,472 |
+| Saved allocated bytes | 1,617,297,408 (65.97%) |
+| Encoded / retained raw / overlap | 12,315 / 4,492 / 0 |
+| Conversion wall / CPU | 250.874825 s / 52.568747 s |
+| All logical SHA-256 values verified | 16,807; 7.862591 s |
+| Complete comparison + conversion + verification wall / CPU | 396.871068 s / 177.035199 s |
+| Whole-process peak RSS | 70,877,184 bytes |
+| Minimum free volume space | 285,966,983,168 bytes |
+| New 93,932,119-byte foreground image publication | 0.823939 s |
+| Final migrations / clone cleanup | 1–5 / clone deleted immediately |
+
+The final container comparison used a **fresh temporary per identity and block
+size**, with the same actual-allocation decision as publication. It checked
+36 ranges for each of the three largest blobs per block size, including block
+boundaries, EOF and sequential 23,646-byte pages.
+
+| Block bytes | Retained allocation for the whole corpus | Warm range median across the three largest images |
+|---:|---:|---:|
+| 262,144 | 840,491,008 B | 0.166–0.171 ms |
+| **1,048,576** | **834,281,472 B** | **0.678–0.719 ms** |
+| 4,194,304 | 832,892,928 B | 2.917–3.077 ms |
+
+The 1 MiB default saves 6,209,536 bytes over 256 KiB while keeping these warm
+receipt pages below a millisecond at the median. Increasing to 4 MiB saves only
+another 1,388,544 bytes across the corpus and multiplies this range cost by about
+four. It therefore remains configurable, with 1 MiB retained as the default.
+
+After actual publication, cold Store range reads of the three largest
+93.9 MB images took **92.117/100.215/92.907 ms**; warm medians were
+**0.768/0.820/0.760 ms**, maxima **1.778/1.587/1.718 ms**. All 108 checked ranges
+matched the independently read logical bytes and reported logical size.
+
+On the real daemon in `load-compat-30b`, a 93,932,119-byte conversion took
+**0.716671 s**, **131,067,197 logical bytes/s**. Maximum observed loop gap was
+**7.393 ms**. During five caught-up idle seconds, CPU time changed
+**7.70 → 7.75 s**, RSS **238,560 → 238,048 KiB**, and converter scan/header counters
+stayed **2/4 → 2/4**. Two scans reflect the recorder's explicit stop/restart for
+receipt conversion; there was no recurring idle scan or header read.
+
+In `pressure-green-30c` (exit **0**, 66.676 s), eight 93,932,119-byte
+images converted **751,456,952 bytes in 5.276959 s** of completed processing,
+**142,403,398 bytes/s**, with backlog/failures/overlap all zero afterward.
+Conversion paused first under the injected recovery-pressure signal and again
+during a **real healthy dormant-writer admission**, then resumed. The maximum
+loop gap was **6.401 ms** and daemon peak RSS **68,878,336 bytes**.
+
+That healthy admission completed in **26.481492 s** under conversion, compared
+with **26.446189 s** on installed 2.4.29 in `cold-red-29` (exit 0).
+Both returned the existing `WRITER_START_PENDING` after the 20-second wait while
+their roughly 26-second admission calibration continued; persisted demand state
+subsequently became `complete`. This existing calibration cost was explicitly
+excluded from the release scope. These healthy-start timings are distinct from
+the shorter permanent-failure refusal samples above.
+
+A second batch began an actual candidate before `daemon/stop`. Drain returned
+in **0.118641 s**; instrumentation at the stopping checkout-lease release
+observed **converter_alive=false**. Restart verified **all 14 logical blobs**
+and migrations 1–5. Ordinary non-draining lease release was not altered by the
+final recorder. All owned processes stopped before the command returned.
+
+
+
+## Release checks and repeat commands
+
+The corrected release checks exited **0** before documentation/version updates
+(`checks-before-docs-fixed/checks.json`). The same checks run again on the final
+2.4.30 files in `checks-final/checks.json` and `checks-final.log`;
+`final-packaging.json` records the isolated installation and exact command exits.
+
+| Check | Recorded result |
+|---|---|
+| Python 3.15 in-memory compilation | 98 plugin Python files, zero errors. |
+| Apple Python 3.9.6 hook closure | 18 files compile; actual imports exit 0. |
+| Codec-disabled hook imports | Exit 0 with zlib/bz2/lzma and their native helpers unavailable; none loaded into `sys.modules`. Standard-library optional imports receive `ImportError`. |
+| `coordinator/hooks.py --check` | Exit 0; `{"compatible": true, "protocol": "jsonl-v1"}`. |
+| Git shim syntax | sh, bash POSIX and zsh sh-emulation each exit 0; executable bit retained. |
+| Ruff delta versus installed 2.4.29 | 31 findings versus 33, **zero added**, compared by relative file/code/message and multiplicity. |
+| Strict plugin and marketplace validation | Both exit 0; `Validation passed`. |
+| Changed-file whitespace/newline check | 19 files clean. |
+| Existing reclaim configuration checks | 1/2/4 exit 0; 0/-1/1.5/invalid exit 1 with expected CONFIG positive-integer refusal. |
+
+Final repeat commands, after the version bump and with no probe running:
+
+```sh
+EXPECTED_VERSION=2.4.30 python3.15 -B "$E/static_checks.py" "$E/checks-final"
+claude plugin validate --strict plugins/software-workflows
+claude plugin validate --strict .
+```
+
+The packaging runner uses a fresh scratch `CLAUDE_CONFIG_DIR` for
+`claude plugin marketplace add <checkout> --scope user --json` followed by
+`claude plugin install software-workflows@agent-teams --scope user --json`.
+It checks the installed manifest and all three new modules, then removes that
+isolated configuration. It never replaces the live installed release.
+
+
+No repository test files were added. Recorders are external disposable real runs,
+using supervisor, worker, real Codex 0.163.0 app-servers and the loopback provider.
+Each command stops and checks its own processes before returning. The production
+corpus run starts no daemon and constructs no Store on a live-ledger copy.
+
+Use a **new, lead-prepared fixture repository for each run** (the used 141–167
+repositories cannot be reused without preparation). The repeat form is:
+
+```sh
+E=/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2430/writer
+P=/Users/ahrar/Documents/agent-teams-plugin/plugins/software-workflows
+OLD=/Users/ahrar/.claude/plugins/cache/agent-teams/software-workflows/2.4.29
+python3.15 -B "$E/run_case.py" "$OLD" "$E/new-c1-red" "$FRESH_REPO" c1
+python3.15 -B "$E/run_case.py" "$P" "$E/new-c1-green" "$NEXT_FRESH_REPO" c1
+```
+
+The same recorder's cases are `cross` (additional fresh repo argument), `edges`,
+`load`, `pressure`, `c2`, `c2-legacy` (start installed 2.4.29),
+`c2-red-new` (start installed 2.4.28), `c2-claim-before`,
+`c2-claim-after`, `cold`, and `crash:<boundary>` using the seven names above.
+Case summaries and console logs are retained even for failed recorder calibration.
+`startup_compat.py` exercises the old-daemon and codec startup refusals.
+`production.py` makes, converts and immediately removes its own blobs-only APFS
+clone; it must be run with at least 15 GiB free.
+
+Only the lead runs the following recorder because it creates and records fixture
+repositories:
+
+```sh
+PY=/Users/ahrar/.claude/plugins/data/software-workflows-agent-teams/venv/91e1e736a04fad0e/bin/python
+"$PY" -B "$E/upgrade/probe.py" "$OLD" r2430-upgrade backfill "$P"
+"$PY" -B "$E/upgrade/probe.py" "$P" r2430-base-proof base_dependency .
+```
+
+The copied provider, fault injection and recorder are all in `E/upgrade`.
+Their private `/private/tmp/r2429p-*` fixtures are removed by the recorder.
+
+### Limits and recorder corrections
+
+- Live coordinator state was only read or cloned at the blobs-directory level;
+  no live daemon, ledger or service was changed. Corpus allocation is per-file
+  `st_blocks * 512`; APFS clone sharing means it is not exclusive live-volume
+  space reclaimed.
+- Hardware power-loss ordering was not physically exercised. The real process
+  crash runs cover the seven declared publication boundaries and both repair
+  claim boundaries.
+- Python 3.11 was excluded by the resume brief. Daemon checks use Homebrew
+  Python 3.15; the hook closure uses Apple Python 3.9.6.
+- Initial recorder attempts exposed harness issues: an unguarded old-version
+  monkeypatch, a claim fault armed before the existing backoff expired, oversized
+  RPC argv, a codec-denial exception unlike a missing Python codec, a demand
+  recorder that mistook the bounded wait response for final failure, and a drain
+  assertion initially applied to ordinary non-draining lease release.
+  Corrected repetitions are the named final runs above; the failed attempts are
+  retained and are not claimed as product greens.
+- The older paused production comparison reused a truncated temporary and could
+  bias APFS allocation. The measurements above supersede it with a fresh candidate
+  for every blob and block size.
+
+---
+
 # software-workflows 2.4.29 — publication fixes — 2026-11-01
 
 ## Fix round 2 — review turn 141

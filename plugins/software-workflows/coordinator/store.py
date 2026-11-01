@@ -6,18 +6,17 @@ calling these methods. Historical events and UNKNOWN records are append-only.
 from collections import Counter
 from contextlib import contextmanager
 import hashlib
-import io
+import asyncio
+import concurrent.futures
 import json
 import os
-from pathlib import Path
 import sqlite3
-import tempfile
 import threading
 import time
 import uuid
 
 from .client import CoordinatorError, validate_state
-from . import native, telemetry
+from . import telemetry
 
 
 # Unreconciled operations: admission and custody look only at these, per checkout.
@@ -142,6 +141,12 @@ class Store:
         self._validated_blobs = {}
         self._path_blobs = {}  # advisory source stamps; never persisted across a restart
         self._blob_publish = threading.RLock()
+        self._blob_owner = threading.get_ident()
+        self._storage5_ready = False
+        try:
+            self._blob_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._blob_loop = None
         for name in ("blobs", "listeners", "indexes", "schemas", "calibrations"):
             directory = self.root / name
             directory.mkdir(mode=0o700, exist_ok=True)
@@ -207,8 +212,9 @@ class Store:
         INSERT OR IGNORE INTO migrations VALUES(1,unixepoch());
         """)
         current = self.db.execute("SELECT max(version) FROM migrations").fetchone()[0]
-        if current not in (1, 2, 3, 4):
+        if current not in (1, 2, 3, 4, 5):
             raise CoordinatorError("SCHEMA_VERSION", "Unknown ledger migration version")
+        self._storage5_ready = current >= 5
         if current == 1:
             with self.transaction():
                 self.db.execute("""CREATE TABLE checkout_identities(
@@ -422,7 +428,7 @@ class Store:
                     self.db.execute("CREATE TRIGGER IF NOT EXISTS immutable_" + table + "_" + action.lower() +
                                     " BEFORE " + action + " ON " + table + " BEGIN SELECT RAISE(ABORT,'immutable storage evidence'); END")
             self.retention_triggers()
-        if current == 4:
+        if current >= 4:
             archive_delete = ARCHIVE_DELETE
         existing = self.db.execute("SELECT sql FROM sqlite_master WHERE name='immutable_events_delete'").fetchone()
         if not existing or existing[0] != archive_delete:
@@ -433,6 +439,46 @@ class Store:
         self.generation = (generation or {}).get("generation", 0) + 1
         self.put("meta", "daemon", {"generation": self.generation, "pid": os.getpid(),
                                     "sqlite": sqlite3.sqlite_version, "started": time.time()})
+
+    @property
+    def blobs(self):
+        # Store is imported by hooks, but only daemon/receipt work needs zlib.
+        if not hasattr(self, "_blob_storage"):
+            from .blob_storage import Storage
+            with self._blob_publish:
+                if not hasattr(self, "_blob_storage"):
+                    self._blob_storage = Storage(self)
+        return self._blob_storage
+
+    def blob_owner(self, function, *args):
+        """Run a storage barrier or event on the SQLite connection's owner."""
+        if threading.get_ident() != self._blob_owner:
+            if self._blob_loop is None:
+                raise CoordinatorError("STORAGE_THREAD", "Content publication needs its ledger owner")
+            result = concurrent.futures.Future()
+            def commit():
+                try:
+                    result.set_result(function(*args))
+                except BaseException as exc:
+                    result.set_exception(exc)
+            self._blob_loop.call_soon_threadsafe(commit)
+            return result.result()
+        return function(*args)
+
+    def blob_event(self, kind, subject, data):
+        return self.blob_owner(self.event, kind, subject, data)
+
+    def storage5(self):
+        if self._storage5_ready:
+            return
+        if threading.get_ident() != self._blob_owner:
+            self.blob_owner(self.storage5)
+            return
+        with self.transaction():
+            self.storage4()
+            self.durable()
+            self.db.execute("INSERT OR IGNORE INTO migrations VALUES(5,?)", (time.time(),))
+        self._storage5_ready = True
 
     def storage4(self):
         """Call in the transaction that first publishes an incompatible value.
@@ -750,136 +796,19 @@ class Store:
 
     @telemetry.measured("hashing_blob_io")
     def blob(self, content):
-        """Hash first: reusing durable content creates and syncs nothing.
-
-        A validated blob is reusable only while its file identity and change times
-        match this generation's validation. Source streams are rewound for a new
-        publication; non-seekable streams are buffered without creating a file.
-        """
-        if isinstance(content, bytes):
-            content = io.BytesIO(content)
-        if not content.seekable():
-            content = io.BytesIO(content.read())
-        position = content.tell()
-        h = hashlib.sha256()
-        io_count = telemetry.IO.get()
-        measured = bool(telemetry.CURRENT.get())
-        for chunk in iter(lambda: content.read(1 << 20), b""):
-            if io_count is not None:
-                io_count["bytes"] += len(chunk)
-            if measured:
-                with telemetry.span("hashing", False):
-                    h.update(chunk)
-            else:
-                h.update(chunk)
-        name = h.hexdigest()
-        target = self.root / "blobs" / name
-        # A second publisher must not reference a renamed blob before the first
-        # publisher has synced its directory. Hashing stays outside this lock.
-        with self._blob_publish:
-            try:
-                stamp = self._blob_stamp(target.stat())
-            except FileNotFoundError:
-                stamp = None
-            if stamp is not None:
-                if self._validated_blobs.get(name) != stamp:
-                    self.verify_blob(name)
-                return name
-            content.seek(position)
-            fd, pending = tempfile.mkstemp(prefix="pending-", dir=target.parent)
-            try:
-                written = hashlib.sha256()
-                with os.fdopen(fd, "wb") as stream:
-                    for chunk in iter(lambda: content.read(1 << 20), b""):
-                        with telemetry.span("hashing", False):
-                            written.update(chunk)
-                        stream.write(chunk)
-                    if written.hexdigest() != name:
-                        raise CoordinatorError("UNSTABLE_READ", "Source changed while publishing receipt bytes")
-                    stream.flush()
-                    telemetry.fsync(stream.fileno())
-                os.replace(pending, target)
-                fsync_dir(target.parent)
-                self._validated_blobs[name] = self._blob_stamp(target.stat())
-                return name
-            except BaseException:
-                if os.path.exists(pending):
-                    os.unlink(pending)
-                raise
+        return self.blobs.blob(content)
 
     def read_blob(self, name):
-        if not name or len(name) != 64 or any(c not in "0123456789abcdef" for c in name):
-            raise CoordinatorError("BLOB_ID", "Invalid receipt identifier")
-        try:
-            with (self.root / "blobs" / name).open("rb") as stream:
-                before = self._blob_stamp(os.fstat(stream.fileno()))
-                data = stream.read()
-                after = self._blob_stamp(os.fstat(stream.fileno()))
-        except OSError as exc:
-            if native.local_resource_failure(exc):
-                raise  # descriptors, memory, storage: stops native intake (review turn 106), not a missing receipt
-            raise CoordinatorError("BLOB_MISSING", "Receipt bytes are unavailable", {"blob": name}, True) from exc
-        with telemetry.span("hashing", False):
-            observed = hashlib.sha256(data).hexdigest()
-        if before != after or observed != name:
-            self._validated_blobs.pop(name, None)
-            raise CoordinatorError("BLOB_CORRUPT", "Receipt hash does not match", {"blob": name}, True)
-        self._validated_blobs[name] = after
-        return data
+        return self.blobs.read(name)[0]
 
     def verify_blob(self, name):
-        """Check a receipt's bytes against its name and record its stamp as verified, as read_blob does, hashing it
-        in 1 MiB chunks: memory one chunk, not the receipt (through 2.4.16 the first use of a receipt in a daemon,
-        a publication's reuse included, read it whole)."""
-        if not name or len(name) != 64 or any(c not in "0123456789abcdef" for c in name):
-            raise CoordinatorError("BLOB_ID", "Invalid receipt identifier")
-        observed = hashlib.sha256()
-        try:
-            with (self.root / "blobs" / name).open("rb") as stream:
-                before = self._blob_stamp(os.fstat(stream.fileno()))
-                with telemetry.span("hashing", False):
-                    for chunk in iter(lambda: stream.read(1 << 20), b""):
-                        observed.update(chunk)
-                after = self._blob_stamp(os.fstat(stream.fileno()))
-        except OSError as exc:
-            if native.local_resource_failure(exc):
-                raise  # descriptors, memory, storage: stops native intake (review turn 106), not a missing receipt
-            raise CoordinatorError("BLOB_MISSING", "Receipt bytes are unavailable", {"blob": name}, True) from exc
-        if before != after or observed.hexdigest() != name:
-            self._validated_blobs.pop(name, None)
-            raise CoordinatorError("BLOB_CORRUPT", "Receipt hash does not match", {"blob": name}, True)
-        self._validated_blobs[name] = after
+        return self.blobs.verify(name)
 
     def read_blob_range(self, name, offset, length):
-        """Bytes [offset, offset + length) of a receipt, and its size, in memory bounded by the range (a read_file
-        page): a receipt not verified since its file last changed (its stamp) is verified first (verify_blob), then
-        only the range is read. Through 2.4.16 every page read the whole receipt, on the loop."""
-        if not name or len(name) != 64 or any(c not in "0123456789abcdef" for c in name):
-            raise CoordinatorError("BLOB_ID", "Invalid receipt identifier")
-        try:
-            stamp = self._blob_stamp((self.root / "blobs" / name).stat())
-        except OSError as exc:
-            if native.local_resource_failure(exc):
-                raise  # descriptors, memory, storage: stops native intake (review turn 106), not a missing receipt
-            raise CoordinatorError("BLOB_MISSING", "Receipt bytes are unavailable", {"blob": name}, True) from exc
-        if self._validated_blobs.get(name) != stamp:
-            self.verify_blob(name)
-        try:
-            with (self.root / "blobs" / name).open("rb") as stream:
-                before = self._blob_stamp(os.fstat(stream.fileno()))
-                data = b""
-                if offset < before[2]:  # at or past the end reads nothing: seek refuses an offset from 2**63 on
-                    stream.seek(offset)
-                    data = stream.read(length)
-                after = os.fstat(stream.fileno())
-        except OSError as exc:
-            if native.local_resource_failure(exc):
-                raise  # descriptors, memory, storage: stops native intake (review turn 106), not a missing receipt
-            raise CoordinatorError("BLOB_MISSING", "Receipt bytes are unavailable", {"blob": name}, True) from exc
-        if before != self._validated_blobs.get(name) or self._blob_stamp(after) != before:
-            self._validated_blobs.pop(name, None)
-            raise CoordinatorError("BLOB_CORRUPT", "Receipt changed while read", {"blob": name}, True)
-        return data, after.st_size
+        return self.blobs.read(name, offset, length)
+
+    def reusable_blob(self, name):
+        return self.blobs.reusable(name)
 
     @telemetry.measured("heads_fetch_materialization")
     def heads(self, checkout):

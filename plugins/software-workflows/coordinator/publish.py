@@ -166,8 +166,7 @@ class Publisher:
                 if row["blob"] is None:
                     matches = row["mode"] is None and entry is None
                 elif row["mode"] in ("100644", "100755"):
-                    content = await finish_thread(self.store.read_blob, row["blob"])
-                    oid = gitio.blob_oid(content, checkout["object_format"])
+                    oid = await finish_thread(lambda: gitio.blob_oid(self.store.read_blob(row["blob"]), checkout["object_format"]))
                     matches = entry == {"path": row["path"], "type": "blob", "mode": row["mode"], "oid": oid}
             if matches:
                 proofs.append({"revision": row["id"], "source_revision": source["id"], "checkout": checkout["id"],
@@ -337,7 +336,7 @@ class Publisher:
     async def verify_working(self, checkout, rows):
         for row in rows:
             try:
-                self.store.read_blob(row["blob"]) if row["blob"] else None
+                await finish_thread(self.store.verify_blob, row["blob"]) if row["blob"] else None
             except CoordinatorError as exc:
                 if row.get("operation"):
                     await self.daemon.ledger.quarantine(self.store.get(row["operation"]), exc.code)

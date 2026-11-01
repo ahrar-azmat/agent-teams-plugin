@@ -118,6 +118,9 @@ class NativeBacklog:
 class Daemon:
     def __init__(self, root):
         self.store = Store(root)
+        self.store.blobs  # Real codec round trip before admission or retention imports.
+        from .blob_conversion import Conversion
+        self.blob_conversion = Conversion(self)
         self.ledger = Ledger(self.store)
         self.custody = Custody(self.store, self.ledger)
         self.connections, self.queues, self.workers, self.tasks = {}, {}, {}, set()
@@ -330,6 +333,7 @@ class Daemon:
         """The daemon's identity and readiness; unless brief, every run's writers too. A client checking
         readiness asks for brief: the full answer decodes each run's claims and custody."""
         from .recovery import recovering_counts, startup_counts, retry_claim
+        from .repairs import decision
         from .lead_calls import legacy_status
         cached = self.writer_status.get(checkout)
         epoch = self.store.status_epoch
@@ -349,7 +353,8 @@ class Daemon:
                                 "recovery_state", "recovery_error", "recovery_retryable", "recovery_version")},
                                 "quarantined": listener.get("recovery_state") == "failed",
                                 "retirement": self.parking.intent(listener.get("id", "")),
-                                "retry_claim": retry_claim(self.store, listener) if listener.get("run") else None},
+                                "retry_claim": retry_claim(self.store, listener) if listener.get("run") else None,
+                                "retry": decision(self.store, listener) if listener.get("run") else None},
                             **({"capability_fallback": listener["capability_fallback"]} if listener.get("capability_fallback") else {}),
                             "actors": [a for a in self.store.all("actor", unit["id"])],
                             "claims": self.custody.claims(run["checkout"], unit["id"]),
@@ -387,6 +392,7 @@ class Daemon:
                 "ended": dict(self.ended), "silent": len(self.silent), "dormancy": self.dormancy.status(), "writer_mcp_profile": self.writer_profile,
                 "retention": self.retention.status(), "tool_results": tools.metrics(),
                 "reclamation": self.reclamation.status(),
+                "blob_storage": self.blob_conversion.status(),
                 "sqlite": sqlite3.sqlite_version, "version": VERSION, **({} if brief else {"writers": writers})}
 
     def intake_status(self):
@@ -770,7 +776,13 @@ class Daemon:
         directory.mkdir(mode=0o700, exist_ok=True)
         allocation = runtime.allocate("native")
         socket = Path(allocation["path"])
-        binary = native.native_codex()
+        from .repairs import capture
+        try:
+            binary = native.native_codex()
+        except (OSError, CoordinatorError):
+            await capture(self, actor, config, None)
+            raise
+        evidence = await capture(self, actor, config, binary)
         environment = native.environment(SOFTWARE_WORKFLOWS_ROLE="writer")
         environment["LOG_FORMAT"] = "json"
         environment["RUST_LOG"] = native.WRITER_LOG
@@ -798,7 +810,7 @@ class Daemon:
                 code = await process.wait()
                 raise CoordinatorError("LISTENER_START", "Native listener exited before its process identity could be recorded", {"exit_code": code}, True)
             self.store.put("listener", ident, {"actor": actor["id"], "run": actor["run"], "unit": actor["unit"],
-                           "socket": str(socket), "binary": binary, "binary_digest": await telemetry.to_thread(native.file_digest, binary),
+                           "socket": str(socket), "binary": binary, "binary_digest": evidence["binary_digest"],
                            "endpoint_allocation": allocation,
                            "pid": process.pid, "birth": birth["birth"], "incarnation": ident, "state": "starting",
                            "kernel_id": birth.get("kernel_id"), "boot_session": birth.get("boot_session"),
@@ -2730,7 +2742,7 @@ class Daemon:
         for path, image in entries:
             routed = routing.route(self.store, actor, path, params.get("cwd"))
             grouped.setdefault(routed["checkout"], {})[routed["path"]] = image
-        expected = {key: await self.expected_images(self.store.get(key), values) for key, values in grouped.items()}
+        expected = {key: await self.expected_images(self.store.get(key), values, restore) for key, values in grouped.items()}
         await self.custody.acquire(actor, [routing.qualified(key, p) for key, values in expected.items() for p in values], mark=mark)
         kind = "restore" if restore else "lead-edit"
         if len(expected) == 1:
@@ -2740,7 +2752,8 @@ class Daemon:
             from .operations import prepare
             operation = await prepare(self.ledger, actor, kind, {"expected": expected}, expected)
         try:
-            await finish_all(*(telemetry.to_thread(self.install_images, self.store.get(key), values) for key, values in expected.items()))
+            checkouts = {key: self.store.get(key) for key in expected}
+            await finish_thread(self.install_operation, checkouts, expected)
             if operation.get("parts"):
                 from .operations import verify
                 return await verify(self.ledger, operation, expected, "restore" if restore else "exact", {"executor": "coordinator"})
@@ -2750,7 +2763,7 @@ class Daemon:
             await finish(self.ledger.quarantine(operation, getattr(exc, "code", type(exc).__name__)))
             raise
 
-    async def expected_images(self, checkout, changes):
+    async def expected_images(self, checkout, changes, restore=False):
         if not isinstance(changes, dict) or not changes:
             raise CoordinatorError("LEAD_INTENT", "Record at least one complete intended path image")
         expected = {}
@@ -2759,12 +2772,24 @@ class Daemon:
             mode = change.get("mode")
             if mode not in (None, "100644", "100755"):
                 raise CoordinatorError("FILE_MODE", "Only regular file modes are supported")
-            content = base64.b64decode(change["bytes_base64"], validate=True) if mode else None
-            expected[path] = {"blob": await telemetry.to_thread(self.store.blob, content) if content is not None else None, "mode": mode}
+            if restore and "blob" in change:
+                expected[path] = {"blob": change["blob"], "mode": mode}
+            else:
+                def image():
+                    content = base64.b64decode(change["bytes_base64"], validate=True) if mode else None
+                    return {"blob": self.store.blob(content) if content is not None else None, "mode": mode}
+                expected[path] = await finish_thread(image)
         return expected
 
-    def install_images(self, checkout, expected):
-        from .store import fsync_dir
+    def install_operation(self, checkouts, expected):
+        # Staging all participants precedes even mkdir/unlink. One joined worker
+        # owns the spool and every installer, including during cancellation.
+        with self.store.blobs.staged(expected) as spool:
+            for key, values in expected.items():
+                self.install_images(checkouts[key], values, spool)
+
+    def install_images(self, checkout, expected, spool):
+        from .blob_storage import install
         for name, image in expected.items():
             normalize(checkout, name)
             parts, descriptors = name.split("/"), []
@@ -2792,7 +2817,7 @@ class Daemon:
                         if not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
                             raise CoordinatorError("UNSAFE_FILE", "Lead edit encountered a special file or hardlink before truncation")
                         output.truncate(0)
-                        output.write(self.store.read_blob(image["blob"]))
+                        install(spool, image["blob"], output)
                         output.flush()
                         os.fchmod(output.fileno(), 0o755 if image["mode"] == "100755" else 0o644)
                         os.fsync(output.fileno())
@@ -2953,6 +2978,7 @@ class Daemon:
             # No pending completion remains. Fence even new observational RPCs
             # before detaching listeners or releasing leases/closing SQLite.
             self.closing = True
+            await self.blob_conversion.close()
             for listener in list(self.store.all("listener")):
                 if listener["state"] not in ("stopped", "dead", "dormant"):
                     await self.stop_listener(listener)
@@ -2964,6 +2990,7 @@ class Daemon:
         finally:
             if not self.stop.is_set():
                 self.draining = self.closing = False
+                self.blob_conversion.start()
 
     async def dispatch(self, method, params):
         self.admit_rpc(method, params)
@@ -3543,6 +3570,7 @@ class Daemon:
                 self.store.event("maintenance/retry", None, {"reason": "native connection retired"})
 
     async def serve(self):
+        self.store._blob_loop = asyncio.get_running_loop()
         from .locks import finish
         from .recovery import recover, recover_writers
         allocation = server = None
@@ -3601,6 +3629,7 @@ class Daemon:
             self.start_service("lead_calls", lambda: observe(self))
             self.background(self.compact_history())
             self.retention.request()
+            self.blob_conversion.start()
             self.start_service("reclamation", self.reclamation.run)
             for listener in list(self.store.all("listener")):
                 if listener["state"] == "connected":
@@ -3695,6 +3724,7 @@ class Daemon:
         self.store.event("daemon/native_intake_closed", None, {"receivers": len(connections)})
         if hasattr(self, "admission_executor"):
             self.admission_executor.shutdown(wait=True, cancel_futures=True)
+        await self.blob_conversion.close()
         await self.reclamation.drained_checkpoint()
         # No unconditional finally: an unsuccessful join must never release the
         # database or descriptors still owned by its unfinished users.
@@ -3762,6 +3792,9 @@ def _worker(root, control):
             from .maintenance import continue_start
             continue_start(root)
             daemon = Daemon(root)
+            # Only this worker owns the state. CLI/hook Store construction must
+            # never remove a running worker's publication or staging files.
+            daemon.store.blobs.reclaim_temporaries()
             daemon.stop_control = control
             if upgrade:
                 daemon.upgrade_fd = int(upgrade)

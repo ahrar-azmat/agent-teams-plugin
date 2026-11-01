@@ -16,6 +16,7 @@ import subprocess
 import time
 
 from .client import CoordinatorError, clean_environment
+from .repairs import CURRENT, consume
 
 
 def quiet_status(status):
@@ -761,6 +762,13 @@ class Connection:
         params = params or {}
         if not unchecked:
             (self.schema.validate if self.schema else validate)(method, params)
+        attempt = CURRENT.get()
+        if attempt is not None:
+            consume()
+            # An attached-writer RPC can already have acted before a later
+            # bootstrap reports that its own launch never started.
+            if attempt["active"]:
+                attempt["launched"] = True
         self.counter += 1
         ident = self.counter
         future = asyncio.get_running_loop().create_future()

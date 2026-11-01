@@ -110,12 +110,18 @@ async def spawn(*argv, kind="helper", listener=None, **options):
             passed[descriptor] = len(descriptors)
             descriptors.append(os.dup(descriptor))
         fd_arguments = {str(index): passed[descriptor] for index, descriptor in options.get("fd_arguments", {}).items()}
+        if "app-server" in argv:
+            from .repairs import consume
+            consume()
         submitted = True
         response = await authority.call("spawn", cwd=str(options.get("cwd") or os.getcwd()),
             payload={"kind": kind, "listener": ident, "argv": [str(x) for x in argv],
                      "env_delta": dict(options.get("env") or os.environ), "stdio": stdio,
                      "fd_arguments": fd_arguments}, descriptors=descriptors)
         result = Process(authority, response["family"])
+        if "app-server" in argv:
+            from .repairs import launched
+            launched()
         loop = asyncio.get_running_loop()
         for name, descriptor in list(local.items()):
             if name == "stdin":
@@ -129,7 +135,10 @@ async def spawn(*argv, kind="helper", listener=None, **options):
                 setattr(result, name, reader)
             del local[name]
         return result
-    except BaseException:
+    except BaseException as failure:
+        if "app-server" in argv:
+            from .repairs import deferred
+            deferred(failure)
         if submitted:
             from .locks import finish
             try:

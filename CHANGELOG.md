@@ -3,6 +3,59 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.30] — 2026-11-01
+
+- Store beneficial receipt content in versioned `.zlib-blocks-v1` containers:
+  independent zlib-6 blocks, logical lengths, index integrity and block digests.
+  Identities remain SHA-256 of uncompressed bytes; raw receipts stay readable
+  indefinitely, and small or incompressible content stays raw when it uses less
+  allocated space. Cold validation checks the full logical hash; warm ranges
+  decode only intersecting blocks. Deduplication, checkout reuse and replay use
+  the same retained-descriptor representation lookup.
+- Hash seekable content before allocating a publication candidate, so unchanged
+  receipts can be reused without a temporary copy under disk pressure. Verified
+  republication repairs a corrupt representation atomically and records a
+  repair event/counter; ordinary reads still refuse corruption.
+- Verify and privately stage every intended image across all participants before
+  a lead edit or restore changes any working path, including mkdir and deletion.
+  Installation consumes the staged bytes; a missing or corrupt later image
+  cannot truncate a file or partially apply an earlier checkout. Cancellation
+  joins the filesystem worker before staging is closed.
+- Convert existing raw content after readiness with a dedicated paced worker,
+  per-hash publication, verified candidates, macOS full synchronization and raw
+  reader coordination. Conversion pauses for pressure and joins before drain
+  releases leases. Cached incremental status replaces idle directory rescans;
+  discovery, refresh, stat and conversion failures retry with bounded backoff
+  without ending the worker. Due retries respect pressure waits. Raw content
+  occupying at most one filesystem allocation unit skips encoding and is
+  counted as kept raw. The optional converter reserves maintenance headroom
+  plus a validated `SOFTWARE_WORKFLOWS_BLOB_RESERVE_BYTES` setting (default
+  15 GiB); foreground writes gain no free-space floor.
+  No logical content is deleted and no retention window is introduced.
+- Reclaim abandoned store temporaries only at daemon startup under exclusive
+  worker ownership, before serving or conversion. Store/Storage construction
+  by other processes never sweeps; unexpected names and logical content remain
+  untouched. Startup records removed counts/bytes in an event and status.
+- Retry a permanent writer failure only for an applicable declared repair, once
+  per stable incident and repair ID. **2.4.30 declares no repairs.** Coordinator
+  releases and native binary changes do not grant attempts. Recovery and dormant
+  demand share the gate; legacy release claims remain readable and inert.
+  Capacity deferral does not consume an attempt; a crash after its durable claim
+  does. Explicit resume retains its existing admission, history and UNKNOWN checks.
+- Persist failed-attempt evidence, cache binary identity by physical stamp, and
+  bound optional `--version` collection to one second. Status reports suppression,
+  matched repair and consumed attempt. Hook imports remain Python 3.9-compatible
+  without a codec; the daemon probes actual codec capability at startup.
+- Durably record **migration 5 before either compressed publication or new
+  failure/repair records**. Older daemons refuse `SCHEMA_VERSION`; rollback below
+  2.4.30 is unsupported. The 2.4.29 review indexes, publication receipts, consumed
+  transfers and initialization marker are preserved across upgrade.
+- Verification includes installed-2.4.29 C1 reds, release-triggered C2 reds,
+  disposable real-daemon greens, publication and retry crash boundaries, old
+  hooks, a real 2.4.29 publication upgrade, dependency-proof publication, and a
+  blobs-only APFS clone converted and fully verified by the production Store.
+  Exact measurements, commands and limitations are in `coordinator/VERIFY.md`.
+
 ## [software-workflows 2.4.29] — 2026-11-01
 
 - Exec prompts leave argv for fresh and resumed advisors and writers. Private

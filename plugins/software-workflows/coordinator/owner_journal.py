@@ -12,7 +12,7 @@ import struct
 import sys
 import time
 import uuid
-import zlib
+import binascii
 
 from .client import CoordinatorError
 from .processes import boot_session
@@ -54,7 +54,7 @@ def frame(sequence, value, boot=None):
     data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     boot = uuid.UUID(boot or boot_session()).bytes
     prefix = struct.pack("!IQ16s", len(data), sequence, boot)
-    return HEADER.pack(MAGIC, len(data), sequence, boot, zlib.crc32(prefix + data)) + data
+    return HEADER.pack(MAGIC, len(data), sequence, boot, binascii.crc32(prefix + data)) + data
 
 
 def replay(path, visit, events=None):
@@ -83,7 +83,7 @@ def replay(path, visit, events=None):
                 damaged = True
                 break
             data = os.pread(fd, length, offset + HEADER.size)
-            if zlib.crc32(struct.pack("!IQ16s", length, sequence, boot) + data) != crc:
+            if binascii.crc32(struct.pack("!IQ16s", length, sequence, boot) + data) != crc:
                 damaged = True
                 break
             if markers is None or any(marker in data for marker in markers):

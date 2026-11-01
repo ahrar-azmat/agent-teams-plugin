@@ -17,7 +17,7 @@ import tempfile
 import time
 import unicodedata
 
-from .locks import KeyedLocks, finish_all
+from .locks import KeyedLocks, finish_all, finish_thread
 from .client import CoordinatorError
 from . import gitio
 from .store import uid, digest
@@ -217,12 +217,8 @@ def read_path(store, checkout, name):
                 with store._blob_publish:
                     cached = store._path_blobs.get(cache_key)
                     reusable = bool(cached and cached[0] == stamp and cached[2] < began)
-                    if reusable:
-                        target = store.root / "blobs" / cached[1]["blob"]
-                        try:
-                            reusable = store._validated_blobs.get(cached[1]["blob"]) == store._blob_stamp(target.stat())
-                        except FileNotFoundError:
-                            reusable = False
+                if reusable:
+                    reusable = store.reusable_blob(cached[1]["blob"])
                 blob = cached[1]["blob"] if reusable else store.blob(stream)
                 after = os.fstat(stream.fileno())
                 current = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False)
@@ -1082,7 +1078,7 @@ class Ledger:
                 pre = operation["pre"][path]
                 if pre is None:
                     raise CoordinatorError("PATCH_EVIDENCE", "A move from outside the ledger left no readable pre-image", {"path": path})
-                before = self.store.read_blob(pre["blob"]) if pre["blob"] else b""
+                before = await finish_thread(self.store.read_blob, pre["blob"]) if pre["blob"] else b""
                 diff = change["diff"]
                 if kind == "add":
                     if pre["blob"] is not None:

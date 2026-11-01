@@ -167,8 +167,6 @@ async def _registered_reconcile(daemon, listener, advance, invocation, demand, s
                 raise CoordinatorError("WRITER_START_FAILED", "Automatic recovery is held until its retry is due",
                                        {"retryable": not permanently_failed(daemon, listener), "run": run["id"]}, True)
             return
-        if scheduled and permanent_classification(store, listener)[0]:
-            claim_retry(daemon, listener)
         if listener["state"] == "dormant" and not demand:
             if not listener.get("dormant_proof"):
                 async with capacity(daemon):
@@ -176,13 +174,17 @@ async def _registered_reconcile(daemon, listener, advance, invocation, demand, s
             return
         invocation["listener"] = listener["id"]
         invocation["phase"] = "queued"
-        claim = retry_claim(store, listener)
         async with capacity(daemon):
             invocation["phase"] = "active"
+            from . import repairs
+            attempt = {"daemon": daemon, "listener": listener, "scheduled": scheduled, "active": True,
+                       "evidence": (store.get("writer_attempt:" + listener["run"], required=False) or {}).get("evidence")}
+            token = repairs.CURRENT.set(attempt)
             try:
                 notice = await reconcile_pass(daemon, listener)
                 ensure_running(daemon)
             except Exception as exc:
+                repairs.record_failure(store, listener, failure_info(exc), retryable_failure(failure_info(exc)))
                 if demand:
                     raise
                 reconcile_failed(daemon, listener, exc)
@@ -190,9 +192,14 @@ async def _registered_reconcile(daemon, listener, advance, invocation, demand, s
                     quarantine_failed(daemon, listener, exc)
                 raise
             else:
+                repairs.resolved(store, listener["run"])
+                claim = store.get(attempt.get("claim"), required=False)
                 if claim:
                     claim.update(state="resolved", completed=time.time())
                     store.save(claim)
+            finally:
+                attempt["active"] = False
+                repairs.CURRENT.reset(token)
     # Outside the reconcile lock: advancement may need another reconcile. Unproven inputs are never resent.
     ensure_running(daemon)
     run = store.get(listener["run"])
@@ -394,6 +401,8 @@ def reconcile_failed(daemon, listener, exc):
     retries = current.get("recovery_retries", 0) + 1
     info = failure_info(exc)
     retryable, delay = retryable_failure(info), retry_delay(retries)
+    from .repairs import record_failure
+    record_failure(store, current, info, retryable)
     current.update(recovery_state="failed", recovery_error=info["code"], recovery_error_details=info,
                    recovery_retryable=retryable, recovery_version=plugin_version(), recovery_retries=retries,
                    retry_at=time.time() + delay)
@@ -460,8 +469,8 @@ def startup_obligation(store, runid):
 def retry_due(daemon, listener):
     """Whether a writer whose reconcile failed is reconciled again now by a caller on its own schedule (maintenance, a
     cancel's settlement): its backoff has passed, and its failure can heal (the incident's classification, else the
-    listener's) or this release has not tried it yet. A failure that cannot heal may have been the coordinator's own
-    (HOOK_DEFINITIONS was, through 2.4.15), so each release tries it once; then only a resume does. Through 2.4.15 a
+    listener's) or a matching declared repair remains unused. Release and binary changes do not grant an attempt;
+    explicit resume remains available. Through 2.4.15 a
     cancel's settlement checked only the backoff, and two writers whose readmission could not pass were tried 121
     times in 6 h, each with a new app-server."""
     if listener.get("recovery_state") != "failed":
@@ -489,13 +498,10 @@ def memory_gated(info):
 
 
 def permanently_failed(daemon, listener):
-    """A writer whose reconcile failed with a failure that cannot heal, which this release has tried (retry_due): no
-    schedule reconciles it again, only a resume or the next release. Startup recovery keeps it as it is (recover), and
-    so does a transport gap."""
-    failed, version = permanent_classification(daemon.store, listener)
-    claim = retry_claim(daemon.store, listener)
-    return (bool(claim and claim["state"] != "resolved") or
-            failed and listener.get("recovery_state") == "failed" and version == plugin_version())
+    """Automatic recovery needs an unused repair matching the failed attempt."""
+    from .repairs import decision
+    choice = decision(daemon.store, listener)
+    return choice["permanent"] and not choice["eligible"]
 
 
 RECOVERY_CLASSIFICATION = ("recovery_state", "recovery_error", "recovery_error_details", "recovery_retryable",
@@ -503,45 +509,18 @@ RECOVERY_CLASSIFICATION = ("recovery_state", "recovery_error", "recovery_error_d
 
 
 def permanent_classification(store, listener):
-    incident = startup_obligation(store, listener["run"])
-    if incident:
-        retryable, version = incident["retryable"], incident.get("version")
-    else:
-        retryable = listener.get("recovery_retryable", listener["state"] != "quarantined")
-        version = listener.get("recovery_version")
-    return not retryable, version
-
-
-def retry_key(store, listener):
-    incident = startup_obligation(store, listener["run"])
-    return "writer_retry:" + (incident["id"] if incident else listener["run"]) + ":" + plugin_version()
+    from .repairs import decision
+    return decision(store, listener)["permanent"], listener.get("recovery_version")
 
 
 def retry_claim(store, listener):
-    # A listener-only failure may acquire an incident on a later restart. Its
-    # unresolved release claim still belongs to the run, whichever key saved it.
-    release = plugin_version()
-    for claim in store.all("writer_retry", listener["run"]):
-        if claim["release"] == release and claim["state"] != "resolved":
-            return claim
-    return store.get(retry_key(store, listener), required=False)
-
-
-def claim_retry(daemon, listener):
-    """Commit the release attempt before admission, including its bootstrap launches.
-
-    The run/release lookup survives listener replacement and incident reconstruction.
-    The sidecar preserves classification without changing the incident to claim it.
-    """
-    store = daemon.store
-    ident = retry_key(store, listener)
-    prior = retry_claim(store, listener)
-    if prior and prior["state"] != "resolved":
-        raise CoordinatorError("RECOVERY_ATTEMPT_CLAIMED", "This release already claimed its automatic recovery attempt",
-                               {"run": listener["run"], "claim": prior["id"]})
-    store.put("writer_retry", ident, {"state": "claimed", "run": listener["run"], "listener": listener["id"],
-        "release": plugin_version(), "generation": store.generation, "claimed": time.time(),
-        "classification": {k: listener[k] for k in RECOVERY_CLASSIFICATION if k in listener}}, listener["run"])
+    from .repairs import failure
+    incident = failure(store, listener["run"])
+    if not incident:
+        return None
+    claims = [claim for claim in store.all("writer_retry", listener["run"])
+              if claim.get("incident") == incident["incident"] and claim["state"] != "deferred"]
+    return max(claims, key=lambda claim: claim["claimed"]) if claims else None
 
 
 def repair_retry_claim(daemon, listener):
@@ -1179,7 +1158,7 @@ async def recover(daemon):
                 raise
             retirement_runs.add(runid)
     for claim in store.all("writer_retry"):
-        if claim["release"] == plugin_version() and claim["state"] != "resolved":
+        if claim.get("repair") and claim["state"] == "claimed":
             run = store.get(claim["run"])
             repair_retry_claim(daemon, store.get(store.get(run["root_actor"])["listener"]))
     defer_unbound(store)
@@ -1951,15 +1930,17 @@ async def restore_unknown(daemon, params):
                                    {"path": path, "latest_known_revision": known_revision(store, checkout, path)})
         mode, data = None, None
     else:
-        data = store.read_blob(known["blob"]) if known["blob"] else None
-        mode = known["mode"] if data is not None else None
+        data = None
+        mode = known["mode"]
     # The read records what is there now: a restore replaces bytes it has seen.
     await daemon.ledger.reconcile(checkout, [path], ignore_pending=False,
                                   owner={"kind": "restore", "unknown": row["id"], "phase": "before"},
                                   guard=lambda: refuse_executing(store, checkout["id"], [path]))
     change = {"mode": mode}
+    if revision not in (None, "baseline"):
+        change["blob"] = known["blob"]
     if data is not None:
-        change["bytes_base64"] = base64.b64encode(data).decode()
+        change["bytes_base64"] = await finish_thread(lambda: base64.b64encode(data).decode())
     # It resolves what it found before its edit, by id: an UNKNOWN or a quarantined operation recorded later is an
     # effect it never saw.
     found = [unknown["id"] for unknown in store.unresolved(row["checkout"], [path]) if unknown["path"] == path]
@@ -2052,12 +2033,12 @@ async def restore_checkout(daemon, actor, unknown, revisions):
             raise CoordinatorError("RESTORE_KNOWN", "Every restored image must be a stored known revision")
         changes[path] = {"mode": known["mode"]}
         if known["blob"]:
-            changes[path]["bytes_base64"] = base64.b64encode(store.read_blob(known["blob"])).decode()
+            changes[path]["blob"] = known["blob"]
     wanted = {base[path]["oid"] for path, revision in revisions.items() if revision == "baseline" and base[path]["mode"]}
     data = await finish_thread(committed_blobs, checkout["root"], wanted)
     for path, revision in revisions.items():
         if revision == "baseline" and base[path]["mode"]:
-            changes[path]["bytes_base64"] = base64.b64encode(data[base[path]["oid"]]).decode()
+            changes[path]["bytes_base64"] = await finish_thread(lambda: base64.b64encode(data[base[path]["oid"]]).decode())
     # As a path's restore: it resolves what it found before its edit, holds its claims until that commits, and is
     # resolved only while every head is still the one its read found.
     before = [item["id"] for item in store.unresolved(checkout["id"])]

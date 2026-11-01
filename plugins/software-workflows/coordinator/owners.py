@@ -1,5 +1,6 @@
 """The supervisor's single process authority; no ledger or native protocol here."""
 import fcntl
+import errno
 import json
 import os
 from pathlib import Path
@@ -92,9 +93,14 @@ class Owner:
             # Only a durable OWNED record opens the gate. No argv/env enters the journal.
             os.write(write_fd, b"GO\n")
             return family
-        except BaseException:
+        except BaseException as exc:
+            if isinstance(exc, CoordinatorError) and exc.code in ("RESOURCE_PAUSED", "RESOURCE_EXHAUSTED"):
+                exc.details = dict(exc.details or {}, launch_not_started=True)
             if ident in self.families:
                 self.begin_end(ident)
+            if isinstance(exc, OSError) and exc.errno in (errno.EAGAIN, errno.ENOMEM, errno.EMFILE, errno.ENFILE, errno.ENOSPC):
+                raise CoordinatorError("RESOURCE_EXHAUSTED", "Owner could not open the launch gate",
+                                       {"errno": exc.errno, "launch_not_started": True, "retryable": True}, True) from exc
             raise
         finally:
             os.close(read_fd)

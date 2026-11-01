@@ -38,7 +38,7 @@ class Dormancy:
     def start_due(self, runid):
         """Whether a caller on its own schedule (a waking message, a workflow's advance, startup recovery) may start the
         run's writer now: no failed demand start, or one due by the policy of recovery.retry_due: its backoff has passed,
-        and its cause can heal or this release has not tried it. A resume starts it regardless. Through 2.4.15 a failed
+        and its cause can heal or a matching declared repair remains unused. A resume starts it regardless. Through 2.4.15 a failed
         start was tried again at each message delivery pass, each with a new app-server: on the user's ledger four runs'
         starts were tried 1,072 to 2,788 times, failing OWNER_UNREGISTERED or HOOK_DEFINITIONS every time."""
         from .recovery import gate_reopened
@@ -50,12 +50,11 @@ class Dormancy:
         return not self.start_held(runid)
 
     def start_held(self, runid):
-        """A failed demand start whose cause cannot heal, which this release has tried (start_due): no schedule starts it
-        again, only a resume or the next release."""
-        from .runtime import plugin_version
-        record = self.demand(runid)
-        return (bool(record) and record.get("state") == "failed" and not record.get("retryable", True)
-                and record.get("version") == plugin_version())
+        """The same incident/repair gate as startup, maintenance and transport recovery."""
+        from .recovery import permanently_failed
+        run = self.store.get(runid)
+        listener = self.store.get(self.store.get(run["root_actor"])["listener"])
+        return permanently_failed(self.daemon, listener)
 
     def require_quiet(self, listener):
         """A dormant state is not itself proof that its family is quiescent."""
@@ -348,8 +347,11 @@ class Dormancy:
                 # the memory gate made is due again once the gate would admit it (recovery.gate_reopened).
                 streak, info = record.get("failure_streak", 0) + 1, failure_info(exc)
                 record.update(failure_streak=streak, retryable=retryable_failure(info), version=plugin_version(),
+                              failure=info,
                               resource="memory" if memory_gated(info) else info.get("resource"),
                               retry_at=time.time() + retry_delay(streak))
+                from .repairs import record_failure
+                record_failure(store, original, info, record["retryable"])
             store.save(record)
             store.event("writer/start_failed", runid, {"code": code, "demand": record["id"], "retryable":
                                                        record["state"] == "pending" or record["state"] == "failed" and record["retryable"],

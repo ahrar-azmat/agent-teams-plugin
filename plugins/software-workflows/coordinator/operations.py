@@ -78,7 +78,7 @@ async def complete_patch(ledger, operation, item):
             pre = parts[source["checkout"]]["pre"][source["path"]]
             if pre is None:
                 raise CoordinatorError("PATCH_EVIDENCE", "A move from outside the ledger left no readable pre-image", {"path": source["path"]})
-            before = store.read_blob(pre["blob"]) if pre["blob"] else b""
+            before = await finish_thread(store.read_blob, pre["blob"]) if pre["blob"] else b""
             diff = change["diff"]
             if kind == "add":
                 if pre["blob"] is not None:

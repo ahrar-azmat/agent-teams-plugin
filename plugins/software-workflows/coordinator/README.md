@@ -1,4 +1,4 @@
-# Writer coordinator — software-workflows 2.4.29 / P1
+# Writer coordinator — software-workflows 2.4.30 / P1
 
 C1 runs native Codex app-server writers in their original checkouts. A native
 Codex project is one unit spanning all of its repositories; several projects can
@@ -8,7 +8,163 @@ coordinator. The package does not import `server.py`; the MCP server uses the
 same Python client and JSONL RPC as the CLI. Actual verification results are in
 [VERIFY.md](VERIFY.md).
 
-Version 2.4.29 fixes large reviews, handback provenance and publication guards.
+Version 2.4.30 changes content storage and permanent writer-failure retries.
+Version 2.4.29's review and publication behavior remains in force.
+
+## Content representations and installation
+
+A receipt's identity is always the SHA-256 of its uncompressed bytes. Raw
+`blobs/<sha256>` files remain readable without an age limit. Beneficial new writes
+use `blobs/<sha256>.zlib-blocks-v1`; encoding is explicit in the filename, never
+guessed from content. A container is retained only when its actual allocated
+blocks (`st_blocks * 512`) are smaller than the raw representation's. Small or
+incompressible content can therefore stay raw. No logical blob is deleted.
+
+Seekable input is hashed in place before publication. If its identity already
+has a verified representation, reuse creates no temporary copy, even after a
+daemon restart. New input is rewound and rehashed into a bounded private raw
+candidate; a changed source refuses `UNSTABLE_READ`. Nonseekable input uses a
+bounded spool. Raw content occupying at most one filesystem allocation unit
+cannot shrink, so neither foreground publication nor conversion attempts to
+encode it. The unit comes from `statvfs.f_frsize` (falling back to `f_bsize`).
+
+The version-1 container uses big-endian integers and independently framed zlib
+streams at compression level **6**:
+
+| Structure | Exact layout |
+|---|---|
+| Header, 64 bytes (`>8sIIQQ32s`) | Magic `SWBLK001` (8 bytes), version `1` (u32), block bytes (u32), logical length (u64), block count (u64), SHA-256 of all index entries (32 bytes). |
+| Index entry, 64 bytes (`>QQQQ32s`) | Logical offset, physical offset, uncompressed length, stored length (four u64s), SHA-256 of the uncompressed block (32 bytes). |
+| Payload | One independent zlib stream per entry, contiguous after the index; no gaps or trailing bytes. |
+
+The default block size is **1,048,576 bytes**. Set
+`SOFTWARE_WORKFLOWS_BLOB_BLOCK_BYTES` to a positive unsigned 32-bit integer to
+choose another size for new containers; each existing container records its own
+size. The default balances the full-corpus allocation and receipt-range
+measurements in [VERIFY.md](VERIFY.md). Input, index traversal and codec output
+are streamed in bounded chunks; an advertised length is never an allocation
+request. Startup performs a real encode/decode round trip and refuses
+`BLOB_CODEC_UNAVAILABLE` if it fails. Hook clients require no codec.
+
+Cold access validates the complete index and logical SHA-256. A verified physical
+stamp caches the representation and logical length. A warm range decodes only
+the intersecting blocks, verifies their digests, and returns the logical size.
+The same descriptor spans validation and use. Lookup is compressed, raw, then
+compressed, retrying only a missing-file race; corruption never falls back to
+raw. Missing content is `BLOB_MISSING`, malformed content is `BLOB_CORRUPT`, and
+native local-resource failures retain their existing classification. Deduplication
+and checkout-image reuse use this same representation layer.
+
+Publication with verified source bytes can repair a corrupt representation of
+the same identity. It synchronizes and atomically installs the verified
+replacement under the per-hash lock before retiring the corrupt representation.
+The ordinary raw/container allocation rule still applies. Each repair records
+a `blob/repaired` event and increments the daemon's `repaired` status counter.
+Reads without verified replacement bytes continue to refuse `BLOB_CORRUPT`.
+
+Publication prepares and fully verifies a private candidate outside the per-hash
+publication lock. Before incompatible publication, the ledger owner durably
+commits **migration 5**. The candidate then receives `fsync` and, on macOS,
+`F_FULLFSYNC`, followed by atomic rename and directory synchronization. Raw
+readers retain the per-hash lock through descriptor closure; raw is unlinked only
+after they finish, followed by another directory synchronization. A crash can
+leave raw, compressed, or both; readers resolve those representations directly.
+Unpublished temporaries and progress counters are never receipt authority.
+
+On daemon startup, after acquiring exclusive `worker.lock` ownership and before
+serving or conversion, the worker removes abandoned store temporaries in
+`blobs/`: `pending-*`, `pending-blocks-*`, `pending-raw-*` and `tmp*` spools
+with tempfile's eight-character suffix. Only owned, regular, single-link files
+with those names qualify. Logical identities, containers, links, directories
+and unexpected names are preserved. Startup reports removed counts, logical
+and allocated bytes, and unexpected entries, and records
+`blob/temporaries_reclaimed`. Store/Storage construction by a CLI, hook or tool
+never runs this sweep.
+
+A lead edit or restore stages **every intended non-deletion image across all
+participant checkouts** in a private spool before creating a directory, removing
+a path or opening a working file for installation. Installers consume only the
+verified spool. Blob refusal leaves all working paths unchanged. Cancellation
+joins the filesystem worker before closing the spool; later filesystem failures
+retain the existing quarantine/reconciliation behavior. Full reads and hashing
+in asynchronous publication, recovery and operation completion run off the
+event loop; SQLite stays on its owning thread.
+
+Backlog conversion starts after readiness in its own paced worker. It discovers
+the initial directory once, then processes changed names; a caught-up worker does
+no polling scan or container-header reads. Discovery, inventory refresh, stat
+and conversion failures preserve pending work and retry with backoff from
+5 seconds to at most 300 seconds. The worker remains alive until stopped;
+status distinguishes retrying, paused, idle and intentionally stopped states.
+An overdue retry still respects the one-second pressure wait. Writer recovery, memory pressure, WAL
+pressure and draining pause conversion. Shutdown joins the worker before
+checkout leases are released. Raw files with no allocation benefit are remembered
+by stamp rather than repeatedly encoded.
+
+Only optional background conversion reserves free space. Set
+`SOFTWARE_WORKFLOWS_BLOB_RESERVE_BYTES` to a nonnegative integer byte count;
+the default is **16,106,127,360 bytes (15 GiB)**, derived from the requested
+disk-space floor. Invalid values refuse startup with `INVALID_SETTING`.
+The existing maintenance allowance (twice the ledger size) and outstanding
+candidate/staging reservations are added separately. Foreground writes
+and operation staging have no new free-space refusal threshold; actual resource
+exhaustion remains a failure. Reservations let the background worker account for
+foreground work already in progress.
+
+`daemon/status.blob_storage` is cached and creates no per-tick ledger records:
+
+| Field | Meaning |
+|---|---|
+| `logical_bytes` | Unique uncompressed bytes across discovered identities. |
+| `raw_logical_bytes`, `encoded_logical_bytes` | Logical bytes present in each representation; overlaps appear in both. |
+| `raw_allocated_bytes`, `encoded_allocated_bytes` | Per-file allocated bytes, not a measurement of exclusive APFS extents. |
+| `overlap_bytes` | Allocation of raw files that also have an encoded representation. |
+| `backlog`, `converted`, `converted_bytes`, `kept_raw` | Pending raw identities, successful conversion totals, and processed raw images kept without an allocation benefit. |
+| `seconds`, `bytes_per_second` | Completed processing time and converted logical-byte throughput. |
+| `failures`, `failed_blobs`, `last_error` | Total failures, currently backed-off names, and the last code/blob/repetition count and phase. |
+| `state`, `pause_reason`, `next_retry_at` | Worker state, pressure/backoff reason and next retry's Unix timestamp, or null. Discovery errors can have no blob identity. |
+| `reserved_bytes`, `block_bytes`, `background_reserve_bytes`, `allocation_unit` | Outstanding reservations, configured block size and background floor, and filesystem allocation unit. |
+| `scans`, `container_header_reads` | Discovery counters; unchanged during caught-up idle time. |
+| `repaired` | Corrupt representations replaced from verified source bytes during this daemon lifetime. |
+| `reclaimed_temporaries`, `reclaimed_temporary_bytes`, `reclaimed_temporary_allocated_bytes` | Startup's removed temporary count, logical bytes and per-file allocated bytes. |
+| `unexpected_entries` | Other non-identity entries found at startup and preserved. |
+
+## Declared repairs and downgrade refusal
+
+Permanent writer failures persist a stable incident, normalized cause, and the
+failed attempt's binary digest/version and configuration/mode evidence. Configuration
+and writer-profile evidence is stored as digests rather than secret values.
+The production repair registry in `repairs.py` is **empty in 2.4.30**.
+Changing the coordinator release or native executable alone opens no retry.
+
+A future declaration supplies a stable repair ID and a predicate over the
+persisted failure evidence. A matching unused declaration permits one automatic
+attempt, keyed by **incident + repair ID**. Capacity and memory admission precede
+the durable claim; consumption immediately precedes the first bootstrap launch
+or retry RPC against an attached writer. Discovery and trusted app-server launches
+belong to one attempt. Replacement, restart and version oscillation preserve the
+claim. Only an explicit owner proof that launch never began can defer it;
+a crash or lost reply after consumption remains consumed.
+
+Startup recovery, maintenance, cancellation settlement, transport recovery and
+dormant demand share that decision under the existing run serialization.
+Legacy failures without matching evidence remain suppressed; old release-keyed
+claims are readable and inert. Explicit resume still retries through admission,
+history reconciliation, UNKNOWN and custody safeguards. Status exposes the
+decision's suppression reason, incident, matched repair and consumed attempt.
+Transient failure backoff is unchanged.
+
+Binary evidence is cached in-process by device, inode, size and nanosecond mtime.
+A new stamp is hashed once and its optional `--version` response has a one-second
+timeout; timeout records an unknown version and reaps the owned process.
+Warm demand starts reuse the evidence.
+
+Migration **5 covers both the block representation and the new failure/repair
+records**. Its durable owner-thread barrier precedes the first such publication.
+Once recorded, daemons older than **2.4.30** refuse the ledger with
+`SCHEMA_VERSION`; rollback below 2.4.30 is unsupported. This barrier does not
+replace or reorder 2.4.29's review indexes or publication-evidence initialization.
+
 
 ## Review and publication objects
 
@@ -2619,26 +2775,20 @@ Retries run in the background, even for terminal runs, after 5 s, doubling to
 workflow's submission) applies this classification (`recovery.retry_due`; through
 2.4.15 a cancel's settlement checked only the backoff), and decides it under the
 run's reconcile lock, on the incarnation current by then: a pass queued behind one
-that failed is not made until it is due. A failure classified permanent is tried
-once by each new release, since its cause may have been the coordinator's own
-(`HOOK_DEFINITIONS` was, through 2.4.15), then only by a resume. A writer whose
-reconcile failed keeps that failure across a restart and a transport gap until
-the policy makes it due: neither marks it reconciling nor tries it before then
-(`recovery/writer_held` at startup). An incident rebuilt from an earlier
-release's quarantine keeps that failure's release (none before 2.4.16), so this
-release still tries it once. Before any admission or replacement launch, the
-scheduled reconcile durably claims that incident's (otherwise run's) release
-attempt under the reconcile lock. The claim survives listener replacement and
-crashes before failure stamping. Restart restores an interrupted attempt's saved
-classification; it cannot launch another automatic attempt for that release.
-Unresolved claims are found by run and release even if startup has since rebuilt
-an incident for a failure that originally belonged only to the listener.
+that failed is not made until it is due. A permanent failure needs an unused
+declared repair matching its persisted incident and failed-attempt evidence.
+Coordinator releases and native binary changes alone never make it due;
+2.4.30 declares no repairs. The same decision applies to dormant demand starts.
+The durable incident/repair claim precedes the first bootstrap launch or retry
+RPC, after capacity admission, and survives listener replacement and restart.
+Legacy release claims are inert. A crash after consumption cannot open another
+automatic attempt; only definite proof that launch never began can defer it.
 Explicit resume still tries and resolves a recovered incident through the normal
 history and UNKNOWN reconciliation path. A memory-gate refusal, made directly or in every
 failed case of a calibration, is also due before its backoff once the gate would
 admit a launch. A writer is held while its reconcile failed and is not
-`retry_due` (its backoff has not passed, or its cause cannot heal and this
-release has tried it), and while its demand start failed and is not
+`retry_due` (its backoff has not passed, or its permanent failure has no unused
+matching repair), and while its demand start failed and is not
 `start_due`. A stop does not wait for a held writer's workflow or its mail not
 yet sent, nor for its turn once its app-server has exited with no live
 connection; a live app-server's turn is still waited for, as are custody,
@@ -2655,7 +2805,7 @@ chosen delay; `listener/startup_retry`, `listener/startup_quarantined` and
 do not hold the initial `recovering` barrier. Startup adopts older quarantines
 and their UNKNOWNs, including those already narrowed by a lead.
 
-A permanently failed writer that this release has tried can release its native
+A permanently failed writer without an eligible repair can release its native
 family while keeping its quarantine. Retirement holds writer, parking and
 reconcile locks in that order and rechecks the current root binding, live PID and
 birth, quiet unit, executing operations, outstanding native evidence and demand.
@@ -2671,7 +2821,7 @@ inspection and finishes any authorized stop before replacement. Resume joins tha
 stop or returns retryable `FAMILY_REAPING`. Retirement changes no recovery
 classification, pending incident, UNKNOWN resolution or history checkpoint and
 creates no dormant proof. Status exposes `state: stopped`, `quarantined: true`,
-the retirement's release, times, members and proof, and the release-attempt claim.
+the retirement's release, times, members and proof, and the incident/repair claim.
 
 Each retry completes the same history, admission and replacement checks as a
 successful startup. An attached connection is resumed again when its earlier
@@ -2827,7 +2977,8 @@ Each probe step has its own bound;
 | State entry | Purpose |
 |---|---|
 | `ledger.sqlite`, WAL/SHM | Versioned schema, identities, revisions, events, UNKNOWNs, idempotency and journals; daemon only. |
-| `blobs/<sha256>` | Immutable raw receipt bytes, fsynced before any reference is committed. |
+| `blobs/<sha256>` | Immutable raw receipt representation; identity is the uncompressed SHA-256. |
+| `blobs/<sha256>.zlib-blocks-v1` | Verified, durably published independent zlib-6 blocks when they reduce allocated space. |
 | `listeners/<incarnation>/` | Persistent listener evidence; endpoint allocations live in the short runtime directory. |
 | `indexes/` | Private candidate and publication index copies. |
 | `schemas/<binary-digest>/` | Native generated experimental schema and completion marker. |
@@ -3477,12 +3628,13 @@ development logs retain only their newest segment-sized tail. Rotation and
 diagnostic writes happen in the watchdog, never on the daemon loop. Inclusive spans and queued RPC time must
 not be mistaken for a single uninterrupted loop stall.
 
-Blob persistence hashes the source before publication. Existing content creates
-no temporary file and performs no fsync; reuse requires a validated blob with
-unchanged inode, size and change times in this Store generation. Every `read_blob`
-still verifies the hash. New publication uses a temporary file, file fsync,
-atomic rename and directory fsync; concurrent publishers cannot reference the
-renamed file before its directory sync. Full observations read ledger heads in
+Blob persistence streams the source into private staging and hashes its logical
+bytes before publication. Reuse requires a validated representation with
+unchanged device, inode, size and change times. Cold access verifies the complete
+logical hash; warm ranges verify only their intersecting blocks. New publication
+uses a fully verified candidate, the migration-5 barrier, full file
+synchronization, atomic rename and directory synchronization as described above.
+Full observations read ledger heads in
 one query. Unexpected startup exceptions include their type and at most 1,024
 message characters in `DAEMON_STARTUP`.
 

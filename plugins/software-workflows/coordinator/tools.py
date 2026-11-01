@@ -3,7 +3,7 @@ import base64
 import errno
 import json
 import os
-import zlib
+from .blob_storage import codec
 
 from .locks import finish_thread
 from .client import CoordinatorError
@@ -194,7 +194,7 @@ def stored(response, value=None, source=None):
     text = encoded(response)
     if len(text) <= STORED_PLAIN_BYTES:
         return response
-    return {"form": "deflate", "bytes": len(text), "data": base64.b64encode(zlib.compress(text.encode(), 6)).decode()}
+    return {"form": "deflate", "bytes": len(text), "data": base64.b64encode(codec().compress(text.encode(), 6)).decode()}
 
 
 def replayed(store, kept):
@@ -203,7 +203,7 @@ def replayed(store, kept):
     if form is None:
         return kept
     if form == "deflate":
-        return json.loads(zlib.decompress(base64.b64decode(kept["data"])))
+        return json.loads(codec().decompress(base64.b64decode(kept["data"])))
     if form == "receipt_range":
         data, _ = store.read_blob_range(kept["receipt"], kept["offset"], kept["length"])
         if len(data) != kept["length"]:
