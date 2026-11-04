@@ -3364,6 +3364,9 @@ class Daemon:
             return publisher.reopen(self.store.get(unit["id"]))
         if method == "unit/settle-history":
             return self.dormancy.settle(params["unit"], params.get("actor"), params.get("gaps"), params.get("reason"))
+        if method == "unit/settle-operation":
+            from .recovery import settle_operation
+            return await settle_operation(self, params)
         if method == "unit/seal":
             return await publisher.seal(params["unit"], params.get("validation", []), params.get("publication_order"))
         if method == "unit/review-record":

@@ -5036,14 +5036,21 @@ async def coordinator_inbox(acknowledge: list[str] = [], cursor: str = "", limit
 async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "",
                            paths: list[str] | None = None, unknown: str = "", revision: str = "",
                            revisions: dict[str, str | None] | None = None, custody: str = "",
-                           gaps: list[str] | None = None, reason: str = "") -> str:
+                           gaps: list[str] | None = None, reason: str = "", operation: str = "") -> str:
     """Inspect status/object diff/UNKNOWN, reconcile effects or custody, restore a
     known revision, narrow a checkout-wide UNKNOWN, reopen a seal, recover
     publication, or abandon an unapplied publication. Actions: status, diff,
-    unknown, reconcile, restore, narrow, reopen, recover, abandon, settle-history.
+    unknown, reconcile, restore, narrow, reopen, recover, abandon, settle-history,
+    settle-operation.
     settle-history needs explicit gap IDs and a nonblank reason. It records the
     lead's decision about that exact history observation; publication still
-    requires valid receipts, rights, provenance, review and repository proofs. restore
+    requires valid receipts, rights, provenance, review and repository proofs.
+    settle-operation takes a quarantined operation's id (operation), its unit
+    (unit) and a nonblank reason, once native can no longer write for it: what it
+    could have changed is read again, bytes the coordinator cannot explain there
+    become UNKNOWNs, and the operation is resolved: restores of its paths are then
+    admitted, and its unit can hand back its claims once their UNKNOWNs are
+    resolved. It writes nothing and explains no bytes. restore
     writes the UNKNOWN's path again: revision names a known revision of it, or
     "baseline" (what the branch commit and the index both hold there), and
     revisions {path: null} removes a path both lack. A restore found at the
@@ -5063,7 +5070,8 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
     methods = {"status": "unit/status" if unit or session_id else "run/status", "diff": "unit/diff",
                "unknown": "unknown/list", "reconcile": "custody/reconcile" if custody else "checkout/reconcile",
                "restore": "unknown/restore", "narrow": "unknown/narrow", "reopen": "unit/reopen",
-               "recover": "unit/recover", "abandon": "unit/recover", "settle-history": "unit/settle-history"}
+               "recover": "unit/recover", "abandon": "unit/recover", "settle-history": "unit/settle-history",
+               "settle-operation": "unit/settle-operation"}
     if action not in methods:
         return await _coordinator_notice("[Unsupported unit action.]", session_id)
     params = {}
@@ -5079,7 +5087,10 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
         params["action"] = "abandon"
     if action == "settle-history":
         params.update(gaps=gaps, reason=reason)
-    return await _lead_request(methods[action], params, cwd, session_id, own=action in ("restore", "narrow", "settle-history"), unit=unit, project=project, dispatch_cwd=dispatch_cwd)
+    if action == "settle-operation":
+        params.update(operation=operation, reason=reason)
+    return await _lead_request(methods[action], params, cwd, session_id, own=action in ("restore", "narrow", "settle-history", "settle-operation"),
+                               unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
 
 @_lead_tool()

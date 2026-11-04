@@ -24,7 +24,24 @@ READ_GIT = {"status", "diff", "show", "log", "rev-parse", "ls-files", "ls-tree",
 REDIRECTIONS = ("<<<", "<<-", ">>", ">&", ">|", "<<", "<&", "<>", ">", "<")
 
 
-def shell_words(command):
+class ShellWord(str):
+    """A decoded word, with the characters the shell may still interpret as pattern syntax."""
+    def __new__(cls, value, active, qualifier=False, regrouped=False):
+        word = str.__new__(cls, value)
+        word.active = tuple(active)
+        word.qualifier = qualifier
+        word.regrouped = regrouped
+        return word
+
+
+ZSH_PATTERN = "a zsh glob qualifier or pattern group"
+NUMERIC_GLOB = re.compile(r"<[0-9]*-[0-9]*>")
+SAFE_QUALIFIER = re.compile(r"\([ND./@-]+\)(?=$|[\s;|&<>)])")
+SHELL_LITERAL = re.compile(r"[^\s'\"\\`$#<>;|&()]+")
+SHELL_PATTERN_WORD = re.compile(r"(?:[^\s'\"\\`$#<>;|&()]+|<[0-9]*-[0-9]*>)+")
+
+
+def shell_words(command, patterns=True):
     """Small conservative lexer; retain quoted punctuation as ordinary arguments.
 
     Yields (value, kind): kind False for a word, True for a control operator, "redirect" for a
@@ -34,12 +51,13 @@ def shell_words(command):
     unsupported grammar raise ValueError naming the construct, rather than pretending this is a
     complete shell parser. No shell text is ever evaluated here.
     """
-    tokens, word, present, quoted, quote, i = [], [], False, False, None, 0
+    tokens, word, active, present, quoted, quote, i = [], [], [], False, False, None, 0
+    qualifier, argument, regrouped = False, False, False
     pending, target = [], None  # heredocs whose lines are still to come; the redirection awaiting its word
     def flush():
-        nonlocal word, present, quoted, target
+        nonlocal word, active, present, quoted, target, qualifier, argument, regrouped
         if present:
-            value = "".join(word)
+            value = ShellWord("".join(word), active, qualifier, regrouped)
             if target in ("<<", "<<-"):
                 heredoc = {"delimiter": value, "strip": target == "<<-", "quoted": quoted, "body": None}
                 pending.append(heredoc)
@@ -48,8 +66,12 @@ def shell_words(command):
                 tokens.append((value, "herestring" if target == "<<<" else "target"))
             else:
                 tokens.append((value, False))
+                if value not in ("!", "if", "then", "elif", "else", "while", "until", "do", "{", "coproc") and not re.fullmatch(
+                        r"[A-Za-z_][A-Za-z_0-9]*=.*", value):
+                    argument = True
             target = None
-        word, present, quoted = [], False, False
+        word, active, present, quoted, qualifier = [], [], False, False, False
+        regrouped = False
     while i < len(command):
         char = command[i]
         if quote == "'":
@@ -57,6 +79,7 @@ def shell_words(command):
                 quote = None
             else:
                 word.append(char)
+                active.append(False)
         elif char == "\\" and quote != "'":
             i += 1
             if i == len(command):
@@ -65,7 +88,9 @@ def shell_words(command):
             if escaped != "\n":  # An escaped newline only joins two lines: it quotes nothing and makes no word.
                 if quote == '"' and escaped not in '$`"\\':
                     word.append("\\")
+                    active.append(False)
                 word.append(escaped)
+                active.append(False)
                 present = quoted = True
         elif char == quote:
             quote = None
@@ -75,11 +100,19 @@ def shell_words(command):
             raise ValueError("parameter expansion")
         elif quote:
             word.append(char)
+            active.append(False)
         elif char in "'\"":
             quote, present, quoted = char, True, True
         elif char == "#" and not present:
             end = command.find("\n", i)
             i = len(command) if end < 0 else end - 1
+        elif patterns and char == "<" and NUMERIC_GLOB.match(command, i):
+            # zsh's numeric glob is one word, not two redirections (including at its start).
+            numeric = SHELL_PATTERN_WORD.match(command, i)[0]
+            word.extend(numeric)
+            active.extend([True] * len(numeric))
+            present, regrouped = True, True
+            i += len(numeric) - 1
         elif char in "<>" or command.startswith("&>", i):
             if char in "<>" and command[i + 1:i + 2] == "(":
                 raise ValueError("process substitution")
@@ -87,7 +120,7 @@ def shell_words(command):
                 raise ValueError("a redirection without its target")
             if char in "<>" and present and not quoted and not target and re.fullmatch(
                     r"[0-9]+|\{[A-Za-z_][A-Za-z_0-9]*\}", "".join(word)):
-                word, present = [], False  # A descriptor: the 2 of 2>&1, or the {name} that is to hold a new one.
+                word, active, present = [], [], False  # A descriptor: the 2 of 2>&1, or the {name} that is to hold a new one.
             else:
                 flush()
             operator = ("&>>" if command.startswith("&>>", i) else "&>") if char == "&" else next(
@@ -95,6 +128,15 @@ def shell_words(command):
             tokens.append((operator, "redirect"))
             target = operator
             i += len(operator) - 1
+        elif patterns and target not in ("<<<", "<<", "<<-") and char == "(" and (present or argument or target):
+            # A leading group in an argument is a pattern too: `printf %s (cat|ls)(e:code:)`.
+            # Only one trailing, unquoted, selection-only qualifier is understood. Strip it for
+            # the name check, but retain that this word expands even without a `*` or a `?`.
+            safe = SAFE_QUALIFIER.match(command, i)
+            if not present or qualifier or not safe or word and word[-1] in "@+!*?":
+                raise ValueError(ZSH_PATTERN)
+            qualifier = True
+            i += len(safe[0]) - 1
         elif char in ";|&()\n":
             flush()
             if target:
@@ -106,13 +148,20 @@ def shell_words(command):
             elif command.startswith("|&", i):
                 i += 1  # |& also pipes standard error.
             tokens.append((operator, True))
+            argument = False
             if char == "\n" and pending:
                 i = heredoc_bodies(command, i + 1, pending) - 1
                 del pending[:]
         elif char.isspace():
             flush()
         else:
-            word.append(char)
+            # Consume ordinary runs together: metadata stays linear even for a huge word.
+            run = (SHELL_PATTERN_WORD if patterns else SHELL_LITERAL).match(command, i)
+            text = run[0] if run else char
+            word.extend(text)
+            active.extend([True] * len(text))
+            regrouped = regrouped or "<" in text
+            i += len(text) - 1
             present = True
         i += 1
     if quote:
@@ -305,18 +354,301 @@ def gh_read(words):
 
 GIT_COMMAND = "a Git command"
 MENTIONS_GIT = "that mentions Git (its semantics are not established)"
+NESTED = "commands nested more than 16 deep"
+SHELLS = ("sh", "bash", "dash", "zsh", "ksh")
+SHELL_OPTIONS = ("--noprofile", "--norc", "-l")
 # `git` as a word of its own: a path's last part, a shell word, an option's value, a call, or a command inside text
 # that an inner shell may run (`sh -c "cd x&&git commit"`, `{git,commit}`); a word naming a dashed Git program
 # (git-receive-pack); or Git's own program directory (libexec/git-core/git-commit). In any letter case: on the
 # default case-insensitive macOS file system `nice /usr/bin/GIT commit` runs git (measured 11-02).
 GIT_WORD = re.compile(r"(?:^|[\s/'\"`;|&(){},=\\!<>])git(?:$|[\s'\"`;|&(){},<>])|(?:^|\s)git-[a-z]|/git-core/", re.IGNORECASE)
-# The command word is a glob or a brace expansion: what runs is whatever it expands to.
-COMMAND_PATTERN = re.compile(r"[*?]|\[.*\]|\{.*(?:,|\.\.).*\}")
 # The system's own tool directories (read-only on macOS): a tool there is the one its name says.
 SYSTEM_TOOL = re.compile(r"/(?:usr/)?bin/[^/]+")
 # A closed list of read-only tools that never execute their arguments or their input.
 DATA_ONLY = {"grep", "rg", "cat", "head", "tail", "wc", "ls", "stat", "file", "diff", "cmp", "sort", "uniq", "cut", "tr",
              "shasum", "sha256sum"}
+
+
+def command_pattern(word):
+    """The old command-position pattern rule, without a failing regex retry at every opener."""
+    if "*" in word or "?" in word:
+        return True
+    for line in word.split("\n"):
+        start = line.find("[")
+        if start >= 0 and line.rfind("]") > start:
+            return True
+        start, end = line.find("{"), line.rfind("}")
+        if start >= 0 and end > start and (line.find(",", start, end) >= 0 or line.find("..", start, end) >= 0):
+            return True
+    return False
+
+
+def active_pattern(word):
+    """Whether an unquoted character of word may make the shell expand it (zsh's operators, a numeric glob, a
+    qualifier): what the word then names is not established by its letters."""
+    active = getattr(word, "active", ())
+    return bool(getattr(word, "qualifier", False)) or any(
+        on and (char in "*?[{#^<" or char == "~" and i) for i, (char, on) in enumerate(zip(word, active)))
+
+
+POSIX_CLASS = re.compile(r"\[:[a-z]+:\]")
+BRACE_SEQUENCE = re.compile(r"(-?[0-9]+|[A-Za-z])\.\.(-?[0-9]+|[A-Za-z])(?:\.\.(-?[0-9]+))?")
+
+
+def pattern_class_ends(word, active):
+    """Read disjoint classes once; an unfinished '[' never rescans the rest of the word. None when a bracket holds an
+    equivalence class or a collating symbol (`[[=g=]]`, `[[.g.]]`): bash 3.2 reads them and zsh 5.9 does not, so the two
+    shells close that bracket at different places (measured: bash matches `[[=g=]]it` to git, zsh `[[=g=]it`)."""
+    ends, i = {}, 0
+    if "]" not in word:
+        return ends
+    while i < len(word):
+        start = word.find("[", i)
+        if start < 0:
+            break
+        i = start + 1
+        if not active[start]:
+            continue
+        if i < len(word) and active[i] and word[i] in "!^":
+            i += 1
+        if i < len(word) and word[i] == "]":
+            i += 1
+        while i < len(word):
+            if active[i] and word[i] == "]":
+                ends[start] = i
+                i += 1
+                break
+            if active[i] and word.startswith("[:", i):
+                match = POSIX_CLASS.match(word, i)
+                if match and all(active[i:match.end()]):
+                    i = match.end()
+                    continue
+            if active[i] and word.startswith(("[=", "[."), i) and active[i + 1]:
+                return None
+            i += 1
+    return ends
+
+
+# git_pattern's fixed relations, built once: a relation maps each of its seven states to the set of states (bits) that
+# one fragment reaches. Every character outside ASCII reads as `.`: the only one whose lower case is an ASCII name
+# character is the Kelvin sign, as `k`, which is no Git letter (measured over every code point, 3.9 and 3.15).
+NAME_ALPHABET = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+RELATION_IDENTITY = (1, 2, 4, 8, 16, 32, 64)
+RELATION_EMPTY = (0,) * 7
+
+
+def literal_relation(char):
+    lower = char.lower()
+    return (1,) * 7 if char == "/" else (
+        2 if lower == "g" else 64, 4 if lower == "i" else 64,
+        8 if lower == "t" else 64, 16 if char == "-" else 64,
+        32 if char in NAME_ALPHABET else 64, 32 if char in NAME_ALPHABET else 64, 64)
+
+
+def relation_union(left, right):
+    return tuple(a | b for a, b in zip(left, right))
+
+
+def relation_closure(part):
+    result = relation_union(RELATION_IDENTITY, part)
+    # Reachability in a seven-vertex graph; always exactly seven bounded passes.
+    for k in range(7):
+        result = tuple(row | result[k] if row & (1 << k) else row for row in result)
+    return result
+
+
+def any_char_relation():
+    result = RELATION_LITERALS["."]
+    for char in NAME_ALPHABET:
+        result = relation_union(result, RELATION_LITERALS[char])
+    return result
+
+
+RELATION_LITERALS = {chr(code): literal_relation(chr(code)) for code in range(128)}
+RELATION_OTHER = RELATION_LITERALS["."]
+RELATION_ANY_CHAR = any_char_relation()
+RELATION_STAR = relation_closure(RELATION_ANY_CHAR)
+CLASS_PREDICATES = {"alnum": str.isalnum, "alpha": str.isalpha, "ascii": str.isascii,
+                    "blank": lambda c: c in " \t", "cntrl": lambda c: ord(c) < 32 or ord(c) == 127,
+                    "digit": str.isdigit, "graph": lambda c: c.isprintable() and not c.isspace(),
+                    "lower": str.islower, "print": str.isprintable,
+                    "punct": lambda c: not c.isalnum() and not c.isspace(), "space": str.isspace,
+                    "upper": str.isupper, "word": lambda c: c.isalnum() or c == "_",
+                    "xdigit": lambda c: c in "0123456789abcdefABCDEF"}
+
+
+def git_pattern(word):
+    """Read a pattern through a fixed seven-state Git-basename recognizer.
+
+    Each fragment is a relation between the states. Composition, union and repetition cost a
+    fixed amount; neither brace products nor regex derivative states are enumerated. Quoting
+    remains per character. A slash resets the basename, even when supplied by a brace branch.
+    Exclusions never remove a name here; a complement may select any component. This deliberate
+    over-approximation keeps admission linear and independent of filenames and login locales.
+    """
+    active = getattr(word, "active", None)
+    if active is None:
+        return False
+    patterned = bool(getattr(word, "qualifier", False))
+    possible = ("*" in word or "?" in word or "[" in word and "]" in word or
+                "{" in word and "}" in word or "#" in word or "^" in word or
+                "~" in word[1:] or "<" in word)
+    if not patterned and not possible:
+        return False
+    if not patterned and not any(active):
+        return False
+    classes = pattern_class_ends(word, active)
+    if classes is None:
+        return True  # Which bracket the shell closes is not established (pattern_class_ends).
+    braces, stack = {}, []
+    if "}" in word:
+        for i, char in enumerate(word):
+            if active[i] and char == "{":
+                stack.append(i)
+            elif active[i] and char == "}" and stack:
+                braces[stack.pop()] = i
+    identity, empty, alphabet = RELATION_IDENTITY, RELATION_EMPTY, NAME_ALPHABET
+    products = {}
+    def literal(char):
+        return RELATION_LITERALS.get(char, RELATION_OTHER)
+    def compose(left, right):
+        if left == identity:
+            return right
+        if right == identity:
+            return left
+        key = (left, right)
+        if key not in products:
+            result = []
+            for states in left:
+                dest = 0
+                while states:
+                    bit = states & -states
+                    dest |= right[bit.bit_length() - 1]
+                    states -= bit
+                result.append(dest)
+            products[key] = tuple(result)
+        return products[key]
+    union, closure = relation_union, relation_closure
+    any_char, star, predicates = RELATION_ANY_CHAR, RELATION_STAR, CLASS_PREDICATES
+    def character_class(start, end):
+        i = start + 1
+        negate = active[i] and word[i] in "!^"
+        i += bool(negate)
+        selected = set()
+        while i < end:
+            match = POSIX_CLASS.match(word, i) if active[i] and word.startswith("[:", i) else None
+            predicate = predicates.get(match[0][2:-2]) if match else None
+            if predicate and all(active[i:match.end()]):
+                selected.update(c for c in alphabet if predicate(c))
+                i = match.end()
+            elif i + 2 < end and active[i + 1] and word[i + 1] == "-":
+                selected.update(c for c in alphabet if word[i] <= c <= word[i + 2])
+                i += 3
+            else:
+                selected.add(word[i])
+                i += 1
+        # Other characters may occur in directories, including Unicode. No wildcard matches /.
+        result = literal(".")
+        for c in alphabet:
+            if (c not in selected) if negate else (c in selected):
+                result = union(result, literal(c))
+        return result
+    def sequence(match):
+        first, last, stride = match.groups()
+        if first.isalpha() and last.isalpha():
+            # Only 58 possible ASCII endpoints: a long stride need not become a huge integer.
+            digits = (stride or "1").lstrip("-0")
+            step = int(digits) if len(digits) <= 2 and digits else 1
+            step = step if len(digits) <= 2 else 128
+            a, b = ord(first), ord(last)
+            values = range(a, b + (1 if a <= b else -1), step if a <= b else -step)
+            result = empty
+            for value in values:
+                char = chr(value)
+                if char in "[]^\\":  # Brace expansion can synthesize glob grammar.
+                    return None
+                result = union(result, literal(char))
+            return result
+        if first.isalpha() or last.isalpha():
+            return False
+        # All nonnegative decimal strings have the same relation, as do all negative ones.
+        # Do not convert arbitrary-size integers or enumerate a sequence/stride product.
+        result = literal("0") if not first.startswith("-") or not last.startswith("-") else empty
+        if first.startswith("-") or last.startswith("-"):
+            result = union(result, compose(literal("-"), literal("0")))
+        return result
+    # Frame: concatenation before its last atom, last atom, alternatives, opening offset,
+    # whether it has a nested brace. Keeping the last atom separate makes #/## constant-time.
+    frames = [[identity, identity, empty, -1, False]]
+    i = 0
+    while i < len(word):
+        char, frame = word[i], frames[-1]
+        part = None
+        if active[i] and char == "{" and i in braces:
+            frame[4] = True
+            frames.append([identity, identity, empty, i, False])
+        elif active[i] and char == "," and len(frames) > 1:
+            frame[2] = union(frame[2], compose(frame[0], frame[1]))
+            frame[0], frame[1] = identity, identity
+            patterned = True
+        elif active[i] and char == "}" and len(frames) > 1 and braces[frame[3]] == i:
+            before, last, branches, start, nested = frames.pop()
+            inner = compose(before, last)
+            if branches != empty:
+                part = union(branches, inner)
+            else:
+                match = BRACE_SEQUENCE.fullmatch(word, start + 1, i) if not nested else None
+                if match and all(active[start:i + 1]):
+                    part = sequence(match)
+                    if part is None:
+                        return True
+                    patterned = patterned or part is not False
+                if part is None or part is False:
+                    part = compose(compose(literal("{"), inner), literal("}"))
+            frame = frames[-1]
+        elif active[i] and char in "#^~" and (char != "~" or i):
+            if braces:
+                return True  # An expansion can splice operators across its branch boundaries.
+            patterned = True
+            if char == "~":
+                break  # An exclusion can only remove filenames. Never use it to prove safety.
+            if char == "^":
+                part = star
+                end = word.find("/", i + 1)
+                i = len(word) - 1 if end < 0 else end - 1
+            else:
+                repeat = closure(frame[1])
+                if i + 1 < len(word) and active[i + 1] and word[i + 1] == "#":
+                    repeat = compose(frame[1], repeat)
+                    i += 1
+                frame[1] = repeat
+        elif active[i] and char in "*?":
+            part = star if char == "*" else any_char
+            patterned = True
+        elif active[i] and i in classes:
+            end = classes[i]
+            if braces and any(active[j] and word[j] in "{}" for j in range(i, end + 1)):
+                return True  # E.g. g{[,x}i{],y}t expands to the active class g[i]t.
+            part = character_class(i, end)
+            i, patterned = end, True
+        elif active[i] and char == "<":
+            match = NUMERIC_GLOB.match(word, i)
+            if match and all(active[i:match.end()]):
+                if braces:
+                    return True
+                low, high = match[0][1:-1].split("-")
+                a, b = low.lstrip("0") or "0", high.lstrip("0") or "0"
+                part = empty if high and (len(a), a) > (len(b), b) else literal("0")
+                i, patterned = match.end() - 1, True
+            else:
+                part = literal(char)
+        else:
+            part = literal(char)
+        if part is not None:
+            frame[0], frame[1] = compose(frame[0], frame[1]), part
+        i += 1
+    result = compose(frames[0][0], frames[0][1])
+    return patterned and bool(result[0] & (8 | 32))
 
 
 def data_exec(executable, words):
@@ -353,39 +685,50 @@ def stdin_refusal(executable, stdin):
     return False
 
 
-def invocation(words, depth, stdin=(), lookup=True):
+def invocation(words, depth, stdin=(), lookup=True, patterns=True, git_only=False):
     """Why this simple command must be refused (a reason naming it, or LEAD_PUBLISHES); False when admitted.
     lookup is False once something in front of the command (an assignment, an env option) may change what its name
     finds."""
+    if depth > 16:  # Wrappers nest here as shells do in _recording_command (5,000 `command` raised RecursionError).
+        return NESTED
     # A plain `git` refuses whatever its environment, and the one accepted form starts with
     # `/usr/bin/env -i`, which clears it: assignments in front cannot make Git out of another
     # command. Refusing them refused `PYTHONPATH=. python -m …` as Git execution (measured, 2.3.0).
     # Except the ones that make a shell or interpreter run code this reading never sees.
     # Keywords and assignments may follow each other (`if X=1 cmd`): neither is the command.
-    while words and (words[0] in ("!", "if", "then", "elif", "else", "while", "until", "do", "{", "coproc")
-                     or re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", words[0])):
-        if "=" in words[0]:
-            if words[0].split("=", 1)[0] in STARTUP_CODE:
-                return "the startup-code variable " + words[0].split("=", 1)[0]
+    # An index, not a slice per word: 25,000 leading assignments took 0.71 s on the event loop.
+    start = 0
+    while start < len(words) and (words[start] in ("!", "if", "then", "elif", "else", "while", "until", "do", "{", "coproc")
+                                  or re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", words[start])):
+        if "=" in words[start]:
+            if words[start].split("=", 1)[0] in STARTUP_CODE:
+                return "the startup-code variable " + words[start].split("=", 1)[0]
             lookup = False
-        words = words[1:]
+        start += 1
+    words = words[start:]
     if not words or words in (["}"], ["done"], ["fi"], ["esac"]):
         # A heredoc after `)`, `}`, done, fi or esac is the standard input of every command the group runs.
         return stdin_refusal("a command group", stdin)
-    if COMMAND_PATTERN.search(words[0]):
+    if (command_pattern(words[0]) or getattr(words[0], "qualifier", False) or patterns and git_pattern(words[0])) and (not git_only or git_pattern(words[0])):
+        return "a pattern (glob or brace expansion) in the command position"
+    # Where only a pattern naming Git refuses here (git_only), the word may still name a shell: perl … /bin/s[h] -c ….
+    if patterns and active_pattern(words[0]) and shell_text(words, 0, depth, lookup):
         return "a pattern (glob or brace expansion) in the command position"
     # What is refused matches in any case: on the default case-insensitive macOS file system, GIT finds and runs git.
     # What is trusted must be spelled exactly: on a case-sensitive one, Cat need not be cat.
-    name = words[0].rsplit("/", 1)[-1]
+    # zsh EQUALS performs path lookup before invocation. Only an active leading '=' expands;
+    # a quoted/escaped one remains a literal program name. The resolved path gains no trust.
+    equals = patterns and words[0].startswith("=") and bool(getattr(words[0], "active", (False,))[0])
+    name = (words[0][1:] if equals else words[0]).rsplit("/", 1)[-1]
     executable = name.lower()
-    exact = name == executable
+    exact = name == executable and not equals
     by_name = exact and lookup and "/" not in words[0]  # The shell's own lookup of this name, nothing in front changing it.
     # Before any answer that admits: the shell runs what a heredoc expands before this command starts.
     expanded = heredoc_expansion(executable, stdin)
     if expanded:
         return expanded
     if executable == "git" or executable.startswith("git-"):
-        return (executable != "git" or git_invocation(words)) and GIT_COMMAND
+        return (equals or executable != "git" or git_invocation(words)) and GIT_COMMAND
     if executable == "gh":
         return False if exact and gh_read(words) else "LEAD_PUBLISHES"
     if executable in ("eval", "source", ".", "alias", "function", "xargs", "sudo", "time"):
@@ -397,16 +740,18 @@ def invocation(words, depth, stdin=(), lookup=True):
         if executable == "env":
             isolated = bool(rest) and rest[0] == "-i"
             assignments = []
-            rest = rest[1:] if isolated else rest
-            while not isolated and rest and (rest[0] in ("-u", "--unset") and len(rest) > 1 or re.fullmatch(
-                    r"(?:-u|--unset=)[A-Za-z_][A-Za-z_0-9]*", rest[0])):
-                rest = rest[2:] if rest[0] in ("-u", "--unset") else rest[1:]  # Unsetting a variable runs nothing.
+            at = 1 if isolated else 0  # An index, not a slice per word (see above).
+            while not isolated and at < len(rest) and (rest[at] in ("-u", "--unset") and at + 1 < len(rest) or re.fullmatch(
+                    r"(?:-u|--unset=)[A-Za-z_][A-Za-z_0-9]*", rest[at])):
+                at += 2 if rest[at] in ("-u", "--unset") else 1  # Unsetting a variable runs nothing.
                 lookup = False
-            while rest and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", rest[0]):
-                if rest[0].split("=", 1)[0] in STARTUP_CODE:
-                    return "the startup-code variable " + rest[0].split("=", 1)[0]
-                assignments.append(rest.pop(0))
+            while at < len(rest) and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*=.*", rest[at]):
+                if rest[at].split("=", 1)[0] in STARTUP_CODE:
+                    return "the startup-code variable " + rest[at].split("=", 1)[0]
+                assignments.append(rest[at])
+                at += 1
                 lookup = False
+            rest = rest[at:]
             if isolated and rest and rest[0].rsplit("/", 1)[-1] == "git":
                 from .gitio import SHELL_GIT_ENV, shell_git_binary, shell_env_binary
                 return (words[0] != shell_env_binary() or set(assignments) != set(SHELL_GIT_ENV) or len(assignments) != len(SHELL_GIT_ENV)
@@ -420,15 +765,17 @@ def invocation(words, depth, stdin=(), lookup=True):
             if rest[0].startswith("-"):
                 return "an env option this reading cannot establish"
         else:
-            while rest and rest[0] in ("--", "-p"):
-                rest = rest[1:]
+            at = 0
+            while at < len(rest) and rest[at] in ("--", "-p"):
+                at += 1
+            rest = rest[at:]
             if executable == "command" and rest and re.fullmatch(r"-[pvV]+", rest[0]) and set(rest[0]) & set("vV"):
                 return False  # command -v/-V only says what a name would run.
             if rest and rest[0].startswith("-"):
                 return ("an " if executable == "exec" else "a ") + executable + " option this reading cannot establish"
         # Without a command, each of them runs nothing; exec only applies its redirections, and the commands after it
         # read a heredoc it gives the shell.
-        return invocation(rest, depth + 1, stdin, lookup) if rest else stdin_refusal(executable, stdin)
+        return invocation(rest, depth + 1, stdin, lookup, patterns, git_only) if rest else stdin_refusal(executable, stdin)
     if executable in ("sh", "bash", "dash", "zsh", "ksh"):
         rest = words[1:]
         if rest == ["--version"]:
@@ -443,7 +790,7 @@ def invocation(words, depth, stdin=(), lookup=True):
                     return executable + " -c without its command"
                 if rest[i + 1].startswith(("-", "+")):  # The shell runs the first word after its options (-c -- cmd).
                     return executable + " -c with an option after it (which word it runs is not established)"
-                return _recording_command(rest[i + 1], depth + 1, lookup) or stdin_refusal(executable, stdin)
+                return _recording_command(rest[i + 1], depth + 1, lookup, patterns, git_only) or stdin_refusal(executable, stdin)
             if flag not in ("--noprofile", "--norc", "-l"):
                 break
         return "a shell (" + executable + ") reading a script or its standard input"
@@ -457,24 +804,132 @@ def invocation(words, depth, stdin=(), lookup=True):
     # Unknown wrappers/interpreters that mention Git have unestablished semantics.
     if any(GIT_WORD.search(arg) for arg in words[1:]):
         return executable + " with an argument " + MENTIONS_GIT
+    # The census uses precisely this timeout wrapper. With more than one ARGV element Perl
+    # calls execvp directly; a single element can instead become shell text, so is not trusted.
+    # Keep the old literal-mention check above this narrow contract (no old refusal is relaxed).
+    if patterns and executable == "perl" and (by_name or system) and len(words) >= 5 and words[1] == "-e" and re.fullmatch(
+            r"alarm [0-9]+; exec @ARGV", words[2]) and not words[3].startswith(("-", "+")):
+        reason = invocation(words[3:], depth + 1, stdin, lookup, patterns, True)
+        if forwards(reason):
+            return reason
+        # An old refusal may precede the new argument check (xargs, a shell script, rg
+        # --pre, sort --compress-program). Ignoring that old refusal must not trust its
+        # pattern arguments, nor -c text it may give a shell (=sh, SH). A False result,
+        # e.g. printf, command -v or sh -n, really is data-only: it forwards nothing.
+        if reason and any(git_pattern(arg) for arg in words[4:]):
+            return words[3].rsplit("/", 1)[-1].lower() + " with a pattern argument that may name a Git program"
+        return reason and forwarded_shell(executable, words, 3, depth, lookup) or stdin_refusal(executable, stdin)
+    if patterns and any(git_pattern(arg) for arg in words[1:]):
+        return executable + " with a pattern argument that may name a Git program"
+    if patterns:
+        return forwarded_shell(executable, words, 1, depth, lookup) or stdin_refusal(executable, stdin)
     return stdin_refusal(executable, stdin)
 
 
-def _recording_command(command, depth=0, lookup=True):
+def forwards(reason):
+    """Whether refusing text that another program hands on refuses that program too: the text may run Git or
+    publish, names Git by a pattern, or was not read to its end (nested too deep). A refusal only of code this
+    reading never sees (a script, eval, an unestablished option) stays one of the documented limits."""
+    return reason in (ZSH_PATTERN, NESTED, GIT_COMMAND, "LEAD_PUBLISHES", "a pattern (glob or brace expansion) in the command position") or isinstance(
+        reason, str) and reason.endswith((" with a pattern argument that may name a Git program", MENTIONS_GIT))
+
+
+def brace_alternatives(word):
+    """The alternatives of word's first unquoted brace expansion with commas (`{-c,'…'}`), without what surrounds
+    it: each becomes a word of its own."""
+    if "{" not in word or "," not in word:
+        return []
+    active, depth, start, parts = getattr(word, "active", ()), 0, 0, []
+    for i, (char, on) in enumerate(zip(word, active)):
+        if on and char == "{":
+            depth += 1
+            if depth == 1:
+                start, parts = i + 1, []
+        elif on and char == "," and depth == 1:
+            parts.append(word[start:i])
+            start = i + 1
+        elif on and char == "}" and depth:
+            depth -= 1
+            if not depth and parts:
+                return parts + [word[start:i]]
+    return []
+
+
+def shell_text(words, i, depth, lookup, scan=None):
+    """The refusal (forwards) of the -c text that words[i] runs if it is a shell, else False.
+
+    The outer shell does not expand quoted -c text, but the inner shell does. A shell is found by its name's last part
+    in any letter case, after an active zsh `=`: `nice =sh -c …` and `nice SH -c …` run sh on the default
+    case-insensitive file system (measured). A word with an active pattern may name a shell, or its -c, too
+    (`nice /bin/s[h] -c …` runs /bin/sh), so it counts as either. A brace expansion may supply an option among its
+    alternatives, and then a shell's -c and its text too (`nice sh {-c,'…'}`, `nice {/bin/sh,-c} '…'`), so the
+    alternatives after the first that may be an option, and the word after the brace, are read as text. Among another
+    program's arguments (scan: where each run of shell options ends, and what was read), each word is read as sh's
+    text at most once, and each option position is judged once."""
+    ends, read = scan or (None, {})
+    def text(k):
+        if k not in read:
+            reason = invocation(["sh", "-c", words[k]], depth + 1, (), lookup, True, True)
+            read[k] = reason if forwards(reason) else False
+        return read[k]
+    parts = brace_alternatives(words[i])
+    cut = next((j for j, part in enumerate(parts) if part.startswith("-") and (set(part[1:]) & set("*?[") or "c" in part[1:]
+                                                                              and set(part[1:]) <= set("celuxv"))), None)
+    if cut is not None:
+        for part in parts[cut + 1:]:
+            reason = invocation(["sh", "-c", part], depth + 1, (), lookup, True, True)
+            if forwards(reason):
+                return reason
+        if i + 1 < len(words) and text(i + 1):
+            return text(i + 1)
+    word = words[i]
+    if word.startswith("=") and getattr(word, "active", (False,))[0]:
+        word = word[1:]
+    if word.rsplit("/", 1)[-1].lower() not in SHELLS and not active_pattern(words[i]):
+        return False
+    end = ends[i + 1] if ends else next((k for k in range(i + 1, len(words)) if words[k] not in SHELL_OPTIONS), len(words))
+    if ("option", end) not in read:
+        option = words[end] if end < len(words) else ""
+        read[("option", end)] = end + 1 < len(words) and (active_pattern(option) or option.startswith("-") and "c" in option[1:]
+                                                           and set(option[1:]) <= set("celuxv"))
+    # Only -c text is read: copying every remaining argument for each possible shell would make a wrapper quadratic.
+    return read[("option", end)] and text(end + 1)
+
+
+def forwarded_shell(executable, words, start, depth, lookup):
+    """The refusal for -c text that a shell among words[start:] would run (shell_text), else False: an unknown wrapper,
+    or perl's exec @ARGV, can hand a shell quoted -c text. Script files and other opaque code remain the existing
+    documented limits."""
+    ends = list(range(len(words) + 1))  # where the run of shell options from each word ends, found once
+    for k in range(len(words) - 1, -1, -1):
+        if words[k] in SHELL_OPTIONS:
+            ends[k] = ends[k + 1]
+    scan = (ends, {})
+    for i in range(start, len(words)):
+        reason = shell_text(words, i, depth, lookup, scan)
+        if reason == "a pattern (glob or brace expansion) in the command position" or isinstance(reason, str) and reason.endswith(
+                " with a pattern argument that may name a Git program"):
+            return executable + " with a pattern argument that may name a Git program"
+        if reason:
+            return reason
+    return False
+
+
+def _recording_command(command, depth=0, lookup=True, patterns=True, git_only=False):
     """Why the command must be refused (a reason naming it, or LEAD_PUBLISHES); False when admitted. lookup is
     False for a shell's command text run with assignments in front of that shell (see invocation)."""
     if not isinstance(command, str) or not command:
         return "an empty command"
     if depth > 16:
-        return "commands nested more than 16 deep"
+        return NESTED
     try:
-        tokens = shell_words(command)
+        tokens = shell_words(command, patterns)
     except ValueError as exc:
         return str(exc)
     words, stdin = [], []
     for value, kind in tokens + [(";", True)]:
         if kind is True:
-            refused = invocation(words, depth, stdin, lookup)
+            refused = invocation(words, depth, stdin, lookup, patterns, git_only)
             if refused:
                 return refused
             if value not in (";", "|", "||", "&", "&&", "(", ")"):
@@ -487,6 +942,10 @@ def _recording_command(command, depth=0, lookup=True):
         elif kind is False:
             words.append(value)
         # A redirection and its target (a file or a descriptor) are never an executable position.
+    # Recognizing a selection-only qualifier joins what the old lexer split into commands.
+    # Keep any old refusal as well: e.g. `echo x(N) git` must not become newly admitted.
+    if patterns and any(getattr(value, "qualifier", False) or getattr(value, "regrouped", False) for value, _ in tokens):
+        return _recording_command(command, depth, lookup, False, git_only)
     return False
 
 

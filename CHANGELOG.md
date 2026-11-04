@@ -3,6 +3,93 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.33] — 2026-11-04
+
+### Change 1 — settling a quarantined operation
+
+- Let a lead attached to a unit settle one of its quarantined operations once
+  native can no longer write for it: `coordinator_unit` action
+  `settle-operation` (`unit/settle-operation`), with the operation id and a
+  nonblank reason. What the operation could have changed is read again, as its
+  quarantine scoped it: its paths and its paths outside the ledger, or every
+  checkout of its unit, whole, for a command, MCP call or lead command. Bytes the
+  coordinator cannot explain there become UNKNOWNs. The operation, its parent and
+  its parts are resolved with a recorded settlement and an `operation/settled`
+  event. Nothing is written, and no claim or custody is taken.
+- A settlement explains no bytes. The UNKNOWNs on the operation's paths stay
+  open, and its paths stay in its unit's mutation scope, so a seal still needs
+  them restored or edited. After it, restores of its paths are admitted, and the
+  unit can hand back its claims: those on paths with UNKNOWNs once they are
+  resolved (`UNKNOWN_BLOCKS_HANDBACK`, unchanged).
+- Refused while native may still write for the operation (`SETTLE_EXECUTING`) or
+  a command holds custody in a checkout it reads (`SETTLE_CUSTODY`), both
+  retryable; and for a blank reason, a missing or another unit's operation, or
+  one that is not quarantined.
+- Through 2.4.32 a restore replaced only a quarantined operation whose paths it
+  covered, and a path's restore names one path. A quarantined patch of several
+  paths, or one whose only path was outside the ledger, could leave only through
+  a checkout-wide restore, which needs claims over the whole checkout. In the
+  Sales_Profiler checkout two units holding 53 and 37 claims each blocked the
+  other's checkout-wide restore. All 8 quarantined operations on the live ledger
+  are in that checkout, and each can be settled.
+
+### Change 2 — the writer command gate reads zsh patterns and `=name`
+
+- A pattern in another program's arguments refuses when it can expand to `git` or
+  a dashed Git program name, in any letter case, as a path's last part
+  (`nice /usr/bin/g?t commit`). The gate intersects the pattern with a seven-state
+  recognizer of those names, enumerating no filenames or brace products, so its
+  cost stays linear in the command's length. Through 2.4.32 a pattern refused only
+  in the command position, and such a command committed.
+- zsh glob qualifiers and pattern groups refuse with any command:
+  `printf %s a.txt(e:'git commit':)` committed through 2.4.32, since zsh runs the
+  qualifier while it expands the filename. One trailing qualifier made only of the
+  selection flags `N`, `D`, `.`, `/`, `@` and `-` is admitted (`ls *.txt(N)`);
+  any other qualifier, a group in an argument (`(a|b)`), a `(#…)` flag and the ksh
+  operators `@(`, `+(`, `!(`, `*(` and `?(` refuse.
+- zsh's extended operators (`#`, `##`, `^`, `~` after a word's first character)
+  and numeric globs (`<1-20>`) are read wherever they stand unquoted, whatever
+  options are set. The reading errs only toward refusing: an exclusion never
+  removes a name, a complement may select any name of its path component, and a
+  brace sequence that yields a glob character (`{Z..a}` yields `[`) refuses. So an unquoted
+  `^` in a program's argument (`pytest -k ^test`) now refuses; quoted, it does
+  not. In a paired census of the live ledger's writer commands, no command is newly
+  refused and no refusal is reopened.
+- zsh's equals expansion: an unquoted `=name` in a command position runs what
+  `name` finds on the path, and `=git commit` committed through 2.4.32. It now
+  refuses as Git for a Git name, and any other `=name` is read as an untrusted
+  program of that name (`=cat` and `=printf` lose their trusted readings). A
+  quoted `'=git'` stays a literal name.
+- The release's review found more ways to the same commit, all fixed. A bracket
+  holding an equivalence class or collating symbol (`bash -c 'nice /usr/bin/[[=g=]]it
+  commit'`) refuses, since bash 3.2 and zsh 5.9 close it at different places. A shell
+  that another program runs is found whatever name finds it: `nice =sh -c '…'`,
+  `nice SH -c '…'` on the case-insensitive file system, a pattern that may name the
+  shell or its `-c` (`nice /bin/s[h] -c '…'`, also as the perl wrapper's program),
+  and a brace expansion that may supply the `-c` and its text, or the shell and its
+  `-c` (`nice sh {-c,'…'}`, `nice {/bin/sh,-c} '…'`). What its `-c` text establishes
+  refuses the command that hands it on: Git (`g""it`), publication
+  (`gh pr create`), a pattern that may name Git, or nesting too deep to read to its
+  end (16 `env` words before the pattern). A data-only program behind the perl
+  wrapper (`printf`, `echo`) forwards nothing and stays admitted. Behind another
+  wrapper, whose grammar the gate does not know, such text is read wherever it
+  stands, so `nice /bin/echo sh -c 'gh pr create'` refuses.
+- The gate runs on the daemon's event loop, so its cost is every session's. The
+  first candidate of this change took 2.27 s for a 60-character pattern and 9.7 s
+  for an 8,000-character word; the shipped reading takes under 20 ms on 100,000
+  characters. Leading assignments and wrapper options are read with an index (25,000
+  assignments: 0.71 s through 2.4.32, 0.05 s now), and commands nest at most 16 deep
+  through wrappers too (5,000 nested `command` wrappers raised `RecursionError`).
+  Each shell text that another program hands on, and each run of shell options, is
+  read once: 25,000 such texts in a 325 KB command take 0.56 s (2.4.32 reads none of
+  them).
+- Still known limits, both for 2.4.34: a dashed Git program named by its path in
+  another program's arguments (`nice /usr/bin/git-upload-pack`), since reading every
+  such path as Git refused 18 real commands, documentation URLs among them; and an
+  expansion (`$…`, a backtick) in text that another program hands a shell, which ends
+  its reading there, so a pattern after it is not read. Refusing such text refused 14
+  real commands (`lockf … sh -c '… $X …'`).
+
 ## [software-workflows 2.4.32] — 2026-11-02
 
 ### Change 1 — sealed units and history gaps

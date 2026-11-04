@@ -1456,7 +1456,8 @@ async def recover_writers(daemon, plan):
 # it names while startup recovery reconciles it (recovered). A run's cancel does not wait: it is recorded at once,
 # and its settlement waits for the writer as it does for any reconcile.
 RUN_CALLS = ("run/resume", "run/terminate-terminal")
-UNIT_CALLS = ("unit/recover", "unit/reopen", "unit/seal", "unit/review-record", "unit/publish", "unit/settle-history")
+UNIT_CALLS = ("unit/recover", "unit/reopen", "unit/seal", "unit/review-record", "unit/publish", "unit/settle-history",
+              "unit/settle-operation")
 UNKNOWN_CALLS = ("unknown/restore", "unknown/narrow")
 
 
@@ -2138,3 +2139,105 @@ async def narrow_unknown(daemon, params):
                                                     "paths_scanned": result["paths_scanned"], "found": found})
     await daemon.ledger.notify_released()  # the leads of the units whose UNKNOWNs outside the ledger were resolved
     return {"narrowing": ident, "state": "narrowed", "resolved": resolved, "paths_scanned": result["paths_scanned"], "unknown": found}
+
+
+OPAQUE_KINDS = ("command", "mcp", "lead-command")  # what they change can be anywhere in their unit's checkouts
+
+
+async def settle_operation(daemon, params):
+    """A quarantined operation's effects are unknown. Once native can no longer write for it, all that is left of it is
+    what it may have changed, and the lead attached to its unit settles it with a reason: that is read again, as
+    Ledger.quarantine scoped it (its paths and its paths outside the ledger, in its checkout; every checkout of its unit,
+    whole, for a command, MCP call or lead command, or for a path-scoped operation that named none), and bytes the
+    coordinator cannot explain there become that path's UNKNOWN, as in any reconcile. The operation, with its parent
+    and parts, is then resolved. Nothing is written and no claim or custody is taken. The UNKNOWNs open on its paths
+    stay open, since a settlement explains no bytes, and its paths stay in its unit's mutation scope: seal and
+    publication still need them restored or edited. Through 2.4.32 only a restore covering all of a quarantined
+    operation's paths replaced it, and only the checkout-wide restore covers several paths, or none: a patch of several
+    paths, or one whose only path was outside the ledger, held its unit's claims for good (Sales_Profiler, 11-04: two
+    units, 90 claims, each blocking the other's checkout-wide restore)."""
+    store = daemon.store
+    actor = store.get(params["actor"])
+    if actor["kind"] != "lead":
+        raise CoordinatorError("LEAD_ONLY", "Only a lead can settle a quarantined operation")
+    reason = params.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise CoordinatorError("SETTLE_REASON", "Give a nonblank reason: it is recorded with the settlement")
+    named = store.get(params.get("operation") or "", required=False) if isinstance(params.get("operation"), str) else None
+    if not named or named.get("_kind") != "operation":
+        raise CoordinatorError("SETTLE_SCOPE", "Name a quarantined operation by its id", {"operation": params.get("operation")})
+    root = store.get(named["parent_operation"]) if named.get("parent_operation") else named
+    if root["unit"] != actor["unit"] or root["unit"] != params["unit"]:
+        raise CoordinatorError("SETTLE_SCOPE", "Settle an operation as a lead attached to its unit (pass that unit)",
+                               {"operation": named["id"], "unit": root["unit"]})
+
+    def family():
+        top = store.get(root["id"])
+        return [top] + [store.get(key) for key in top.get("parts", [])]
+
+    def eligible(records):
+        if records[0]["state"] != "quarantined" or any(r["state"] not in ("quarantined", "resolved") for r in records[1:]):
+            raise CoordinatorError("SETTLE_STATE", "Only a quarantined operation is settled",
+                                   {"operation": records[0]["id"], "states": {r["id"]: r["state"] for r in records}})
+        executing = [r["id"] for r in records if r.get("executing")]
+        if executing:
+            raise CoordinatorError("SETTLE_EXECUTING", "Native may still write for this operation; settle it once its "
+                                   "call has ended", {"operations": executing, "retryable": True}, True)
+        turn = (records[0].get("native") or {}).get("turn")
+        active = (store.get(records[0]["actor"], required=False) or {}).get("active_turn")
+        if turn and (active.get("id") if isinstance(active, dict) else active) == turn:
+            raise CoordinatorError("SETTLE_EXECUTING", "The turn that made this call is still running; settle it once "
+                                   "that turn has ended", {"operation": records[0]["id"], "turn": turn, "retryable": True}, True)
+
+    records = family()
+    eligible(records)
+    # What it could have changed, by checkout: the paths named, or None for the whole checkout. Its parts carry a split
+    # operation's paths.
+    scope = {}
+    for record in [store.get(key) for key in records[0].get("parts", [])] or records[:1]:
+        if record["kind"] in OPAQUE_KINDS:
+            for key in participants.checkout_ids(store, record["unit"]):
+                scope[key] = None
+        elif record["paths"] or record.get("outside"):
+            paths = scope.setdefault(record["checkout"], set())
+            if paths is not None:
+                paths.update(record["paths"], record.get("outside", ()))
+        else:
+            scope[record["checkout"]] = None
+
+    def quiet(key, paths):
+        # A command's effects are opaque until it is reconciled: read while one runs, they would be UNKNOWN.
+        holding = daemon.custody.active(key)
+        if holding:
+            raise CoordinatorError("SETTLE_CUSTODY", "A command holds custody in this checkout; settle once it is reconciled",
+                                   {"checkout": key, "custody": [c["id"] for c in holding], "retryable": True}, True)
+        refuse_executing(store, key, None if paths is None else sorted(paths))
+
+    for key, paths in sorted(scope.items()):
+        quiet(key, paths)
+    read, found, released = [], [], False
+    for key, paths in sorted(scope.items()):
+        result = await daemon.ledger.reconcile(store.get(key), None if paths is None else sorted(paths), ignore_pending=False,
+                                               reason="unexplained bytes, found settling quarantined operation " + root["id"],
+                                               owner={"kind": "settlement", "operation": root["id"]},
+                                               guard=lambda key=key, paths=paths: quiet(key, paths))
+        read.append({"checkout": key, "paths": "*" if paths is None else sorted(paths), "paths_scanned": result["paths_scanned"],
+                     "unknowns": list(result["unknowns"])})
+        found.extend({"id": r["id"], "checkout": key, "path": r["path"]} for unknown in result["unknowns"]
+                     for r in store.db.execute("SELECT id, path FROM unknowns WHERE id=?", (unknown,)))
+        released = released or bool(result.get("released"))
+    # Nothing is awaited from here to the commit: what is resolved is what was read.
+    records = family()
+    eligible(records)
+    settlement = {"reason": reason.strip(), "actor": actor["id"], "time": time.time(), "read": read}
+    settled = []
+    with store.transaction():
+        for record in records:
+            if record["state"] == "quarantined":
+                record.update(state="resolved", settlement=settlement)
+                store.save(record)
+                settled.append(record["id"])
+        store.event("operation/settled", root["id"], {"unit": root["unit"], "operations": settled, "unknowns": found, **settlement})
+    if released:
+        await daemon.ledger.notify_released()  # outside-ledger heads it let go, as narrow_unknown
+    return {"operation": root["id"], "state": "resolved", "settled": settled, "read": read, "unknown": found}

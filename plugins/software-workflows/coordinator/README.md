@@ -552,7 +552,7 @@ exception rests on timing: a lead Bash command whose armed window stays globally
 quiet is recorded as `lead-command` throughout its reconciliation reach (see the
 Bash contract below and its known limits).
 
-### The writer command gate (2.4.32 Change 2)
+### The writer command gate (2.4.32 Change 2; zsh patterns and `=name`, 2.4.33 Change 2)
 
 Every native writer shell command is read before it runs
 (`custody.command_refusal_reason`). The gate admits only what it can read as never
@@ -565,7 +565,15 @@ running Git, and every refusal names its reason, so a writer can fix the command
 - **Command positions.** The gate reads the command word of each simple command,
   after assignments and keywords, and through `command`, `exec`, `env`, `nohup`,
   `builtin`, `coproc` and `sh -c` (the word right after its option cluster; an option
-  after it refuses). A glob or brace expansion there refuses. `eval`, `source`, `.`,
+  after it refuses). Commands nest at most 16 deep, through wrappers or `-c` text
+  ("commands nested more than 16 deep"). A glob or brace expansion there refuses, as does a glob
+  qualifier or a zsh pattern that can name Git (below), or one that may name a shell
+  whose `-c` text refuses (`/bin/s#h -c '…'`, and as the perl wrapper's program,
+  where only a pattern naming Git refuses otherwise). An unquoted `=name` there
+  is zsh's equals expansion, which runs what `name` finds on the path: it refuses
+  as Git for a Git name (`=git commit`), and any other `=name` is read as an
+  untrusted program of that name, so `=cat` and `=printf` lose their trusted
+  readings. A quoted `'=git'` or `\=git` stays a literal name. `eval`, `source`, `.`,
   `xargs`, `sudo`, `time`, `alias` and `function` refuse, as does a shell reading a
   script or its standard input (excepted: `--version`, and its `-n` syntax check
   with no other option than `--noprofile` or `--norc`).
@@ -584,9 +592,49 @@ running Git, and every refusal names its reason, so a writer can fix the command
   /usr/bin. The `echo` and `printf` builtins are admitted the same way when named
   without a path, or from /bin or /usr/bin.
 - **Anything else.** Another program is admitted unless an argument or its heredoc
-  mentions Git, in any letter case, as a word of its own: a path's last part, a
-  shell word, an option's value, a call, or a command in text that an inner shell
-  may run.
+  mentions Git, in any letter case: `git` as a word of its own (a path's last part,
+  a shell word, an option's value, a call, or a command in text that an inner shell
+  may run), a word that starts with `git-` and a letter (`git-receive-pack`), or
+  Git's program directory (`…/git-core/…`).
+- **Patterns.** zsh reads its pattern grammar in every unquoted word, so the gate
+  does too, whatever options are set: globs (`*`, `?`, `[…]`), brace expansion,
+  the extended operators (`#`, `##`, `^`, and `~` after a word's first character),
+  numeric globs (`<1-20>`) and glob qualifiers. In another program's arguments a
+  pattern refuses when it can expand to `git` or a dashed Git program name, in any
+  letter case, as a path's last part (`nice /usr/bin/g?t commit`: "a pattern
+  argument that may name a Git program"). The gate intersects the pattern with a
+  seven-state recognizer of those names, so it enumerates no filenames and no brace
+  products, and its cost is linear in the command's length. The reading errs only
+  toward refusing: an exclusion (`~`) never removes a name, a complement (`^`) may
+  select any name of its path component, and a brace sequence that yields a glob
+  character (`{Z..a}` yields `[`, literal in zsh 5.9 and bash 3.2 as measured)
+  refuses. So does a bracket that holds an equivalence class or a collating symbol
+  (`[[=g=]]it`, `[[.g.]]it`): bash 3.2 reads them and zsh 5.9 does not, so the two
+  close that bracket at different places (bash matches `[[=g=]]it` to `git`, zsh
+  `[[=g=]it`). Ordinary file globs stay admitted (`python3 x.py *.txt`,
+  `rm -f build/*.o`). Data-only tools, `echo` and `printf` may still take
+  pattern arguments: they never run them. The timeout wrapper
+  `perl -e 'alarm N; exec @ARGV' program …` and `-c` text that another program
+  hands a shell are read as the command they run, whatever name finds that shell
+  (`caffeinate zsh -c '…'`, `nice =sh -c '…'`, `nice SH -c '…'`, which runs sh on
+  the case-insensitive file system, and a pattern that may name the shell or its
+  `-c`: `nice /bin/s[h] -c '…'`). A brace expansion that has an alternative that may
+  be an option may supply the `-c` and its text, or the shell and its `-c`
+  (`nice sh {-c,'…'}`, `nice {/bin/sh,-c} '…'`): its later alternatives and the word
+  after it are read as that text. What that reading finds refuses the command that
+  hands the text on: Git (`g""it`), publication (`gh pr create`), a pattern that may
+  name Git, or nesting too deep to read to its end. A refusal only of code the
+  reading never sees (a script, `eval`, an option it cannot establish) does not, and
+  a data-only perl target (`printf`, `echo`, `command -v`) forwards nothing. The
+  gate does not know another wrapper's grammar, so it reads such text wherever it
+  stands among that wrapper's arguments, even when the program the wrapper runs only
+  prints it (`nice /bin/echo sh -c 'gh pr create'` refuses).
+- **Qualifiers.** One trailing qualifier made only of the selection flags `N`, `D`,
+  `.`, `/`, `@` and `-` is admitted (`ls *.txt(N)`). Any other qualifier refuses,
+  with any command, since zsh runs it while it expands the filename
+  (`a.txt(e:'…':)` evaluates code), as do a pattern group in an argument
+  (`(a|b)`), a `(#…)` flag and the ksh operators `@(`, `+(`, `!(`, `*(` and `?(`
+  ("a zsh glob qualifier or pattern group").
 - **Expansions.** Parameter, command and arithmetic expansion refuse: the gate never
   evaluates shell text.
 
@@ -595,12 +643,23 @@ interpreter runs from a file, `-c` text that builds a Git command without naming
 text piped into an interpreter (`echo … | python3 -`), a program planted under a
 trusted name or a copy of Git under another name, or an alias or function that a
 shell startup file defines (Codex runs writer commands in the user's login shell,
-`zsh -lc` here, which reads its login startup files). Two limits found by the
-2.4.32 review were already in 2.4.31; a fix is planned for the next release. A
-pattern (glob or brace) is refused only in the command position, so one in a
-wrapper's program argument is not refused. A zsh glob qualifier, which can run
-code while the shell expands a filename, is not recognized. The push guard above
-stays in place as a separate layer, with its own limits.
+`zsh -lc` here, which reads its login startup files). Nor does it read shell text
+or a script that a wrapper runs (a single-element `exec @ARGV` becomes shell text),
+options a startup file sets that change zsh's grammar further (`BRACE_CCL` makes
+`{gti}` expand), or a program that chooses what it runs by its own matching
+(`find -exec` with a quoted `-name` pattern). A dashed Git program named by its path
+in another program's arguments (`nice /usr/bin/git-upload-pack`) is not recognized
+either: outside git-core those are Git's transport and shell helpers (receive-pack,
+upload-pack, upload-archive, shell, cvsserver). Reading every such path as Git
+refused 18 commands of the 2.4.33 census, documentation URLs among them
+(`https://git-scm.com/docs/git-hash-object`), so it waits for a reading that tells
+a program path from a URL. An expansion (`$…`, a backtick) in `-c` text that
+another program hands a shell ends the reading of that text, so a pattern after it
+is not read: refusing such text refused 14 commands of the census
+(`lockf … sh -c '… $X …'`). A brace expansion's alternatives are read as that text
+without the characters around the brace. The two limits that 2.4.32 documented, a pattern in a
+wrapper's program argument and a zsh glob qualifier, are read since 2.4.33 (above).
+The push guard above stays in place as a separate layer, with its own limits.
 
 ## Start and discover
 
@@ -1253,6 +1312,7 @@ Bash window that belonged to the retired generation.
 | `unknown/list` | `checkout`, optional `paths`; unresolved UNKNOWNs, context and restoration links. |
 | `unknown/restore` | `actor`, `unknown`, `revision` (a known revision, or `baseline`); for a checkout-wide `*`, `revisions:{path: revision_id\|"baseline"\|null}` covering every path in the ledger. Null only where the branch commit and the index both lack the path; a path without a baseline is refused `RESTORE_BASELINE` with its `latest_known_revision`. Found at the baseline afterwards: `state: resolved, resolution: baseline`; otherwise `restored_requires_new_edit`. A path outside the ledger: `resolution: outside-ledger`, nothing written. A restore resolves only what it found before its edit, and holds its claims until that resolution commits. It then releases the claims its edit created (not one another call has acquired since) and is no unit's work: an edit or read that follows depends on whose bytes it restored. |
 | `unknown/narrow` | `actor`, `unknown` (a checkout-wide `*`); read the whole checkout again, record each path whose bytes differ from its ledger head, and each path it cannot read (a symlink, a special file, bytes changing while read), as its own UNKNOWN, leave out a path outside the ledger (its UNKNOWNs resolved `outside-ledger`), and resolve every checkout-wide UNKNOWN recorded before the read. Writes nothing; refused (`RESTORE_CUSTODY`) while custody is active in the checkout, `RESTORE_EXECUTING` while a patch may still be writing, `NARROW_SCOPE` for a path's UNKNOWN. |
+| `unit/settle-operation` | `unit`, `actor` (a lead attached to that unit), `operation`, nonblank `reason`; settle a quarantined operation of that unit that native can no longer write for. Read again what it could have changed, as its quarantine scoped it (its paths and its paths outside the ledger; every checkout of its unit, whole, for a command, MCP call or lead command), record each path whose bytes differ from its ledger head as its own UNKNOWN, and resolve the operation with its parent and parts: each carries the settlement (actor, reason, time, what was read) and `operation/settled` is emitted. Writes nothing, takes no claim or custody, and explains no bytes: open UNKNOWNs stay open and its paths stay in its unit's mutation scope. Refused `LEAD_ONLY`, `SETTLE_REASON`, `SETTLE_SCOPE` (no such operation, or another unit's), `SETTLE_STATE` (not quarantined), `SETTLE_EXECUTING` (native may still write for it, or its call's turn is still running; retryable), `SETTLE_CUSTODY` (a command holds custody in a checkout it reads; retryable), `RESTORE_EXECUTING` (a pending operation or lead call over what it reads). |
 | `message/send` | `recipient`, `text`, required `wake:"none\|queue\|start"`, optional lead `sender`; durable message record. |
 | `message/inbox` | Optional `recipient` (default `lead`, or a lead mailbox), `cursor`, `limit`, `session_id`, `cwd`. A lead's inbox is the mail its session or folder may read (lead session surfaces), one page in id order, with that mail's unread count independent of pagination. A lead read with neither session nor folder answers an empty inbox with a restart `notice`. Any other recipient's inbox (a writer's own `inbox` tool) is the mail to it. Reading does not acknowledge or claim context entry. |
 | `message/ack` | `message`; optional lead `actor` (`lead`, a lead mailbox or a lead actor), `session_id`, `cwd`. A lead acknowledges the mail it may read, as its inbox reads it: as its session, as its mailbox of an explicit unit, as a lead actor (its own mail wherever it went), or as `lead` by its folder. Anything else is `ACK_ACTOR`; `lead` with neither session nor folder is `INBOX_SCOPE`. The evidence records who acknowledged (`by`). A second acknowledgement answers `duplicate:true`. A writer acknowledges only through its own native-bound `ack` tool, after its context echo (`NATIVE_BOUND` here). |
@@ -3068,6 +3128,23 @@ lifecycle. Seal reads its scope again and publish the whole checkout before they
 freeze anything, so a change made after the read is still found. Not found: a change
 made and undone before the read.
 
+A quarantined operation is settled with `unit/settle-operation` (`coordinator_unit`
+action `settle-operation`, as a lead attached to its unit) once native can no longer
+write for it. A restore replaces only a quarantined operation whose paths it covers,
+and a path's restore names one path. So through 2.4.32 a quarantined patch of several
+paths, or one whose only path was outside the ledger, could be replaced only by a
+checkout-wide restore, which takes claims over every path of the checkout and is
+refused by any other unit's claim: its unit could never hand back its own claims.
+Settlement takes no claim or custody and writes nothing. It reads again what the
+operation could have changed, as its quarantine scoped it, so each unexplained byte
+becomes an UNKNOWN as in any reconcile, and then resolves the operation with the
+lead's reason. Restores of its paths are then admitted. A handback transfers no
+provenance over unexplained bytes (`UNKNOWN_BLOCKS_HANDBACK`), so its unit hands back
+the claims on those paths once their UNKNOWNs are resolved, and the rest at once. Its
+paths stay in its unit's mutation scope, so a seal still needs each of them restored
+or edited. A checkout-wide UNKNOWN that a command's quarantine left is narrowed, as
+before; settlement resolves no UNKNOWN.
+
 A recorded process id that another user's process now holds (a root daemon that
 took the id of one that exited) counts as gone. macOS refuses both the process's
 description and a signal to it. Its short description (`PROC_PIDT_SHORTBSDINFO`)
@@ -3334,7 +3411,7 @@ deadline again on the run as it is when the cancel begins: a resume renews it.
 | `coordinator_claims` | list, acquire for this Claude session, release request, lead-authorized handback |
 | `coordinator_send` | durable send to run/unit/actor/lead; explicit none/queue/start wake policy |
 | `coordinator_inbox` | cursor read; acknowledge only explicitly supplied IDs |
-| `coordinator_unit` | status, object diff, UNKNOWN, reconcile, restore, narrow, reopen, recover, abandon |
+| `coordinator_unit` | status, object diff, UNKNOWN, reconcile, restore, narrow, reopen, recover, abandon, settle-history, settle-operation |
 | `coordinator_seal` | freeze exact receipt-backed candidate and explicit validation evidence |
 | `coordinator_publish` | exact review binding plus all seven explicit commit metadata fields |
 

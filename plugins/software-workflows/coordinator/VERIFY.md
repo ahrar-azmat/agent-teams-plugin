@@ -1,4 +1,342 @@
-# software-workflows 2.4.32 — sealed units, history gaps and the writer command gate — 2026-11-02
+# software-workflows 2.4.33 — settling a quarantined operation, and the gate's zsh patterns and `=name` — 2026-11-04
+
+Base is **055a58c52837ca8c9b023e40fa73459dd5486c1a** (2.4.32). The release has two changes. The lead wrote Change 1,
+the settlement of a quarantined operation (`recovery.py`, `daemon.py`, `server.py`), and the docs. The Codex writer
+wrote Change 2 (`custody.py`): the two gate limits 2.4.32 documented, and zsh's `=name` lookup, which the lead's review
+found. Every run below used a disposable daemon state
+and a fresh fixture repository; the reds ran on installed 2.4.32 (in the review rounds, on the code each round
+refuted), the greens on a frozen composition (a `git archive` of 055a58c with the release files laid over it). The
+live ledger was read only with sqlite `mode=ro`.
+
+## Change 1 — settling a quarantined operation
+
+Evidence root (**L**) is `/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2433/lead`.
+
+**Live evidence** (read-only; `L/probe_deadlock.py` and `L/live_eligibility.py`, 2026-11-04 19:13 IST, reported by the
+Sales_Profiler lead). The live ledger holds 8 quarantined operations, all in the Sales_Profiler checkout
+(checkout_ffa59063). None is executing, no custody is held there and no writer has an active turn.
+
+| operations | kind | paths | refusal | unit |
+|---|---|---|---|---|
+| op_25e5bfc8 | patch | none; outside the ledger: `lead-share/ai-settings/p1a/round5-probes.py` | native ended the call without its Post hook | unit_c0516894, 53 claims |
+| op_b5968a3e | patch | 4, with 12 open UNKNOWNs | REVISION_CHANGED | unit_ebde504a, 37 claims |
+| 4 | lead-edit | 1 each, no open UNKNOWN | admission refused | unit_459d0e0f, 6 claims |
+| 2 | command | none | crash gap before a durable custody decision | unit_966d59e3, no claims |
+
+Through 2.4.32 each unit's handback refuses `UNVERIFIED_OPERATION`. A per-path restore of one of op_b5968a3e's paths
+refuses `OPERATION_BUSY`: a restore replaces a quarantined operation only when it covers all of its paths. The only
+restore that covers several paths, or none, is the checkout-wide one, which needs an open `*` UNKNOWN (none is open), a
+revision for each of the checkout's 4,916 ledger paths and claims over all of them. Every other unit's claims refuse it
+(`CLAIM_CONFLICT`). Under 2.4.33 all 8 can be settled now: 6 read their own paths, and the 2 commands read the whole
+checkout.
+
+**Recorder.** `L/settle_case.py`, with faults injected at import (`L/inject/sitecustomize.py`), on real native fixture
+writers (Codex 0.163.0, `r2432/writer/provider.py`):
+- a writer patch whose text carries a marker has its PostToolUse hook dropped before the coordinator reads it, as a
+  listener restart loses it (op_25e5bfc8's cause); native ends the call and the patch is quarantined;
+- `probe/r2433-crash-gap` leaves what a crash between a writer command's preparation and its custody decision leaves:
+  the real `Ledger.prepare` of a command operation with no custody, then the real `recovery.reconcile_effects`, which
+  quarantines it (unit_966d59e3's cause);
+- `probe/r2433-executing` sets and clears one operation's `executing` flag, only for the `SETTLE_EXECUTING` refusal.
+
+Scenario `patch`: unit A's patch updates `a.txt` and adds `c.txt`; unit B, holding `d.txt`, adds `lead-share/probe.py`,
+which git ignores (outside the ledger). Both Post hooks are dropped. Scenario `upgrade` makes the same state on installed
+2.4.32 and then restarts it on the candidate, as a live switch does. Scenario `command` quarantines unit C's command.
+
+| case | plugin | checks | result |
+|---|---|---|---|
+| red1-patch-341 | installed 2.4.32 | 10/10 | A quarantined (2 paths), B quarantined (paths none, outside 1). Both handbacks refuse `UNVERIFIED_OPERATION`; the per-path restore of `a.txt` refuses `OPERATION_BUSY` and writes nothing; `unit/settle-operation` is `METHOD`. |
+| red4-command-351 | installed 2.4.32 | 6/6 | C quarantined: crash gap, paths none, no custody, a `*` UNKNOWN. Narrowing it leaves no `*` UNKNOWN, and the handback still refuses `UNVERIFIED_OPERATION`; no settlement. |
+| green4-patch-349 | candidate (comp3) | 32/32 | below |
+| upgrade4-350 | 2.4.32, then the candidate | 34/34 | the 2.4.32 reds above, then, after the restart on the candidate, both stay quarantined and held, and everything below |
+| green4-command-352 | candidate (comp3) | 8/8 | below |
+
+The greens, on the candidate:
+- **Refusals.** `SETTLE_REASON` (blank reason), `LEAD_ONLY` (a writer actor), `SETTLE_SCOPE` (another unit's lead; an
+  unknown id), `SETTLE_EXECUTING` with `retryable` (the flag set), `SETTLE_CUSTODY` with `retryable` and the custody's
+  id (while a fixture command runs), `SETTLE_STATE` (settled again). None of them changed either operation.
+- **B, outside-only.** Settled in 0.14 s: it read `lead-share/probe.py` (1 path) and found nothing. No file changed and
+  no UNKNOWN changed. The handback then released its 1 claim.
+- **A, two paths.** Settled in 0.07 s: it read `a.txt` and `c.txt` and found nothing new (its quarantine had recorded
+  their bytes as UNKNOWNs). No file changed, and the UNKNOWNs stayed open. A's handback then refused
+  `UNKNOWN_BLOCKS_HANDBACK` (2.4.29's rule: a handback transfers no provenance over unexplained bytes). The per-path
+  restores, refused `OPERATION_BUSY` before the settlement, resolved `a.txt` (baseline) and `c.txt` (absence), and the
+  handback released its 2 claims. One `operation/settled` event per operation.
+- **Restart.** Both settlement records are unchanged after a restart, and the claims stay handed back.
+- **C, command.** Settled by a whole-checkout read (2 paths). `planted.txt`, written after the narrowing, became a new
+  UNKNOWN, and no file was written. The handback then released its 1 claim.
+
+Each case removed its own state, repository and processes (none remained).
+
+## Change 2 — the writer command gate reads zsh patterns and `=name`
+
+Evidence root (**W**) is `/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2433/writer`.
+The Codex writer changed only the command gate's helpers in `custody.py`, frozen at SHA-256
+`eb56c72424d9cd7b45e15d4c3906d95d55c4288bd0b48adfecede9a66d542f3a`. Its candidate is installed 2.4.32 with only that
+file replaced. Its report is `W/final-report.md`.
+
+**Native cases**, run by the lead one after another (`W/gate_case.py`). A real native fixture writer runs each command
+in `/bin/zsh -lc`, with a disposable daemon state and a fresh repository.
+
+| case | plugin | exit | checks | result |
+|---|---|---|---|---|
+| red glob, repo-329 | installed 2.4.32 | 0 | 4/4 | `nice /usr/bin/g?t … commit --allow-empty -qm r2433-glob` was admitted and committed (HEAD 0960f911 → 33cec025) |
+| green glob, repo-330 | candidate | 0 | 6/6 | refused `LEAD_RECORDS`, "nice with a pattern argument that may name a Git program"; HEAD unchanged |
+| red qualifier, repo-331 | installed 2.4.32 | 0 | 4/4 | `printf '%s\n' a.txt(e:'git … commit …':)` committed (→ c7b2bc46) |
+| green qualifier, repo-332 | candidate | 0 | 6/6 | refused, "a zsh glob qualifier or pattern group"; HEAD unchanged |
+| red equals, repo-333 | installed 2.4.32 | 0 | 4/4 | `=git … commit --allow-empty -qm r2433-equals` committed (→ fb2ea354) |
+| green equals, repo-334 | candidate | 0 | 6/6 | refused, "a Git command"; HEAD unchanged |
+
+Each case removed its state, fixture and repository, left no process, and kept at least 215 GiB free.
+
+**The writer's evidence** (`W`):
+- **Gate table.** 326/326 rows pass, including all 154 of 2.4.32's. The three exclusion and complement controls are
+  labelled as conservative refusals (the lead's ruling).
+- **Real shells.** 213 observations in bash 3.2.57, sh 3.2.57 and zsh 5.9 match. Only recording stand-ins ran, never
+  Git. `BRACE_CCL` is recorded as the known limit's positive observation.
+- **Census.** A read-only census of the live ledger's writer commands: 33,032 distinct commands in 37,210 operations,
+  with all 31,041 commands of the first census present. 786 are refused by both 2.4.32 and the candidate. None is newly
+  refused and none is reopened.
+- **Build checks.** Python 3.9.6 and 3.15.2 compile it, and both strict validators exit 0.
+
+**Cost.** The gate runs on the daemon's event loop. The lead's review of the writer's first candidate measured, with
+pure calls:
+- an exponential regex-derivative search: `nice [ab]#a` followed by 12 `[ab]` took 2.27 s, and with an exclusion
+  8.94 s;
+- quadratic scans: 8,000 unclosed `[` took 4.49 s and 1,600 `<1-2>` took 10.95 s, where 2.4.32 takes under 3 ms each.
+
+It was replaced before the freeze. The lead's re-measure of the frozen file, best of three:
+
+| shape | ms |
+|---|---|
+| `nice [ab]#a` + 24 `[ab]` + `~[ab]#b` + 24 `[ab]` | 0.15 |
+| `nice [ab]#a` + 24 `[ab]`; the same as the command word | 0.13; 0.01 |
+| `nice ` + 48 `^a` | 0.05 |
+| `nice ` + 100,000 `[` | 4.53 |
+| `nice ` + 50,000 `[a` | 3.89 |
+| `nice x` + 20,000 `<1-2>` | 17.64 |
+| `nice ` + 30,000 `{a,` | 3.89 |
+| 20,000 `<1-2>` as the command word | 15.16 |
+
+Over the census, the writer measured 1.546 s for all 33,032 commands (2.4.32: 1.438 s) and at most 19.7 ms for one
+(17.5 ms).
+
+**Shell facts the lead measured.**
+- `zsh -fc '=git --version'` runs git: EQUALS is on by default.
+- zsh 5.9's `<3-1>` matches nothing.
+- Neither zsh 5.9 nor bash 3.2 expands a letter range with a stride.
+- zsh expands `{Z..a}` to ``Z [ \ ] ^ _ ` a``, as literal characters.
+- bash 3.2 starts a command-substitution parse on such a generated backtick, but the first generated word holding one
+  is unbalanced, so bash aborts the command (`bad substitution`). A stand-in command placed between two generated
+  backticks never ran.
+
+## Review fix round — code_review turn 149
+
+The blind Codex review (session 01a14eac, turn 149) found two HIGH ways past the frozen gate and one MEDIUM pre-existing
+cost, and found no blocker in Change 1. The lead measured each before fixing it, and wrote the fix (`custody.py`).
+
+| finding | measured on eb56c724 (pure calls; shells with stand-ins) | fix |
+|---|---|---|
+| HIGH: an equivalence class or collating symbol | bash 3.2 matches `[[=g=]]it` and `[[.g.]]it` to a file named `git`; zsh 5.9 matches neither, but matches `[[=g=]it`. The gate admitted `bash -c 'nice /usr/bin/[[=g=]]it commit'` and `nice /usr/bin/[[.g.]]it commit`. | A bracket holding `[=` or `[.` refuses as a pattern that may name Git: the two shells close it at different places. |
+| HIGH: an inexact shell behind a wrapper | zsh runs `nice =sh -c 'echo g[i]t'` and `nice SH -c '…'`, and the inner sh expands `g[i]t` to `git`. The gate admitted `nice =sh`, `SH`, `/bin/SH` and `=bash -c '/usr/bin/g[i]t commit'`, also behind the perl wrapper. | A shell among a wrapper's (or perl's) arguments is found by its last part in any letter case after an active `=`, and its `-c` text is read as that shell's. |
+| MEDIUM: leading words re-sliced (pre-existing) | 25,000 `A=1 ` then `:`: 0.71 s (2.4.32: 0.66 s), on the event loop | an index for leading keywords and assignments, `env`'s options and assignments, and `--`/`-p`: 0.045 s |
+
+The lead found two more while measuring:
+- **Nesting.** 5,000 nested `command` wrappers raised `RecursionError` inside the gate, in 2.4.32 as well.
+  `invocation` now refuses beyond 16 levels, as `_recording_command` already did for `-c` text ("commands nested more
+  than 16 deep"): 25,000 refuse in 0.042 s.
+- **Per-call setup.** `nice` with 25,000 `a*` arguments took 1.07 s, mostly `git_pattern`'s setup on every call. Its
+  fixed relations are now built once at import: 0.083 s. No character outside ASCII lowercases to an ASCII name
+  character except the Kelvin sign, as `k`, which is no Git letter (measured over every code point under 3.9 and
+  3.15), so a 128-entry table with a `.` default reads every character as before.
+
+**A pre-existing gap, kept as a documented limit.** A dashed Git program named by its path in another program's
+arguments (`nice /usr/bin/git-upload-pack .`) is admitted by 2.4.32 and by this release: GIT_WORD reads `git-…` only at
+a word's start. Widening GIT_WORD to any path's last part newly refused 18 commands of the census: 5 `curl` fetches of
+`https://git-scm.com/docs/git-*`, 12 `python3 -c` scripts naming such paths, and 1 `chmod +x …/git-remote-…`. The lead
+reverted that edit (GIT_WORD is 2.4.32's) and documented the limit for 2.4.34 (README, CHANGELOG).
+
+**Census, clean environment.** `W/census_gate.py` classified the same 33,032-command snapshot under `env -i`, with
+`PATH=/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`, as the daemon runs it. The lead's shell PATH starts with
+2.4.11's gitshim, so `gitio.shell_git_binary()` resolves the shim there, and the one admitted Git form refused (307 of
+325 apparent new refusals in a first run). In the clean environment:
+- installed 2.4.32 refuses 786, identical to the writer's verdicts;
+- the fix refuses the same 786: none newly refused, none reopened, and no reason changed;
+- gate time is 1.46 s in total.
+
+**Gate table** (the lead's copy, `r2433/leadgate/gate_table.py`): the writer's 326 rows plus 22 for this round pass,
+348/348: 154 existing, 140 new, 49 controls, 3 conservative, 1 retained, and 1 `limit` row (the dashed path, admitted
+by both).
+
+**Native cases** (`r2433/leadgate/gate_case.py`), run by the lead as above. The reds ran on the frozen candidate the
+review refuted (eb56c724), the greens on the fix's composition (C, below):
+
+| case | plugin | exit | checks | result |
+|---|---|---|---|---|
+| red equivalence class, repo-321 | eb56c724 | 0 | 4/4 | `bash -c 'nice /usr/bin/[[=g=]]it … commit --allow-empty -qm r2433-equivclass'` was admitted and committed (HEAD 838f7ff5 → 5daead1c) |
+| green equivalence class, repo-322 | C | 0 | 6/6 | refused `LEAD_RECORDS`, "nice with a pattern argument that may name a Git program"; HEAD unchanged |
+| red `=sh`, repo-323 | eb56c724 | 0 | 4/4 | `nice =sh -c '/usr/bin/g[i]t … commit --allow-empty -qm r2433-eqshell'` committed (→ d4093b9c) |
+| green `=sh`, repo-324 | C | 0 | 6/6 | refused with the same reason; HEAD unchanged |
+
+Each case removed its state, fixture and repository, left no process, and kept at least 214 GiB free.
+
+## Review fix round 2 — code_review turn 150
+
+The same session's turn 150 confirmed the turn-149 bracket and cost fixes. It found two regressions of that fix round
+and one way past it that still stood. The lead measured each one before fixing it (`L/review/review150.py`: pure calls on
+2.4.32, eb56c724, the first fix 6eee1696 and this fix; real shells ran only `echo` or `printf` stand-ins, never
+Git), and wrote the fix (`custody.py`; diff from 6eee1696 in `L/review/r150-fix.diff`).
+
+| finding | measured | fix |
+|---|---|---|
+| HIGH, a regression: a refusal for nesting in forwarded text became admission | `nice sh -c '` + 16 `env` + ` /usr/bin/g[i]t commit …'` was admitted by 6eee1696; eb56c724 refused it. In zsh 5.9 the same chain ending in `/bin/echo /usr/bin/g[i]t` prints `/usr/bin/git`. | `forwards`: a reading cut short by nesting refuses the command that hands the text on, and so it does behind the perl wrapper |
+| HIGH: a shell named by a pattern | `nice /bin/s[h] -c '/usr/bin/g[i]t …'` was admitted by 2.4.32, eb56c724 and 6eee1696. zsh expands `/bin/s[h]` to `/bin/sh`, whose `-c` text expands `g[i]t` (stand-in: prints `/usr/bin/git`). | A word with an active pattern counts as a shell and as its `-c` (`sh -[c]` runs `-c` when a file of that name exists, measured), and its text is read as sh's |
+| MEDIUM, a regression: perl's data-only target | `perl -e 'alarm 60; exec @ARGV' printf '%s\n' sh -c '/usr/bin/g[i]t status'` was refused by 6eee1696; 2.4.32 and eb56c724 admit it. perl's exec of printf prints the three words and runs no shell. | Forwarded text behind perl is read only when its program's reading left something unestablished; printf, echo and `command -v` are admitted again |
+
+The lead found three more while measuring, each fixed:
+- **What forwarded text establishes.** The forwarded reading propagated only pattern refusals, so it discarded what it
+  found. `nice sh -c 'g""it status'`, `'g\it status'` and `'/usr/bin/git-upload-pack .'` read as "a Git command" and
+  `nice sh -c 'gh pr create --fill'` as `LEAD_PUBLISHES`, and all four were admitted. Behind perl, so were
+  `gh pr merge 1` and `/usr/bin/git-upload-pack .`. These now refuse the command that hands the text on, as do Git
+  mentions it finds. A refusal only of code the reading never sees (a script, `eval`, an unestablished option) still
+  does not.
+- **The program itself a pattern.** `perl -e 'alarm 60; exec @ARGV' /bin/s[h] -c '…'` was admitted by every version:
+  there, as in forwarded text, only a pattern naming Git refuses in the command position. A pattern that may name a
+  shell now has its `-c` text read. So does one at the top level that only the extended grammar reads
+  (`/bin/s#h -c '…'`).
+- **Expansions, kept as a documented limit.** A `$` or a backtick in forwarded text ends its reading, so a pattern
+  after it is not read. A variant that also propagated those refusals newly refused 14 commands of the census, all
+  `parameter expansion` in real SmartPay commands (`/usr/bin/lockf -k … /usr/bin/env -i … sh -c '… $X …'`, and
+  `perl -e 'alarm 120; exec @ARGV' /bin/sh -c '… $X …'`). It is documented for 2.4.34 (README, CHANGELOG).
+
+**Census**, clean environment, the same 33,032-command snapshot: this fix refuses 786, the same 786 as installed
+2.4.32. None is newly refused, none is reopened and no reason changed. Gate time is 1.85 s in total, at most 26.8 ms
+for one command (6eee1696: 1.46 s and 19.2 ms; the longest command has 238,858 characters).
+
+**Gate table** (`r2433/leadgate/gate_table.py`): 33 rows for this round, 381/381 pass. The rows are 154 existing,
+159 new, 60 controls, 3 conservative, 2 `publishes` (`LEAD_PUBLISHES`), 2 `limit` (the dashed path, and an
+expansion before a pattern in forwarded text) and 1 retained.
+
+**Cost of forwarded text**, best of three, pure calls. Each shell text that another program hands on is read once:
+
+| shape | bytes | 2.4.32 | eb56c724 | 6eee1696 | this fix |
+|---|---|---|---|---|---|
+| `nice` + 25,000 `sh -c 'a*'` | 275,005 | 46 ms | 1,333 ms | 328 ms | 400 ms |
+| `nice` + 2,500 `sh -c 'a*'` | 27,505 | 4.5 ms | 131 ms | 32 ms | 39 ms |
+| `nice` + 25,000 `a*` | 75,005 | 15 ms | 1,055 ms | 80 ms | 313 ms |
+| `nice` + 25,000 `s[h] -c 'a*'` | 325,005 | 54 ms | 1,257 ms | 239 ms | 503 ms |
+
+2.4.32 reads no forwarded text. The cost is linear, about 16 µs a reading, and no command of the census comes near it.
+
+**Native cases** (`r2433/leadgate/gate_case.py`), run by the lead as above. The reds ran on the first fix (the
+composition `L/comp-r149`, `custody.py` 6eee1696), the greens on this fix (C, below):
+
+| case | plugin | exit | checks | result |
+|---|---|---|---|---|
+| red nesting, repo-325 | 6eee1696 | 0 | 4/4 | `nice sh -c '` + 16 `env` + ` /usr/bin/g[i]t … commit --allow-empty -qm r2433-nestfwd'` was admitted and committed (HEAD 51529160 → 23a6554f) |
+| green nesting, repo-326 | C | 0 | 6/6 | refused `LEAD_RECORDS`, "commands nested more than 16 deep"; HEAD unchanged |
+| red pattern shell, repo-327 | 6eee1696 | 0 | 4/4 | `nice /bin/s[h] -c '/usr/bin/g[i]t … commit --allow-empty -qm r2433-patshell'` committed (→ 88720d71) |
+| green pattern shell, repo-328 | C | 0 | 6/6 | refused, "nice with a pattern argument that may name a Git program"; HEAD unchanged |
+| red perl pattern program, repo-329 | 6eee1696 | 0 | 4/4 | `perl -e 'alarm 60; exec @ARGV' /bin/s[h] -c '/usr/bin/g[i]t … commit --allow-empty -qm r2433-perlpat'` committed (→ 142cc120) |
+| green perl pattern program, repo-330 | C | 0 | 6/6 | refused, "a pattern (glob or brace expansion) in the command position"; HEAD unchanged |
+
+Each case removed its state, fixture and repository, left no process, and kept at least 213 GiB free.
+
+## Review fix round 3 — code_review turn 151
+
+Turn 151 confirmed the round-2 fixes: nesting propagates, perl's data-only targets are admitted, and pattern-named
+shells refuse, including as perl's program. It found one more way past the forwarded reading, and two regressions of
+round 2. The lead measured each one (`L/review/review151.py` and `L/review/cost151.py`: pure calls on 2.4.32, eb56c724,
+6eee1696, the round-2 fix f9c6cd82 and this fix; real shells ran only `echo` stand-ins) and wrote the fix
+(`custody.py`; diff from f9c6cd82 in `L/review/r151-fix.diff`).
+
+| finding | measured | fix |
+|---|---|---|
+| HIGH: a brace expansion supplies a shell's arguments | Every earlier version admitted `nice sh {-c,'/usr/bin/g[i]t …'}` and `nice {/bin/sh,-c} '/usr/bin/g[i]t …'`. In zsh 5.9 both, with `echo` in front of the stand-in path, print `/usr/bin/git`. | Some alternatives of a brace expansion may be an option: `-c`, `-lc`, or one with a glob character. The alternatives after the first such one, and the word after the brace, are read as `-c` text. This applies among another program's arguments and in the command position (`perl … {/bin/sh,-c} '…'`). |
+| MEDIUM, a regression: a quadratic scan | `nice true` + N × `-l(N)`: each word counted as a possible shell and scanned the rest of the run of shell options. f9c6cd82 took 8.7, 25.5 and 144 ms for N = 500, 1,000 and 2,500. | Where each run of shell options ends is found once per command, and each option position and each word's text are judged once: 4.7, 9.3 and 23.8 ms, and 258 ms for N = 25,000. |
+| MEDIUM, a regression: printed data refused | `/usr/bin/nice /bin/echo sh -c 'gh pr create --fill'` refuses `LEAD_PUBLISHES` (f9c6cd82, this fix). 6eee1696 admitted it, but it and eb56c724 refused the same command with `'/usr/bin/g[i]t status'` as the text. | Kept and documented (README, CHANGELOG). The gate does not know `nice`'s grammar, so an unknown wrapper's later arguments are read as text a shell may run, whatever program the wrapper runs first. Trusting that first program would admit `script echo sh -c '…'`, which writes its log to a file named `echo` and runs the shell (measured, with an `echo` stand-in). No census command is refused by it. |
+
+Brace controls stay admitted: `python3 x.py {a,b}.py 'f(x)'`, `python3 x.py {'f(x)',b}`, `nice grep {-c,-n} x file`,
+`mkdir -p {src,tests}/{a,b}` and `cp a.{txt,bak} b`. A first variant also read every brace word, and the word after it,
+as text. It refused the first of them (`f(x)` read as a zsh pattern group), and it missed perl's brace program; the
+alternative rule replaced it before any run.
+
+**Census**, clean environment, the same snapshot: this fix refuses the same 786 commands as installed 2.4.32. None is
+newly refused, none is reopened and no reason changed. Gate time is 2.10 s in total, at most 31.8 ms for one command.
+
+**Gate table**: 17 rows for this round, 398/398 pass. The rows are 154 existing, 168 new, 67 controls, 3 conservative,
+3 `publishes` (one is the printed-data row above), 2 `limit` and 1 retained.
+
+**Native cases**, as above. The reds ran on the round-2 fix (`L/comp-r150`, f9c6cd82), the greens on this fix (C):
+
+| case | plugin | exit | checks | result |
+|---|---|---|---|---|
+| red brace `-c` and text, repo-321 | f9c6cd82 | 0 | 4/4 | `nice sh {-c,'/usr/bin/g[i]t … commit --allow-empty -qm r2433-bracec'}` was admitted and committed (HEAD 590453ca → 873fc507) |
+| green brace `-c` and text, repo-322 | C | 0 | 6/6 | refused `LEAD_RECORDS`, "nice with a pattern argument that may name a Git program"; HEAD unchanged |
+| red brace shell and `-c`, repo-323 | f9c6cd82 | 0 | 4/4 | `nice {/bin/sh,-c} '/usr/bin/g[i]t … commit --allow-empty -qm r2433-braceshell'` committed (→ 0832ff68) |
+| green brace shell and `-c`, repo-324 | C | 0 | 6/6 | refused with the same reason; HEAD unchanged |
+| red perl brace program, repo-325 | f9c6cd82 | 0 | 4/4 | `perl -e 'alarm 60; exec @ARGV' {/bin/sh,-c} '/usr/bin/g[i]t … commit --allow-empty -qm r2433-perlbrace'` committed (→ 56d64f5c) |
+| green perl brace program, repo-326 | C | 0 | 6/6 | refused, "a pattern (glob or brace expansion) in the command position"; HEAD unchanged |
+
+Each case removed its state, fixture and repository, left no process, and kept at least 208 GiB free. This round's
+fix was verified by these runs and was not reviewed again before the release (the rule of one review at the end).
+
+## Final runs
+
+The lead's frozen composition (**C**) is
+`/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2433/lead/comp-r151`:
+a `git archive` of tree 44582ff7, which is 055a58c with the release patch applied (`L/export_stage.sh`). Its
+`custody.py` is the third review fix, SHA-256 `72810dfc2908222c254a8b439bb5bf3dd1ba87dc89d30e471ea1ce97f93c041c`,
+and its version is 2.4.33. `L/final_runs.py` ran three cases at a time, each on a fresh fixture repository:
+
+| case | checks | case | checks |
+|---|---|---|---|
+| settle-patch | 32/32 | park-crash | 15/15 |
+| settle-upgrade (from installed 2.4.32) | 34/34 | publication | 9/9 |
+| settle-command | 8/8 | guards | 15/15 |
+| calibration | 5/5 | message-proofs | 9/9 |
+| lifecycle | 23/23 | project | 19/19 |
+| park | 15/15 | continuation | 28/28 |
+
+That is 12 cases and 212/212 checks. Every recorder exited 0 and removed its state, and no process remained. On C,
+every earlier green passed 6/6, with HEAD unchanged: glob, qualifier, equals, the equivalence class, `=sh`, nesting,
+the pattern shell and perl's pattern program (repos 327–334), and this round's three greens above. Each earlier
+composition passed the same 12 cases, 212/212 checks: `L/comp-final1` (tree 36848ac7, `custody.py` eb56c724) before
+the review, `L/comp-r149` (tree 87a5e7ae, 6eee1696) and `L/comp-r150` (tree 481cc6c0, f9c6cd82) after its first two
+rounds.
+
+**Cost on C**, best of three, pure calls:
+
+| shape | ms |
+|---|---|
+| `nice [ab]#a` + 24 `[ab]` + `~[ab]#b` + 24 `[ab]` | 0.12 |
+| `nice [ab]#a` + 24 `[ab]`; the same as the command word | 0.10; 0.00 |
+| `nice ` + 48 `^a` | 0.01 |
+| `nice ` + 100,000 `[` | 3.88 |
+| `nice ` + 50,000 `[a` | 4.01 |
+| `nice x` + 20,000 `<1-2>` | 17.23 |
+| `nice ` + 30,000 `{a,` | 7.28 |
+| 20,000 `<1-2>` as the command word | 14.41 |
+| 25,000 `A=1 ` then `:`; the same after `env` | 45; 47 (2.4.32: 608) |
+| `nice true` + 25,000 `-l(N)` | 258 |
+| `nice` + 25,000 `a*` (each pattern read as a possible shell and `-c`) | 354 |
+| `nice` + 25,000 `sh -c 'a*'`; 25,000 `s[h] -c 'a*'` (forwarded texts, 275 KB; 325 KB) | 454; 562 |
+| 900 nested `command`, then `ls` | 1, refused as nested (2.4.32: 5,000 raise `RecursionError`) |
+
+`=git commit -qm x` and `=GIT commit` read as a Git command (2.4.32 admits both).
+
+**Static gates** (`L/lead_static.py`) ran on the final export (`L/comp-final7`, tree a8e8048d; only CHANGELOG.md,
+README.md and VERIFY.md differ from C), with exit 0 and no gating failure:
+- Python 3.15 compiled all 98 files.
+- Under Python 3.9 the hook closure compiled and imported, and `coordinator/hooks.py --check` reported compatible,
+  `jsonl-v1`.
+- The hook-runtime modules imported under 3.9 with the codec modules blocked. The informational whole-closure variant
+  fails on `gzip`, as in 2.4.32.
+- Every release module imported under 3.15.
+- Ruff: 31 findings on installed 2.4.32 and on the composition, with none added.
+- Strict plugin and marketplace validation passed, and the version is 2.4.33.
+
+## Historical 2.4.32 — sealed units, history gaps and the writer command gate — 2026-11-02
 
 Base is **e008d07620f48e0c6d1298fb5d6f427dd4f3b99f** (2.4.31). The release has
 two changes. The Codex writer (run_78c49ab7) wrote Change 1, sealed units and
