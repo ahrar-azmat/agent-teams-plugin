@@ -3,6 +3,101 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.35] — 2026-11-05
+
+Change 1 comes from 2.4.34's own switch. Change 2 comes from the Sales_Profiler
+lead's field report on 2.4.33 (batch 1, #10).
+
+### Change 1 — a coordinator start keeps answering
+
+- `compact_history` runs once per ledger, after startup recovery, and reads its
+  candidates on a connection and thread of its own. The `history_compaction`
+  record, written once a pass has read both kinds, ends it. Through 2.4.34 it
+  read every operation and custody record at every start, on the event loop's
+  own connection, right after the worker began serving. That took 9.79 s and
+  2.13 s on the live ledger (read-only, 11-05: 967 MB of operation and 324 MB of
+  custody JSON), though nothing had matched since 10-21. On a disposable daemon
+  with a 1.36 GB ledger of the live shape, 2.4.34 served at 0.79 s and then
+  answered nothing until about 9.3 s. Lead Pre hooks sent in that window fell
+  back to `unavailable` after 3 s, so their edits ran unadmitted. That is how
+  two SmartPay Edits after 2.4.34's switch became an UNKNOWN. 2.4.35 answered
+  all 83 Pre hooks within 0.37 s.
+- A graceful stop saves the scan's source stamps to `path-stamps.json` in the
+  state directory. The next start loads them before recovery's first scan, so
+  a restart reuses the hash of every unchanged file instead of reading the file
+  again. Through 2.4.34 they lived in memory only: after 2.4.34's switch
+  SmartPay's backend hashed 31.8 MB in 8.5 s, and its lead Edits waited on that
+  scan. A saved stamp is reused under the same rule as within a run (every stat
+  field equal, ctime included). So a file changed while the daemon was down is
+  read again, even with its size and mtime put back. A saved entry naming an
+  invalid blob is skipped, and a file whose stored blob is missing or damaged is
+  hashed again, which republishes the damaged copy. A reused stamp's stored blob
+  is still read and checked once per run, as the first use of any blob in a run
+  is. On the fixture, the first scan after a graceful restart hashed none of the
+  24.6 MB of files and took 0.53 s instead of 1.15 s. After three files changed
+  during downtime, it hashed only those three, and each became an UNKNOWN.
+  Status reports `path_stamps`. The live ledger's 10,400 heads make about 4.3 MB.
+- A loop stall records the loop thread's stack. A sampler thread reads it with
+  `sys._current_frames()` once the loop's heartbeat is 0.75 s old, and again at
+  3 s and 12 s, into `loop-stall-stacks.log` (16 MiB, one rotation). Since 2.4.9
+  the watchdog has recorded only that a stall happened, so the startup stalls
+  and 2.4.29's and 2.4.31's ~20 s stalls named no cause. On the fixture,
+  `loop-stalls.log` had no line for most of 2.4.34's startup stall: the
+  watchdog is started by the loop supervisor's task, which could not run. A
+  3.5 s stall injected on the candidate was sampled at 0.85 s and 3.09 s, with
+  the blocking function on the stack. Status: `event_loop_lag` adds
+  `stack_file`, `stack_samples`, `stack_error` and `stack_sampler_alive`.
+
+### Change 2 — a lead's file calls queue instead of failing
+
+- A lead file PreToolUse ends the earlier file calls of its own thread before its
+  conflicts are checked. Claude Code runs one thread's file calls one at a time
+  (2.1.318, measured), so a later Pre from the same host process, session and
+  agent thread proves the earlier call has ended. That fixes the Sales_Profiler
+  report (#10): three batched Edits to one file were all refused, the first
+  `LEAD_ADMISSION_BUSY` and the others "A lead file call may still write". A
+  denied call gets no Post, and its transcript result arrives only as the batch
+  ends, so nothing had ended the first call's window. The earlier call is
+  settled first. A refused one gets no receipt, even when the bytes match its
+  intent, unless its Post or its own transcript result shows it ran. That
+  includes a call granted just as its deadline passed: its grant is withdrawn
+  before the busy reply. Another thread, session or host process still cannot
+  end a call.
+- A lead file admission waits up to 10 s for the checkout instead of refusing at
+  2 s: 10 s decision < 10.5 s acceptance bound < 11 s hook RPC < 14 s hook
+  budget < the 15 s host timeout. Past it, `LEAD_ADMISSION_BUSY` names the
+  blocker, with `retry_after_seconds`. A file Pre that meets a daemon being
+  replaced waits for the replacement until its decision is due, then retries
+  once.
+- The thread is declared only by a hook that verified its host (`CLAUDE_PID` as
+  its parent, with its kernel birth): `agent_id` for a subagent, `main_thread`
+  otherwise. `agent_type` is recorded, not identity. A present but invalid
+  `agent_id` declares nothing and records `thread_undeclared`. Hooks through
+  2.4.34 declare neither thread nor budget and keep 2.4.34's behaviour. The new
+  hook works against a 2.4.34 daemon.
+- On real Claude Code 2.1.318 (`claude -p`, three Edits to one file in one
+  message, the checkout held at the first one):
+  - 2.4.34, held 5 s: refused all three, and its retry of the first, and left the
+    file without that edit.
+  - 2.4.35, held 5 s: admitted the first after 5.06 s and the others in 0.13 s
+    and 0.27 s.
+  - 2.4.35, held 12 s, past the budget: the first was refused at 10.0 s; host
+    order ended it, and the other two were admitted. The retry was admitted. Each
+    edit had its exact receipt, with no UNKNOWN.
+
+### Not changed
+
+- Queued for 2.4.36:
+  - A seal refused `UNKNOWN_DEPENDENCY` by a verified operation whose output a
+    restore has since replaced (Sales_Profiler, 11-05). A restore resolves only
+    the quarantined operations it replaced, and the seal counts every base the
+    others ever had.
+  - Resumes that time out under load, though one had in fact started its turn.
+  - Foreign dirt acknowledged per path, not only through `allow_dirty` (#11).
+  - The push gate's refusal of a commit in a repository outside the checkout
+    (#13).
+- Writers keep full access with no off switch (user ruling, 10-18; #12).
+
 ## [software-workflows 2.4.34] — 2026-11-05
 
 Both changes come from the Sales_Profiler lead's field report on 2.4.33 (batch 1,

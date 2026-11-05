@@ -225,14 +225,18 @@ def read_path(store, checkout, name):
                 if stamp == path_stamp(after) == path_stamp(current):
                     image = {"blob": blob, "mode": "100755" if before.st_mode & 0o111 else "100644"}
                     if reusable:
+                        with store._blob_publish:
+                            store._path_touched.add(cache_key)  # saved at a graceful stop (Store.save_path_stamps)
                         counters = telemetry.IO.get()
                         if counters is not None:
                             counters["skipped_bytes"] = counters.get("skipped_bytes", 0) + before.st_size
                     else:
                         with store._blob_publish:
                             store._path_blobs.pop(cache_key, None)
+                            store._path_touched.discard(cache_key)
                             if max(before.st_mtime_ns, before.st_ctime_ns) + RACY_NS < began:
                                 store._path_blobs[cache_key] = (stamp, dict(image), began)
+                                store._path_touched.add(cache_key)
                     return image
         except (FileNotFoundError, NotADirectoryError):
             # A tracked path whose parent is now a file is absent like a deleted one.

@@ -93,7 +93,7 @@ def owner(daemon, item):
     execution = (record or {}).get("execution") or {}
     end = (execution.get("end") or {}).get("source")
     if execution.get("unadmitted_completion") or end in (
-            "PostToolUse", "PostToolUseFailure", "PostToolBatch", "transcript", "host exited"):
+            "PostToolUse", "PostToolUseFailure", "PostToolBatch", "transcript", "host exited", "host order"):
         return record["id"]
     return None
 

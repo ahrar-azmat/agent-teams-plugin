@@ -1,4 +1,212 @@
-# software-workflows 2.4.34 — lead replies carry what a lead reads, and refusals name their cause — 2026-11-05
+# software-workflows 2.4.35 — a coordinator start keeps answering, and a lead's file calls queue instead of failing — 2026-11-05
+
+Base is **d9db6c68f38e195782d1c392695b28c692b34a88** (2.4.34). The lead wrote Change 1 (`daemon.py`, `store.py`,
+`ledger.py` and the new `stall_stacks.py`), the review fixes and the docs. The Codex writer wrote Change 2
+(`admissions.py`, `lead_calls.py`, `lead_batches.py` and `hooks/coordinator_lead.py`) from the lead's charter, with two
+amendments from the lead's reading of its diff: a present but invalid `agent_id` declares no thread (R1), and the docs
+state the host premise as measured (R2). Every run below used a disposable daemon state and a fresh fixture
+repository. The reds ran on installed 2.4.34, and for the review fixes on the code the review refuted; the greens ran
+on the release's code. The live ledger was read only with sqlite `mode=ro`.
+
+Evidence roots: **L** (the lead's) is
+`/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2435/lead`,
+and **W** (the writer's) is
+`/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2435/writer`.
+
+## Change 1 — a coordinator start keeps answering
+
+`L/restart_case.py` drives a disposable daemon from `--plugin`, with no writer and no Git command:
+1. It registers a fixture checkout holding 1,500 untracked files of 16 KB (24.6 MB), lets its first scan finish, and
+   stops.
+2. Into the stopped ledger it puts 41,000 finished command operations and 50,000 released custody records, each JSON
+   of many small fields as the live records are. The operations are 40,000 of 20,852 B and 1,000 of 74,052 B (the
+   compaction's own candidates, over 64 KB); the custody records are 6,258 B. That is 1.22 GB of JSON in a 1.36 GB
+   ledger (live: 967 MB and 324 MB). It removes the `history_compaction` record the first start wrote, as a ledger
+   2.4.34 leaves. Then it starts, waits for recovery and (on the candidate) for the compaction's one pass, and stops
+   gracefully.
+3. It starts again while real lead hook processes (`hooks/coordinator_lead.py` under `/usr/bin/python3`, as Claude
+   Code runs them) send an Edit's PreToolUse every 0.25 s from the start's first moment. Each admitted Pre is then
+   ended by its PostToolUseFailure. Readiness is the ledger's `recovery/serving` event. A status poll cannot answer
+   while the stall that follows readiness lasts.
+4. On the candidate, it starts once more with a 3.5 s synchronous sleep injected on the loop
+   (`L/inject/sitecustomize.py`, `R2435_LOOP_SLEEP`).
+5. While the daemon is stopped it changes three files: a same-size rewrite with its mtime put back, an append, and a
+   replacement by rename. Then it starts.
+
+Red ran on installed 2.4.34 and green on `L/comp-c1` (installed 2.4.34 with the four Change 1 files laid over it;
+byte-identical to the release's). Evidence is under `L/run3/` (`c1-red3`, `c1-green3`).
+
+| check | 2.4.34 (red) | 2.4.35 (green) |
+|---|---|---|
+| lead Pre hooks around readiness | served at 0.79 s; the Pres sent at 0.76 s and 4.15 s were `unavailable` after 3.13 s and 3.08 s ("Lead edits are allowed; later reconciliation will expose unexplained change"); the one sent at 7.49 s was admitted at 9.28 s; 65 of 67 admitted | served at 0.72 s; 83 of 83 admitted, the slowest in 0.37 s |
+| recovered (status answers) | 9.54 s | 1.37 s |
+| the compaction pass over the 2.4.34-shaped ledger | at every start, on the loop; `loop-stalls.log` has one line a start, late in the stall (detected at 0.77 s and 0.84 s of heartbeat age) | once, off the loop: no stall of 0.75 s; `history_compaction` written, `compacted: {}` |
+| first scan after a graceful restart | hashed 24,576,017 B | hashed 0 B, reused 24,576,017 B; `path_stamps` load 1,501, saved 624,459 B |
+| three files changed while stopped | each an UNKNOWN; hashed 24,625,179 B | each an UNKNOWN, nothing else; hashed 98,314 B (each changed file twice, as 2.4.34 also does), reused exactly the other 24,526,865 B |
+| an injected 3.5 s loop stall | (no sampler) | sampled at 0.851 s and 3.085 s; the stack names `r2435_blocking_sleep` under `coordinator/daemon.py` `_worker` |
+
+Two earlier iterations are kept in `L/run1/` and `L/run2/`. Both started the lead hooks only after a status poll
+answered. 2.4.34 could not answer that poll until its stall had ended, so their hooks met no stall: every Pre was
+admitted on both releases. Run 1's records were also one long string each, which `json_extract` parses faster than
+the live records. In run 2's red fifth start, recovery served at 3.85 s and the ledger's next event came at
+11.43 s. `loop-stalls.log` has no line for that gap: the watchdog is started by the loop supervisor's task, which
+could not run.
+
+Live, read-only (11-05): the live ledger holds 10,400 heads in 6 checkouts, about 4.3 MB of stamps at the fixture's
+416 B a stamp.
+
+## Change 2 — a lead's file calls queue instead of failing
+
+### The writer's runs
+
+`W/recorder.py` drives a disposable daemon from `--server-plugin` with the fixture provider (`W/provider.py`), on a
+committed fixture repository from the lead (repo-351 to repo-377, each removed after its case). It sends lead hook
+payloads through the `lead-hook/dispatch` and `lead-hook/batch` RPCs, or runs the changed hook itself under
+`/usr/bin/python3` (3.9.6), and makes the host's file effects between an admitted Pre and its Post. Faults are injected
+at import (`W/inject/sitecustomize.py`): a daemon task holds the checkout's real ledger lock, a real preparation is
+paused, or a real settlement observation fails. Nothing fabricates an admission answer. The reds ran on installed
+2.4.34, the greens on the checkout with Change 1 (each summary records the source hashes).
+
+| case | installed 2.4.34 | 2.4.35 |
+|---|---|---|
+| three Edits to one file in one batch, the checkout held | Pre 1 `LEAD_ADMISSION_BUSY` at 2.0039 s; Pres 2 and 3 "may still write"; no receipt | Pre 1 BUSY at 10.0028 s; Pres 2 and 3 admitted in 0.0594 s and 0.0633 s once host order had settled Pre 1; two receipts, no UNKNOWN |
+| a subagent's Edit while the main thread's call is open | refused "may still write" | the same refusal: another thread does not end the call |
+| the checkout held 5 s | BUSY at 2.0015 s, with `retry_after_seconds` | admitted at 5.0053 s; one receipt, no UNKNOWN |
+| held past the declared budget | not run | BUSY at 10.0029 s, with `retry_after_seconds`; no receipt |
+| 2.4.34 hook payloads (no thread, no budget) on 2.4.35 | not run | BUSY at 2.0035 s, then the same two refusals as 2.4.34: no host order |
+| the 2.4.35 hook (Python 3.9) on a 2.4.34 daemon | not run | Pre in 0.30 s and Post in 0.06 s, both hook exit 0; one receipt |
+| the 2.4.35 hook, the checkout held 5 s | not run | Pre in 5.0085 s, exit 0, with the 10 s budget and thread main recorded; one receipt |
+| one session id from two live host processes | the second refused | the second refused, and the first process's window stays open |
+
+On 2.4.35 only:
+- **Boundaries** (23 checks). The same agent with a changed `agent_type` settled its earlier call: type is not
+  identity. A duplicate Pre did not end itself. A rewritten active Pre stayed `CLAIM_CONFLICT`, and a host rebinding or
+  an ambiguous thread declaration stayed `LEAD_HOOK_IDENTITY`. Budgets of true, 0, a negative, infinity, NaN and a
+  string were `LEAD_HOOK_FIELDS`, and none of these ended an open call. Claims of another session or unit still refused
+  and named their holder. Late Posts and batches added no receipt.
+- **The successor's budget runs out while it settles its predecessor.** The first call was BUSY at 0.303 s and the
+  successor at 0.402 s. The predecessor's end was already saved, and its settlement finished after the release.
+- **The settlement's observation fails.** A named refusal kept the older call's hold. Once the fault was cleared, a
+  retry settled it, and a fresh Pre was admitted in 0.061 s; one receipt, no UNKNOWN.
+- **A preparation paused before its lead file window exists.** Host order fenced the old attempt: resumed, it could not
+  open a stale window. The successor was admitted in 0.746 s.
+- **No verified host.** The hook admitted a normal Edit with no thread or budget declared, and the stored deadline kept
+  2.4.34's allowance.
+- **All four file tools,** Write, MultiEdit, NotebookEdit and Edit, each ended by the next. The three calibrated
+  operations got receipts. NotebookEdit stays uncalibrated, with no receipt. No UNKNOWN.
+- **A subagent's hook.** Pre, Post and the batch forwarded and recorded `agent_id` and `agent_type`; one receipt.
+- **Prepared but not admitted.** After the real intent preparation, the call was refused BUSY at 0.703 s, and the
+  recorder then wrote the intended bytes anyway. The next Pre, for another path, ended it by host order. Its operation
+  was quarantined and never receipted, and both UNKNOWN rows (an obligation and an observed revision) name a.txt.
+- **R1: a null or empty `agent_id`** (16 checks). Admitted in 0.292 s with the 10 s budget and `thread_undeclared`, and
+  no thread. Neither it nor a main-thread call could end the other's window. A malformed declaration sent straight to
+  the daemon was still `LEAD_HOOK_IDENTITY`.
+
+That is 24 runs and 216 checks (`W/acceptance-index.json`). Three more attempts exited 1 on the recorder's own
+expectations, not on the code, and each is kept beside its corrected rerun (`W/final-report.md`): a rewritten active
+Pre is `CLAIM_CONFLICT`, not `LEAD_HOOK_REWRITTEN`; the invalid string budget broke the recorder's own deadline sum
+before the RPC; and a refused write leaves two UNKNOWN rows for its path, not one. The writer's static checks
+(`W/static-checks.json`) passed, with Ruff's 30 findings on the whole plugin the same on both releases. Every fixture,
+state and provider directory was removed, and no process of theirs remained (`W/delivery-audit.json`).
+
+### End to end on Claude Code 2.1.318 (lead)
+
+`L/e2e_case.py` runs real `claude -p` (Claude Code 2.1.318, headless, `--permission-mode acceptEdits`,
+`--model haiku`). It loads `--plugin` with `--plugin-dir` and no other plugin or MCP server (`--setting-sources
+project,local --strict-mcp-config`), against a disposable daemon started from `--daemon` (default `--plugin`) and a
+registered fixture checkout (`L/e2e-repos/repo-N`, a.txt holding the probe's three lines).
+- With `--hold S`, `L/inject-e2e/sitecustomize.py` makes the first Edit's admission wait until a daemon task holds
+  the checkout's real lock (`Ledger.lock`, as a scan or a writer's operation holds it), and releases the lock S seconds
+  after taking it.
+- The prompt asks for three Edits to a.txt in one message, then a retry of any refused one.
+- Recorded: Claude's calls and results from its transcript, each admission (budget, seconds to decide, end source,
+  thread), operations, final bytes, and UNKNOWNs.
+
+`L/e2e_all.sh` ran the four cases one after another. The candidate is `L/comp-e2e` (`L/compose.sh`: a `git archive` of
+d9db6c6 with the release files over it; the writer's files match `W/release-files.json`).
+
+| case | the batch's three Edits | then | result |
+|---|---|---|---|
+| installed 2.4.34, checkout held 5 s | 1: `LEAD_ADMISSION_BUSY`, expired at 2.0 s; 2, 3: "A lead file call may still write or is settling its bytes" in 0.05 s | the retry of 1 refused again (0.06 s); 2 and 3 retried, admitted | file without edit 1; 2 receipts, 0 UNKNOWN |
+| 2.4.35, held 5 s | 1 admitted after 5.06 s; 2, 3 in 0.13 s and 0.27 s; budget 10 s, thread main | none needed | all three edits; 3 receipts, 0 UNKNOWN |
+| 2.4.35, held 12 s | 1 refused at 10.0 s (`LEAD_ADMISSION_BUSY`), its end source `host order`; 2 admitted after 2.08 s (call 1 settling behind the rest of the hold); 3 in 0.10 s | the retry of 1 admitted in 0.93 s | all three edits; 3 receipts, 0 UNKNOWN |
+| the 2.4.35 hook on a 2.4.34 daemon, no hold | all three admitted (0.34, 0.36, 0.17 s); the old daemon recorded its 2 s budget | none needed | all three edits; 3 receipts, 0 UNKNOWN |
+
+Two earlier recorder iterations are kept in `L/e2e-failed/`. Run 0 crashed reading the output: 2.1.318's
+`--output-format json` prints the session's events as an array. Run 1 was a valid red, but its checks counted each
+tool call twice, because the transcript repeats a tool_use in a later entry.
+
+## Review fix round — code_review turn 155
+
+Turn 155 (session 01a14eac, continued) answered Needs changes, with one HIGH and two MEDIUM, all in this release's new
+code. The lead fixed all three, in `admissions.py`, `lead_calls.py`, `hooks/coordinator_lead.py` and `store.py`:
+- **HIGH: a refused call could receive an exact receipt.** The preparation saves `granted` before its waiter answers.
+  A waiter that woke after the deadline answered `LEAD_ADMISSION_BUSY` but left the grant saved. A duplicate Pre of
+  that call was then allowed, and host order, whose end evidence has no failure flag, let settlement verify matching
+  bytes from any source as that call's. Now the waiter withdraws such a grant before the busy reply (`granted: false`,
+  `withdrawn`), so a duplicate Pre is refused. Settlement gives a call the host was refused no receipt unless its Post
+  or its own transcript result shows it ran: host order, a batch or the host's exit never award one.
+- **MEDIUM: a file Pre waited only about 3 s for a daemon being replaced.** The hook's replacement wait subtracted its
+  full 11 s RPC timeout from its 14 s budget, so it answered unavailable, and the edit ran unadmitted, while its
+  decision still had 7 s. Through 2.4.34 it waited about 11 s, with a 3 s RPC. Now a file Pre waits until its decision
+  is due (10 s) and leaves the rest of its 11 s reply deadline to the one retry. Bash keeps its reservation.
+- **MEDIUM: a damaged saved stamp could fail recovery.** A loaded stamp's blob id was not checked, and a reused stamp
+  whose stored blob was damaged raised `BLOB_CORRUPT` out of the scan instead of hashing the unchanged file. Now an
+  entry naming an invalid blob is skipped at load, and a missing, damaged or invalid stored blob makes the scan hash
+  the file again (`Store.reusable_blob`), which republishes the damaged copy (`Storage.publication_state` still sees
+  the damage).
+
+The reds ran on `L/comp-final` (the code turn 155 refuted), the greens on `L/comp-r155` (the fix):
+
+| case | `L/comp-final` | `L/comp-r155` |
+|---|---|---|
+| late grant (`r2435/lfinal/recorder.py --case late-grant --expect`): after a call's grant is saved, the loop is blocked until 0.3 s past its 2 s deadline, so its waiter answers BUSY (2.31 s). Another source then writes the call's intended bytes, and a second such call is ended by a batch | the grant stays saved; a duplicate Pre is allowed (0.002 s); host order and the batch each give the refused call an exact receipt: 4 receipts, no UNKNOWN (13/13) | the grant is withdrawn (`expired`, `withdrawn`); the duplicate Pre is BUSY; both calls' operations are quarantined: 2 receipts, and the UNKNOWNs name a.txt and c.txt (13/13) |
+| replacement (`L/fix_case.py --case replacement`): a helper holds `upgrade.lock`, stops the daemon, waits 4 s and starts it again; the real hook sends an Edit's Pre once the old daemon has stopped | the hook answered unavailable after 3.07 s ("Writer coordinator is unavailable. Lead edits are allowed ...") | the hook waited, and the new daemon admitted it after 5.28 s with the 10 s budget and the main thread; its PostToolUseFailure settled it |
+| damaged stamps (`L/fix_case.py --case stamps`): while the daemon is stopped, one byte of a reused stamp's stored blob changes, and another saved entry names an invalid blob | all 41 entries loaded; recovery's filesystem snapshot failed `BLOB_CORRUPT` and left a checkout-wide UNKNOWN ("recovery filesystem snapshot incomplete"); no scan completed | the invalid entry was skipped (40 loaded); the scan hashed exactly those two files again, 49,152 B (the damaged one twice: to name it, then to republish it); `blob/repaired` names the damaged blob; no new UNKNOWN |
+
+The stamps runs above are `L/fix-stamps-red5` and `L/fix-stamps-green5`. Earlier attempts are kept: the first wrote
+their files less than 3 s before the first scan, so no stamp was saved for them (`RACY_NS`); the third reused fixture
+repositories that a registration had bound to another state (`CHECKOUT_OWNED`); and the fourth green counted the
+fixture's untracked files, UNKNOWN from the first scan on both releases, and looked for the blob in the repair event's
+data rather than its subject.
+
+While the lead made these fixes on the live 2.4.34 daemon, with a load average near 21, six lead Edits were refused
+at its 2 s budget, in "pre-image IO" or "grant", and nothing ran. Two more ran unadmitted after their hook's 3 s reply
+fell back to unavailable. Their UNKNOWNs (`admissions.py`, `lead_calls.py`) were restored and the edits made again.
+
+## Final runs
+
+C is `L/comp-final3`, a `git archive` of d9db6c6 with the release files laid over it, version 2.4.35. Its code is
+byte-identical to `L/comp-r155`'s. `L/final_all3.sh` ran these on it one after another. Every run removed its state
+and repositories, and no process remained.
+
+| run | result |
+|---|---|
+| Change 1 (`L/restart_case.py`, `L/final3-c1-green`) | 10/10 checks. Served at 0.91 s, and status answered at 2.66 s; 74 of 74 lead Pres admitted, the slowest in 0.77 s. The compaction's one pass made no stall of 0.75 s. The first scan after a graceful restart hashed 0 B. The injected 3.5 s stall was sampled at 0.829 s and 3.014 s. The three files changed while stopped were each an UNKNOWN, and that scan hashed 98,314 B. |
+| end to end, held 5 s | 1 admitted after 5.06 s, 2 and 3 in 0.13 s and 0.14 s; 3 receipts, 0 UNKNOWN |
+| end to end, held 12 s | 1 `LEAD_ADMISSION_BUSY` at 10.0 s and ended by host order; 2 admitted after 2.08 s and 3 in 0.11 s; the retry of 1 in 0.37 s; 3 receipts, 0 UNKNOWN |
+| end to end, the 2.4.35 hook on a 2.4.34 daemon | all three admitted (0.31, 0.11 and 0.27 s) under the old daemon's 2 s budget, with no thread; 3 receipts, 0 UNKNOWN |
+| the writer's cases through the lead's copy of its recorder (`r2435/lfinal/recorder.py --server-plugin` C) | unadmitted-prepared 10/10, boundaries 23/23, delayed 7/7, failure 7/7, preparing 9/9; with C's own hook file (`--candidate` C, `L/final_hooks3.sh`), malformed-agent 16/16 and hook-agent 7/7 |
+| the fix round's greens | late grant 13/13; replacement admitted after 5.15 s with the 10 s budget; damaged stamps 6/6 |
+
+The first final set (`L/final_all.sh` on `L/comp-final`, the code turn 155 refuted) passed the same cases. Its first
+unadmitted-prepared attempt failed: the case gives its call a 0.7 s budget, so that the budget runs out while a gate
+holds the call's real preparation, and that budget ran out at 0.745 s in the call's own `lease` phase, before the gate
+(the first call on a new checkout takes the checkout's lease; 2.4.35 does not change that path). Its two reruns passed.
+
+**Static gates** (`L/lead_static.py`, `L/static-final3`) exited 0, with no gating failure:
+- Python 3.15 compiled all 99 files.
+- Under Python 3.9 the hook closure compiled and imported (71 coordinator modules), and `coordinator/hooks.py --check`
+  reported compatible, `jsonl-v1`.
+- The hook-runtime modules imported under 3.9 with the codec modules blocked. The informational whole-closure variant
+  fails on `gzip`, as in 2.4.34.
+- Every release module (7) imported under 3.15.
+- Ruff: 30 findings on installed 2.4.34 and 30 on C, none added.
+- Strict plugin and marketplace validation passed, and the version is 2.4.35.
+
+`git diff --check` on the checkout exited 0.
+
+## Historical 2.4.34 — lead replies carry what a lead reads, and refusals name their cause — 2026-11-05
 
 Base is **824ed971b7f4f141cb581211a56f98f4c85f105d** (2.4.33). The lead wrote both changes, the review fixes and the
 docs, from the Sales_Profiler lead's field report on 2.4.33 (batch 1, 11-05: 14 issues found while running three or

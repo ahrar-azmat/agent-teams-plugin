@@ -115,7 +115,10 @@ def describe(record):
             "phase": execution["phase"], "since": execution["since"], "host": execution.get("host"),
             "waiting_for": "byte settlement" if execution.get("end") else
                 "PostToolUse/Failure or PostToolBatch; legacy quarantine limit" if deadline is not None else
-                "PostToolUse/Failure, PostToolBatch, transcript tool_result, or birth-verified host exit",
+                "PostToolUse/Failure, PostToolBatch, transcript tool_result, or birth-verified host exit" +
+                ("; next file Pre from the same declared host/thread" if execution.get("thread") else ""),
+            **({"thread": execution["thread"]} if execution.get("thread") else {}),
+            **({"thread_undeclared": execution["thread_undeclared"]} if "thread_undeclared" in execution else {}),
             **({"legacy_limit": {"at": deadline, "seconds": LEGACY_FILE_CALL_SECONDS, "reason": LEGACY_LIMIT_REASON}}
                if deadline is not None and not execution.get("end") else {}),
             **({"observation_problem": execution["problem"]} if execution.get("problem") else {}),
@@ -159,6 +162,63 @@ def host_snapshot(named):
         return {key: named[key] for key in ("pid", "birth", "parent")}
     return {"unavailable": (named or {}).get("unavailable", "Pre supplied no verified host birth") if isinstance(named, dict)
             else "Pre supplied no verified host birth"}
+
+
+def thread_identity(payload):
+    """Missing host or declaration is legacy, never an inferred main thread.
+
+    Two processes can resume the same session. Agent type describes a role,
+    including --agent on the main thread; only agent_id distinguishes a child.
+    """
+    host = host_snapshot(payload.get("host"))
+    if "unavailable" in host:
+        return None
+    agent = payload.get("agent_id")
+    main = payload.get("main_thread")
+    if "agent_id" not in payload and "main_thread" not in payload:
+        return None
+    if ("agent_id" in payload and (not isinstance(agent, str) or not agent or main is True)
+            or "main_thread" in payload and main is not True):
+        raise CoordinatorError("LEAD_HOOK_IDENTITY", "Declare either a nonempty agent_id or main_thread=true")
+    if not isinstance(payload.get("session_id"), str) or not payload["session_id"] or not isinstance(
+            payload.get("tool_use_id"), str) or not payload["tool_use_id"]:
+        raise CoordinatorError("LEAD_HOOK_IDENTITY", "Host session_id and tool_use_id are required")
+    return {"host": {"pid": host["pid"], "birth": host["birth"]}, "session_id": payload["session_id"],
+            **({"agent_id": agent} if agent is not None else {"main_thread": True})}
+
+
+def ordered_settlement(daemon, prior):
+    """A retained completion task, independent of the successor's deadline."""
+    if not hasattr(daemon, "lead_ordered_settlements"):
+        daemon.lead_ordered_settlements = {}
+    jobs = daemon.lead_ordered_settlements
+    key = lock_key(prior["session_id"], prior["tool_use_id"])
+    if key in jobs:
+        return jobs[key]
+
+    async def complete():
+        task = asyncio.current_task()
+        try:
+            daemon.admit_rpc("lead-hook/dispatch", {"payload": {"hook_event_name": "PostToolBatch"}})
+            daemon.inflight[task] = "lead-hook/dispatch"
+            preparing = admissions.runtime(daemon).get(prior["admission"])
+            if preparing:
+                await asyncio.shield(preparing)
+            async with daemon.actor_locks.hold(key):
+                current = find(daemon.store, prior["session_id"], prior["tool_use_id"])
+                if current and current.get("execution", {}).get("phase") in PHASES:
+                    try:
+                        await settle(daemon, current)
+                    except Exception as exc:
+                        # The durable end remains retryable. A successor cannot
+                        # run through a failed observation as an unavailable RPC.
+                        raise conflict([describe(daemon.store.get(current["id"]))]) from exc
+        finally:
+            daemon.inflight.pop(task, None)
+
+    jobs[key] = daemon.background(complete())
+    jobs[key].add_done_callback(lambda task: jobs.pop(key, None) if jobs.get(key) is task else None)
+    return jobs[key]
 
 
 def transcript_result(record):
@@ -347,12 +407,24 @@ async def settle(daemon, record, evidence=None):
         return {"coordinated": True, "settled": False, "waiting": describe(record)}
     operation = store.get(record.get("operation"), required=False)
     checkout = store.get(record["checkout"])
+    attempt = store.get(execution.get("admission"), required=False) if execution.get("admission") else None
+    # Only a Post or the call's own transcript result shows the host ran it. Host
+    # order, a batch or the host's exit ends a call the host was refused (or whose
+    # grant was withdrawn at its deadline) without showing it ran.
+    unadmitted_end = (attempt and not attempt.get("granted")
+                      and end["source"] not in ("PostToolUse", "PostToolUseFailure", "transcript"))
     try:
         if operation is None:
             await daemon.ledger.reconcile(checkout, record.get("paths") or None,
                                           reason="lead call ended without a prepared image", ignore_pending=False,
                                           owner={"kind": "lead-call", "call": record["id"]})
             state = "unrecorded"
+        elif operation["state"] == "prepared" and unadmitted_end:
+            # Even matching intended bytes earn no receipt.
+            await daemon.ledger.settle_unapplied(operation, "unadmitted lead call ended by " + end["source"],
+                                                 lambda current: True)
+            operation = store.get(operation["id"])
+            state = terminal_state(operation)
         elif operation["state"] == "prepared" and not end.get("rewritten"):
             expected = operation["intended"]["expected"]
             images = {path: await admissions.io(read_path, store, checkout, path) for path in operation["paths"]}
@@ -489,7 +561,8 @@ async def dispatch(daemon, payload):
                 "paths": [path], "execution": {"phase": "settled", "since": now, "completed": now, "end": evidence,
                     "unadmitted_completion": dict(evidence, state="pending")}})
         return await settle(daemon, record, evidence)
-    waiting = list(active(store, checkout["id"], [path]))
+    ordered = admissions.predecessors() if event == "PreToolUse" else []
+    waiting = [] if ordered else list(active(store, checkout["id"], [path]))
     if event == "PreToolUse" and waiting:
         # A denied host call must never become a fresh admission if its Pre is
         # replayed after the conflicting call ends.
@@ -506,8 +579,19 @@ async def dispatch(daemon, payload):
                 {"path": payload.get("transcript_path")}, cursor=0)}})
     record = store.get(ident)
     admissions.bind(record)
+    thread = thread_identity(payload) if event == "PreToolUse" else None
+    if thread is not None:
+        record["execution"]["thread"] = thread
+    for field in ("agent_type", "thread_undeclared"):
+        if field in payload:
+            record["execution"][field] = payload[field]
     store.save(record)
     try:
+        if ordered:
+            # Reserve this call before any new wait; no custody or intent exists
+            # yet. The older calls settle first, then all ordinary guards run.
+            await admissions.settle_predecessors(daemon)
+            refuse(store, checkout["id"], [path], ident)
         admissions.check("recovery")
         while not daemon.ready:
             await asyncio.sleep(0.01)

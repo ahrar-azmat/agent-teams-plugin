@@ -123,6 +123,15 @@ def fsync_dir(path):
         os.close(fd)
 
 
+# 2.4.35: the source stamps (ledger.read_path) a graceful stop leaves for the next start, so its first scan of a
+# checkout hashes only what changed. After 2.4.34's switch SmartPay's backend hashed 31.8 MB in 8.5 s, and its lead's
+# edits waited for that scan. A saved stamp is reused exactly as one from the same run: every stat field equal, ctime
+# included (no user-space call sets it back), the hash begun after the stamp's, the file 3 s old when hashed (RACY_NS),
+# its blob still present. Only the stamps a run read or hashed are saved, so a deleted file's stamp outlives one run.
+PATH_STAMPS = "path-stamps.json"
+PATH_STAMPS_VERSION = 1
+
+
 class Store:
     def __init__(self, root):
         self.status_epoch = 0
@@ -139,7 +148,10 @@ class Store:
         self.reclamation_wake = None
         self.root = validate_state(root, create=True)
         self._validated_blobs = {}
-        self._path_blobs = {}  # advisory source stamps; never persisted across a restart
+        # Advisory source stamps (ledger.read_path), and the keys this run read or hashed: since 2.4.35 a graceful stop
+        # saves those (save_path_stamps) and the next start loads them (load_path_stamps).
+        self._path_blobs = {}
+        self._path_touched = set()
         self._blob_publish = threading.RLock()
         self._blob_owner = threading.get_ident()
         self._storage5_ready = False
@@ -831,7 +843,60 @@ class Store:
         return self.blobs.read(name, offset, length)
 
     def reusable_blob(self, name):
-        return self.blobs.reusable(name)
+        """Whether a stamp's blob can stand for hashing its source again (ledger.read_path). A missing, damaged or
+        invalid one cannot: the source is hashed instead, and blob() republishes a damaged representation from it."""
+        try:
+            return self.blobs.reusable(name)
+        except CoordinatorError as exc:
+            if exc.code in ("BLOB_CORRUPT", "BLOB_ID"):
+                return False
+            raise
+
+    def load_path_stamps(self):
+        """The stamps the last graceful stop saved (PATH_STAMPS): {"loaded": n}, with "skipped" or "error" when some or
+        all of it could not be used. A missing, damaged or other-version file costs one full hash of each checkout."""
+        from . import runtime
+        from .blob_storage import valid_name
+        try:
+            value = runtime.private_json(self.root / PATH_STAMPS)
+        except FileNotFoundError:
+            return {"loaded": 0}
+        except (OSError, ValueError, CoordinatorError) as exc:
+            return {"loaded": 0, "error": getattr(exc, "code", None) or type(exc).__name__}
+        if not isinstance(value, dict) or value.get("version") != PATH_STAMPS_VERSION or not isinstance(value.get("entries"), list):
+            return {"loaded": 0, "error": "PATH_STAMPS_VERSION"}
+        loaded = skipped = 0
+        with self._blob_publish:
+            for item in value["entries"]:
+                try:
+                    checkout, root, device, inode, name, stamp, blob, mode, began = item
+                    if not (isinstance(checkout, str) and isinstance(root, str) and isinstance(name, str)
+                            and valid_name(blob) and mode in ("100644", "100755")
+                            and all(type(v) is int for v in (device, inode, began))
+                            and isinstance(stamp, list) and len(stamp) == 7 and all(type(v) is int for v in stamp)):
+                        raise ValueError("path stamp")
+                except (TypeError, ValueError):
+                    skipped += 1
+                    continue
+                self._path_blobs.setdefault((checkout, root, device, inode, name),
+                                            (tuple(stamp), {"blob": blob, "mode": mode}, began))
+                loaded += 1
+        return dict({"loaded": loaded}, **({"skipped": skipped} if skipped else {}))
+
+    def save_path_stamps(self):
+        """Save the stamps this run read or hashed (PATH_STAMPS), at a graceful stop once no scan or pre-image read
+        can run (Daemon.close_serving): {"saved": n}, or the error with nothing replaced."""
+        from . import runtime
+        with self._blob_publish:
+            entries = [[key[0], key[1], key[2], key[3], key[4], list(stamp), image["blob"], image["mode"], began]
+                       for key, (stamp, image, began) in self._path_blobs.items()
+                       if key in self._path_touched and isinstance(key[0], str)]
+        try:
+            runtime.atomic_json(self.root / PATH_STAMPS, {"version": PATH_STAMPS_VERSION, "saved": time.time(),
+                                                          "entries": entries})
+        except OSError as exc:
+            return {"saved": 0, "error": type(exc).__name__}
+        return {"saved": len(entries)}
 
     @telemetry.measured("heads_fetch_materialization")
     def heads(self, checkout):

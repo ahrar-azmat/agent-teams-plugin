@@ -8,14 +8,22 @@ import stat
 import time
 
 HOOK_STARTED = time.time()
+HOOK_MONOTONIC = time.monotonic()
 
 
 TOOLS = {"abraham", "code_review", "codex_runs", "codex_run_log", "codex_resume_run", "codex_cancel_run",
          "coordinator_claims", "coordinator_send", "coordinator_inbox", "coordinator_unit", "coordinator_seal", "coordinator_publish"}
 FILES = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 CALL_SECONDS = 3
-# Stay below hooks.json's 15 s including parsing/output. Reserve a full call
-# for the retry, and another for Bash's arm; waiting never consumes either.
+# File Pre: 10 s decision < 10.5 s acceptance < 11 s RPC < 14 s hook <
+# hooks.json's 15 s host timeout. admissions.py retains 2 s for old payloads.
+# A missing host keeps that legacy 2 s decision < 2.5 s acceptance < 3 s RPC.
+FILE_DECISION_SECONDS = 10.0
+FILE_CALL_SECONDS = 11.0
+LEGACY_DECISION_SECONDS = 2.0
+# Stay below the host timeout including parsing/output. Bash reserves a full
+# CALL_SECONDS for a retry and another for its arm; file retries share one
+# absolute RPC deadline and never renew their admission budget.
 # PostToolBatch submits all completions in one call. Only the released-daemon
 # fallback spends this budget on per-call requests; it starts one only while a
 # full CALL_SECONDS fits. Registered file calls are included even if unmarked.
@@ -203,11 +211,17 @@ def batch(payload, state, deadline):
     older per-call protocol. Marked calls precede unmarked registered file calls.
     """
     found, unmarked = [], []
+    thread = None
     for call in payload.get("tool_calls") or []:
         if not isinstance(call, dict) or call.get("tool_name") not in FILES | {"Bash"}:
             continue
         data = {key: call[key] for key in ("tool_name", "tool_input", "tool_use_id") if key in call}
         data.update(hook_event_name="PostToolBatch", session_id=payload.get("session_id", ""), cwd=payload.get("cwd", ""))
+        if data["tool_name"] in FILES:
+            if thread is None:
+                sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+                thread = thread_fields(payload)
+            data.update(thread)
         path = marker(state, data)
         if path and os.path.lexists(path):
             found.append((data, path))
@@ -294,7 +308,14 @@ def replacement_call(client, method, params, deadline, reserve=0):
         lock = client.state / "upgrade.lock"
         if not _held(lock):
             raise  # No upgrade owner: today's unavailable path, without waiting.
-        until = deadline - CALL_SECONDS - reserve
+        if client.deadline is None:
+            until = deadline - client.timeout - reserve
+        else:
+            # A file Pre's one retry shares its absolute RPC deadline: wait until
+            # its admission decision is due, leaving the rest of that deadline for
+            # the retry's answer, not a second full call timeout.
+            due = min(client.deadline, params["payload"].get("admission_deadline", client.deadline))
+            until = min(deadline - reserve, time.monotonic() + max(0, due - time.time()))
         while _held(lock) and time.monotonic() < until:
             time.sleep(min(0.05, max(0, until - time.monotonic())))
         if _held(lock) or time.monotonic() > until:
@@ -324,6 +345,23 @@ def host_identity():
     return {"unavailable": "host ended before its birth was captured"}
 
 
+def thread_fields(payload):
+    host = host_identity()
+    data = {key: payload[key] for key in ("agent_type",) if key in payload}
+    data["host"] = host
+    if "pid" not in host:
+        data["thread_undeclared"] = "host unavailable: " + host["unavailable"]
+    elif "agent_id" not in payload:
+        data["main_thread"] = True
+    elif isinstance(payload["agent_id"], str) and payload["agent_id"]:
+        data["agent_id"] = payload["agent_id"]
+    else:
+        # An optional field that is present but malformed is not proof of the
+        # main thread. Preserve legacy exclusion, with a visible diagnostic.
+        data["thread_undeclared"] = "agent_id is present but is not a nonempty string"
+    return data
+
+
 def transcript_identity(path):
     result = {"path": path, "cursor": 0}
     if not isinstance(path, str) or not os.path.isabs(path):
@@ -342,8 +380,7 @@ def transcript_identity(path):
 
 
 def main():
-    deadline = time.monotonic() + HOOK_SECONDS
-    admission_deadline = HOOK_STARTED + 2
+    deadline = HOOK_MONOTONIC + HOOK_SECONDS
     payload = json.load(sys.stdin)
     event, tool, session = payload.get("hook_event_name"), payload.get("tool_name", ""), payload.get("session_id", "")
     short = tool.split("__")[-1]
@@ -370,14 +407,22 @@ def main():
         return unavailable(session, state)
     try:
         data = {key: payload[key] for key in ("cwd", "session_id", "tool_use_id", "tool_name", "tool_input", "hook_event_name", "tool_response", "transcript_path") if key in payload}
+        call_seconds, call_deadline = CALL_SECONDS, None
         if tool == "Bash":
             # How long the host lets this call run: the coordinator cannot read the host's environment.
             data["bash_limits"] = {k: os.environ[k] for k in ("BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS") if k in os.environ}
-        elif event == "PreToolUse":
-            data["admission_deadline"] = admission_deadline
-            data["host"] = host_identity()
-            data["transcript"] = transcript_identity(payload.get("transcript_path"))
-        client = Client(state, timeout=CALL_SECONDS)
+        else:
+            data.update(thread_fields(payload))
+            if event == "PreToolUse":
+                budget = LEGACY_DECISION_SECONDS
+                if "pid" in data["host"]:
+                    budget = FILE_DECISION_SECONDS
+                    data["admission_budget"] = budget
+                    call_seconds = FILE_CALL_SECONDS
+                    call_deadline = HOOK_STARTED + call_seconds
+                data["admission_deadline"] = HOOK_STARTED + budget
+                data["transcript"] = transcript_identity(payload.get("transcript_path"))
+        client = Client(state, timeout=call_seconds, deadline=call_deadline)
         bash_pre = tool == "Bash" and event == "PreToolUse"
         pending = marker(state, payload)
         if pending and event == "PreToolUse":

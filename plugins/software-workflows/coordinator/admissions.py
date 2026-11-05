@@ -21,11 +21,11 @@ from .store import digest
 
 CURRENT = ContextVar("lead_admission", default=None)
 STARTED = ContextVar("lead_hook_started", default=None)
-# Threat: a file hook's 3 s client timeout can allow an unadmitted edit. The
-# decision ends 2 s after hook process birth, leaving 0.5 s to the acceptance
-# bound and another 0.5 s to that timeout. Round-16 calibrated pre-image work
-# (1.15 s) needs more than the former 1 s receipt-relative budget; measured
-# reply/output cost was 6–11 ms. Receipt delay consumes this budget too.
+# Undeclared budgets retain 2.4.34's 2 s decision < 2.5 s acceptance < 3 s RPC.
+# coordinator_lead.py declares 10 s for a host-qualified file Pre:
+# 10 s decision < 10.5 s acceptance < 11 s RPC < 14 s hook < 15 s hooks.json.
+# Both budgets start at hook birth (receipt when unavailable); a supplied
+# absolute deadline can only shorten them. Queueing and receipt delay count.
 DECISION_SECONDS = 2.0
 
 
@@ -159,6 +159,16 @@ def busy(daemon, attempt):
         phase = "startup recovery"
         retry = retry_after(daemon) if daemon.recovery_began is not None else max(
             .05, time.time() - daemon.store.get("daemon")["started"])
+    elif progress(daemon, attempt) == "earlier file call settlement":
+        for prior in attempt.get("predecessors", []):
+            earlier = find(daemon.store, prior["session_id"], prior["tool_use_id"])
+            if earlier and earlier.get("execution", {}).get("phase") in ("admitting", "open", "settling"):
+                blocker = {"kind": "lead-edit", "operation": earlier.get("operation"),
+                           "admission": prior["admission"], "call": earlier["id"],
+                           "paths": earlier.get("paths"), "end": earlier["execution"].get("end"),
+                           "problem": earlier["execution"].get("problem")}
+                phase = "earlier file call settlement"
+                break
     holder = blocker.get("operation") or blocker.get("actor") or blocker.get("observation") or blocker.get("admission")
     if blocker["kind"] == "coordinator startup recovery":
         holder = blocker["kind"]
@@ -323,8 +333,14 @@ def record_end(daemon, payload):
     evidence = {"source": event, "observed": time.time(),
                 "failed": event == "PostToolUseFailure" or isinstance(response, dict) and response.get("isError") is True,
                 "rewritten": bool(record and record["input_digest"] != digest([payload.get("tool_name"), payload.get("tool_input") or {}]))}
+    save_end(daemon, attempt, record, evidence)
+    return attempt
+
+
+def save_end(daemon, attempt, record, evidence):
+    """Fence preparation before waiting for its worker or host-call lock."""
     with daemon.store.transaction():
-        if not attempt.get("end"):
+        if attempt and not attempt.get("end"):
             attempt.update(end=evidence, ended=time.time())
             if attempt["state"] == "preparing":
                 attempt["state"] = "ended"
@@ -335,13 +351,54 @@ def record_end(daemon, payload):
                 execution.update(phase="settling", end=evidence)
                 daemon.store.save(record)
                 daemon.store.event("lead_hook/execution_ended", record["id"], evidence)
-    cancel_reads(daemon, attempt["id"])
-    return attempt
+    if attempt:
+        cancel_reads(daemon, attempt["id"])
+
+
+def host_order(daemon, payload, thread):
+    """Snapshot earlier calls only. A replay is never a new host-order event."""
+    from .lead_calls import active, find
+    if thread is None or find(daemon.store, payload["session_id"], payload["tool_use_id"]):
+        return []
+    predecessors = {}
+    for record in active(daemon.store):
+        if record["execution"].get("thread") == thread:
+            predecessors[identity(record)] = (record, daemon.store.get(identity(record), required=False))
+    # A preparation may still be waiting for ownership, before its lead_hook
+    # exists. Fence it too, so it cannot create an older window after this Pre.
+    for ident in runtime(daemon):
+        attempt = daemon.store.get(ident)
+        if attempt.get("thread") == thread and ident not in predecessors:
+            predecessors[ident] = (find(daemon.store, attempt["session_id"], attempt["tool_use_id"]), attempt)
+    evidence = {"source": "host order", "observed": time.time(), "thread": thread,
+                "successor": {"session_id": payload["session_id"], "tool_use_id": payload["tool_use_id"]}}
+    result = []
+    for ident, (record, attempt) in predecessors.items():
+        save_end(daemon, attempt, record, evidence)
+        owner = record or attempt
+        result.append({"admission": ident, "session_id": owner["session_id"], "tool_use_id": owner["tool_use_id"]})
+    return result
+
+
+async def settle_predecessors(daemon):
+    """Bound this admission's wait, never the predecessor's durable settlement."""
+    from .lead_calls import ordered_settlement
+    context = CURRENT.get()
+    attempt = daemon.store.get(context[1]) if context else {}
+    for prior in attempt.get("predecessors", []):
+        check("earlier file call settlement")
+        await wait(asyncio.shield(ordered_settlement(daemon, prior)))
+        check()
+
+
+def predecessors():
+    context = CURRENT.get()
+    return context[0].store.get(context[1]).get("predecessors", []) if context else []
 
 
 async def dispatch(daemon, payload):
     from .intents import dispatch as apply
-    from .lead_calls import lock_key
+    from .lead_calls import lock_key, thread_identity
     key = lock_key(payload.get("session_id"), payload.get("tool_use_id"))
     ident = identity(payload)
     jobs = runtime(daemon)
@@ -358,7 +415,10 @@ async def dispatch(daemon, payload):
         async with daemon.actor_locks.hold(key):
             return await apply(daemon, payload)
     existing = daemon.store.get(ident, required=False)
+    thread = thread_identity(payload)
     if existing:
+        if existing.get("thread") != thread:
+            raise CoordinatorError("LEAD_HOOK_IDENTITY", "A host call cannot be rebound to another thread or host process")
         if existing.get("granted"):
             # The duplicate Pre branch reads the durable call without awaiting.
             # Its settled/rewritten states refuse; an open grant retains exclusion.
@@ -367,21 +427,28 @@ async def dispatch(daemon, payload):
             raise busy(daemon, existing)
         attempt = existing
     else:
+        budget = payload.get("admission_budget", DECISION_SECONDS)
+        if type(budget) not in (float, int) or not math.isfinite(budget) or budget <= 0:
+            raise CoordinatorError("LEAD_HOOK_FIELDS", "admission_budget must be a finite positive number of seconds")
         now = time.time()
         supplied = payload.get("admission_deadline")
         peer = STARTED.get() or {"reason": "no socket peer context"}
         began = peer.get("started", now)
-        candidates = [(began + DECISION_SECONDS, "peer birth" if "started" in peer else "receipt")]
+        candidates = [(began + budget, "peer birth" if "started" in peer else "receipt")]
         if type(supplied) in (float, int) and math.isfinite(supplied):
             candidates.append((supplied, "supplied"))
         deadline, source = min(candidates, key=lambda item: item[0])
         data = payload.get("tool_input") or {}
+        earlier = host_order(daemon, payload, thread)
         attempt = daemon.store.put("lead_admission", ident, {
             "generation": daemon.store.generation, "deadline": deadline, "created": now, "hook_started": began,
             "deadline_source": source, "deadline_peer": peer,
             "state": "preparing", "phase": "host-call lock", "session_id": payload.get("session_id"),
             "tool_use_id": payload.get("tool_use_id"), "paths": [data.get("notebook_path") or data.get("file_path")],
-            "input_digest": digest([payload.get("tool_name"), data])})
+            "input_digest": digest([payload.get("tool_name"), data]),
+            **({"thread": thread, "predecessors": earlier} if thread is not None else {}),
+            **({"thread_undeclared": payload["thread_undeclared"]} if "thread_undeclared" in payload else {}),
+            **({"budget": budget} if "admission_budget" in payload else {})})
         async def prepare():
             token = CURRENT.set((daemon, ident))
             task = asyncio.current_task()
@@ -415,7 +482,8 @@ async def dispatch(daemon, payload):
     job = jobs[ident]
     done, _ = await asyncio.wait({job}, timeout=max(0, attempt["deadline"] - time.time()))
     # A completed preparation can wake this waiter after the admission deadline.
-    # Keep its durable ownership for settlement, but do not send a late allow.
+    # Keep its durable ownership for settlement, but do not send a late allow:
+    # its grant is withdrawn below, before the busy reply.
     if done and time.time() < attempt["deadline"]:
         result, error = job.result()
         if error:
@@ -428,6 +496,12 @@ async def dispatch(daemon, payload):
     # No await between observing the state, abandonment, and the busy reply.
     if current["state"] == "preparing":
         current.update(state="expired", decided=time.time())
+        save_attempt(daemon, current)
+    elif current.get("granted"):
+        # Granted as the deadline passed, so the host is refused. A duplicate Pre
+        # is refused too, and settlement gives what it prepared no receipt
+        # without a Post (lead_calls.settle).
+        current.update(state="expired", granted=False, withdrawn=current.get("decided"), decided=time.time())
         save_attempt(daemon, current)
     cancel_reads(daemon, ident)
     raise busy(daemon, current)

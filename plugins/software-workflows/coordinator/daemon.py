@@ -135,6 +135,8 @@ class Daemon:
         self.native_progress_flush = None
         self.settlements = {}
         self.loop_lag = {"last_seconds": 0.0, "max_seconds": 0.0, "samples": 0}
+        self.stall_sampler = None  # stall_stacks.Sampler, from the loop supervisor's start (serve)
+        self.path_stamps = None  # what serve loaded and close_serving saved (Store.load_path_stamps, save_path_stamps)
         self.birth = processes.identity(os.getpid())["birth"]
         self.writer_status = {}
         self.publication_right_repair = None
@@ -371,7 +373,8 @@ class Daemon:
                 "boot": self.boot, "capabilities": ["draining-stop"], "draining": self.draining,
                 "birth": self.birth, "state_root": str(self.store.root),
                 "endpoint": getattr(self, "endpoint", None),
-                "event_loop_lag": dict(self.loop_lag),
+                "event_loop_lag": dict(self.loop_lag, **(self.stall_sampler.status() if self.stall_sampler else {})),
+                "path_stamps": self.path_stamps,
                 "publication_right_repair": self.publication_right_repair,
                 "services": {name: dict(state) for name, state in self.services.items()},
                 "project_services": self.broker.status(),
@@ -2061,6 +2064,8 @@ class Daemon:
                         restarts += 1
                 sample = watchdog.beat() if watchdog else {"wall": time.time(), "monotonic": time.monotonic(),
                                                            "generation": self.store.generation}
+                if self.stall_sampler:
+                    self.stall_sampler.beat = time.monotonic()
                 await asyncio.sleep(INTERVAL)
                 lag = max(0.0, time.monotonic() - sample["monotonic"] - INTERVAL)
                 self.loop_lag.update(last_seconds=lag, max_seconds=max(lag, self.loop_lag["max_seconds"]),
@@ -3510,8 +3515,17 @@ class Daemon:
     async def compact_history(self):
         """Before 2.4.1 an opaque operation copied every head into its record, and released custody kept the
         process table its command was checked against: every scan decoded both again. Neither is read once
-        the record is finished (publish skips opaque bases), so keep a fingerprint of the bases and drop the table."""
+        the record is finished (publish skips opaque bases), so keep a fingerprint of the bases and drop the table.
+        2.4.35: once per ledger (the HISTORY_COMPACTION record, written when a pass has read both kinds), after startup
+        recovery, with its candidate reads off the event loop. Through 2.4.34 both reads ran at every start on the
+        loop's own connection: 9.79 s and 2.13 s on the live ledger (11-05, read-only: 967 MB of operation and 324 MB of
+        custody JSON), the stall after recovery/serving at every start (5-13 s in loop-stalls.log, generations 28-33),
+        though no record had matched since 2.4.1's first start (10-21: 1,250 operations, 1,166 custody records)."""
         from .store import fingerprint
+        if self.store.get(HISTORY_COMPACTION, required=False):
+            return
+        while self.recovering and not (self.stop.is_set() or self.draining):
+            await asyncio.sleep(1)
         def operation(record):
             if (record["kind"] in ("command", "mcp", "lead-command") and record.get("bases")
                     and record["state"] in ("reconciled", "denied", "resolved")):
@@ -3520,23 +3534,37 @@ class Daemon:
             return False
         def custody(record):
             return record["state"] == "released" and record.pop("process_baseline", None) is not None
+        uri = (self.store.root / "ledger.sqlite").as_uri() + "?mode=ro"
+
+        def candidates(kind, where):
+            # A connection of its own: the store's belongs to the loop thread.
+            db = sqlite3.connect(uri, uri=True, timeout=30)
+            try:
+                return [ident for (ident,) in db.execute("SELECT id FROM records WHERE kind=? AND " + where, (kind,))]
+            finally:
+                db.close()
         compacted = {}
         for kind, where, compact in (
                 ("operation", "json_extract(data,'$.kind') IN ('command','mcp','lead-command') AND length(data)>65536", operation),
                 ("custody", "json_extract(data,'$.state')='released' AND json_extract(data,'$.process_baseline') IS NOT NULL", custody)):
-            candidates = [row["id"] for row in self.store.db.execute("SELECT id FROM records WHERE kind=? AND " + where, (kind,))]
-            for start in range(0, len(candidates), 20):
+            if self.stop.is_set() or self.draining:
+                return
+            found = await finish_thread(candidates, kind, where)
+            for start in range(0, len(found), 20):
                 if self.stop.is_set() or self.draining:
                     return
                 with self.store.transaction():
-                    for ident in candidates[start:start + 20]:
-                        record = self.store.get(ident)
-                        if compact(record):
+                    for ident in found[start:start + 20]:
+                        record = self.store.get(ident, required=False)
+                        if record and compact(record):
                             self.store.save(record)
                             compacted[kind] = compacted.get(kind, 0) + 1
                 await asyncio.sleep(0)
-        if compacted:
-            self.store.event("ledger/compacted", None, compacted)
+        with self.store.transaction():
+            if compacted:
+                self.store.event("ledger/compacted", None, compacted)
+            self.store.put("meta", HISTORY_COMPACTION, {"completed": time.time(), "generation": self.store.generation,
+                                                        "compacted": compacted})
 
     async def maintenance(self):
         while not self.stop.is_set():
@@ -3670,6 +3698,8 @@ class Daemon:
                                 "generation": self.store.generation, "allocation": allocation})
             # Calls are admitted once the ledger is consistent (recover); each writer's own reconcile then runs in the
             # background, and a call for one still reconciling waits for it (recovery.recovered, writer_ready).
+            # 2.4.35: the stamps the last graceful stop saved, before recovery's first scan of each checkout.
+            self.path_stamps = {"load": self.store.load_path_stamps()}
             plan = await recover(self)
             from .reviews import repair
             repair(self)
@@ -3683,6 +3713,10 @@ class Daemon:
             self.background(self.forget_consumed_families())
             self.background(self.broker.recover())
             self.start_loop_supervisor()
+            if self.stall_sampler is None:
+                import threading
+                from .stall_stacks import Sampler
+                self.stall_sampler = Sampler(self.store.root, self.store.generation, threading.get_ident()).start()
             self.start_service("maintenance", self.maintenance)
             from .executors import observe as observe_executors
             self.start_service("executors", lambda: observe_executors(self))
@@ -3785,6 +3819,9 @@ class Daemon:
         self.store.event("daemon/native_intake_closed", None, {"receivers": len(connections)})
         if hasattr(self, "admission_executor"):
             self.admission_executor.shutdown(wait=True, cancel_futures=True)
+        # No scan or pre-image read runs from here on. A run that read nothing leaves the last saved stamps in place.
+        if self.store._path_touched:
+            self.path_stamps = dict(self.path_stamps or {}, save=self.store.save_path_stamps())
         await self.blob_conversion.close()
         await self.reclamation.drained_checkpoint()
         # No unconditional finally: an unsuccessful join must never release the
@@ -3795,6 +3832,8 @@ class Daemon:
         for descriptor in self.ledger.ownership.values():
             os.close(descriptor)
         self.ledger.ownership.clear()
+        if self.stall_sampler:
+            self.stall_sampler.close()
         self.store.db.close()
 
     def release_upgrade(self):
@@ -3802,6 +3841,10 @@ class Daemon:
         if self.upgrade_fd is not None:
             os.close(self.upgrade_fd)
             self.upgrade_fd = None
+
+
+# compact_history's record (kind meta): its one pass over this ledger has read both kinds (2.4.35).
+HISTORY_COMPACTION = "history_compaction"
 
 
 # A worker its supervisor restarted holds upgrade.lock until it serves, as a client that starts a daemon holds it

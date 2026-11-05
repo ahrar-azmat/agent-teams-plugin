@@ -1279,13 +1279,19 @@ guards also refuse new work during draining; a dropped connection is left failed
 for the next daemon (or maintenance if the stop is refused). Backoff waiting alone
 does not prevent a stop. Listener identity and settlement safeguards still apply.
 
-Host hooks use three-second client calls within a fourteen-second budget, below
-their fifteen-second host timeout. If a call encounters an unavailable or draining
-daemon while the client's `upgrade.lock` is held, the hook waits for that lock to
-be released and retries once with the same host invocation identity. It reserves
-time for the retry and, for Bash Pre, the arm call. Without a held upgrade lock it
-takes the existing unavailable path immediately. A replacement cannot rearm a
-Bash window that belonged to the retired generation.
+Host hooks have a fourteen-second budget, below their fifteen-second host
+timeout. Since 2.4.35 a file PreToolUse from a verified host waits up to 11 s for
+its reply, around a 10 s admission decision (Admission deadlines, below), on one
+absolute deadline that its first call and any replacement retry share. Other file
+hooks, completion hooks and Bash keep three-second client calls. If a call
+encounters an unavailable or draining daemon while the client's `upgrade.lock` is
+held, the hook waits for that lock to be released and retries once, with the same
+host invocation identity and what remains of its budget. No retry renews a file
+admission's deadline. Such a file PreToolUse waits until its decision is due and
+leaves the rest of its reply deadline to the retry; other calls reserve a full
+call for the retry and, for Bash Pre, another for the arm call. Without a held
+upgrade lock it takes the existing unavailable path immediately. A replacement cannot rearm a Bash window that belonged to the
+retired generation.
 
 | Method | Parameters and result |
 |---|---|
@@ -1725,9 +1731,15 @@ checkouts (`native evidence processing failed`).
 An opaque operation (a writer's command or MCP call, a lead Bash command) records a
 fingerprint, the count and SHA-256 of the heads it was admitted against, not a copy
 of them; publish never reads it as a dependency. Records from before 2.4.1 are
-compacted to the fingerprint in batches once the daemon is ready. Released custody
+compacted to the fingerprint in batches. Released custody
 drops the process table its command was checked against, and older records lose it
-in the same compaction. Hooks find their operation by call id; admission, reconcile,
+in the same compaction. Since 2.4.35 that compaction runs once per ledger, after
+startup recovery has ended, and its candidate reads use a connection and thread of
+their own: the `history_compaction` record, written when a pass has read both kinds,
+ends it for good. Through 2.4.34 both reads ran at every start on the event loop's
+own connection. That took 9.79 s and 2.13 s on the live ledger (11-05, read-only: 967 MB of
+operation and 324 MB of custody JSON), and it was the 5–13 s stall at every start,
+though nothing had matched since 2.4.1's first start (10-21). Hooks find their operation by call id; admission, reconcile,
 custody and drain read only unreconciled operations and held custody, or custody
 released since a time, through indexes. So does maintenance, each second: held
 custody, runs still in flight, pending lead hooks, and undelivered messages to
@@ -3478,14 +3490,28 @@ Each new attempt records `deadline_source` (`peer birth`, `supplied` or `receipt
 and `deadline_peer`: the validated script and birth, or the reason the peer was
 not a hook or could not be inspected. A lookup/validation failure also records
 its exception type. With a recognized hook, the deadline is the minimum of
-birth plus two seconds and a finite supplied absolute deadline. Other clients
-use the minimum of receipt plus two seconds and a finite supplied deadline;
-their process age is irrelevant. Without a supplied deadline, the applicable
-two-second budget is used; on ties, birth/receipt takes precedence. The new
-Python 3.9 hook supplies its deadline. Non-macOS peers and failed lookups use the
-same recorded request-relative fallback. Installed hooks still use their three-second Client
-timeout. Two seconds leaves 0.5 seconds to the 2.5-second acceptance limit and
-another 0.5 seconds to the client timeout. Round 16's calibrated 1.15-second
+birth plus the decision budget and a finite supplied absolute deadline. Other
+clients use the minimum of receipt plus that budget and a finite supplied
+deadline; their process age is irrelevant. Without a supplied deadline, the
+budget alone applies; on ties, birth/receipt takes precedence. The budget is
+`DECISION_SECONDS = 2.0` unless the payload declares `admission_budget`: a finite
+positive number of seconds, else `LEAD_HOOK_FIELDS`. There is no maximum; the
+supplied deadline bounds it. Since 2.4.35 the hook declares 10 s for a file Pre
+from a verified host, with `admission_deadline` at hook start plus 10 s. The
+attempt records it as `budget`, and a replay cannot renew it. Non-macOS peers and
+failed lookups use the same recorded request-relative fallback.
+
+| File Pre from | Decision | Acceptance bound | Hook RPC timeout |
+|---|---:|---:|---:|
+| the 2.4.35 hook, verified host | 10 s | 10.5 s | 11 s |
+| the 2.4.35 hook, no verified host | 2 s | 2.5 s | 3 s |
+| hooks through 2.4.34 (no `admission_budget`) | 2 s | 2.5 s | 3 s |
+
+Each row leaves 0.5 seconds to its acceptance bound and another 0.5 seconds to
+the hook's timeout, under the hook's 14 s budget and the 15 s hooks.json gives it.
+The decision covers ownership, startup recovery, the lease and claims, the
+checkout lock, the settling of an earlier call of the same thread (host order,
+in Claude lead edit hooks), pre-image reads, intent and executor queueing. Round 16's calibrated 1.15-second
 pre-image read could not fit the former one-second budget even with no competing
 owner. The daemon returns a non-operational
 `CLAIM_CONFLICT` with nonempty conflicts when preparation cannot finish. Its
@@ -3656,6 +3682,17 @@ diagnostics but never blocks the worker. The helper's output queue is bounded to
 drops new output, counts lost bytes in status and logs the loss when output resumes.
 It never signals the worker itself: it asks the owner (`owner/diagnostic`), which
 signals only the worker identity it recorded.
+Since 2.4.35 the worker also records where its loop was. A thread of its own
+(`stall_stacks.Sampler`, started with the loop supervisor) reads the loop thread's
+stack with `sys._current_frames()`, an ordinary call made under the GIL, never from
+a signal handler. Once the loop's heartbeat is 0.75 s old, it appends one JSON line
+(`loop_stack`) to `loop-stall-stacks.log`, and again at 3 s and 12 s of the same
+stall. Each line carries the generation, wall time, estimated stall start,
+heartbeat age, sample number, and up to 48 frames, outermost first, with plugin
+paths relative. The file moves to `loop-stall-stacks.log.1` past 16 MiB, so the two
+hold at most 32 MiB, as `loop-stalls.log` does. `event_loop_lag` adds `stack_file`,
+`stack_samples`, `stack_error` and `stack_sampler_alive`. An interpreter without the
+GIL, or without `sys._current_frames`, samples nothing and says so in `stack_error`.
 Status names the watchdog PID, `loop-stalls.log` path, threshold and diagnostic
 byte limit. It also reports the supervisor's running, restarting or stopped
 state and reason. Supervision ends only when the daemon's final stop event is
@@ -3972,7 +4009,26 @@ observation obligation naming its generation, checkout/path scope, causal point,
 policy, reason and completion action. Custody settlement becomes eligible only
 after the existing native terminal inventory and process checks succeed. The
 producer freezes all currently eligible requests before submitting its reader;
-arrivals during that scan enter the next cohort. It still hashes every file.
+arrivals during that scan enter the next cohort. Since 2.4.8 the reader does not
+hash a file whose stamp is the one it last hashed: device, inode, size, mtime,
+ctime, mode and link count all equal, the hash begun after that stamp was taken,
+the file at least 3 s old then (`RACY_NS`), and its blob still stored. The scan
+event counts what it hashed (`bytes`) and what it reused (`skipped_bytes`).
+Through 2.4.34 the stamps lived in memory only, so the first scan after every
+restart hashed every byte. After 2.4.34's switch SmartPay's backend took 31.8 MB in
+8.5 s, and two lead Edits waiting on it ran unadmitted. Since 2.4.35 a graceful stop
+saves the stamps that run read or hashed to `path-stamps.json` in the state
+directory, once no scan or pre-image read can run, and the next start loads them
+before recovery's first scan. Status reports both as `path_stamps`. A saved stamp
+is reused under exactly the same rule. So a file changed while the daemon was down
+is hashed again: its ctime moves even when its size and mtime are put back. A
+missing, damaged or other-version file costs one full hash of each checkout. A
+saved entry naming an invalid blob is skipped, and a file whose stored blob is
+missing or damaged is hashed again, which republishes the damaged copy from it. A
+reused stamp's stored blob is still read and checked once per run, as the first
+use of any blob in a run is: on the fixture the first scan after a graceful
+restart took 0.53 s instead of 1.15 s. A crash or forced stop saves nothing, and
+the next start uses the stamps the last graceful stop saved.
 Git enumeration, reads, hashing and durable blob publication run outside the
 checkout commit lock, with immutable scan images shared by the frozen cohort.
 Each application receives only its own scoped images and unreadable results.
@@ -5066,7 +5122,8 @@ checkout's compatibility lease. A refusal to record an overlapping file operatio
 is a host `permissionDecision: deny`, not an allowing warning.
 
 The first PostToolUse, PostToolUseFailure, PostToolBatch, matching transcript
-`tool_result`, or verified host exit ends the call. Pre captures `CLAUDE_PID` only
+`tool_result`, verified host exit or, since 2.4.35, later file Pre of the same
+declared thread (host order, below) ends the call. Pre captures `CLAUDE_PID` only
 when it is the hook's parent, including its kernel birth identity. An absent or
 reused PID, or that process as a zombie, proves the original host exited; a stopped
 or uninspectable process does not. An interrupted call on Claude Code 2.1.306 sends
@@ -5076,6 +5133,42 @@ without following a symlink, matching session and tool-use ids. Missing files ar
 retried; an unreadable, replaced, truncated or incomplete transcript is no proof
 of completion. A cursor never skips an incomplete line or a result preceding a
 delayed admission. Both successful and failed results end the call.
+
+**Host order (2.4.35).** Claude Code runs one thread's file calls one at a time.
+Post(n) completes before Pre(n+1) starts. A call that a PreToolUse hook denied
+gets no Post at all, and its transcript result appears only as the batch ends
+(2.1.318, measured by the lead's probe). So a file PreToolUse (Write, Edit,
+MultiEdit, NotebookEdit) from a declared thread is end evidence for every earlier
+active file call of that thread. The thread is the host's PID and kernel birth,
+the session id, and `agent_id` or an explicit `main_thread`. Two processes that
+resume one session are different hosts. `agent_type` is recorded, but it is not
+identity. The hook declares the main thread only when `agent_id` is absent, an
+agent only for a nonempty string id, and nothing without a verified host. A present
+but invalid `agent_id` declares no thread and records `thread_undeclared`. Hooks
+through 2.4.34 declare nothing and keep 2.4.34's behaviour. The daemon refuses an
+inconsistent declaration sent directly (`LEAD_HOOK_IDENTITY`), and one that would
+rebind a call to another thread.
+
+The new Pre saves that end evidence before it waits. It fences a preparation still
+waiting for ownership too, so that one cannot open an older window afterwards.
+Then, within its own budget, it waits for each earlier call to settle under that
+call's lock. The settlement runs as a retained, deduplicated task, which the new
+Pre's timeout never cancels: `LEAD_ADMISSION_BUSY` names the call it waited for.
+Only then do the ordinary conflict, custody, claim, publication and input checks
+run, so another thread's or host's open call still refuses. A replayed Pre is no
+new evidence. Like PostToolBatch and the host's exit, host order proves that a
+call ended, not that a refused call ran. A call the host was refused reconciles
+with no receipt, even when the bytes match its intended image, unless its Post or
+its own transcript result shows it ran. That includes a call whose preparation was
+granted just as its deadline passed: the waiter withdraws the grant (`withdrawn`)
+before the busy reply, and a duplicate Pre of it is refused. An admitted call whose
+Post was lost settles from its intent, with the usual full-image and precondition
+checks.
+
+**Premise:** host order relies on a host that runs a thread's file calls serially
+and sends `agent_id` on every subagent call, as 2.1.318 does. If a host omitted
+`agent_id` on a subagent call, that call's Pre would end the main thread's open
+call early. A write after that becomes an UNKNOWN, never a receipt.
 
 Every terminal source uses the same serialized, idempotent settlement. Expected
 bytes and modes with intact preconditions receive an exact receipt; unchanged
@@ -5132,13 +5225,14 @@ so what it wrote reconciles as UNKNOWN after its end. The
 refusal names a full-file Write route. Direct hook observations are not evidence
 of the host's encoding/serialization behavior; see VERIFY.md for coverage.
 
-Claude Code (2.1.306, measured) sends neither PostToolUse nor PostToolUseFailure for
-a call that another PreToolUse hook denied (the push gate, a project hook), that a
-permission refused, or that the user rejected. Such a call shows only in
-PostToolBatch's `tool_calls`, sent once every call of a batch has resolved; without
-it, a Bash call's record holds every lead's quiet window and `daemon/stop`
-(`lead_hooks`) until its deadline, up to 180 s; file calls instead await one of the
-terminal signals above. Each lead call the coordinator may
+Claude Code (2.1.306, measured; 2.1.318 again) sends neither PostToolUse nor
+PostToolUseFailure for a call that another PreToolUse hook denied (the push gate,
+a project hook), that a permission refused, or that the user rejected. Such a call
+shows only in PostToolBatch's `tool_calls`, sent once every call of a batch has
+resolved. Without it, a Bash call's record holds every lead's quiet window and
+`daemon/stop` (`lead_hooks`) until its deadline, up to 180 s. A file call instead
+awaits one of the terminal signals above: since 2.4.35, usually the next file Pre
+of its declared thread (host order). Each lead call the coordinator may
 hold something of leaves a marker in `<state>/lead-hooks/`, named by the SHA-256 of
 its session and tool-use id, made before its Pre's call and removed once a Post
 settles the call or the daemon definitively refuses its admission. PostToolBatch sends
