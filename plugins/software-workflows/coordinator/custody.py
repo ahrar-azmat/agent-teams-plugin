@@ -1014,7 +1014,7 @@ class Custody:
         self.condition = asyncio.Condition()
 
     def claims(self, checkout, unit=None):
-        return list(self.store.selected("SELECT * FROM records WHERE kind='claim' AND json_extract(data,'$.state')='held' AND "
+        return list(self.store.selected("SELECT * FROM records INDEXED BY claim_checkout WHERE kind='claim' AND json_extract(data,'$.state')='held' AND "
                     "json_extract(data,'$.checkout')=?" + (" AND parent=?" if unit else "") + " ORDER BY id",
                     (checkout, unit) if unit else (checkout,)))
 
@@ -1155,7 +1155,7 @@ class Custody:
             return await self._release(unit, paths, cwd, authorizer)
 
     async def _release(self, unit, paths, cwd, authorizer):
-        from . import transfers
+        from . import dependencies, transfers
         from .participants import checkout_ids
         if self.unit_active(unit["id"]):
             raise CoordinatorError("CUSTODY_HELD", "Reconcile command custody before releasing claims")
@@ -1223,6 +1223,14 @@ class Custody:
                     for n in range(1, len(canonical.split("/")) + 1))
             return {p: revision for p, revision in values.items() if selected(p)}
         expected = {where: selected_heads(where, heads[where]) for where in roots}
+        # Each handed-back path's walk (a restore's reads its dependency graph) runs on a worker's snapshot; the
+        # transaction below checks it is still what the ledger holds. The blob reader is initialized here, its owner.
+        wanted = {key: set(values) for key, values in selected_rights.items() if values}
+        for claim, chosen, _ in planned:
+            wanted.setdefault(claim["checkout"], set()).update(chosen)
+        storage = self.store.blobs
+        walked, tokens = await finish_thread(transfers.segments, self.store.root, unit["id"], wanted,
+                                             lambda name: storage.read(name)[0])
         released, transferred, replacements = [], [], []
         async with self.condition:
             if self.unit_active(unit["id"]):
@@ -1245,6 +1253,11 @@ class Custody:
                 raise unsettled(blocking, "Cannot release an unreconciled operation's claim")
             carried = transfers.publications(self.store)
             with self.store.transaction():
+                try:
+                    dependencies.validate(self.store, {"tokens": tokens})
+                except CoordinatorError as exc:
+                    raise CoordinatorError("HANDBACK_CHANGED", "Claims, rights or revisions changed during handback preparation; retry",
+                                           exc.details) from exc
                 granted = {key: set(values) for key, values in selected_rights.items() if values}
                 for claim, chosen, remainder in planned:
                     checkout = self.store.get(claim["checkout"])
@@ -1260,7 +1273,7 @@ class Custody:
                             unit=unit["id"], actor=claim["actor"], state="held", split_from=claim["id"]), unit["id"])
                         replacements.append({"id": ident, "path": path["path"], "checkout": checkout["id"]})
                 for key, chosen in granted.items():
-                    transferred.extend(transfers.release(self.store, unit["id"], key, chosen, authorizer, carried))
+                    transferred.extend(transfers.release(self.store, unit["id"], key, chosen, authorizer, walked, carried))
                 self.store.event("claim/released", unit["id"], {"paths": paths, "authorizer": authorizer, "transfers": transferred, "replacement_claims": replacements})
             self.condition.notify_all()
         return {"released": bool(released or transferred), "count": len(released), "rights_count": len(transferred),

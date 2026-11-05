@@ -3,7 +3,7 @@ from pathlib import Path
 import time
 
 from .locks import finish, finish_all, finish_thread
-from . import gitio, participants, transfers
+from . import dependencies as dependency_evidence, gitio, participants, transfers
 from .client import CoordinatorError
 from .publish import Publisher, binding, check_validation, review_refusal
 from .store import digest, uid
@@ -21,47 +21,15 @@ class GroupPublisher:
     def view(self, unit, participant):
         return dict(unit, checkout=participant["checkout"], branch=participant["branch"], base=participant["base"])
 
-    def dependencies(self, unit):
-        result = {key: {} for key in participants.checkout_ids(self.store, unit)}
-        for actor in self.store.all("actor", unit["id"]):
-            for read in self.store.all("read", actor["id"]):
-                key = read.get("checkout", actor["checkout"])
-                for path, revision in read["revisions"].items():
-                    if key not in result:
-                        raise CoordinatorError("PATH_ESCAPE", "Recorded read is outside the pinned participants")
-                    result[key][(path, revision)] = {"path": path, "revision": revision}
-        return {key: sorted(values.values(), key=lambda value: (value["path"], value["revision"] or "")) for key, values in result.items()}
+    def dependencies(self, unit, evaluation):
+        keys = participants.checkout_ids(self.store, unit)
+        if set(evaluation["reads"]) - set(keys):
+            raise CoordinatorError("PATH_ESCAPE", "Recorded read is outside the pinned participants")
+        return {key: evaluation["reads"].get(key, []) for key in keys}
 
-    async def check_dependencies(self, unitid, checkoutid, evidence, base=None):
-        """Refuse a project seal whose writers read unexplained bytes or another unit's unpublished revision in this
-        participant. A read of a path outside the ledger (ledger.unwatched) is no dependency, a read of a restore depends
-        on whose bytes it restored (Publisher.provenance), and a git failure refuses."""
-        paths = sorted({row["path"] for row in evidence})
-        if not paths:
-            return []
-        checkout = self.store.get(checkoutid)
-        await self.daemon.ledger.reconcile(checkout, paths)
-        outside = await self.daemon.ledger.unwatched(checkout, paths)
-        paths = [path for path in paths if path not in outside]
-        if not paths:
-            return []
-        unknowns = self.store.unresolved(checkoutid, paths)
-        if unknowns:
-            raise CoordinatorError("UNKNOWN_DEPENDENCY", "Participant read scope includes unresolved UNKNOWN",
-                                   {"root": checkout["root"], "unknowns": [u["id"] for u in unknowns],
-                                    "paths": sorted({u["path"] for u in unknowns})})
-        unknown, rows = set(), []
-        for entry in evidence:
-            if entry["revision"] and entry["path"] not in outside:
-                row = self.store.db.execute("SELECT * FROM revisions WHERE id=?", (entry["revision"],)).fetchone()
-                if not row or row["checkout"] != checkoutid or row["path"] != entry["path"] or row["attribution"] == "UNKNOWN":
-                    unknown.add(entry["path"])
-                    continue
-                rows.append(row)
-        if unknown:
-            raise CoordinatorError("UNKNOWN_DEPENDENCY", "Recorded participant read is not a known revision",
-                                   {"root": checkout["root"], "paths": sorted(unknown)})
-        return await self.repo.dependency_proofs(unitid, rows, {checkoutid: base})
+    async def check_dependencies(self, unit, rows=None, bases=None):
+        return (await self.repo.dependency_preflight(unit) if rows is None
+                else await self.repo.dependency_check(unit, rows, bases))
 
     async def seal(self, unitid, validation, order):
         unit = self.store.get(unitid)
@@ -93,11 +61,9 @@ class GroupPublisher:
 
     async def freeze(self, unit, members, order, validation, sealid):
         await self.repo.quiescent(unit)
-        operations = list(self.store.all("operation", unit["id"]))
-        dependencies = self.dependencies(unit)
         vector, seals = [], []
         prefix = unit.get("published_prefix", {})
-        selected, bases = {}, {}
+        selected, bases, pins = {}, {}, {}
         # Pin every participant, including unchanged ones, before evaluating a
         # cross-repository operation or read. An installed prefix keeps its base.
         for member in members:
@@ -112,7 +78,8 @@ class GroupPublisher:
                 part, journal = self.store.get(saved["seal"]), self.store.get(saved["publication"])
                 if not await finish_thread(self.repo.installed_tip, checkout, part, journal, metadata["base"]):
                     raise CoordinatorError("PUBLICATION_REF_DIVERGED", "Completed prefix is no longer installed")
-                base = part["base"]
+                base, rows = part["base"], part["rows"]
+                pins.update({part["id"]: part["_revision"], journal["id"]: journal["_revision"]})
             else:
                 rows = await self.repo.scope_rows(self.view(unit, member), sealing=True) if paths else []
                 if metadata["base"] != base:
@@ -130,9 +97,9 @@ class GroupPublisher:
         # A handed-away participant is pin-only. Empty is a unit-wide decision,
         # after collecting every participant (including an installed prefix).
         transfers.require_nonempty(self.store, unit["id"], [p for _, paths, _ in selected.values() for p in paths])
-        operation_proofs = await self.repo.dependency_check(unit, operations, bases)
-        read_proofs = {key: await self.check_dependencies(unit["id"], key, values, bases[key])
-                       for key, values in dependencies.items()}
+        evaluation = await self.check_dependencies(unit, [row for _, _, rows in selected.values() for row in rows], bases)
+        evaluation["tokens"].update(pins)
+        dependencies = self.dependencies(unit, evaluation)
         for member in members:
             checkout = self.store.get(member["checkout"])
             metadata, paths, rows = selected[checkout["id"]]
@@ -173,7 +140,7 @@ class GroupPublisher:
                         unit=unit["id"], base=base, branch=member["branch"], candidate=candidate, unchanged=candidate is None,
                         paths=paths, rows=rows, entries=entries, provenance=provenance, transfer_proofs=grants, validation=validation,
                         dependencies=dependencies[checkout["id"]], dependency_digest=digest(dependencies[checkout["id"]]),
-                        dependency_proofs=read_proofs[checkout["id"]] + [p for p in operation_proofs if p["checkout"] == checkout["id"]],
+                        dependency_proofs=[p for p in evaluation["proofs"] if p["checkout"] == checkout["id"]],
                         validation_digest=digest(validation), seal=partid, created=time.time())
             seals.append(part)
             vector.append({k: part[k] for k in ("checkout", "root", "identity", "repository", "branch", "base", "candidate", "unchanged", "provenance", "dependencies", "dependency_digest", "validation_digest", "seal")})
@@ -195,6 +162,7 @@ class GroupPublisher:
                     generation=unit.get("generation", 1), publication_order=order, vector=vector,
                     validation=validation, validation_digest=digest(validation), created=time.time())
         with self.store.transaction():
+            dependency_evidence.validate(self.store, evaluation, [row for part in seals for row in part["rows"]])
             for part in seals:
                 self.store.put("seal_part", part["seal"], part, unit["id"])
             self.store.put("seal", sealid, seal, unit["id"])
@@ -216,19 +184,14 @@ class GroupPublisher:
                              unchanged=item["unchanged"], commit=item.get("commit"), diff=raw.stdout.decode("utf-8", "strict") if raw else ""))
         return {"binding": binding(seal), "diff": "\n".join("Repository: " + d["root"] + "\n" + d["diff"] for d in data), "participants": data}
 
-    async def preflight(self, unit, item, publication=None):
+    async def preflight(self, unit, item, publication=None, evaluation=None):
         checkout, part = self.store.get(item["checkout"]), self.store.get(item["seal"])
+        evaluation = evaluation or await self.check_dependencies(unit)
         if item["unchanged"]:
             await finish_thread(self.repo.publication_pin, checkout, part)
+            dependency_evidence.validate(self.store, evaluation)
             return {"config_digest": None, "base_index_entries": {}}
         config = await finish_thread(self.repo.publication_guards, checkout, part)
-        await self.check_dependencies(unit["id"], checkout["id"], part.get("dependencies", []), part["base"])
-        # Recheck operation dependencies against the same sealed vector, never a
-        # newer branch tip. Participants already published retain their old base.
-        seal = self.store.get(unit["seal"])
-        bases = {v["checkout"]: v["base"] for v in seal["vector"]}
-        operations = list(self.store.all("operation", unit["id"]))
-        await self.repo.dependency_check(unit, operations, bases)
         if part["paths"]:
             await self.repo.scope_rows(self.view(unit, part), part)
         base, real = await finish_all(finish_thread(gitio.entries, checkout["root"], part["base"]),
@@ -241,6 +204,7 @@ class GroupPublisher:
         if Path(lock).exists() and not (publication and publication.get("index_lock") and self.repo.pinned(publication["index_lock"], lock)):
             raise CoordinatorError("INDEX_LOCKED", "Foreign index lock blocks the complete group", {"root": checkout["root"]})
         await finish_thread(self.repo.publication_guards, checkout, part)
+        dependency_evidence.validate(self.store, evaluation, part["rows"])
         return {"config_digest": config, "base_index_entries": {p: real.get(p, []) for p in part["paths"]}}
 
     async def publish(self, unitid, reviewid, metadata):
@@ -260,12 +224,14 @@ class GroupPublisher:
         if set(metadata) != required or any(not isinstance(v, str) or not v or "\0" in v for v in metadata.values()):
             raise CoordinatorError("PUBLICATION_METADATA", "Complete explicit commit metadata is required")
         await self.repo.quiescent(unit)
+        evaluation = await self.check_dependencies(unit)
         prepared = {}
         for item in seal["vector"]:
             if not item.get("commit"):
-                prepared[item["checkout"]] = await self.preflight(unit, item)
+                prepared[item["checkout"]] = await self.preflight(unit, item, evaluation=evaluation)
         groupid, journals = uid("publication_group"), {}
         with self.store.transaction():
+            dependency_evidence.validate(self.store, evaluation)
             for item in seal["vector"]:
                 if item.get("commit"):
                     journals[item["checkout"]] = item["publication"]
@@ -320,10 +286,16 @@ class GroupPublisher:
                 if journal["phase"] in ("ref_updated", "index_pending", "index_updated"):
                     await self.repo.reconcile(journal)
             self.progress(group)
+            remaining = any(self.store.get(key)["phase"] != "complete" for key in group["journals"].values())
+            evaluation = await self.check_dependencies(unit) if remaining or not group["journals"] else None
             for key in seal["publication_order"]:
                 journal = self.store.get(group["journals"].get(key), required=False)
-                if not journal or journal["phase"] != "complete":
-                    await self.preflight(unit, items[key], journal)
+                if journal and journal["phase"] == "complete":
+                    continue
+                if evaluation:
+                    await self.preflight(unit, items[key], journal, evaluation)
+                else:  # every journal is complete: an unchanged participant is still pinned to its sealed base
+                    await finish_thread(self.repo.publication_pin, self.store.get(key), self.store.get(items[key]["seal"]))
             # Establish every required owned lock before changing any ref.
             for key in sorted(group["journals"]):
                 journal = self.store.get(group["journals"][key])
@@ -332,7 +304,15 @@ class GroupPublisher:
             for key in seal["publication_order"]:
                 journalid = group["journals"].get(key)
                 if journalid:
-                    await self.repo.reconcile(self.store.get(journalid))
+                    journal = self.store.get(journalid)
+                    if evaluation and journal["phase"] != "complete":
+                        try:
+                            dependency_evidence.validate(self.store, evaluation)
+                        except CoordinatorError as exc:
+                            if exc.code != "REVISION_CHANGED":
+                                raise
+                            evaluation = await self.check_dependencies(unit)
+                    await self.repo.reconcile(journal, evaluation)
                     self.progress(group)
             async with self.daemon.custody.condition:
                 with self.store.transaction():

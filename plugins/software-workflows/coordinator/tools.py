@@ -8,7 +8,7 @@ from .blob_storage import codec
 from .locks import finish_thread
 from .client import CoordinatorError
 from .ledger import normalize, read_path
-from .store import encoded
+from .store import encoded, read_pass
 from . import routing, participants, runtime
 
 VERSION = runtime.plugin_version()
@@ -460,6 +460,7 @@ def message_text(daemon, actor, args):
     return dict(part, text=text[offset:end], text_next_offset=end if end < len(text) else None)
 
 
+@read_pass(summaries=True, readonly=True)
 def writer_status(daemon, actor, cursor):
     """What a writer's status shows, within the budget: the coordinator's readiness, the UNKNOWNs open on its
     checkouts, its own run, then the other runs on its checkout in run id order, a page at a time. Each run (brief): its
@@ -468,11 +469,12 @@ def writer_status(daemon, actor, cursor):
     store = daemon.store
     if not isinstance(cursor, str):
         raise CoordinatorError("PAGE_CURSOR", "A status cursor is the last run id of the page before")
-    unacknowledged = dict(store.db.execute(
-        "SELECT json_extract(data,'$.unit'), count(*) FROM records WHERE kind='message' AND "
-        "json_extract(data,'$.state')!='acknowledged' GROUP BY 1").fetchall())
-    runs = [r for r in store.all("run") if r["id"] != actor["run"] and participants.contains(store, r["unit"], actor["checkout"])]
-    runs.sort(key=lambda r: r["id"])
+    units = participants.unit_ids(store, actor["checkout"])
+    unacknowledged = {unit: store.db.execute(
+        "SELECT count(*) FROM records INDEXED BY message_unread WHERE kind='message' AND "
+        "json_extract(data,'$.unit')=? AND json_extract(data,'$.state')!='acknowledged'", (unit,)).fetchone()[0]
+        for unit in set(units) | {actor["unit"]}}
+    runs = [ident for ident in store.run_ids(units) if ident != actor["run"]]
     status = {"ready": daemon.ready, "draining": daemon.draining, "version": VERSION, "unknowns": {},
               "self": None, "writers": [], "writers_total": len(runs), "next_cursor": None}
     # Every checkout's open UNKNOWNs, in id order, within a quarter of the budget: a project of dozens of repositories
@@ -490,14 +492,15 @@ def writer_status(daemon, actor, cursor):
     status["self"] = own
     room -= len(encoded(own))
     page = room  # each run is cut only when it alone exceeds a page; one that fits a page waits for the next
-    later = [r for r in runs if r["id"] > cursor]
-    for index, run in enumerate(later):
+    later = [ident for ident in runs if ident > cursor]
+    for index, ident in enumerate(later):
+        run = store.get(ident)
         entry = brief(daemon, run, unacknowledged, page - 1)
         size = len(encoded(entry)) + 1
         if size > room:
             if not status["writers"]:
                 raise CoordinatorError("PAGE_SIZE", "A writer's status does not fit one page", {"run": run["id"]})
-            status["next_cursor"] = later[index - 1]["id"]
+            status["next_cursor"] = later[index - 1]
             break
         status["writers"].append(entry)
         room -= size
@@ -524,7 +527,7 @@ def brief(daemon, run, unacknowledged, room):
         if len(shown["command"]) < len(command):
             shown["command_chars"] = len(command)
         custody.append(shown)
-    entry = {"run": run["id"], "unit": unit["id"], "state": daemon.runs.reported(run)[0], "writer": listener.get("state"),
+    entry = {"run": run["id"], "unit": unit["id"], "state": daemon.runs.reported_state(run), "writer": listener.get("state"),
              "task": task[:fitted_chars(task, 0, TASK_BYTES)],
              "claims": [{"root_id": c["checkout"], "path": c["path"]} for member in participants.members(store, unit)
                         for c in daemon.custody.claims(member["checkout"], unit["id"])],

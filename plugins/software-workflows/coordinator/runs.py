@@ -74,6 +74,13 @@ class Runs:
             state = "running"
         return state, turns
 
+    def reported_state(self, run):
+        state = run["state"]
+        if not run.get("cancel_requested") and state in TERMINAL | {"idle"}:
+            if any(a.get("active_turn") and a["kind"] != "lead" for a in self.store.active_actors(run["unit"])):
+                return "running"
+        return state
+
     def turn_source(self, run, actor):
         """What started a root turn: the phase whose input it took, or the message whose delivery started it."""
         turn = actor["active_turn"]
@@ -934,6 +941,8 @@ class Runs:
     def resendable(run):
         """Whether a resume sends the run's current phase input again, ahead of its own text: one whose outcome
         nothing can tell (unproven), which only the lead's resume sends."""
+        if run.get("_summary"):
+            return run["_phase_state"] == "unproven"
         return (run.get("phases") or {}).get(run.get("phase"), {}).get("state") == "unproven"
 
     @staticmethod

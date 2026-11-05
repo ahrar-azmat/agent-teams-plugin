@@ -15,7 +15,7 @@ import time
 from .locks import KeyedLocks, finish_all, finish_thread
 from .client import CoordinatorError, validate_state
 from . import telemetry
-from .store import Store, uid, digest, encoded, WINDOW_ACTIVE, BLOCKERS
+from .store import Store, uid, digest, encoded, WINDOW_ACTIVE, BLOCKERS, read_pass
 from .ledger import Ledger, normalize, patch_scope, read_path
 from .custody import Custody
 from . import native, tools, processes, runtime, participants, routing
@@ -28,7 +28,7 @@ VERSION = runtime.plugin_version()  # in daemon/status, so that a newer client c
 STOP_DRAIN_S = 1.0
 READ_RPC = {"daemon/status", "checkout/query", "checkout/revisions", "project/status", "services/status",
             "run/status", "run/list", "run/result", "run/events", "run/terminals",
-            "claim/list", "unknown/list", "message/inbox", "unit/status", "unit/diff", "records/list"}
+            "claim/list", "unknown/list", "message/inbox", "unit/status", "unit/diff", "unit/dependencies", "records/list"}
 COMPLETION_RPC = {"operation/complete", "custody/reconcile", "run/interrupt", "run/terminate-terminal", "review/complete", "lead-hook/batch"}
 
 
@@ -224,6 +224,7 @@ class Daemon:
         async with self.lease_locks.hold(checkoutid):
             await self._release_lease(checkoutid, stopping)
 
+    @read_pass(readonly=True)
     async def _release_lease(self, checkoutid, stopping):
         checkout = self.store.get(checkoutid)
         from .lead_calls import active
@@ -236,7 +237,7 @@ class Daemon:
         from .writer import TERMINAL
         if not stopping and any(r["state"] not in TERMINAL | {"idle"} and not self.runs.awaiting_lead(r) for r in runs):
             return
-        if any(a.get("active_turn") for a in self.store.all("actor") if participants.contains(self.store, a["unit"], checkoutid)) or self.custody.active(checkoutid):
+        if any(a.get("active_turn") for a in self.store.active_actors() if participants.contains(self.store, a["unit"], checkoutid)) or self.custody.active(checkoutid):
             return
         if self.admitting.get(checkoutid) or not stopping and any(o["state"] in ("prepared", "allowed", "running") or o.get("executing")
                                                                   for o in self.store.live_operations(checkoutid)):
@@ -244,8 +245,15 @@ class Daemon:
             # ends. A stop releases after every app-server has exited.
             return
         for message in self.store.writer_mail():  # every message delivery_owed can hold
-            if self.delivery_owed(message) and participants.contains(self.store, self.store.get(message["recipient"])["unit"], checkoutid):
+            if self.lead_mail(message):
+                continue
+            actor = self.store.get(message["recipient"], required=False)
+            if actor and actor.get("unit") and participants.contains(self.store, actor["unit"], checkoutid) and self.delivery_owed(message):
                 return  # A queued or uncertain native turn can start without another RPC.
+            if (not actor or not actor.get("unit")) and self.delivery_owed(message):
+                actor = self.store.get(message["recipient"])  # preserve the refusal for an orphaned in-flight delivery
+                if participants.contains(self.store, actor["unit"], checkoutid):
+                    return
         await self.leases.call("release", checkout["root"])
         checkout.pop("compatibility_lease", None)
         self.store.save(checkout)
@@ -332,6 +340,7 @@ class Daemon:
         task.add_done_callback(ended)
         return task
 
+    @read_pass(summaries=True, readonly=True)
     def status(self, checkout=None, brief=False):
         """The daemon's identity and readiness; unless brief, every run's writers too. A client checking
         readiness asks for brief: the full answer decodes each run's claims and custody."""
@@ -342,15 +351,13 @@ class Daemon:
         epoch = self.store.status_epoch
         writers = cached[1] if not brief and cached and cached[0] == epoch else []
         rebuild = not brief and not (cached and cached[0] == epoch)
-        messages = list(self.store.all("message")) if rebuild else ()
-        for run in self.store.all("run") if rebuild else ():
-            if checkout and not participants.contains(self.store, run["unit"], checkout):
-                continue
+        units = participants.unit_ids(self.store, checkout) if rebuild and checkout else None
+        for run in list(self.store.run_summaries(units)) if rebuild else ():
             unit = self.store.get(run["unit"])
             # What its app-server's admission proved (admission.CAPABILITIES): how a notice reaches the writer.
             listener = self.store.get((self.store.get(run.get("root_actor") or "", required=False) or {}).get("listener") or "",
                                       required=False) or {}
-            writers.append({"run": run["id"], "unit": unit["id"], "task": run["task"], "state": self.runs.reported(run)[0],
+            writers.append({"run": run["id"], "unit": unit["id"], "task": run["task"], "state": self.runs.reported_state(run),
                             "capabilities": listener.get("capabilities"),
                             "listener": {**{k: listener.get(k) for k in ("state", "dormant_at", "dormant_reason", "history_gaps", "history_settled", "history_projection", "writer_profile",
                                 "recovery_state", "recovery_error", "recovery_retryable", "recovery_version")},
@@ -365,8 +372,8 @@ class Daemon:
                             **participants.surface(self, unit),
                             "pending_requests": [r for kind in ("claim_request", "release_request", "custody_request")
                                                  for r in self.store.all(kind, unit["id"]) if r["state"] in ("pending", "pending_lead", "waiting")],
-                            "messages": [dict(m, eligibility=self.messages.eligibility(m)) for m in messages
-                                         if m.get("unit") == unit["id"] and m["state"] != "acknowledged"]})
+                            "messages": [dict(m, eligibility=self.messages.eligibility(m))
+                                         for m in self.store.messages("unit", [unit["id"]], unread=True)]})
         if rebuild:
             self.writer_status[checkout] = (epoch, writers)
         return {"ready": self.ready, "generation": self.store.generation, "pid": os.getpid(),
@@ -624,6 +631,7 @@ class Daemon:
                     or self.store.db.execute("SELECT 1 FROM records INDEXED BY blocker_delivery WHERE " + BLOCKERS["delivery"] +
                                              " AND json_extract(data,'$.unit')=? LIMIT 1", (unitid,)).fetchone())
 
+    @read_pass(readonly=True)
     def lead_mail(self, message):
         """Mail a lead reads through its inbox (`lead`, a session mailbox, or an actor of kind lead): no native turn
         starts for it."""
@@ -2877,11 +2885,12 @@ class Daemon:
                                            "NOT IN ('verified','reconciled','resolved','denied')", (run["unit"],)))
         return bool(waiting) and all(self.awaiting_outcome(o) for o in waiting)
 
+    @read_pass(readonly=True)
     def stop_pending(self, caller_commands=()):
         from .writer import TERMINAL
         now = time.time()
         hooks = []
-        for record in self.store.all("lead_hook"):
+        for record in self.store.pending_lead_hooks():
             if record.get("stop_control") and record.get("shell_command_digest") in caller_commands:
                 continue  # only the connected caller's pure stop command, never its other shell work
             if record.get("execution"):
@@ -2914,14 +2923,14 @@ class Daemon:
             # One waiting only for the lead's decision on an unproven input runs nothing (Runs.awaiting_lead), nor one
             # whose writer the retry policy holds (held_by_retry).
             "workflows": sum(r["state"] not in TERMINAL | {"idle"} and not self.settling_on_outcomes(r) and not self.runs.awaiting_lead(r)
-                             and not self.held_by_retry(r["id"]) for r in self.store.all("run") if r.get("workflow") or r["state"] == "admitting"),
+                             and not self.held_by_retry(r["id"]) for r in self.store.unfinished_runs() if r.get("workflow") or r["state"] == "admitting"),
             # A held writer's turn is not waited for only once nothing can still run it (held_turn_gone).
-            "writers": sum(bool(a.get("active_turn")) and not self.held_turn_gone(a) for a in self.store.all("actor")),
+            "writers": sum(bool(a.get("active_turn")) and not self.held_turn_gone(a) for a in self.store.active_actors()),
             "custody": self.store.db.execute("SELECT count(*) FROM records INDEXED BY window_custody WHERE " + WINDOW_ACTIVE["custody"]).fetchone()[0],
             # A lead reads its mail through its inbox, so no native turn starts for it: unread lead mail is no
             # delivery in flight, and a stop never waits for it. Nor for mail not yet sent to a writer the retry
             # policy holds (held_by_retry).
-            "deliveries": sum(self.delivery_owed(m) for m in self.store.all("message")),
+            "deliveries": sum(self.delivery_owed(m) for m in self.store.writer_mail()),
             "lead_hooks": len(hooks), "lead_operations": len(lead_operations),
             "external_editors": len(pending_executors(self.store)),
             "other_operations": len(operations) - len(lead_operations),
@@ -2930,6 +2939,7 @@ class Daemon:
         }
         return {key: value for key, value in counts.items() if value}
 
+    @read_pass(readonly=True)
     def held_by_retry(self, runid):
         """Whether the one retry policy holds a run's writer now: its demand start failed and is not due
         (dormancy.start_due), or its reconcile failed and is not (recovery.retry_due): its backoff has not passed, or
@@ -3356,6 +3366,9 @@ class Daemon:
     async def _unit_dispatch(self, method, params):
         from .publish import Publisher
         publisher = Publisher(self)
+        if method == "unit/dependencies":
+            from .dependencies import report
+            return await report(self.store, params["unit"], params["report"], params.get("cursor"))
         if method == "unit/status":
             unit = self.store.get(params["unit"])
             # The unit's messages are chosen in SQL (store.messages): the server reads this status before each lead call
@@ -3572,89 +3585,94 @@ class Daemon:
             if not self.ready or self.draining:
                 continue
             try:
-                try:
-                    await self.leases.call("ping")
-                except CoordinatorError as exc:
-                    self.store.event("lease/redundancy_unavailable", None, exc.envelope())
-                    continue
-                # What startup recovery is still reconciling stays its own until it is done (recovery.recover_writers):
-                # its writers' custody and retries, its runs' cancels and inputs, its checkouts' leases.
-                recovering = self.recovering
-                self.broker.maintain()
-                held = list(self.store.held_custody())
-                for actor in list(self.store.all("actor")):
-                    if (actor.get("listener") and ("run", actor.get("run")) not in recovering
-                            and any(c["actor"] == actor["id"] for c in held)):
-                        try:
-                            await self.settle_actor(actor)
-                        except (CoordinatorError, OSError):
-                            pass  # custody remains held; no optimistic release
-                from .recovery import settle_lead_command, watch_answers, retry_due, startup_obligation
-                for reservation in held:
-                    if (reservation.get("lead_root") and ("checkout", reservation.get("checkout")) not in recovering
-                            and self.store.get(reservation["id"])["state"] != "released"):
-                        await settle_lead_command(self, reservation)
-                watch_answers(self)
-                self.parking.maintain()
-                # A writer whose reconcile failed holds its unit's work until it is reconciled again. Once its retry is
-                # due, it is retried here in either case:
-                # - a startup incident, which stays owed even for a finished run (only a retryable one; one that
-                #   cannot pass stays quarantined for the lead);
-                # - while work is owed to it (writer_owed), or when it was ended stopped or behind a dead connection
-                #   (recovery.end_wedged: its replacement is due now).
-                # Otherwise its next resume reconciles it. Its backoff is no work under way, so it holds no stop; an
-                # attempt it starts enters reconcile_listener's stop fence like any other.
-                for listener in list(self.store.failed_listeners()):
-                    if (retry_due(self, listener)
-                            and ("run", listener["run"]) not in recovering
-                            and self.store.get(listener["actor"]).get("listener") == listener["id"]
-                            and (startup_obligation(self.store, listener["run"]) or listener.get("wedged")
-                                 or self.writer_owed(listener["unit"]))):
-                        self.readmit(listener["run"])
-                await self.messages.retry()
-                await self.ledger.scans.retry()
-                # Only runs this loop can act on: every finished run is history. A plain run's prepared continuation
-                # (transition_pending) is submitted again too: its writer was being replaced when run/resume prepared it.
-                runs = list(self.store.selected("SELECT * FROM records WHERE kind='run' AND ((json_extract(data,'$.cancel_requested') "
-                        "AND json_extract(data,'$.state')!='cancelled') OR json_extract(data,'$.state') IN ('transition_pending','submission_uncertain') OR "
-                        "(json_extract(data,'$.workflow') IS NOT NULL AND "
-                        "json_extract(data,'$.state') NOT IN ('completed','failed','interrupted','blocked','refused','cancelled'))) ORDER BY id"))
-                for runid in set(self.writer.refused) - {run["id"] for run in runs}:
-                    self.writer.forget(runid)  # its settlement backoff, for a run this loop no longer acts on
-                for run in runs:
-                    if ("run", run["id"]) in recovering:
-                        continue
-                    if run.get("cancel_requested") and run["state"] != "cancelled":
-                        await self.runs.settle_cancel(run["id"])
-                        continue
-                    if self.runs.expired(run):
-                        # This list was read before the awaits of the runs ahead of it, and a resume renews a deadline:
-                        # the cancel checks it again on the run as it is when it begins.
-                        self.background(self.runs.cancel(run, expired=True))
-                        continue
-                    # A workflow whose turn/start result was lost (submission_uncertain) is advanced too: the advance settles
-                    # that input, reading native at most each 2 s (writer.py); one nothing shows waits for the lead's resume.
-                    # A phase refused settlement for a minute is tried at a backoff (Writer.settle_due).
-                    if (run.get("workflow") and run["state"] in ("settling", "transition_pending", "submission_uncertain")
-                            and self.writer.settle_due(run)):
-                        try:
-                            await self.writer.advance(run["id"])
-                        except CoordinatorError as exc:
-                            self.store.event("workflow/advance_refused", run["id"], exc.envelope())
-                    elif not run.get("workflow") and run["state"] == "transition_pending":
-                        self.writer.resubmit(run["id"])
-                    elif not run.get("workflow") and run["state"] == "submission_uncertain":
-                        try:
-                            await self.writer.settle_uncertain(run["id"])
-                        except CoordinatorError as exc:
-                            self.store.event("run/input_settlement_refused", run["id"], exc.envelope())
-                for checkout in list(self.store.all("checkout")):
-                    if ("checkout", checkout["id"]) not in recovering:
-                        await self.release_lease(checkout["id"])
+                await self.maintenance_tick()
             except native.Retired:
                 if self.stop.is_set() or asyncio.current_task().cancelling():
                     raise
                 self.store.event("maintenance/retry", None, {"reason": "native connection retired"})
+
+    @read_pass
+    async def maintenance_tick(self):
+        try:
+            await self.leases.call("ping")
+        except CoordinatorError as exc:
+            self.store.event("lease/redundancy_unavailable", None, exc.envelope())
+            return
+        # What startup recovery is still reconciling stays its own until it is done (recovery.recover_writers):
+        # its writers' custody and retries, its runs' cancels and inputs, its checkouts' leases.
+        recovering = self.recovering
+        self.broker.maintain()
+        held = list(self.store.held_custody())
+        for ident in sorted({c["actor"] for c in held if c.get("actor")}):
+            actor = self.store.get(ident, required=False)
+            if (actor and actor["_kind"] == "actor" and actor.get("listener")
+                    and ("run", actor.get("run")) not in recovering):
+                try:
+                    await self.settle_actor(actor)
+                except (CoordinatorError, OSError):
+                    pass  # custody remains held; no optimistic release
+        from .recovery import settle_lead_command, watch_answers, retry_due, startup_obligation
+        for reservation in held:
+            if (reservation.get("lead_root") and ("checkout", reservation.get("checkout")) not in recovering
+                    and self.store.get(reservation["id"])["state"] != "released"):
+                await settle_lead_command(self, reservation)
+        watch_answers(self)
+        self.parking.maintain()
+        # A writer whose reconcile failed holds its unit's work until it is reconciled again. Once its retry is
+        # due, it is retried here in either case:
+        # - a startup incident, which stays owed even for a finished run (only a retryable one; one that
+        #   cannot pass stays quarantined for the lead);
+        # - while work is owed to it (writer_owed), or when it was ended stopped or behind a dead connection
+        #   (recovery.end_wedged: its replacement is due now).
+        # Otherwise its next resume reconciles it. Its backoff is no work under way, so it holds no stop; an
+        # attempt it starts enters reconcile_listener's stop fence like any other.
+        for listener in list(self.store.failed_listeners()):
+            if (retry_due(self, listener)
+                    and ("run", listener["run"]) not in recovering
+                    and self.store.get(listener["actor"]).get("listener") == listener["id"]
+                    and (startup_obligation(self.store, listener["run"]) or listener.get("wedged")
+                         or self.writer_owed(listener["unit"]))):
+                self.readmit(listener["run"])
+        await self.messages.retry()
+        await self.ledger.scans.retry()
+        # Only runs this loop can act on: every finished run is history. A plain run's prepared continuation
+        # (transition_pending) is submitted again too: its writer was being replaced when run/resume prepared it.
+        runs = list(self.store.selected("SELECT * FROM records WHERE kind='run' AND ((json_extract(data,'$.cancel_requested') "
+                "AND json_extract(data,'$.state')!='cancelled') OR json_extract(data,'$.state') IN ('transition_pending','submission_uncertain') OR "
+                "(json_extract(data,'$.workflow') IS NOT NULL AND "
+                "json_extract(data,'$.state') NOT IN ('completed','failed','interrupted','blocked','refused','cancelled'))) ORDER BY id"))
+        for runid in set(self.writer.refused) - {run["id"] for run in runs}:
+            self.writer.forget(runid)  # its settlement backoff, for a run this loop no longer acts on
+        for run in runs:
+            if ("run", run["id"]) in recovering:
+                continue
+            if run.get("cancel_requested") and run["state"] != "cancelled":
+                await self.runs.settle_cancel(run["id"])
+                continue
+            if self.runs.expired(run):
+                # This list was read before the awaits of the runs ahead of it, and a resume renews a deadline:
+                # the cancel checks it again on the run as it is when it begins.
+                self.background(self.runs.cancel(run, expired=True))
+                continue
+            # A workflow whose turn/start result was lost (submission_uncertain) is advanced too: the advance settles
+            # that input, reading native at most each 2 s (writer.py); one nothing shows waits for the lead's resume.
+            # A phase refused settlement for a minute is tried at a backoff (Writer.settle_due).
+            if (run.get("workflow") and run["state"] in ("settling", "transition_pending", "submission_uncertain")
+                    and self.writer.settle_due(run)):
+                try:
+                    await self.writer.advance(run["id"])
+                except CoordinatorError as exc:
+                    self.store.event("workflow/advance_refused", run["id"], exc.envelope())
+            elif not run.get("workflow") and run["state"] == "transition_pending":
+                self.writer.resubmit(run["id"])
+            elif not run.get("workflow") and run["state"] == "submission_uncertain":
+                try:
+                    await self.writer.settle_uncertain(run["id"])
+                except CoordinatorError as exc:
+                    self.store.event("run/input_settlement_refused", run["id"], exc.envelope())
+        for checkout in list(self.store.all("checkout")):
+            if ("checkout", checkout["id"]) not in recovering:
+                await self.release_lease(checkout["id"])
 
     async def serve(self):
         self.store._blob_loop = asyncio.get_running_loop()

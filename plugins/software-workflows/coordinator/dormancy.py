@@ -6,7 +6,7 @@ import time
 
 from .client import CoordinatorError
 from .locks import finish, finish_thread
-from .store import digest
+from .store import digest, read_pass
 from .item_projection import PROJECTION_VERSION, receipt_digests, receipt_result
 from . import native, participants, processes
 
@@ -45,6 +45,7 @@ class Dormancy:
     def pending(self, runid):
         return (self.demand(runid) or {}).get("state") in ("pending", "starting", "failed")
 
+    @read_pass(readonly=True)
     def start_due(self, runid):
         """Whether a caller on its own schedule (a waking message, a workflow's advance, startup recovery) may start the
         run's writer now: no failed demand start, or one due by the policy of recovery.retry_due: its backoff has passed,
@@ -59,6 +60,7 @@ class Dormancy:
             return False
         return not self.start_held(runid)
 
+    @read_pass(readonly=True)
     def start_held(self, runid):
         """The same incident/repair gate as startup, maintenance and transport recovery."""
         from .recovery import permanently_failed

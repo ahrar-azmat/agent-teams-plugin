@@ -91,7 +91,11 @@ def initialize(store):
 class Lookup:
     """One operation's lazy, primary-key lookups; never a global history map."""
     def __init__(self, store):
-        initialize(store)
+        if getattr(store, "readonly", False):
+            if not store.get("publication_evidence_v1", required=False):
+                raise CoordinatorError("PROVENANCE_MISSING", "Publication evidence has not been initialized")
+        else:
+            initialize(store)
         self.store, self.receipts, self.rights = store, {}, {}
 
     def get(self, revision):
@@ -289,58 +293,78 @@ def validate_seal(store, seal):
             raise CoordinatorError("PUBLICATION_RIGHTS_TRANSFERRED", "Seal predates a handback or acquisition", {"seal": seal["seal"], "checkout": checkout})
 
 
-def segment(store, unit, head, carried):
-    """Unpublished effective ancestry; a restore replaces, rather than inherits, its previous bytes."""
-    from types import SimpleNamespace
-    from .publish import Publisher
-    provenance = Publisher(SimpleNamespace(store=store))
+def segment(evidence, unit, head, carried, read_blob):
+    """Unpublished effective ancestry; a restore replaces, rather than inherits, its previous bytes. Reads one snapshot
+    (segments())."""
+    from .dependencies import Evaluator
     revisions, seen, row = set(), set(), head
     while row and row["id"] not in seen:
         seen.add(row["id"])
-        if row["attribution"] == "baseline" or published(store, row, carried):
+        if row["attribution"] == "baseline" or (row["attribution"] != "UNKNOWN" and published(evidence, row, carried)):
             break
         if row["attribution"] == "restore":
-            source = provenance.provenance(row, unit)
-            if source is None:
+            evaluator = Evaluator(evidence, unit, {}, read_blob)
+            result = evaluator.evaluate([dict(row)])
+            if result["failures"]:
+                failure = result["failures"][0]
+                raise CoordinatorError("UNKNOWN_BLOCKS_HANDBACK" if failure["code"] == "UNKNOWN_DEPENDENCY" else "HANDBACK_PROVENANCE",
+                                       failure["message"], {"path": row["path"], "revision": row["id"], "failure": failure})
+            # Reads validate bytes but do not convey ownership, even on this path.
+            nodes = {value["id"]: value for value in result["graph"] if value["type"] == "node"}
+            sources = {value["source"]: value["target"] for value in result["graph"]
+                       if value["type"] == "edge" and value["kind"] in ("restore/source", "restore/witness")}
+            source, restored = row["id"], set()
+            while source and nodes[source].get("attribution") == "restore":
+                restored.add(nodes[source]["revision"])
+                source = sources.get(source)
+            if not source or nodes[source].get("attribution") == "baseline":
                 break
-            revisions.add(row["id"])
-            if source["id"] != row["id"]:
-                row = source
-                continue
-            # Legacy restoration has no source identity. Its byte-matched
-            # effective source is authoritative; its overwritten history is not.
-            if row["unit"]:
-                revisions.add(row["id"])
-            break
-        if row["attribution"] == "UNKNOWN":
-            resolutions = list(store.db.execute("SELECT s.restore,s.edit FROM unknowns u LEFT JOIN resolutions s "
-                "ON s.unknown_id=u.id WHERE u.revision=?", (row["id"],)))
-            if not resolutions or any(not r["edit"] for r in resolutions):
-                raise CoordinatorError("UNKNOWN_BLOCKS_HANDBACK", "Resolve unexplained bytes before transferring provenance",
-                                       {"path": row["path"], "revision": row["id"]})
-            # Resolution is separate from the immutable UNKNOWN. Follow the
-            # restoring operation's known source, never the UNKNOWN's previous
-            # pointer and never attribute its old unexplained bytes to the lead.
-            restored = store.get(resolutions[-1]["restore"])
-            if restored.get("resolution") == "baseline" or restored.get("kind") == "outside-ledger":
-                break
-            source = restored.get("restored_from", {}).get(row["path"], "unrecorded")
-            if source is None or source == "baseline":
-                break
-            found = store.db.execute("SELECT * FROM revisions WHERE id=?", (source,)).fetchone()
-            if not found or found["checkout"] != row["checkout"] or found["path"] != row["path"]:
-                raise CoordinatorError("HANDBACK_PROVENANCE", "Resolved UNKNOWN lacks a known effective source",
-                                       {"path": row["path"], "revision": row["id"]})
-            row = found
+            revisions.update(restored)
+            row = evidence.revision(nodes[source]["revision"])
             continue
+        if row["attribution"] == "UNKNOWN":
+            resolutions = [dict(value) for value in evidence.db.execute("SELECT u.id AS unknown,s.restore,s.edit FROM unknowns u "
+                "LEFT JOIN resolutions s ON s.unknown_id=u.id WHERE u.revision=? ORDER BY u.id", (row["id"],))]
+            raise CoordinatorError("UNKNOWN_BLOCKS_HANDBACK", "Handback reaches unexplained bytes",
+                                   {"path": row["path"], "revision": row["id"], "unknowns": resolutions})
         if row["unit"]:
             revisions.add(row["id"])
-        row = store.db.execute("SELECT * FROM revisions WHERE id=?", (row["previous"],)).fetchone() if row["previous"] else None
+        row = evidence.revision(row["previous"]) if row["previous"] else None
+    if row and row["id"] in seen and row["attribution"] not in ("baseline", "restore") and not published(evidence, row, carried):
+        raise CoordinatorError("HANDBACK_PROVENANCE", "Dependency cycle has no grounded witness", {"revision": row["id"]})
     return revisions
 
 
-def release(store, unit, checkout, paths, authorizer, carried=None):
-    """Revoke and save a pending grant for each exact path, in one transaction."""
+def segments(root, unit, wanted, read_blob):
+    """segment() of each wanted path's head ({checkout: paths}), on one read snapshot off the event loop: a restore's
+    walk reads its dependency graph (2.4.36), too much for the handback transaction. A path's refusal is kept, as plain
+    data, for release() to raise in that path's turn: the exception's traceback would keep that path's whole graph
+    alive. Returns the walks and the records they read: the caller validates those (dependencies.validate) and
+    release() each head, inside the handback transaction."""
+    from . import archive
+    from .dependencies import Evidence
+    db = archive.readonly(root)
+    try:
+        db.execute("BEGIN")
+        evidence = Evidence(db, root)
+        carried, walked = Lookup(evidence), {}
+        for checkout, paths in wanted.items():
+            for path in sorted(paths):
+                head = db.execute("SELECT r.* FROM revisions r JOIN heads h ON h.revision=r.id WHERE h.checkout=? AND h.path=?",
+                                  (checkout, path)).fetchone()
+                head = dict(head) if head else None
+                try:
+                    walked[(checkout, path)] = (head and head["id"], segment(evidence, unit, head, carried, read_blob), None)
+                except CoordinatorError as exc:
+                    walked[(checkout, path)] = (head and head["id"], None, (exc.code, str(exc), exc.details, exc.operational))
+        return walked, dict(evidence.tokens)
+    finally:
+        db.close()
+
+
+def release(store, unit, checkout, paths, authorizer, walked, carried=None):
+    """Revoke and save a pending grant for each exact path, in one transaction. `walked` is segments() of these paths:
+    a head that moved since refuses the handback (HANDBACK_CHANGED)."""
     result = []
     carried = publications(store, checkout) if carried is None else carried
     for path in sorted(set(paths)):
@@ -352,7 +376,12 @@ def release(store, unit, checkout, paths, authorizer, carried=None):
             transfer_proof(store, current)
             if not head:
                 raise CoordinatorError("HANDBACK_PROVENANCE", "Live publication right has no recorded head", {"path": path})
-        revisions = segment(store, unit, head, carried)
+        found = walked.get((checkout, path))
+        if not found or found[0] != (head["id"] if head else None):
+            raise CoordinatorError("HANDBACK_CHANGED", "Claims, rights or revisions changed during handback preparation; retry", {"path": path})
+        if found[2]:
+            raise CoordinatorError(*found[2])
+        revisions = found[1]
         # A known restore to baseline legitimately retires the previous grant.
         # Missing heads and inconsistent grant records were refused above.
         if not revisions and not current:

@@ -3,6 +3,142 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.36] — 2026-11-05
+
+Change 1 comes from the Sales_Profiler lead's C0 seal (11-05). Change 2 comes from
+2.4.35's own switch: its loop stalls were the daemon's status and drain paths.
+
+After the switch, resume each long-lived Claude session (`claude --resume`): a
+session keeps the hooks it started with, and only hooks from 2.4.35 on give a lead
+file call the 10 s admission budget.
+
+### Change 1 — a seal follows only what its frozen outputs came from
+
+- The Sales_Profiler C0 seal (`unit_9d465a06`) was refused `UNKNOWN_DEPENDENCY` on
+  `scripts/deploy_probe.sh`. The writer's own heredoc had written the path (an
+  UNKNOWN). A verified `apply_patch` then used that UNKNOWN revision as its base and
+  also wrote `DEPLOY_HETZNER.md`. The lead restored the path to its baseline, which
+  resolved the UNKNOWN, and a later exact patch wrote it again. Through 2.4.35 a
+  seal counted every base and every recorded read of every operation of the unit
+  not resolved. A restore resolves only the quarantined operations it replaced,
+  so that patch's base kept refusing, though none of its bytes at that path
+  survived.
+- A seal now walks back from its frozen outputs, the receipt each scoped path's
+  head holds:
+  - an exact update depends on its base at that path, and a move's destination
+    on its source's base;
+  - a restore depends on the source it recorded, through restores of restores. A
+    restore to the baseline or to absence ends the path only when its
+    `unknown/restored` events, the base tree, or a baseline receipt with the same
+    bytes and mode confirm it;
+  - each producing operation reached brings its writer's recorded reads up to that
+    operation's read cutoff, and each read revision is walked the same way.
+- An operation whose outputs were all replaced no longer counts. The walk ends at
+  a published receipt and at another unit's revision that matches the selected base
+  commit. Another unit's revision with neither stops it there:
+  `UNPUBLISHED_DEPENDENCY`. A transfer grant authorizes a revision and the walk
+  continues through it. There is no acknowledgement or waiver: UNKNOWN bytes refuse
+  wherever the walk reaches them, including bytes the writer's own command wrote.
+- As through 2.4.35, a base or read at a path outside the ledger now
+  (`ledger.unwatched`) is no dependency, and neither is a move's source that a patch
+  took from outside the ledger.
+- A refusal carries the first page of a dependency report in `details`: `report`,
+  `digest`, `total`, the graph's `items`, the page's failing `paths`, and
+  `next_cursor`. `coordinator_unit action="dependencies"` reads the next page.
+- Singleton seals, project seals, publication preflight and handback use the same
+  evaluator, off the event loop on a read-only connection of their own. The
+  transaction that writes a seal, publication or handback first checks that every
+  record it read is unchanged (`REVISION_CHANGED`; a handback refuses
+  `HANDBACK_CHANGED`) and that each frozen output, or handed-back path, still has
+  the head it read.
+- Stricter than 2.4.35:
+  - a restore with no recorded source, no event and no byte witness, an ungrounded
+    cycle, or an unproven absence refuses `PROVENANCE_MISSING` (accepted before);
+  - transferred UNKNOWN ancestry refuses `UNKNOWN_DEPENDENCY`;
+  - a handback follows a restore to its source as a seal does. A path restored to a
+    revision whose history reaches UNKNOWN bytes, such as an exact patch over them,
+    refuses `UNKNOWN_BLOCKS_HANDBACK`; 2.4.35 handed it back. Restoring the path to
+    its baseline lets it be handed back.
+- Looser than 2.4.35:
+  - the C0 shape seals;
+  - a project seal with a retained published prefix seals;
+  - bytes that became UNKNOWN only after a writer read a path no longer refuse a
+    project seal; through 2.4.35 any unresolved UNKNOWN on a read path did.
+- Measured:
+  - On fixture writers, C0: 2.4.35 refused `UNKNOWN_DEPENDENCY`; 2.4.36 sealed.
+  - Restored to a known revision that stays in the head's history: refused on both.
+  - Project seal with a retained prefix: 2.4.35 refused; 2.4.36 sealed.
+  - 25 Store scenarios gave the expected result on both versions.
+  - Read-only census of the live ledger, 233 open or sealed units: C0 seals in
+    0.014 s. The slowest unit took 4.05 s (614 roots), all units 19.1 s, 1.5 s of
+    it the outside-ledger lookups.
+  - Installed 2.4.35's own dependency checks, run unchanged on a read-only adapter
+    over the same 233 units, decide 171 alike. Of the other 62, the scope check both
+    versions run first refuses 60: 45 seals (an empty scope, rights handed away,
+    heads that are not the unit's own receipts) and 15 sealed units' publications
+    (rights changed since the seal). The other two seal on 2.4.36 only: C0, and a
+    unit whose refused revision no frozen output descends from.
+- A restore's events are found through the UNKNOWNs of its path (`unknown_checkout`,
+  `event_subject_kind`). An index over every event's `restore` took 6.5 s to build
+  on a copy of the live ledger, at the first start. Both lookups gave the same graph
+  for all 233 units.
+
+### Change 2 — the daemon's per-tick and per-request paths stop decoding whole tables
+
+- In 2.4.35's first minutes live, the worst loop stall (at least 3.09 s) was
+  `daemon/status` decoding every message and every run. The rest were lease release
+  and maintenance reading the same records again through each delivery and
+  eligibility check. In a 300 s soak of 2.4.35, the drain also decoded every lead
+  hook at each stop attempt.
+  - Full status now reads only the checkout's units and their unread messages, and
+    reads runs as summaries: phases, previous phases and the workflow stay in
+    SQLite.
+  - The drain finds pending lead hooks through a partial index (`pending_lead_hook`),
+    running actors through `window_actor`, deliveries through the writer-mail index
+    and workflows through the unfinished-run index.
+  - A writer's status reads run ids first, then each page's runs as summaries.
+  - `custody.claims` and `participants.surface` use their covering indexes.
+- Within one decision a record is decoded at most once: lease release, eligibility,
+  inbox, maintenance and status share a per-pass record cache. Read-only passes hand
+  out frozen snapshots. Writes in the pass, writes by other tasks and rolled-back
+  transactions keep it current, and a run summary cannot be saved.
+- Measured on one synthetic ledger of the live shape (264 runs, 28 MB; 7,119
+  messages; 50,328 lead hooks), 15-sample medians, 2.4.35 → 2.4.36, each with the
+  same outputs:
+
+  | path | 2.4.35 | 2.4.36 |
+  |---|---:|---:|
+  | full status | 394.56 ms | 126.09 ms |
+  | pending work (the drain) | 331.96 ms | 23.33 ms |
+  | maintenance tick | 140.94 ms | 63.68 ms |
+  | delivery pass | 115.61 ms | 28.19 ms |
+  | writer status | 112.65 ms | 17.14 ms |
+  | lease release | 76.82 ms | 13.88 ms |
+  | eligibility | 61.96 ms | 20.81 ms |
+  | lead inbox | 37.61 ms | 29.48 ms |
+
+- The first start of 2.4.36 builds `pending_lead_hook`: 8.26 s on a copy of the live
+  ledger (513K records). The two dependency indexes take 0.38 s. That happens once,
+  before the daemon answers, while the switch holds the upgrade lock. There is no
+  schema version, so 2.4.35 still opens a ledger 2.4.36 has used.
+
+### Not changed
+
+- Queued for 2.4.37:
+  - Resumes that time out under load, though one had in fact started its turn.
+  - Foreign dirt acknowledged per path, not only through `allow_dirty` (#11).
+  - The push gate's refusal of a commit in a repository outside the checkout (#13).
+  - Run records carry their phase history inline (18.6 of 28 MB live).
+  - Listing paths records a read of each listed path, so a listing becomes a
+    dependency.
+  - Lead sessions on hooks before 2.4.35 keep the 2 s admission budget.
+  - A detached daemon left by a writer's command can hold checkout-wide custody.
+  - No notification reaches the lead when a writer messages it.
+  - The writer command gate reads a heredoc's text as Git execution.
+  - Maintenance's run selection, dormancy's demand totals and `lead.scope` still
+    evaluate JSON in SQL.
+- Writers keep full access with no off switch (user ruling, 10-18; #12).
+
 ## [software-workflows 2.4.35] — 2026-11-05
 
 Change 1 comes from 2.4.34's own switch. Change 2 comes from the Sales_Profiler

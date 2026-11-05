@@ -1094,9 +1094,13 @@ This compares the unit's own scoped receipts with the installed vector, not with
 later UNKNOWN heads. Those later bytes remain UNKNOWN and cannot enter the old
 unit's candidate. They do not by themselves prevent its writable remainder from
 being reviewed and published with the original prefix commit preserved. The
-exception is a read dependency: when a writer of the unit recorded a read
-(`read_file`, `list_paths`) of a path whose bytes later became UNKNOWN, the seal
-refuses `UNKNOWN_DEPENDENCY`, as for any UNKNOWN content the unit's work read.
+exception is a read dependency: when an operation whose output is in the
+candidate's history (the prefix's receipts included) had a recorded read
+(`read_file`, `list_paths`) of UNKNOWN bytes, the seal refuses
+`UNKNOWN_DEPENDENCY`, as for any UNKNOWN content that work read. Bytes that became
+UNKNOWN only after the read do not refuse it. Through 2.4.35 a project seal
+refused whenever a path any writer of the unit had read held an unresolved
+UNKNOWN at seal time.
 A participant counts as published from the moment the unit's current
 publication records the unit's commit for it (`commit_created`, which precedes
 the ref update), before any reopen, until `abandon()` proves the ref unmoved or a
@@ -1327,6 +1331,7 @@ retired generation.
 | `message/retry` | `message`; reconcile native history/queue before an explicitly requested retry of an uncertain or `unproven` delivery, which may deliver it twice. |
 | `unit/seal` | `unit`, optional `validation` array; freezes a candidate from verified receipt blobs. Each validation record names `command`, `exit_code`, `inputs` and `scope` (`mixed-checkout` or `candidate-objects`), checked before any seal attempt, so a refusal leaves the unit and its seal as they were: `VALIDATION_EVIDENCE` names the record and the fields it lacks, `VALIDATION_SCOPE` the scope given and those accepted. Since 2.4.34 it answers the seal's identity, candidate, digests, `path_count` and number of validation records; the rows, entries and proofs stay in the ledger, where review and publication read them (echoed, ~700 B a path). |
 | `unit/diff` | `unit`; object diff and exact review binding. |
+| `unit/dependencies` | `unit`, `report` (from a dependency refusal's `details.report`), optional `cursor` (the previous page's `next_cursor`); one page of that unit's dependency report: `digest`, `total`, `items`, the page's failing `paths`, `paths_total`, `next_cursor`. A read. Refused `PROVENANCE_MISSING` for another unit's report and `DEPENDENCY_CURSOR` for a cursor of another digest or out of range. |
 | `unit/review-record` | `unit`, `evidence`; lead-only completed review contract described below. |
 | `unit/publish` | `unit`, `review`, complete `metadata`; lead-only journaled publication. `REVIEW_BINDING` names its `cause`: `missing` (no such record), `job` (a review job: its state and verdict; a recorded job names the review it recorded), `verdict` (only a completed answer opening `Verdict: Ship it` records a review: any other verdict leaves the job negative and records none), `kind`, `invalidated`, or `stale` (the binding keys that differ from the current seal's). |
 | `unit/reopen` | `unit`; reopen a sealed unit with no publication or only provably abandoned journals, invalidating its review. |
@@ -1896,14 +1901,47 @@ client connected.
 
 Sealing checks the root and all discoverable descendants, active turns, pending
 hooks/tools, native terminals, process custody and unverified operations. It
-refuses UNKNOWN paths and unresolved dependencies on other-unit revisions; a
-dependency refusal (`UNKNOWN_DEPENDENCY`, `UNPUBLISHED_DEPENDENCY`) names its paths
-(`details.paths`). A reference to a path outside the ledger is no dependency. A
-revision a restore wrote is the work of whoever wrote the bytes it restored: the
-source the restore recorded, followed through restores of restores, or where it
-recorded none, the receipt holding the same bytes. The path's baseline, or its
-absence where the baseline lacks it, is no unit's work; bytes no receipt holds
-remain the restoring unit's.
+refuses UNKNOWN paths and unresolved dependencies on other-unit revisions.
+
+Dependencies (2.4.36) are what the seal's frozen outputs came from: the walk
+starts at the receipt each scoped path's head holds and follows only these edges:
+
+- an exact update depends on its base at that path, and a move's destination on
+  its source's base;
+- a revision a restore wrote depends on the source the restore recorded, followed
+  through restores of restores. A restore to the baseline, or to absence where the
+  branch commit holds nothing, ends the path only when its `unknown/restored`
+  events, the base tree, or a baseline receipt with the same bytes and mode confirm
+  it. A restore that recorded no source is matched by its events first, then by a
+  receipt with the same bytes and mode; with neither it refuses
+  `PROVENANCE_MISSING`;
+- each producing operation the walk reaches brings the reads its writer had
+  recorded (`read_file`, `list_paths`) up to that operation's read cutoff, and each
+  read revision is walked the same way.
+
+So an operation whose outputs a restore or a later edit has replaced no longer
+counts: its base and its reads count only while one of its outputs is still in a
+frozen output's history. The walk ends at a published receipt and at another
+unit's revision that matches the selected base commit (below). Another unit's
+revision with neither stops it there: `UNPUBLISHED_DEPENDENCY`. A transfer grant
+authorizes that revision and the walk continues through it. UNKNOWN bytes refuse
+`UNKNOWN_DEPENDENCY` wherever the walk reaches them, including bytes a writer's own
+command wrote: there is no acknowledgement or waiver. Resolving an UNKNOWN does not
+rewrite what was derived from it before. As through 2.4.35, a base or a read at a
+path outside the ledger now (`ledger.unwatched`) is no dependency, and neither is a
+move's source that a patch took from outside the ledger (the operation's `outside`).
+
+A refusal (`UNKNOWN_DEPENDENCY`, `UNPUBLISHED_DEPENDENCY`, `PROVENANCE_MISSING`)
+carries the first page of its dependency report in `details`: `report`, `digest`,
+`total`, the page's `items` (the graph's nodes, edges and failures: each surviving
+output's base or read path to the bytes that refused it), the page's failing
+`paths`, `paths_total` and `next_cursor`. `coordinator_unit action="dependencies"
+report=<report> cursor=<next_cursor>` reads the next page. Singleton seals,
+project seals, publication preflight and handback use the same evaluator. It runs
+off the event loop on a read-only connection of its own; the transaction that
+writes the seal, the publication or the handback first checks that every record it
+read is unchanged (`REVISION_CHANGED`; a handback refuses `HANDBACK_CHANGED`) and
+that each frozen output, or handed-back path, still has the head it read.
 
 In 2.4.27, each checkout's immutable base commit is selected and validated before
 dependency checks. After UNKNOWN and provenance checks, an otherwise unpublished
@@ -3160,7 +3198,10 @@ operation could have changed, as its quarantine scoped it, so each unexplained b
 becomes an UNKNOWN as in any reconcile, and then resolves the operation with the
 lead's reason. Restores of its paths are then admitted. A handback transfers no
 provenance over unexplained bytes (`UNKNOWN_BLOCKS_HANDBACK`), so its unit hands back
-the claims on those paths once their UNKNOWNs are resolved, and the rest at once. Its
+the claims on those paths once their UNKNOWNs are resolved, and the rest at once.
+Since 2.4.36 a handback follows a restore to its source as a seal does: a path
+restored to a revision whose own history reaches UNKNOWN bytes (an exact patch over
+them) is refused too, and is handed back once restored to its baseline. Its
 paths stay in its unit's mutation scope, so a seal still needs each of them restored
 or edited. A checkout-wide UNKNOWN that a command's quarantine left is narrowed, as
 before; settlement resolves no UNKNOWN.
@@ -3431,7 +3472,7 @@ deadline again on the run as it is when the cancel begins: a resume renews it.
 | `coordinator_claims` | list, acquire for this Claude session, release request, lead-authorized handback |
 | `coordinator_send` | durable send to run/unit/actor/lead; explicit none/queue/start wake policy |
 | `coordinator_inbox` | cursor read; acknowledge only explicitly supplied IDs, or every unread message created before a time (`acknowledge_before`, an ISO 8601 time or seconds since the epoch, from a 2.4.34 coordinator); a call that acknowledges answers what it acknowledged and the unread count left, not the mailbox |
-| `coordinator_unit` | status, object diff, UNKNOWN, reconcile, restore, narrow, reopen, recover, abandon, settle-history, settle-operation |
+| `coordinator_unit` | status, object diff, UNKNOWN, reconcile, restore, narrow, reopen, recover, abandon, settle-history, settle-operation, dependencies |
 | `coordinator_seal` | freeze exact receipt-backed candidate and explicit validation evidence; its description names the four record fields and the two scopes |
 | `coordinator_publish` | exact review binding plus all seven explicit commit metadata fields |
 

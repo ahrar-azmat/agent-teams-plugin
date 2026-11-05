@@ -5126,12 +5126,16 @@ async def _require_daemon(version: tuple, action: str) -> None:
 async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "",
                            paths: list[str] | None = None, unknown: str = "", revision: str = "",
                            revisions: dict[str, str | None] | None = None, custody: str = "",
-                           gaps: list[str] | None = None, reason: str = "", operation: str = "") -> str:
+                           gaps: list[str] | None = None, reason: str = "", operation: str = "",
+                           report: str = "", cursor: str = "") -> str:
     """Inspect status/object diff/UNKNOWN, reconcile effects or custody, restore a
     known revision, narrow a checkout-wide UNKNOWN, reopen a seal, recover
     publication, or abandon an unapplied publication. Actions: status, diff,
     unknown, reconcile, restore, narrow, reopen, recover, abandon, settle-history,
-    settle-operation.
+    settle-operation, dependencies.
+    dependencies pages the dependency report a seal or publication refusal names
+    (its `report`): each surviving output's base or read path to the bytes that
+    refused it. cursor is the previous page's next_cursor.
     settle-history needs explicit gap IDs and a nonblank reason. It records the
     lead's decision about that exact history observation; publication still
     requires valid receipts, rights, provenance, review and repository proofs.
@@ -5161,7 +5165,7 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
                "unknown": "unknown/list", "reconcile": "custody/reconcile" if custody else "checkout/reconcile",
                "restore": "unknown/restore", "narrow": "unknown/narrow", "reopen": "unit/reopen",
                "recover": "unit/recover", "abandon": "unit/recover", "settle-history": "unit/settle-history",
-               "settle-operation": "unit/settle-operation"}
+               "settle-operation": "unit/settle-operation", "dependencies": "unit/dependencies"}
     if action not in methods:
         return await _coordinator_notice("[Unsupported unit action.]", session_id)
     params = {}
@@ -5179,6 +5183,8 @@ async def coordinator_unit(action: str = "status", unit: str = "", cwd: str = ""
         params.update(gaps=gaps, reason=reason)
     if action == "settle-operation":
         params.update(operation=operation, reason=reason)
+    if action == "dependencies":
+        params = {"report": report, **({"cursor": cursor} if cursor else {})}
     return await _lead_request(methods[action], params, cwd, session_id, own=action in ("restore", "narrow", "settle-history", "settle-operation"),
                                unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 

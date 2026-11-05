@@ -5,6 +5,8 @@ calling these methods. Historical events and UNKNOWN records are append-only.
 """
 from collections import Counter
 from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
 import hashlib
 import asyncio
 import concurrent.futures
@@ -70,6 +72,10 @@ WINDOW_ACTIVE = {
                  "(json_extract(data,'$.tool') IN ('Write','Edit','MultiEdit','NotebookEdit') AND json_extract(data,'$.state')='received'))",
 }
 
+PENDING_LEAD_HOOK = ("kind='lead_hook' AND (json_extract(data,'$.execution.phase') IN ('admitting','open','settling') OR "
+                     "(coalesce(json_extract(data,'$.execution'),0) IN (0,'','{}','[]') AND "
+                     "json_extract(data,'$.state') IN ('received','prepared','observed')))")
+
 # Eligibility is queried between cooperative retention batches. Index only the
 # blockers, with their scope in the index: historic tool output may be gigabytes
 # and must never be decoded to answer an existence question. SQLite maintains
@@ -115,6 +121,114 @@ def identities(*groups):
     return frozenset((entry["pid"], entry["birth"]) for group in groups for entry in group or ())
 
 
+def read_pass(function=None, *, summaries=None, readonly=None):
+    """Share record materialization across one decision, including its nested readers."""
+    def decorate(function):
+        if asyncio.iscoroutinefunction(function):
+            @wraps(function)
+            async def asynchronous(self, *args, **kwargs):
+                with self.store.read_pass(summaries, readonly):
+                    return await function(self, *args, **kwargs)
+            return asynchronous
+        @wraps(function)
+        def synchronous(self, *args, **kwargs):
+            with self.store.read_pass(summaries, readonly):
+                return function(self, *args, **kwargs)
+        return synchronous
+    return decorate(function) if function else decorate
+
+
+def immutable(*args, **kwargs):
+    raise TypeError("A decision's record snapshot is read-only")
+
+
+class RecordDict(dict):
+    """A decision's snapshot; nested containers become read-only when accessed."""
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = immutable
+
+    def __iter__(self):
+        return (key for key in dict.__iter__(self))
+
+    def __getitem__(self, key):
+        value = record_copy(dict.__getitem__(self, key), frozen=True)
+        dict.__setitem__(self, key, value)
+        return value
+
+    def get(self, key, default=None):
+        return self[key] if key in self else default
+
+    def items(self):
+        for key in self:
+            self[key]
+        return dict.items(self)
+
+    def values(self):
+        for key in self:
+            self[key]
+        return dict.values(self)
+
+    def copy(self):
+        return dict(self.items())
+
+    def __or__(self, other):
+        return self.copy() | other
+
+    def __ror__(self, other):
+        return other | self.copy()
+
+
+class RecordList(list):
+    __setitem__ = __delitem__ = append = clear = extend = insert = pop = remove = reverse = sort = __iadd__ = __imul__ = immutable
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return [self[i] for i in range(*key.indices(len(self)))]
+        value = record_copy(list.__getitem__(self, key), frozen=True)
+        list.__setitem__(self, key, value)
+        return value
+
+    def __iter__(self):
+        return (self[index] for index in range(len(self)))
+
+    def copy(self):
+        return list(self)
+
+    def __reversed__(self):
+        return (self[index] for index in range(len(self) - 1, -1, -1))
+
+    def __add__(self, other):
+        return list(self) + (list(other) if isinstance(other, RecordList) else other)
+
+    def __radd__(self, other):
+        return other + list(self)
+
+    def __mul__(self, count):
+        return list(self) * count
+
+    __rmul__ = __mul__
+
+
+def record_copy(value, frozen=False):
+    if frozen:
+        if isinstance(value, (RecordDict, RecordList)):
+            return value
+        if isinstance(value, dict):
+            return RecordDict(value)
+        if isinstance(value, (list, tuple)):
+            return RecordList(value)
+        return value
+    if isinstance(value, dict):
+        return {k if isinstance(k, str) else json.dumps(k): record_copy(v) for k, v in dict.items(value)}
+    if isinstance(value, (list, tuple)):
+        return [record_copy(v) for v in (list.__iter__(value) if isinstance(value, list) else value)]
+    return value
+
+
+RUN_SUMMARY = ("id,kind,parent,revision,json_remove(data,'$.phases','$.previous_phases','$.workflow') AS data,"
+               "(SELECT json_extract(value,'$.state') FROM json_each(records.data,'$.phases') "
+               "WHERE key=json_extract(records.data,'$.phase')) AS phase_state")
+
+
 def fsync_dir(path):
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -135,6 +249,8 @@ PATH_STAMPS_VERSION = 1
 class Store:
     def __init__(self, root):
         self.status_epoch = 0
+        self._reading = ContextVar("store_read_pass", default=None)
+        self._readers = []
         # Writes per record kind in this process: a projection read from records of some kinds is computed again only
         # once one of them was written (Dormancy.status). A write rolled back still counts: one more computation.
         self.puts = Counter()
@@ -325,6 +441,8 @@ class Store:
             # 10.3 M).
             self.db.execute("CREATE INDEX IF NOT EXISTS claim_custody_revision ON records(parent,kind,revision) "
                             "WHERE kind IN ('claim','custody')")
+            # Legacy pending hooks also block a drain; window_lead_hook covers only some tools and states.
+            self.db.execute("CREATE INDEX IF NOT EXISTS pending_lead_hook ON records(id) WHERE " + PENDING_LEAD_HOOK)
         # Exclusion epochs detect even a lead admission that starts and ends
         # during a scan. Heads detect byte transitions separately. The trigger
         # changes no epoch for ordinary native journal/progress saves.
@@ -447,6 +565,9 @@ class Store:
             with self.transaction():
                 self.db.execute("DROP TRIGGER IF EXISTS immutable_events_delete")
                 self.db.execute(archive_delete)
+        with self.transaction():
+            self.db.execute("CREATE INDEX IF NOT EXISTS dependency_revision_witness ON revisions(checkout,path,attribution,blob,mode)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS dependency_unknown_revision ON unknowns(revision)")
         generation = self.get("daemon", required=False)
         self.generation = (generation or {}).get("generation", 0) + 1
         self.put("meta", "daemon", {"generation": self.generation, "pid": os.getpid(),
@@ -581,6 +702,8 @@ class Store:
                                "AND data IS NOT ? RETURNING parent", (data, ident, kind, revision, data)).fetchall()
         if not rows:
             return False
+        for reader in self._readers:
+            reader["records"].pop(ident, None)
         if rows[0][0] in self.watched:
             self.watched[rows[0][0]] += 1
         self.puts[kind] += 1
@@ -588,6 +711,7 @@ class Store:
 
     @contextmanager
     def transaction(self):
+        snapshots = [(reader, dict(reader["records"])) for reader in self._readers]
         measured = bool(telemetry.CURRENT.get())
         if measured:
             with telemetry.span("sql_begin", False):
@@ -605,6 +729,11 @@ class Store:
             if self.reclamation_wake:
                 self.reclamation_wake()
         except BaseException as exc:
+            for reader in self._readers:
+                if not any(reader is prior for prior, _ in snapshots):
+                    reader["records"].clear()
+            for reader, records in snapshots:
+                reader["records"] = records
             if self._listener_written:
                 self._listener_processes = None  # what this transaction's listeners kept is read again
             # COMMIT can fail with the transaction still active (notably BUSY).
@@ -647,8 +776,14 @@ class Store:
         # ledger: 318 of 363 listener saves a minute and 96 of 103 run saves changed nothing).
         written = self.db.execute("""INSERT INTO records(id,kind,parent,data) VALUES(?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET data=excluded.data,revision=records.revision+1
-            WHERE records.data IS NOT excluded.data RETURNING parent""", (ident, kind, parent, encoded(data))).fetchall()
+            WHERE records.data IS NOT excluded.data RETURNING parent,kind,revision""", (ident, kind, parent, encoded(data))).fetchall()
         if written:
+            for reader in self._readers:
+                if ident in reader["records"]:
+                    record = dict(data, id=ident, _kind=written[0][1], _revision=written[0][2])
+                    if reader["summaries"] and record["_kind"] == "run":
+                        record = self._summary(record)
+                    reader["records"][ident] = record_copy(record_copy(record), frozen=True)
             if self.retention_wake and kind in {"listener", "native_applied", "native_obligation", "operation", "dynamic",
                                                "native_history", "actor", "writer_start", "archive"}:
                 self.retention_wake()
@@ -665,22 +800,89 @@ class Store:
                 self._listener_processes[ident] = identities(data.get("services"), data.get("helpers"))
         return dict(data, id=ident)
 
+    def _reader(self):
+        reader = self._reading.get()
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            owner = None
+        return reader if reader and reader["owner"] is owner else None
+
+    @contextmanager
+    def read_pass(self, summaries=None, readonly=None):
+        prior = self._reader()
+        if prior and (summaries is None or summaries == prior["summaries"]):
+            mode = prior["readonly"]
+            if readonly is not None:
+                prior["readonly"] = readonly
+            try:
+                yield
+            finally:
+                prior["readonly"] = mode
+            return
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            owner = None
+        reader = {"owner": owner, "records": {}, "summaries": bool(summaries), "readonly": bool(readonly)}
+        token = self._reading.set(reader)
+        self._readers.append(reader)
+        try:
+            yield
+        finally:
+            self._readers.remove(reader)
+            self._reading.reset(token)
+
+    @staticmethod
+    def _summary(record):
+        record["_phase_state"] = (record.get("phases") or {}).get(record.get("phase"), {}).get("state")
+        for field in ("phases", "previous_phases", "workflow"):
+            record.pop(field, None)
+        record["_summary"] = True
+        return record
+
+    def _record(self, row):
+        reader = self._reader()
+        cached = reader["records"].get(row["id"]) if reader else None
+        if cached is not None and cached["_revision"] == row["revision"]:
+            return cached if reader["readonly"] else record_copy(cached)
+        record = dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
+        if "phase_state" in row.keys() and row["kind"] == "run":
+            record.update(_summary=True, _phase_state=row["phase_state"])
+        if reader and row["kind"] in {"run", "unit", "listener", "actor", "participant", "writer_start", "writer_failure", "startup_recovery"}:
+            reader["records"][row["id"]] = record_copy(record, frozen=True)
+            return reader["records"][row["id"]] if reader["readonly"] else record_copy(record)
+        return record
+
     def get(self, ident, required=True):
+        reader = self._reader()
+        if reader and ident in reader["records"]:
+            record = reader["records"][ident]
+            if record is None and required:
+                raise CoordinatorError("NOT_FOUND", "Record does not exist", {"id": ident})
+            return record if reader["readonly"] else record_copy(record)
+        fields = ("id,kind,parent,revision,CASE WHEN kind='run' THEN json_remove(data,'$.phases','$.previous_phases','$.workflow') "
+                  "ELSE data END AS data,(SELECT json_extract(value,'$.state') FROM json_each(records.data,'$.phases') "
+                  "WHERE key=json_extract(records.data,'$.phase')) AS phase_state") if reader and reader["summaries"] else "*"
         if telemetry.CURRENT.get():
             with telemetry.span("database_fetch", False):
-                row = self.db.execute("SELECT * FROM records WHERE id=?", (ident,)).fetchone()
+                row = self.db.execute("SELECT " + fields + " FROM records WHERE id=?", (ident,)).fetchone()
         else:
-            row = self.db.execute("SELECT * FROM records WHERE id=?", (ident,)).fetchone()
+            row = self.db.execute("SELECT " + fields + " FROM records WHERE id=?", (ident,)).fetchone()
         if row is None:
+            if reader:
+                reader["records"][ident] = None
             if required:
                 raise CoordinatorError("NOT_FOUND", "Record does not exist", {"id": ident})
             return None
         if telemetry.CURRENT.get():
             with telemetry.span("json_materialization", False):
-                return dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
-        return dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
+                return self._record(row)
+        return self._record(row)
 
     def save(self, record):
+        if record.get("_summary"):
+            raise ValueError("A run summary cannot be saved")
         self.put(record["_kind"], record["id"], {k: v for k, v in record.items() if not k.startswith("_") and k != "id"})
 
     def all(self, kind, parent=None):
@@ -690,7 +892,7 @@ class Store:
             yield from self.selected("SELECT * FROM records INDEXED BY record_children WHERE parent=? AND kind=? ORDER BY id",
                                      (parent, kind))
 
-    def messages(self, field, values):
+    def messages(self, field, values, unread=False):
         """The messages whose `field` (unit, recipient) is one of `values`, chosen in SQL and decoded alone. Decoding
         every message to find a unit's took 0.54 s of the event loop (7,030 messages, 14.4 MB: live ledger, 11-05)."""
         if field not in ("unit", "recipient"):
@@ -698,15 +900,16 @@ class Store:
         values, found = sorted(set(values)), []
         for start in range(0, len(values), 500):  # within SQLite's host parameter limit, as lead_inbox reads
             chunk = values[start:start + 500]
-            found.extend(self.selected("SELECT * FROM records WHERE kind='message' AND json_extract(data,'$." + field + "') IN (" +
-                                       ",".join("?" * len(chunk)) + ")", chunk))
+            index = "message_unread" if unread and field == "unit" else "message_" + field
+            found.extend(self.selected("SELECT * FROM records INDEXED BY " + index + " WHERE kind='message' AND json_extract(data,'$." + field + "') IN (" +
+                                       ",".join("?" * len(chunk)) + ")" + (" AND json_extract(data,'$.state')!='acknowledged'" if unread else ""), chunk))
         return sorted(found, key=lambda message: message["id"])
 
     def selected(self, query, args=()):
         """Decode only records selected by an internal, parameterized query."""
         if not telemetry.CURRENT.get():
             for row in self.db.execute(query, args):
-                yield dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
+                yield self._record(row)
             return
         with telemetry.span("database_fetch", False):
             cursor = self.db.execute(query, args)
@@ -716,8 +919,29 @@ class Store:
             if row is None:
                 return
             with telemetry.span("json_materialization", False):
-                record = dict(json.loads(row["data"]), id=row["id"], _kind=row["kind"], _revision=row["revision"])
+                record = self._record(row)
             yield record  # no measurement context remains open across a yield
+
+    def active_actors(self, unit=None):
+        index = "quiet_actor" if unit is not None else "window_actor"
+        return self.selected("SELECT * FROM records INDEXED BY " + index + " WHERE " + WINDOW_ACTIVE["actor"] +
+                             (" AND parent=?" if unit is not None else "") + " ORDER BY id", (unit,) if unit is not None else ())
+
+    def pending_lead_hooks(self):
+        return self.selected("SELECT * FROM records INDEXED BY pending_lead_hook WHERE " + PENDING_LEAD_HOOK + " ORDER BY id")
+
+    def run_ids(self, units=None):
+        if units is None:
+            return [row[0] for row in self.db.execute("SELECT id FROM records WHERE kind='run' ORDER BY id")]
+        return sorted({row[0] for unit in units for row in self.db.execute(
+            "SELECT id FROM records INDEXED BY record_children WHERE parent=? AND kind='run' ORDER BY id", (unit,))})
+
+    def run_summaries(self, units=None):
+        if units is None:
+            yield from self.selected("SELECT " + RUN_SUMMARY + " FROM records WHERE kind='run' ORDER BY id")
+        else:
+            for ident in self.run_ids(units):
+                yield from self.selected("SELECT " + RUN_SUMMARY + " FROM records WHERE id=?", (ident,))
 
     def listener_processes(self):
         """The identities, {pid, birth}, of every listener's services and helpers. Kept per listener as each listener

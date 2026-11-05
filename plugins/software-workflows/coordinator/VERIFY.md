@@ -1,3 +1,267 @@
+# software-workflows 2.4.36 — a seal follows only what its frozen outputs came from, and the daemon's per-tick and per-request paths stop decoding whole tables — 2026-11-05
+
+Base is **d93f4ba957bff19945f52d4c471b0183baabd156** (2.4.35). Codex writers wrote Change 1 (`dependencies.py`,
+`publish.py`, `group_publish.py`, `transfers.py`) and Change 2 (`store.py`, `daemon.py`, `messages.py`, `dormancy.py`,
+`runs.py`, `participants.py`, `tools.py`, `custody.py`), each from the lead's charter; Change 2's writer also added
+Change 1's `unit/dependencies` dispatch and its indexes to `daemon.py` and `store.py`. The lead wrote `server.py`'s
+`coordinator_unit action="dependencies"`, the restore-event lookup below (in place of the writer's index over every
+event), the fixes of the review round below (`group_publish.py`, `dependencies.py`, `transfers.py`, `custody.py`), the
+version and the docs. Every run below used a disposable daemon or Store state, and every native case a fresh fixture
+repository. Reds ran on installed 2.4.35. Greens ran on the frozen export `L/comp2` (a `git archive` of d93f4ba with
+the release's code laid over it), then, after review turn 157's fixes, Change 1's again on `L/comp3`, and after turn
+158's on `L/comp4`, byte for byte the code committed (only the docs changed after it). comp4 differs from comp3 only in
+`transfers.py`'s handback walk: the runs that reach it ran again on comp4, the others stand on comp3. Change 2's
+measures and soaks stand on comp2: the fixes touch none of the paths they time.
+Every run had a clean environment (`env -i`, no gate variables, no Git shim). The live ledger was read only with
+sqlite `mode=ro`, or copied page by page from such a connection for the index timing, and the copy deleted.
+
+Evidence roots: **L** (the lead's) is
+`/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2436/lead`,
+**W1** and **W2** (the writers') are `.../scratchpad/r2436/w1` and `.../scratchpad/r2436/w2`.
+
+## Static gates (`L/lead_static.py`, `L/static2.log`, `L/static3.log` and `L/static4.log`, equal)
+
+| check | result |
+|---|---|
+| Python 3.15 compile, every file | 99 files, pass |
+| Python 3.9 hook closure, compile and import | 71 coordinator modules, no failure |
+| `hooks.py --check` under Python 3.9 | compatible, `jsonl-v1` |
+| hook-runtime modules under Python 3.9 with the codec modules blocked | 5 imported |
+| Python 3.15 import of every release module | 13 |
+| Ruff, installed 2.4.35 → release | 30 → 30 findings, none added |
+| strict validation, plugin and marketplace | pass |
+| version | 2.4.36 |
+
+## Change 1 — a seal follows only what its frozen outputs came from
+
+### Native fixture writers (`L/c0_case.py`)
+
+A disposable daemon from `--plugin` drives real native fixture writers (`r2432/writer/provider.py`); the only
+injection is the ProbeListener's skipped scratch `git init` (`L/inject/sitecustomize.py`). Scenario `c0` is the live
+sequence on `a.txt` (P) and `d.txt` (Q): the writer's own heredoc rewrites P (an UNKNOWN), one patch updates P on that
+UNKNOWN revision and adds Q, the lead restores P to its baseline, an exact patch writes P again, seal. Scenario `known`
+restores P to turn 1's own output instead, so that output stays in P's head history.
+
+| case (2.4.35 run; comp2 run, comp3 run) | installed 2.4.35 | 2.4.36 (comp2 and comp3 alike) |
+|---|---|---|
+| c0, seal (`red3-c0-480`; `green4-c0-488`, `green5-c0-533`) | `UNKNOWN_DEPENDENCY` on `a.txt` | sealed, 2 paths, 0.30 s and 0.32 s |
+| known, seal (`red3-known-482`; `green3-known-483`, `green5-known-534`) | `UNKNOWN_DEPENDENCY` on `a.txt` | `UNKNOWN_DEPENDENCY`: report of 27 items, the failure at the UNKNOWN revision, `paths` `["a.txt"]` |
+| known, the report read back (`green4-known-502`, `green5-known-534`) | — | `unit/dependencies` returned the refusal's first page exactly (report, digest, total, items, paths, `next_cursor`); a cursor of another digest `DEPENDENCY_CURSOR`; an unknown unit `NOT_FOUND` |
+| c0, handback instead of a seal (`hb-red-c0-503`; `hb-green-c0-504`, `hb5-green-c0-535`) | handed back, both paths | handed back, both paths |
+| known, handback instead of a seal (`hb-red-known-505`; `hb-green-known-506`, `hb5-green-known-536`) | handed back, both paths | `UNKNOWN_BLOCKS_HANDBACK` on `a.txt`, the failure `UNKNOWN_DEPENDENCY` at the heredoc's UNKNOWN revision |
+
+Each case's checks (11 to 14: the UNKNOWN on P, the patch's base, the restore's resolution, P's bytes after each step,
+no open UNKNOWN before the seal, Q's head) passed in every run. `green3-c0-481` was not counted: run beside `red3-c0-480`, its
+resume answered the retryable `WRITER_START_PENDING` after 20 s and the recorder did not retry (queue: resumes under
+load); the recorder now retries that code, as a lead does, and `green4-c0-488` ran alone.
+
+### Store scenarios (`W1/store_cases.py`, run by the lead from inside a fixture repository)
+
+The writer's 25 Store-API scenarios, each in a disposable Store: `W1/store-red-lead2.json` (installed 2.4.35) and
+`W1/store-green-lead2.json` (comp2), from inside repository 489, both equal to the writer's final runs; then
+`W1/store-red-lead3.json` (repository 520), `L/store-green-lead3.json` (comp3, repository 521) and
+`L/store-green-lead4.json` (comp4, repository 542), equal to them. comp3 and comp4 ran `L/store_cases3.py`, the
+writer's file with its handback walks taken through `transfers.segments()`. A first
+lead run from the scratch directory gave `GIT_FAILED` on every 2.4.35 case: the scenarios use the working directory as
+the checkout root, and 2.4.35's check asks Git which paths are ignored.
+
+| scenario | installed 2.4.35 | 2.4.36 |
+|---|---|---|
+| `c0` | UNKNOWN_DEPENDENCY | success |
+| `known` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `own_output` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `move` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `cross_move` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `transitive` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `inline` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `object` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `qualified_inline` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `qualified_object` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `duplicate` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `coverage` | DEPENDENCY_COVERAGE | DEPENDENCY_COVERAGE |
+| `corrupt_object` | DEPENDENCY_DIGEST | DEPENDENCY_DIGEST |
+| `legacy_event` | UNKNOWN_DEPENDENCY | UNKNOWN_DEPENDENCY |
+| `legacy_witness` | success | success |
+| `legacy_baseline` | success | success |
+| `legacy_alternative` | success | success |
+| `legacy_missing` | success | PROVENANCE_MISSING |
+| `legacy_cycle` | success | PROVENANCE_MISSING |
+| `legacy_absence` | success | PROVENANCE_MISSING |
+| `published` | success | success |
+| `published_unknown` | success | success |
+| `published_direct` | UNPUBLISHED_DEPENDENCY | UNPUBLISHED_DEPENDENCY |
+| `unpublished_unknown` | UNPUBLISHED_DEPENDENCY | UNPUBLISHED_DEPENDENCY |
+| `transferred_unknown` | success | UNKNOWN_DEPENDENCY |
+
+### Project seal with a retained prefix (`W1/group_case.py`)
+
+Two fixture repositories, one participant's prefix already published (through the Store API, no Git ref change). On
+2.4.35 (`W1/group-red-lead2.json`, repositories 484-485) the seal refused `UNKNOWN_DEPENDENCY` on `a.txt`. On 2.4.36
+(`W1/group-green-lead2.json`, 486-487, and on comp3 `W1/group-green-lead3.json`, 537-538) it sealed, its preflight
+passed, and preflight after adding a reachable UNKNOWN behind the prefix refused `UNKNOWN_DEPENDENCY` with a 19-item
+report; the branch proof was accepted.
+
+### The live ledger, read only (`L/live_census_lead.py`, `L/live_census_equivalence.py`)
+
+One read transaction over the live ledger, 233 open or sealed units, the export's evaluator on each unit's frozen
+outputs (its scope's heads, or its seal's rows): comp2 (`L/live-census-lead.json`) and comp3
+(`L/live-census-lead3.json`, snapshot at event 14,108,958).
+
+- C0 (`unit_9d465a06`) seals: 8 roots, 0.016 s and 0.014 s.
+- comp3's decisions: 158 seal, 66 `UNPUBLISHED_DEPENDENCY`, 8 `UNKNOWN_DEPENDENCY` and `UNPUBLISHED_DEPENDENCY`, 1
+  `UNKNOWN_DEPENDENCY`; no error. comp2's equal them but one: `unit_7e015145` (Sales_Profiler) loses its
+  `UNKNOWN_DEPENDENCY` on comp3 and stays refused `UNPUBLISHED_DEPENDENCY`. Its UNKNOWN bytes are under
+  `web/node_modules/next/dist/`, ignored and untracked: outside the ledger, so no dependency (review fix 2 below).
+  comp2's 233 decisions equal the Change 1 writer's final census (`W1/live-census-final.json`).
+- The slowest unit took 3.75 s on comp2 and 4.05 s on comp3 (614 roots; 0.195 s of it the outside-ledger lookup); all
+  233 took 17.5 s and 19.1 s. comp3's outside-ledger lookups: 44, 1.5 s in all. Restore-event lookups: 4,789, 0.83 s.
+- On comp2, the restore-event lookup through each path's UNKNOWNs (`unknown_checkout`, then `event_subject_kind`) and
+  the writer's lookup of every event by its `restore` (prefetched) gave the same digest and failures for all 233 units
+  in one snapshot. The fixes did not change the lookup.
+
+Against 2.4.35 (`L/full_comparison_lead.py`, `L/full-comparison-lead3.json`, snapshot at event 14,109,038, 257 s):
+installed 2.4.35's own decision, its code unchanged on a read-only adapter (its singleton `dependency_check`, then for
+a project unit its group read check, as its freeze ran them; the group check's reconcile, a write, skipped), against
+comp3's evaluator, for all 233 units:
+
+| 2.4.35 → 2.4.36 | units |
+|---|---:|
+| seal → seal | 113 |
+| refused → refused | 58 |
+| refused → seal | 45 |
+| seal → refused | 17 |
+
+`L/comparison_scope.py` (`L/comparison-scope3.json`) runs, read only, the scope check both versions run before any
+dependency on the 62 that differ (for a sealed unit, the one its publication runs against the seal); it refuses 60 of
+them already. Of the 45: 11 have an empty scope (`UNIT_EMPTY`), 12 handed their rights away
+(`PUBLICATION_RIGHTS_TRANSFERRED`), 19 have heads that are not their own receipts (`PROVENANCE_INCOMPLETE`), and 1 is
+sealed, its publication refused `PUBLICATION_RIGHTS_TRANSFERRED`. Of the 17: 3 have heads that are not their own
+receipts, and 14 are sealed project units whose publication 2.4.35 refuses `PUBLICATION_RIGHTS_TRANSFERRED` (6: a
+sealed path's right is now another unit's; 8: the rights differ from the seal's); 2.4.36 refuses each at a frozen
+output. The remaining two of the 45 seal on 2.4.36 only: C0, and `unit_9ba11ee8`, whose refused revision no frozen
+output descends from. No seal or publication that 2.4.35 would make is refused. The earlier comparison
+(`W1/full-old-comparison.json`) ran 2.4.35's singleton check over 55 units and judged 20 by a simpler predicate.
+
+### First-start cost (`L/clone_index.py`, `L/clone-index.json`)
+
+A page copy of the live ledger (4.57 GB: 512,973 records, 1,050,278 events, 72,126 revisions, 4,322 UNKNOWNs; 19.2 s
+to copy), with plain SQL:
+
+| index | build |
+|---|---:|
+| `pending_lead_hook` (Change 2) | 8.263 s |
+| `dependency_revision_witness` | 0.374 s |
+| `dependency_unknown_revision` | 0.009 s |
+| `dependency_restore_event` (the writer's, not shipped) | 6.481 s |
+
+The release keeps the first three; repeated, they cost 0.1 ms. Each selector named with `INDEXED BY` searched its
+index. The writer had measured 60 ms for the restore-event index on a synthetic ledger of a million small events.
+
+## Change 2 — the daemon's per-tick and per-request paths stop decoding whole tables
+
+### Decision paths (`W2/measure.py`, `L/c2-measure-*.log`)
+
+One synthetic ledger of the live shape generated by installed 2.4.35 (`W2/generate_state.py`: 264 runs, 28.0 MB;
+7,119 messages; 50,328 lead hooks; 212 writer mails in 51 units), measured by 2.4.35 and then by the export, 15
+samples each. Each path's output equals 2.4.35's (`W2/lead-green.json`: `equivalent: true`, no difference), and each
+decoded each run, unit and listener at most once (2.4.35: up to 12).
+
+| path | 2.4.35 | 2.4.36 | records decoded at most (2.4.35 → 2.4.36) |
+|---|---:|---:|---:|
+| full status | 394.56 ms | 126.09 ms | 10 → 1 |
+| pending work (the drain) | 331.96 ms | 23.33 ms | 9 → 1 |
+| maintenance tick | 140.94 ms | 63.68 ms | 12 → 1 |
+| delivery pass | 115.61 ms | 28.19 ms | 12 → 1 |
+| writer status | 112.65 ms | 17.14 ms | 2 → 1 |
+| lease release | 76.82 ms | 13.88 ms | 8 → 1 |
+| eligibility | 61.96 ms | 20.81 ms | 8 → 1 |
+| lead inbox | 37.61 ms | 29.48 ms | 4 → 1 |
+
+`W2/semantics.py`: 22 scenarios and 96 lead-hook cases, equal on both versions.
+
+### Soaks (`W2/soak.py`, 300 s, real supervisor and worker)
+
+The red ran installed 2.4.35 on a ledger the export had created and opened (`W2/generate_state.py --plugin` the
+export, fixture repositories 490-495): the rollback. The green ran the export on a ledger installed 2.4.35 had created
+(496-501): the switch's direction. Each started a native fixture writer, then for 300 s sent a message, read the full
+status and the lead inbox and asked a draining stop, in a loop, while the writer read its own status; the stall
+sampler ran throughout. Evidence: `L/c2-soak-red.log`, `L/c2-soak-green.log`, `W2/state-lead-soak-*-evidence`.
+
+| | 2.4.35 on 2.4.36's ledger | 2.4.36 on 2.4.35's ledger |
+|---|---:|---:|
+| seconds | 300.5 | 300.7 |
+| drains refused `NOT_QUIESCENT` (each beside a full status and an inbox read) | 255 | 505 |
+| the writer's own status receipts | 134 | 226 |
+| loop stall samples (0.75 s and over) | 16, longest 0.845 s | 0 |
+| `daemon/status` median / max | 1.419 / 2.719 s | 0.460 / 1.174 s |
+| `daemon/stop` median / max | 0.434 / 1.368 s | 0.060 / 0.272 s |
+| `message/inbox` median / max | 0.145 / 1.223 s | 0.109 / 0.353 s |
+| supervisor exit, state removed | 0, yes | 0, yes |
+
+## Review fix rounds — code_review turns 157 and 158
+
+The blind review of comp2's diff (Codex session `01a14eac`, turn 157) answered Needs changes with three MEDIUM findings,
+and CONFIRMED the hypothesis that the restore-event lookup through each path's UNKNOWNs finds the same events as an
+index over every event. The lead fixed each. Every probe ran in a clean environment on fresh fixture repositories
+(`L/make_repos.sh`, 520-538), on installed 2.4.35, on the pre-fix export comp2 and on comp3 (`L/gates3.sh`).
+
+1. **A group recovery skipped the pin of an unchanged participant once every repository journal was complete**
+   (`group_publish.py`). Recovery now pins each unchanged participant to its sealed base whether or not a changed
+   journal still needs the dependency evaluation, as 2.4.35's recovery did. `L/group_recovery_case.py`: the first
+   participant's journal is complete, the second participant is unchanged (pin-only), the group still publishing.
+
+   | case | installed 2.4.35 | comp2 | comp3 |
+   |---|---|---|---|
+   | the unchanged participant's branch advanced one commit (525-530) | `STALE_BASE` | the group completed, the unit `published` | `STALE_BASE` |
+   | control: no advance (531-532) | — | — | the group completed |
+
+2. **The evaluator lost 2.4.35's outside-ledger rule** (`dependencies.py`). A move's source that the patch took from
+   outside the ledger (the operation's `outside`) gets no base edge; a revision reached at a path outside the ledger now
+   (`ledger.unwatched`, asked a level at a time: one batch per checkout and level, of paths not asked before, each up to
+   two Git commands) stands as a satisfied leaf, marked `outside` in the report; an output's own path is never asked. `L/outside_cases.py`, from inside fresh
+   repositories 522-524 whose `.git/info/exclude` names `cache/` and `a.txt`:
+
+   | case | installed 2.4.35 | comp2 | comp3 |
+   |---|---|---|---|
+   | a patch moved `cache/x` (outside) to `b` | seal | `PROVENANCE_MISSING` | seal |
+   | the writer read another unit's unpublished `cache/y`, outside now | seal | `UNPUBLISHED_DEPENDENCY` | seal, the revision `outside` |
+   | a move's recorded source base is another unit's unpublished `cache/z`, outside now | seal | `UNPUBLISHED_DEPENDENCY` | seal, the revision `outside` |
+   | control: the same read at `kept/y`, inside the ledger | `UNPUBLISHED_DEPENDENCY` | `UNPUBLISHED_DEPENDENCY` | `UNPUBLISHED_DEPENDENCY` |
+   | control: an exclude rule matching the tracked `a.txt` | `UNPUBLISHED_DEPENDENCY` | `UNPUBLISHED_DEPENDENCY` | `UNPUBLISHED_DEPENDENCY` |
+
+   On the live ledger the rule changes one unit's failures and no decision (the census above).
+
+3. **A handback ran each restore's walk synchronously in its write transaction, on the event loop** (`transfers.py`,
+   `custody.py`). `transfers.segments()` now walks every handed-back path's head on one read snapshot in a worker,
+   keeping a path's refusal for that path's turn; the handback transaction first validates every record the walks read
+   (a change refuses `HANDBACK_CHANGED`), and `release()` refuses `HANDBACK_CHANGED` for a head that moved since its
+   walk. `L/store_cases3.py` on comp3: the writer's handback-scope checks pass through `segments()`; a walk whose head
+   moved before the transaction refuses `HANDBACK_CHANGED` with nothing written. The native handbacks above
+   (`hb5-green-c0-535`, `hb5-green-known-536`) ran through the daemon's handback.
+
+Turn 158 confirmed all three fixed and found two more, both fixed:
+
+4. **MEDIUM: the walks kept each refusal as an exception** (`transfers.py`), and its traceback kept that path's whole
+   graph alive until the handback answered. A refusal is now kept as plain data (code, message, details) and raised
+   anew in its path's turn. `L/walk_memory.py`: 40 restored paths whose walks each reach the same 1,001-revision read
+   and refuse `UNKNOWN_BLOCKS_HANDBACK`; after `segments()` returns and a full collection:
+
+   | | comp3 (`L/walkmem-comp3.json`) | comp4 (`L/walkmem-comp4.json`) |
+   |---|---:|---:|
+   | traced memory still allocated | 102.0 MB | 1.6 MB |
+   | Evaluators alive | 40 | 0 |
+   | exceptions held | 40 | 0 |
+   | refusals, each `UNKNOWN_BLOCKS_HANDBACK` | 40 | 40 |
+
+   On comp4 the native handbacks passed again (`hb6-green-c0-547`, `hb6-green-known-546`), the known case's refusal
+   carrying the same failure, path and revision. A first `hb6-green-c0-545` was refused `EXCLUSIVE_WRITER` at its
+   writer's start, before any handback: the fixture daemon's mixed-version barrier saw a pre-1.17.2 codex-oracle
+   server process, pid 12681, gone when looked up; it is not counted.
+5. **LOW: this file said one Git call per checkout and level**; `ledger.unwatched` can run two. Corrected above.
+
+Turn 159 confirmed both fixed and the turn-157 fixes intact, with no new finding: Ship it. `git diff --check` on the
+checkout exited 0.
+
 # software-workflows 2.4.35 — a coordinator start keeps answering, and a lead's file calls queue instead of failing — 2026-11-05
 
 Base is **d9db6c68f38e195782d1c392695b28c692b34a88** (2.4.34). The lead wrote Change 1 (`daemon.py`, `store.py`,

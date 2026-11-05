@@ -81,6 +81,14 @@ def at_checkout(store, checkout):
                           "WHERE p.kind='participant' AND json_extract(p.data,'$.checkout')=? ORDER BY u.id", (checkout,))
 
 
+def unit_ids(store, checkout):
+    """Participant membership, including a legacy unit's primary checkout."""
+    return sorted({row[0] for row in store.db.execute(
+        "SELECT parent FROM records INDEXED BY participant_checkout WHERE kind='participant' AND "
+        "json_extract(data,'$.checkout')=? UNION SELECT id FROM records INDEXED BY record_children "
+        "WHERE parent=? AND kind='unit'", (checkout, checkout))})
+
+
 def roots(store, unit):
     unit = store.get(unit) if isinstance(unit, str) else unit
     if unit.get("project_revision"):
@@ -122,7 +130,8 @@ def surface(daemon, unit, publication_only=False):
     # Pollers must observe changes in member progress even when run metadata is idle.
     revision = sum(r.get("_revision", 0) for r in [unit, *membership, *groups, *journals])
     # Every command leaves a custody record: sum their revisions without decoding them.
-    revision += store.db.execute("SELECT coalesce(sum(revision),0) FROM records WHERE parent=? AND kind IN ('claim','custody')",
+    revision += store.db.execute("SELECT coalesce(sum(revision),0) FROM records INDEXED BY claim_custody_revision "
+                                 "WHERE parent=? AND kind IN ('claim','custody')",
                                  (unit["id"],)).fetchone()[0]
     for member in membership:
         revision += store.db.execute("SELECT count(*) + coalesce(sum(s.restore IS NOT NULL),0) + "

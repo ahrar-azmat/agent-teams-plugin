@@ -5,7 +5,7 @@ import time
 
 from .client import CoordinatorError
 from .native import page
-from .store import WRITER_MAIL, uid
+from .store import WRITER_MAIL, uid, read_pass
 from .locks import KeyedLocks
 
 
@@ -129,6 +129,7 @@ class Messages:
             return session.get("mailbox") or mailbox(self.store, session["session_id"], session["unit"])
         return self.store.get(actor["unit"]).get("lead_mailbox")
 
+    @read_pass(readonly=True)
     def cancel_pending(self, message):
         """Settle unsent legacy mail and cancel races without fabricating a receipt.
 
@@ -149,6 +150,7 @@ class Messages:
             self.store.event("message/cancelled", message["id"], {"reason": "recipient run cancelled", "run": run["id"]})
         return True
 
+    @read_pass(readonly=True)
     def eligibility(self, message):
         """One decision for dispatch, drain and status; it never starts work."""
         if message["state"] in ("entered_context", "acknowledged") or self.daemon.lead_mail(message):
@@ -679,13 +681,14 @@ class Messages:
         if not unit:
             # No unit: the folder a lead sent it from, if any; otherwise no project holds it, and any lead reads it.
             return message.get("checkout") is None or message["checkout"] in reach
-        checkouts = cached(("unit", unit), lambda: set(checkout_ids(self.store, unit)) if record(unit) else set())
+        checkouts = cached(("unit", unit), lambda: set(checkout_ids(self.store, record(unit))) if record(unit) else set())
         return bool(checkouts & reach)
 
     def child_ack(self, actor, item):
         for ident in re.findall(r"(?m)^C1_ACK (msg_[0-9a-f]{32})\s*$", item.get("text", "")):
             self.ack(actor["id"], ident)
 
+    @read_pass(readonly=True)
     def inbox(self, recipient="lead", cursor="", limit=100, session_id="", cwd=""):
         """A lead's inbox (`lead` or its mailbox of an explicit unit) is the mail it may read (readable), one page in id
         order, with its unread count. Any other recipient's (a writer's own `inbox` tool) is the mail to it."""
@@ -708,6 +711,7 @@ class Messages:
         return {"data": records[:limit], "next_cursor": records[limit - 1]["id"] if len(records) > limit else None,
                 "unread": unread}
 
+    @read_pass(readonly=True)
     def lead_inbox(self, cursor, limit, session_id="", cwd="", box=None):
         """Read through the recipient index only: the session's mailboxes (or `box`), `lead`, and the lead actors.
         Each candidate's fields are read in SQL; only the page's records are decoded."""
@@ -745,6 +749,7 @@ class Messages:
             await asyncio.sleep(0)
         return {"acknowledged": acknowledged, "before": before, "unread": unread}
 
+    @read_pass(readonly=True)
     def lead_selection(self, session_id="", cwd="", box=None):
         """The mail a lead may read (readable), each message as its fields read in SQL, in id order."""
         from .lead import scope
@@ -763,8 +768,8 @@ class Messages:
         for start in range(0, len(recipients), 500):
             chunk = recipients[start:start + 500]
             rows = self.store.db.execute(
-                "SELECT id, " + ", ".join("json_extract(data,'$." + f + "')" for f in fields) + " FROM records WHERE "
-                "kind='message' AND json_extract(data,'$.recipient') IN (" + ",".join("?" for _ in chunk) + ")", chunk)
+                "SELECT id, " + ", ".join("json_extract(data,'$." + f + "')" for f in fields) + " FROM records INDEXED BY message_recipient WHERE "
+                "kind='message' AND json_extract(data,'$.recipient') IN (" + ",".join("?" for _ in chunk) + ")", chunk).fetchall()
             for row in rows:
                 message = dict(zip(fields, row[1:]), id=row[0])
                 if self.readable(message, session_id, cwd, box, reach, cache):
@@ -806,6 +811,7 @@ class Messages:
         self.daemon.background(self.deliver(ident))
         return message
 
+    @read_pass
     async def retry(self):
         # Every second: decode only messages still to be delivered, not every message ever sent, and read only those
         # (their index: through 2.4.20 each pass tested every message, 19-21 ms for 5,000 on 10-29). A lead's mail (to
