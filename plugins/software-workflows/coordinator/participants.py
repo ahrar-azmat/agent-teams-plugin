@@ -107,8 +107,11 @@ def surface(daemon, unit, publication_only=False):
         journal = store.get(group["journals"].get(member["checkout"]), required=False) if group else next(
             (p for p in journals if p.get("checkout", unit["checkout"]) == member["checkout"]), None)
         data.append(dict(root=member["root"], checkout=member["checkout"], branch=member["branch"], base=member["base"],
+                         # A held claim by its path: its unit, checkout and root are the participant's own. The whole
+                         # record was ~400 B a claim, printed twice in a run's summary (Sales_Profiler, 11-05: 67.8 KB
+                         # for two runs); claim/list keeps the records.
                          **({} if publication_only else dict(
-                             claims=daemon.custody.claims(member["checkout"], unit["id"]),
+                             claims=[{"path": c["path"]} for c in daemon.custody.claims(member["checkout"], unit["id"])],
                              unknown_count=store.unresolved_count(member["checkout"]))), phase=journal["phase"] if journal else "",
                          **({"commit": journal["commit"]} if journal and journal.get("commit") else {})))
     state = group["publication_state"] if group else unit.get("publication_state", "")

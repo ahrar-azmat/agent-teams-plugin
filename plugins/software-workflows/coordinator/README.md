@@ -120,8 +120,8 @@ counts released claims; `rights_count` counts returned publication grants, and
 the normal handback transfer.
 
 Resume of a terminal native run with explicit `production_started:false`
-returns `RUN_NOT_STARTED`, `retryable:false`, its actual acquisition-return count
-and guidance to dispatch a new run. Its seal returns `UNIT_EMPTY`,
+returns `RUN_NOT_STARTED`, `retryable:false`, `sent:false` (2.4.34), its actual
+acquisition-return count and guidance to dispatch a new run. Its seal returns `UNIT_EMPTY`,
 `retryable:false`, before creating a seal attempt or requesting native history,
 while its unit has nothing to publish in any participant checkout: no receipt,
 no live right it owns and no pending right its held claims cover. `lead/attach`
@@ -1296,13 +1296,14 @@ Bash window that belonged to the retired generation.
 | `run/start` | `checkout`, optional `mode`, `task`, `paths`, `model`, `fixture`; returns separate run, attempt, unit and actor IDs plus native policy echoes. `fixture` is only for an owned disposable provider manifest. |
 | `run/status` | `run`, or optional `checkout`; persisted run or detailed checkout status. A run whose writer runs a turn after the run's own work ended (a message's turn) reads `running`, and `turns` lists each running writer turn (`actor`, `kind`, `thread`, `turn`, and for a root turn the `phase` or `message` that started it); the stored state is unchanged. `run/list`, the run's events and the checkout status report the same state. |
 | `run/interrupt` | `run`; cancel the selected run's root/child turns and queued work, then verify process/terminal settlement, for a plain run as for a workflow. Its calls are refused (`RUN_CANCELLED`) until a resume. A lead-mode run has no writer turns (`RUN_LEAD_MODE`). Custody and claims remain until reconciled. |
-| `run/resume` | `run`, `text`; refuse a frozen unit before starting a dormant writer, share its persisted demand start, then reconcile as needed (including replacement of an unavailable or stale app-server), refuse unresolved recovery UNKNOWN, and explicitly submit the new turn. |
+| `run/resume` | `run`, `text`, optional `cancel_generation`; refuse a frozen unit before starting a dormant writer, share its persisted demand start, then reconcile as needed (including replacement of an unavailable or stale app-server), refuse unresolved recovery UNKNOWN, and explicitly submit the new turn. Since 2.4.34 a refusal raised before the continuation is submitted carries `sent: false` (nothing reached the writer); `WRITER_START_PENDING` and `WRITER_RECOVERING` also carry `cancel_generation`, the run's cancel generation when the resume began. `WRITER_START_PENDING` (the writer's start outlasted one wait: a completed run's writer is parked, so its resume is a cold start, measured 20-28 s on the fixture) also carries `waited_seconds`. The 2.4.34 server sends a resume refused `WRITER_START_PENDING` or `WRITER_RECOVERING` again while its call lasts, joining that start, with that `cancel_generation`: a cancel made between two attempts is newer than the call and stands (`RUN_CANCELLED`, before any writer start), and a generation the run has not reached is refused (`RUN_GENERATION`). The server declares this on each attempt (`resend: "cancel_generation"`). A resume that does not, as from a server before 2.4.34, which sends `WRITER_RECOVERING` again unchanged, is refused `RUN_RECOVERING` instead: such a server does not send that again, and its lead resumes again once recovery is done. The reply's writer profile names its mode and servers, not the evidence behind them (~10 KB). |
+| `run/result` | `run`, optional `cursor`, `limit`, `detail`; an Abraham run's signed result: its header, the phase's answer and `[UNIT ATTRIBUTION]`, paged by characters. Since 2.4.34 the attribution is built once the run ended (or with `detail`): the abraham tool reads the result every second while it waits, and reading a unit's operations cost 0.9 s for 3,089 of them (live ledger, 11-05). One JSON line per path the unit wrote, at its latest receipt (`receipts` counts them); its command custody as counts by state, with a line only for an operation not settled; the UNKNOWNs on the unit's own paths (and checkout-wide ones), the rest counted by checkout. `detail` lists every receipt, custody operation and UNKNOWN; the server's next-page hint keeps it, since a cursor counts characters of one representation. |
 | `run/terminals` | `run`; native terminal inventory. |
 | `run/terminate-terminal` | `run`, `process_id`; native termination, followed by custody reconciliation. This ID is not an OS PID. |
 | `lead/attach` | `unit`; create a lead actor in an existing unit, useful for recovery and C2 editor integration. |
 | `claim/acquire` | `actor`, `paths`; all-or-none acquisition using the shared claim/custody conflict model. A path outside the ledger is neither claimed nor checked against other claims; the result lists it under `outside`. |
 | `claim/release-request` | `actor`, `paths`; records a pending lead request and retains claims. |
-| `claim/handback` | `unit`, optional `paths`; explicit lead release after operations/custody reconcile. |
+| `claim/handback` | `unit`, optional `paths`; explicit lead release after operations/custody reconcile. Since 2.4.34 `UNVERIFIED_OPERATION` (here, and from seal or publish) names every operation of the unit not settled (`operations`, each with its state), and how a quarantined one is settled: through 2.4.33 it named the first, and a unit with four took four rounds. |
 | `command/declare` | `actor`, exact `command`, nonempty `reason`; grants one shared invocation to that actor. |
 | `custody/reconcile` | `custody`; lead-requested process/terminal reconciliation. An uninspectable survivor keeps quarantine. |
 | `lead-edit` | `actor`, `changes`; durably record complete intended images, install them, then verify bytes and modes. A path outside the ledger is installed but not recorded; the operation (each part, in a project) lists it under `outside`. |
@@ -1310,18 +1311,18 @@ Bash window that belonged to the retired generation.
 | `operation/complete` | `operation`; compare the actual result to the already recorded intent. An after-the-fact hash cannot establish authorship. |
 | `lead-command` | `actor`, explicit `argv` array; opaque command with custody, actual exit code and output digests. |
 | `unknown/list` | `checkout`, optional `paths`; unresolved UNKNOWNs, context and restoration links. |
-| `unknown/restore` | `actor`, `unknown`, `revision` (a known revision, or `baseline`); for a checkout-wide `*`, `revisions:{path: revision_id\|"baseline"\|null}` covering every path in the ledger. Null only where the branch commit and the index both lack the path; a path without a baseline is refused `RESTORE_BASELINE` with its `latest_known_revision`. Found at the baseline afterwards: `state: resolved, resolution: baseline`; otherwise `restored_requires_new_edit`. A path outside the ledger: `resolution: outside-ledger`, nothing written. A restore resolves only what it found before its edit, and holds its claims until that resolution commits. It then releases the claims its edit created (not one another call has acquired since) and is no unit's work: an edit or read that follows depends on whose bytes it restored. |
+| `unknown/restore` | `actor`, `unknown`, `revision` (a known revision, or `baseline`); for a checkout-wide `*`, `revisions:{path: revision_id\|"baseline"\|null}` covering every path in the ledger. Null only where the branch commit and the index both lack the path; a path without a baseline is refused `RESTORE_BASELINE` with its `latest_known_revision`. Found at the baseline afterwards: `state: resolved, resolution: baseline`; otherwise `restored_requires_new_edit`. A path outside the ledger: `resolution: outside-ledger`, nothing written. A restore resolves only what it found before its edit, and holds its claims until that resolution commits. It then releases the claims its edit created (not one another call has acquired since) and is no unit's work: an edit or read that follows depends on whose bytes it restored. Since 2.4.34 `RESTORE_SCOPE` here and in `unknown/narrow` says which argument to change: an id naming no UNKNOWN, or one in a checkout the acting unit (the session's own there, or the explicit `unit`) does not span, with `holders`, the units claiming its path (`pass unit=<holder>`). A restore writes as the unit it acts for, so another unit's claim on the path is `CLAIM_CONFLICT` with `restore_with_unit`. |
 | `unknown/narrow` | `actor`, `unknown` (a checkout-wide `*`); read the whole checkout again, record each path whose bytes differ from its ledger head, and each path it cannot read (a symlink, a special file, bytes changing while read), as its own UNKNOWN, leave out a path outside the ledger (its UNKNOWNs resolved `outside-ledger`), and resolve every checkout-wide UNKNOWN recorded before the read. Writes nothing; refused (`RESTORE_CUSTODY`) while custody is active in the checkout, `RESTORE_EXECUTING` while a patch may still be writing, `NARROW_SCOPE` for a path's UNKNOWN. |
 | `unit/settle-operation` | `unit`, `actor` (a lead attached to that unit), `operation`, nonblank `reason`; settle a quarantined operation of that unit that native can no longer write for. Read again what it could have changed, as its quarantine scoped it (its paths and its paths outside the ledger; every checkout of its unit, whole, for a command, MCP call or lead command), record each path whose bytes differ from its ledger head as its own UNKNOWN, and resolve the operation with its parent and parts: each carries the settlement (actor, reason, time, what was read) and `operation/settled` is emitted. Writes nothing, takes no claim or custody, and explains no bytes: open UNKNOWNs stay open and its paths stay in its unit's mutation scope. Refused `LEAD_ONLY`, `SETTLE_REASON`, `SETTLE_SCOPE` (no such operation, or another unit's), `SETTLE_STATE` (not quarantined), `SETTLE_EXECUTING` (native may still write for it, or its call's turn is still running; retryable), `SETTLE_CUSTODY` (a command holds custody in a checkout it reads; retryable), `RESTORE_EXECUTING` (a pending operation or lead call over what it reads). |
 | `message/send` | `recipient`, `text`, required `wake:"none\|queue\|start"`, optional lead `sender`; durable message record. |
 | `message/inbox` | Optional `recipient` (default `lead`, or a lead mailbox), `cursor`, `limit`, `session_id`, `cwd`. A lead's inbox is the mail its session or folder may read (lead session surfaces), one page in id order, with that mail's unread count independent of pagination. A lead read with neither session nor folder answers an empty inbox with a restart `notice`. Any other recipient's inbox (a writer's own `inbox` tool) is the mail to it. Reading does not acknowledge or claim context entry. |
-| `message/ack` | `message`; optional lead `actor` (`lead`, a lead mailbox or a lead actor), `session_id`, `cwd`. A lead acknowledges the mail it may read, as its inbox reads it: as its session, as its mailbox of an explicit unit, as a lead actor (its own mail wherever it went), or as `lead` by its folder. Anything else is `ACK_ACTOR`; `lead` with neither session nor folder is `INBOX_SCOPE`. The evidence records who acknowledged (`by`). A second acknowledgement answers `duplicate:true`. A writer acknowledges only through its own native-bound `ack` tool, after its context echo (`NATIVE_BOUND` here). |
+| `message/ack` | `message`; optional lead `actor` (`lead`, a lead mailbox or a lead actor), `session_id`, `cwd`. A lead acknowledges the mail it may read, as its inbox reads it: as its session, as its mailbox of an explicit unit, as a lead actor (its own mail wherever it went), or as `lead` by its folder. Anything else is `ACK_ACTOR`; `lead` with neither session nor folder is `INBOX_SCOPE`. The evidence records who acknowledged (`by`). A second acknowledgement answers `duplicate:true`. A writer acknowledges only through its own native-bound `ack` tool, after its context echo (`NATIVE_BOUND` here). Since 2.4.34, `before` (seconds since the epoch) in place of `message`, as `lead` or a lead mailbox: every unread message of that inbox created before it, each recorded as one acknowledgement is (with `before` in its evidence), one transaction each with the event loop turning between them; it answers `acknowledged` (the count), `before` and the `unread` left. A value that is no time is `ACK_BEFORE`. |
 | `message/wake` | `message`, `wake:"queue\|start"`; explicitly wake a pending idle recipient; an `unproven` delivery is refused `MESSAGE_WAKE`, naming `message/retry`. |
 | `message/retry` | `message`; reconcile native history/queue before an explicitly requested retry of an uncertain or `unproven` delivery, which may deliver it twice. |
-| `unit/seal` | `unit`, optional `validation` array; freezes a candidate from verified receipt blobs. |
+| `unit/seal` | `unit`, optional `validation` array; freezes a candidate from verified receipt blobs. Each validation record names `command`, `exit_code`, `inputs` and `scope` (`mixed-checkout` or `candidate-objects`), checked before any seal attempt, so a refusal leaves the unit and its seal as they were: `VALIDATION_EVIDENCE` names the record and the fields it lacks, `VALIDATION_SCOPE` the scope given and those accepted. Since 2.4.34 it answers the seal's identity, candidate, digests, `path_count` and number of validation records; the rows, entries and proofs stay in the ledger, where review and publication read them (echoed, ~700 B a path). |
 | `unit/diff` | `unit`; object diff and exact review binding. |
 | `unit/review-record` | `unit`, `evidence`; lead-only completed review contract described below. |
-| `unit/publish` | `unit`, `review`, complete `metadata`; lead-only journaled publication. |
+| `unit/publish` | `unit`, `review`, complete `metadata`; lead-only journaled publication. `REVIEW_BINDING` names its `cause`: `missing` (no such record), `job` (a review job: its state and verdict; a recorded job names the review it recorded), `verdict` (only a completed answer opening `Verdict: Ship it` records a review: any other verdict leaves the job negative and records none), `kind`, `invalidated`, or `stale` (the binding keys that differ from the current seal's). |
 | `unit/reopen` | `unit`; reopen a sealed unit with no publication or only provably abandoned journals, invalidating its review. |
 | `admission/check` | `scratch`, optional `probes`; real native capability observations, never external model inference. |
 | `records/list` | `kind`, optional `cursor`, `limit`; paginated diagnostic records, not a way to adopt changes. |
@@ -2072,7 +2073,14 @@ while its run remains unfinished.
 persisted demand attempts, durable failure counters and this generation's cold-start
 p50/max seconds. Run logs include the listener state, dormant time, reason, gap IDs
 and applied profile; run listings the same without the profile (2.4.15: the profiles
-were 130 of the 420 KiB of one `run/list` answer). Every transition is an event.
+were 130 of the 420 KiB of one `run/list` answer), and a run's summary (a resume's
+reply, `unit/status`) with its mode and servers only (2.4.34). Since 2.4.34 a listed or
+summarised claim is `{path}`: its unit, checkout and root are the participant's, and
+the whole record (~400 B, printed twice) made two runs 67.8 KB of `codex_runs`;
+`claim/list` keeps the records. A unit's messages are chosen in SQL (`store.messages`)
+for `unit/status`, a dormant writer's quiet check and a cancel: decoding every message
+took 0.54 s (7,030 messages, 14.4 MB, live ledger 11-05), and the server reads
+`unit/status` before each lead call that names a unit. Every transition is an event.
 Status reads the small writer-start records; it does not count failures by scanning
 events. It counts families through each actor's current listener, and again only
 after a listener, actor, writer start or history gap was written (2.4.15: through
@@ -3410,9 +3418,9 @@ deadline again on the run as it is when the cancel begins: a resume renews it.
 |---|---|
 | `coordinator_claims` | list, acquire for this Claude session, release request, lead-authorized handback |
 | `coordinator_send` | durable send to run/unit/actor/lead; explicit none/queue/start wake policy |
-| `coordinator_inbox` | cursor read; acknowledge only explicitly supplied IDs |
+| `coordinator_inbox` | cursor read; acknowledge only explicitly supplied IDs, or every unread message created before a time (`acknowledge_before`, an ISO 8601 time or seconds since the epoch, from a 2.4.34 coordinator); a call that acknowledges answers what it acknowledged and the unread count left, not the mailbox |
 | `coordinator_unit` | status, object diff, UNKNOWN, reconcile, restore, narrow, reopen, recover, abandon, settle-history, settle-operation |
-| `coordinator_seal` | freeze exact receipt-backed candidate and explicit validation evidence |
+| `coordinator_seal` | freeze exact receipt-backed candidate and explicit validation evidence; its description names the four record fields and the two scopes |
 | `coordinator_publish` | exact review binding plus all seven explicit commit metadata fields |
 
 An optional `session_id` must be the real Claude host session identity. The new
@@ -3422,8 +3430,11 @@ the entire original input preserved. Example qualified tool name:
 plugin/server-qualified names ending in the twelve coordinator-aware tool names;
 it sets no permission decision and reads no transcript. The mapping from checkout
 filesystem identity and host session to lead actor/unit is durable. Every
-coordinator-aware server result includes one unread-lead notice when needed;
-reading status or inbox never acknowledges messages.
+coordinator-aware server result includes one unread-lead notice when needed,
+naming how many messages are unread across the session's mailboxes (2.4.34: a bare
+notice beside a unit's inbox reading `"unread": 0` read as false). An inbox read
+without `unit` carries that count itself, and no notice. Reading status or inbox
+never acknowledges messages.
 
 Writer processes use a registration/configuration overlay that hides these six
 tools, bound `code_review`, Abraham and run controls from inherited instances of

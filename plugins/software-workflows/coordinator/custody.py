@@ -1238,11 +1238,11 @@ class Custody:
             for key in checkout_ids(self.store, unit["id"]):
                 if paths is None or key in paths:
                     refuse(self.store, key, None if paths is None else paths[key], code="UNVERIFIED_OPERATION")
-            # Admission could have begun while this release waited for the condition.
-            for operation in self.store.all("operation", unit["id"]):
-                if operation["state"] not in ("verified", "reconciled", "denied", "resolved"):
-                    raise CoordinatorError("UNVERIFIED_OPERATION", "Cannot release an unreconciled operation's claim",
-                                           {"operation": operation["id"]})
+            # Admission could have begun while this release waited for the condition. Every one not settled is named.
+            from .publish import SETTLED, unsettled
+            blocking = [operation for operation in self.store.all("operation", unit["id"]) if operation["state"] not in SETTLED]
+            if blocking:
+                raise unsettled(blocking, "Cannot release an unreconciled operation's claim")
             carried = transfers.publications(self.store)
             with self.store.transaction():
                 granted = {key: set(values) for key, values in selected_rights.items() if values}

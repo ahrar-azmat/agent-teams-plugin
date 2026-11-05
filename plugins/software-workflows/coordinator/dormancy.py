@@ -129,7 +129,7 @@ class Dormancy:
         if history and any(a.get("active_turn") or a["id"] not in proof.get("actors", []) for a in actors):
             raise CoordinatorError("DORMANT_UNVERIFIED", "Dormant proof does not cover every bound actor")
         recipients = {a["id"] for a in actors}
-        if history and any(m.get("recipient") in recipients and self.daemon.delivery_owed(m) for m in self.store.all("message")):
+        if history and any(self.daemon.delivery_owed(m) for m in self.store.messages("recipient", recipients)):
             raise CoordinatorError("PENDING_DELIVERY", "Dormant writer still has mail or a notice to settle")
 
     def eligible(self, listener):
@@ -398,8 +398,10 @@ class Dormancy:
         try:
             await asyncio.wait_for(asyncio.shield(task), RECOVERY_WAIT_S)
         except TimeoutError as exc:
+            # waited_seconds: what the server's retry measures a further attempt by, as for WRITER_RECOVERING. A cold
+            # start outlasts one wait: every resume of a completed write run met this (Sales_Profiler, 11-05, 5 of 5).
             raise CoordinatorError("WRITER_START_PENDING", "Writer start is still owned; retry to join it",
-                                   {"retryable": True, "run": runid}, True) from exc
+                                   {"retryable": True, "run": runid, "waited_seconds": RECOVERY_WAIT_S}, True) from exc
 
     async def _start(self, runid, original, generation, resume_cancelled, explicit=False):
         async with self.daemon.parking.locks.hold(runid):

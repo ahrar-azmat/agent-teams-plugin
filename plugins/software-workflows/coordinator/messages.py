@@ -711,6 +711,42 @@ class Messages:
     def lead_inbox(self, cursor, limit, session_id="", cwd="", box=None):
         """Read through the recipient index only: the session's mailboxes (or `box`), `lead`, and the lead actors.
         Each candidate's fields are read in SQL; only the page's records are decoded."""
+        selected = self.lead_selection(session_id, cwd, box)
+        page = [m["id"] for m in selected if m["id"] > cursor][:limit + 1]
+        records = [self.store.get(ident) for ident in page]
+        return {"data": records[:limit], "next_cursor": records[limit - 1]["id"] if len(records) > limit else None,
+                "unread": sum(m["state"] != "acknowledged" for m in selected)}
+
+    async def ack_before(self, actorid, before, session_id="", cwd=""):
+        """A lead acknowledges, in one call, every unread message of its inbox (lead_inbox: the session's mailboxes, or
+        the one of an explicit unit) created before `before`, in seconds since the epoch, each recorded as ack records it.
+        A new lead met 325 unread messages of old sessions, which it could clear only one id at a time (Sales_Profiler,
+        11-05). Each is its own transaction, and the event loop turns between them."""
+        if type(before) not in (int, float) or not before > 0:
+            raise CoordinatorError("ACK_BEFORE", "before is a time in seconds since the epoch", {"before": before})
+        box = actorid if actorid.startswith("lead_mailbox_") else None
+        if actorid != "lead" and not box:
+            raise CoordinatorError("ACK_ACTOR", "Acknowledge mail before a time as the session's lead, or its mailbox of a unit")
+        if not box and not session_id and not cwd:
+            raise CoordinatorError("INBOX_SCOPE", INBOX_SCOPE)
+        if box and self.store.get(box)["_kind"] != "lead_mailbox":
+            raise CoordinatorError("MESSAGE_RECIPIENT", "No such lead mailbox", {"mailbox": box})
+        by = {"session_id": session_id} if session_id else {"actor": actorid, **({"cwd": cwd} if cwd else {})}
+        acknowledged, unread = 0, 0
+        for found in self.lead_selection(session_id, cwd, box):
+            if found["state"] == "acknowledged":
+                continue
+            message = self.store.get(found["id"])
+            if message["state"] == "acknowledged" or not (message.get("created") or 0) < before:
+                unread += message["state"] != "acknowledged"
+                continue
+            self.transition(message, "acknowledged", {"actor": message["recipient"], "by": by, "before": before})
+            acknowledged += 1
+            await asyncio.sleep(0)
+        return {"acknowledged": acknowledged, "before": before, "unread": unread}
+
+    def lead_selection(self, session_id="", cwd="", box=None):
+        """The mail a lead may read (readable), each message as its fields read in SQL, in id order."""
         from .lead import scope
         if box:
             boxes = [box]
@@ -734,10 +770,7 @@ class Messages:
                 if self.readable(message, session_id, cwd, box, reach, cache):
                     selected.append(message)
         selected.sort(key=lambda m: m["id"])
-        page = [m["id"] for m in selected if m["id"] > cursor][:limit + 1]
-        records = [self.store.get(ident) for ident in page]
-        return {"data": records[:limit], "next_cursor": records[limit - 1]["id"] if len(records) > limit else None,
-                "unread": sum(m["state"] != "acknowledged" for m in selected)}
+        return selected
 
     async def reconcile(self, message, actor):
         target = actor if actor["kind"] != "child" else self.store.get(self.store.get(actor["run"])["root_actor"])

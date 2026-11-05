@@ -20,8 +20,10 @@ def refuse_unstarted(run, seal=False):
                    "acquisitions_returned": run.get("acquisitions_returned", 0), "next_action": "Dispatch a new run"}
         if seal:
             raise CoordinatorError("UNIT_EMPTY", "This run ended before production and has nothing to seal", details)
+        # A resume refused here sent nothing (sent: false), also from the dispatch's early check (Runs.resume).
         raise CoordinatorError("RUN_NOT_STARTED", "No production continuation exists to resume; dispatch a new run. "
-                               "Returned publication acquisitions: " + str(details["acquisitions_returned"]), details)
+                               "Returned publication acquisitions: " + str(details["acquisitions_returned"]),
+                               dict(details, sent=False))
 
 
 def refuse_empty_seal(daemon, unit):
@@ -96,6 +98,11 @@ class Runs:
         else:
             from .dormancy import view
             listener = view(self.store.get(ident, required=False) or {})
+            # The writer's MCP servers, not the evidence behind them (plugin catalog, plugin servers, publish plugins):
+            # ~10 KB in every resume reply (Sales_Profiler, 11-05). run/events and full daemon/status keep it whole.
+            profile = listener.get("writer_profile")
+            if isinstance(profile, dict):
+                listener["writer_profile"] = {k: profile[k] for k in ("mode", "names", "enabled") if k in profile}
         own = next((p["unknown_count"] for p in surface["participants"] if p["checkout"] == run["checkout"]), None)
         return {"run": run["id"], "revision": run.get("_revision", 0) + surface["participant_revision"], "backend": "native", "unit": unit["id"], "unit_state": unit["state"],
                 "phase": run.get("phase"), "state": state, "listener": listener, "turns": turns, "created": run.get("created", 0),
@@ -235,8 +242,8 @@ class Runs:
             # Not while its app-server is being replaced (no connection): settle_cancel's reconcile, which waits for
             # the replacement, discovers them on the incarnation that is current then.
             await self.daemon.discover_descendants(self.store.get(root["listener"]))
-        for message in list(self.store.all("message")):
-            if (message.get("unit") != run["unit"] or message["state"] in ("entered_context", "acknowledged")
+        for message in self.store.messages("unit", [run["unit"]]):
+            if (message["state"] in ("entered_context", "acknowledged")
                     or self.daemon.lead_mail(message)):
                 continue  # a lead reads its mail through its inbox: it is no work of the run
             async with self.daemon.messages.locks.hold(message["id"]):
@@ -262,8 +269,8 @@ class Runs:
                             # Native started it first: its dispatch and a deletion hold one guard (ext/queue/src/service.rs).
                             # Its turn is interrupted below, and its own records settle the message.
                             continue
-                        for message in list(self.store.all("message")):
-                            if message.get("unit") == run["unit"] and entry["clientUserMessageId"] in (message["native_id"], message["native_id"] + ":relay"):
+                        for message in self.store.messages("unit", [run["unit"]]):
+                            if entry["clientUserMessageId"] in (message["native_id"], message["native_id"] + ":relay"):
                                 message["delivery"] = "cancelled"
                                 self.store.save(message)
                                 self.store.event("message/cancelled", message["id"], {"queue_id": entry["id"]})
@@ -936,7 +943,30 @@ class Runs:
         lease (the resume's submission takes the lease again)."""
         return run["state"] == "submission_uncertain" and Runs.resendable(run)
 
-    async def resume(self, run, text, deadline=None, images=None):
+    async def resume(self, run, text, deadline=None, images=None, generation=None):
+        """A refusal raised before the continuation is submitted says so (`sent`: false): nothing reached the writer.
+        Through 2.4.33 the server read every refusal as "not delivered or not confirmed; reconcile the saved input
+        identity before retrying", beside WRITER_START_PENDING's own "retry to join it" (Sales_Profiler, 11-05: each of
+        5 resumes of a completed write run). Such a refusal also names the cancel generation the resume began at
+        (`cancel_generation`): the server sends a resume refused WRITER_START_PENDING or WRITER_RECOVERING again with it
+        (`generation`), so a cancel made between two attempts of one call stands, as one made during an attempt does."""
+        progress = {"sent": False, "generation": generation}
+        try:
+            return await self._resume(run, text, deadline, images, progress)
+        except CoordinatorError as exc:
+            if progress["sent"] is False:
+                exc.details = dict(exc.details, sent=False, **({} if progress["generation"] is None else
+                                                               {"cancel_generation": progress["generation"]}))
+            raise
+
+    def refuse_cancelled(self, runid, generation):
+        """A cancel requested since this resume began (run/interrupt does not wait for the control lock; a carried
+        generation: since its call's first attempt) is the newer request and stands."""
+        if self.store.get(runid).get("cancel_generation", 0) != generation:
+            raise CoordinatorError("RUN_CANCELLED", "The run was cancelled while this resume waited; the cancel stands. "
+                                   "Resume again to continue it")
+
+    async def _resume(self, run, text, deadline, images, progress):
         refuse_unstarted(self.store.get(run["id"]))
         from .writer import image_paths, IMAGES_NUDGE
         images = image_paths(images)
@@ -948,9 +978,15 @@ class Runs:
             deadline = time.time() + 3600
         if type(deadline) not in (int, float) or not time.time() < deadline <= time.time() + 12600:
             raise CoordinatorError("RUN_DEADLINE", "A resumed turn requires a fresh deadline within the supported runtime budget")
-        generation = self.store.get(run["id"]).get("cancel_generation", 0)
+        current = self.store.get(run["id"]).get("cancel_generation", 0)
+        generation = current if progress["generation"] is None else progress["generation"]
+        if type(generation) is not int or not 0 <= generation <= current:
+            raise CoordinatorError("RUN_GENERATION", "cancel_generation names the cancel generation of this run that a "
+                                   "resume began at", {"cancel_generation": generation, "current": current})
+        progress["generation"] = generation
         async with self.daemon.writer.locks.hold(run["id"]):
             refuse_unstarted(self.store.get(run["id"]))
+            self.refuse_cancelled(run["id"], generation)  # before any writer start for it
             from .recovery import reconcile_listener
             if self.store.get(run["unit"])["state"] != "open":
                 raise CoordinatorError("UNIT_FROZEN", "Reopen a sealed unit before resuming; published units cannot resume")
@@ -982,12 +1018,9 @@ class Runs:
                 raise CoordinatorError("RECOVERY_UNKNOWN", "Resolve UNKNOWN before resuming")
             from .publish import Publisher
             await Publisher(self.daemon).quiescent(self.store.get(run["unit"]), history=False)
-            # Read after the awaits above. A cancel requested since this resume began (run/interrupt does not wait for
-            # this lock) is the newer request and stands. Nothing awaits between this read and the save.
+            # Read after the awaits above (refuse_cancelled). Nothing awaits between this read and the save.
             run = self.store.get(run["id"])
-            if run.get("cancel_generation", 0) != generation:
-                raise CoordinatorError("RUN_CANCELLED", "The run was cancelled while this resume waited; the cancel stands. "
-                                       "Resume again to continue it")
+            self.refuse_cancelled(run["id"], generation)
             if (run["state"] not in eligible and not self.resendable(run)) or any(a.get("active_turn") for a in self.store.all("actor", run["unit"])):
                 raise CoordinatorError("RUN_ACTIVE", "Collect this run; an active or uncertain turn cannot be resumed")
             old = run.get("phases", {}).get(run.get("phase"), {})
@@ -1025,5 +1058,6 @@ class Runs:
                     self.store.event("run/input_resent", run["id"], dict({"phase": run["phase"], "input_id": record["input_id"],
                                                                           "resent": record["resent"], "reason": resent},
                                                                          **({"proof": old["unproven"]} if old.get("unproven") else {})))
+            progress["sent"] = None  # from here the submission decides: delivered, refused or uncertain
             await self.daemon.writer.submit(run["id"])
             return dict(self.summary(self.store.get(run["id"])), missing_historical_images=missing)

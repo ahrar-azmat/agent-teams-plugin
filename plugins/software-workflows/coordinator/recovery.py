@@ -1866,6 +1866,27 @@ async def release_taken(daemon, unitid, checkoutid, paths, mark):
     return released
 
 
+def outside_scope(daemon, actor, row, unknown):
+    """RESTORE_SCOPE for an UNKNOWN this call cannot act on, saying which argument to change: an id that names no
+    UNKNOWN, or one in a checkout the acting unit (the session's own there, or `unit`) does not span, with the units that
+    hold a claim on its path, else those that span its checkout. Through 2.4.33 both read "UNKNOWN must belong to a
+    participant" (Sales_Profiler, 11-05: three calls to find that `unit` was the argument missing)."""
+    if not row:
+        return CoordinatorError("RESTORE_SCOPE", "No UNKNOWN " + json.dumps(unknown) + " exists: pass unknown=<id> as "
+                                "coordinator_unit action=unknown lists them", {"unknown": unknown})
+    from .ledger import key, overlaps
+    checkout = daemon.store.get(row["checkout"])
+    folded = None if row["path"] == "*" else key(checkout, row["path"])
+    holders = sorted({claim["unit"] for claim in daemon.custody.claims(checkout["id"])
+                      if folded is None or overlaps(claim["key"], folded)})
+    advice = ("pass unit=" + holders[0] + ", which holds a claim on " + row["path"] if holders else
+              "run it with cwd inside " + checkout["root"] + " so this session's unit there acts, or pass unit= a unit that spans it")
+    return CoordinatorError("RESTORE_SCOPE", "UNKNOWN " + row["id"] + " (" + row["path"] + ") is in " + checkout["root"] +
+                            ", which unit " + str(actor["unit"]) + ", the one this call acts for, does not span: " + advice,
+                            {"unknown": row["id"], "path": row["path"], "checkout": checkout["id"], "root": checkout["root"],
+                             "acting_unit": actor["unit"], "holders": holders})
+
+
 async def restore_unknown(daemon, params):
     """Write the UNKNOWN's path again: a known revision of it, "baseline" (what the branch commit and the index both hold
     there: an ordinary file's bytes and mode, or absence where both lack it), or null in `revisions` (absence, where both
@@ -1882,7 +1903,7 @@ async def restore_unknown(daemon, params):
         raise CoordinatorError("LEAD_ONLY", "Only a lead can restore a known revision")
     row = store.db.execute("SELECT * FROM unknowns WHERE id=?", (params["unknown"],)).fetchone()
     if not row or not participants.contains(store, actor["unit"], row["checkout"]):
-        raise CoordinatorError("RESTORE_SCOPE", "UNKNOWN must belong to a participant")
+        raise outside_scope(daemon, actor, row, params["unknown"])
     if row and row["path"] == "*":
         return await restore_checkout(daemon, dict(actor, checkout=row["checkout"]), row, params.get("revisions", {}))
     path, revision, revisions = row["path"], params.get("revision") or None, params.get("revisions") or {}
@@ -1949,8 +1970,17 @@ async def restore_unknown(daemon, params):
     replaced = [o["id"] for o in quarantined_operations(store) if not o.get("parts") and o["checkout"] == row["checkout"]
                 and o["state"] == "quarantined" and o["paths"] and set(o["paths"]) <= {path}]
     mark = uid("restore")  # carried by the claims its edit creates (release_taken)
-    result = await daemon.lead_edit({"actor": actor["id"], "changes": {str(Path(checkout["root"]) / path): change}},
-                                    restore=True, mark=mark)
+    try:
+        result = await daemon.lead_edit({"actor": actor["id"], "changes": {str(Path(checkout["root"]) / path): change}},
+                                        restore=True, mark=mark)
+    except CoordinatorError as exc:
+        # A restore writes as the unit it acts for: another unit's claim on the path refuses it, and that unit can.
+        holders = sorted({c["holder"] for c in exc.details.get("conflicts", []) if c.get("kind") == "claim" and c.get("holder")})
+        if exc.code != "CLAIM_CONFLICT" or not holders or actor["unit"] in holders:
+            raise
+        raise CoordinatorError(exc.code, path + " is claimed by unit " + ", ".join(holders) + ", and a restore writes as the "
+                               "unit it acts for: restore it with unit=" + holders[0],
+                               dict(exc.details, restore_with_unit=holders[0]), exc.operational) from exc
     try:
         # Its claim is held until the resolution commits: another unit's claim of the path is refused meanwhile.
         # Resolved only as found now, against what the branch commit and the index hold now: the path read again,
@@ -2100,7 +2130,7 @@ async def narrow_unknown(daemon, params):
         raise CoordinatorError("LEAD_ONLY", "Only a lead can narrow a checkout-wide UNKNOWN")
     row = store.db.execute("SELECT * FROM unknowns WHERE id=?", (params.get("unknown"),)).fetchone()
     if not row or not participants.contains(store, actor["unit"], row["checkout"]):
-        raise CoordinatorError("RESTORE_SCOPE", "UNKNOWN must belong to a participant")
+        raise outside_scope(daemon, actor, row, params.get("unknown"))
     if row["path"] != "*":
         raise CoordinatorError("NARROW_SCOPE", "Only a checkout-wide UNKNOWN is narrowed; restore a path's UNKNOWN to a known revision")
     checkout = store.get(row["checkout"])

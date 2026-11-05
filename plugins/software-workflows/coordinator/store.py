@@ -678,6 +678,18 @@ class Store:
             yield from self.selected("SELECT * FROM records INDEXED BY record_children WHERE parent=? AND kind=? ORDER BY id",
                                      (parent, kind))
 
+    def messages(self, field, values):
+        """The messages whose `field` (unit, recipient) is one of `values`, chosen in SQL and decoded alone. Decoding
+        every message to find a unit's took 0.54 s of the event loop (7,030 messages, 14.4 MB: live ledger, 11-05)."""
+        if field not in ("unit", "recipient"):
+            raise ValueError("messages are chosen by unit or recipient, not " + repr(field))
+        values, found = sorted(set(values)), []
+        for start in range(0, len(values), 500):  # within SQLite's host parameter limit, as lead_inbox reads
+            chunk = values[start:start + 500]
+            found.extend(self.selected("SELECT * FROM records WHERE kind='message' AND json_extract(data,'$." + field + "') IN (" +
+                                       ",".join("?" * len(chunk)) + ")", chunk))
+        return sorted(found, key=lambda message: message["id"])
+
     def selected(self, query, args=()):
         """Decode only records selected by an internal, parameterized query."""
         if not telemetry.CURRENT.get():

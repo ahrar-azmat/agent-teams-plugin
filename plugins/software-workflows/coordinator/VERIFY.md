@@ -1,4 +1,216 @@
-# software-workflows 2.4.33 — settling a quarantined operation, and the gate's zsh patterns and `=name` — 2026-11-04
+# software-workflows 2.4.34 — lead replies carry what a lead reads, and refusals name their cause — 2026-11-05
+
+Base is **824ed971b7f4f141cb581211a56f98f4c85f105d** (2.4.33). The lead wrote both changes, the review fixes and the
+docs, from the Sales_Profiler lead's field report on 2.4.33 (batch 1, 11-05: 14 issues found while running three or
+four Codex writers in one shared checkout). Every run below used a disposable daemon state and a fresh fixture
+repository. The reds ran on installed 2.4.33, and for the review fixes on the code each review refuted; the greens ran
+on a frozen composition (a `git archive` of 824ed97 with the release files laid over it, `L/compose.sh`). The live
+ledger was read only with sqlite `mode=ro`.
+
+Evidence root (**L**) is `/private/tmp/claude-501/-Users-ahrar-Documents-agent-teams-plugin/52d57338-02f1-4ef8-8b01-2d2f6d8b8c98/scratchpad/r2434/lead`.
+
+## The report
+
+| # | report | in 2.4.34 |
+|---|---|---|
+| 1 | `VALIDATION_EVIDENCE` names none of the fields a validation record needs | Change 2: the refusal names the record and the fields it lacks, and `coordinator_seal`'s description names all four |
+| 2 | `VALIDATION_SCOPE` says "Do not label mixed checkout validation isolated" for any other scope | Change 2: it names the scope given and the two accepted |
+| 3 | `REVIEW_BINDING` reads the same for a review whose verdict was Needs changes | Change 2: `cause` is missing, job, kind, invalidated, stale or verdict |
+| 4 | `WRITER_START_PENDING`'s "retry to join it" beside "reconcile ... before retrying" | Change 2: `sent: false`, and the server joins the start |
+| 5 | `codex_runs limit=2` answered 67.8 KB | Change 1: a claim is its path, and a writer profile its mode and servers |
+| 6 | abraham results carry hundreds of custody rows, cut at 50 KB | Change 1: one line per path, custody counted by state, built once the run ended |
+| 7 | the seal echoes every row (about 15 KB for 21 paths) | Change 1: identity, digests and path count |
+| 8 | an acknowledgement echoes the mailbox, and nothing acknowledges all before a time | Change 1: what it acknowledged and the unread count; `acknowledge_before` |
+| 9 | the unread notice beside a reply's own `"unread": 0` | Change 1: the count across the session's mailboxes, or no notice |
+| 10 | three batched lead Edits to one file all refused | 2.4.35 |
+| 11 | `allow_dirty` is all or nothing | 2.4.35 |
+| 12 | abraham refuses `infra=False`, so nothing keeps a writer off `.env` | not changed: writers keep full access (user ruling, 10-18), the user's decision |
+| 13 | the push gate stopped a commit in a repository outside the checkout, and its own check timed out | 2.4.35 |
+| 14 | a restore needs `unit=<holder>`, and a handback names one blocking operation | Change 2: `RESTORE_SCOPE` and `restore_with_unit`; `UNVERIFIED_OPERATION` names every one |
+
+## Live costs
+
+Read-only on the live ledger, 2026-11-05 04:23–04:30 IST, decoding the records as the daemon does:
+- `unit/status`'s waiting messages: decoding every message record (7,030, 14,390,414 B) took 0.539 s; choosing the
+  unit's in SQL took under a millisecond.
+- An abraham result's attribution: unit_bf74ea1e, 3,089 operations (32,202,858 B), 0.898 s to decode and render, and
+  0.222 s for the SQL count by state (2,476 reconciled); unit_c0516894, 2,952 operations (34,971,312 B), 0.908 s and
+  0.109 s. Three runs were running and 15 idle. The abraham tool reads the result once a second while it waits, so
+  through 2.4.33 each waiting writer of such a unit held the daemon's event loop for about 0.9 s of every second.
+- From the Sales_Profiler log: `codex_runs limit=2` answered 67.8 KB; a seal of 21 paths about 15 KB; one inbox read
+  223 KB (325 old messages); 5 of 5 resumes of a completed write run were refused `WRITER_START_PENDING`, and the
+  second call joined.
+
+## Recorder
+
+`L/reply_case.py` drives a disposable daemon from `--plugin` with real native fixture writers (Codex 0.163.0,
+`r2432/writer/provider.py`), and makes lead tool calls through that plugin's own server module (`L/server_call.py`), as
+a Claude session's MCP server makes them. Faults are injected at import (`L/inject/sitecustomize.py`):
+- a writer patch carrying `R2434_DROP_POST` has its PostToolUse hook dropped before the coordinator reads it, as a
+  listener restart loses it (live op_25e5bfc8), so native ends the call and the patch is quarantined;
+- the admission probe listener skips its scratch `git init`;
+- a writer admission of a task starting `R2434_REFUSE` fails `ADMISSION_FAILED` after its claims are taken, so the run
+  ends refused and never produced;
+- in the race scenario only (`R2434_RACE`), the first resume start that outlasts its wait is let finish. Then the run is
+  cancelled through `Runs.cancel` and the cancel waited out, and only then is `WRITER_START_PENDING` answered;
+- in the recovery scenario only (`R2434_RECOVERY_RACE`), the first `run/resume` of a run finds the run in startup
+  recovery: a scope held in the daemon's recovering set, so the real recovery wait waits its 20 s and refuses
+  `WRITER_RECOVERING`. Then the scope ends, the writer is brought up (startup recovery reconciles it), and the run is
+  cancelled and the cancel waited out, and only then is the refusal answered;
+- in both, from that first refusal on, the run's writer is not parked (`Parking.eligible` answers `r2434_hold`), so a
+  resend meets it up, as when its park is not yet due. Without the hold, one red (final3 below) had its writer parked
+  between the cancel and the resend, and that resend stopped at a cold start's `WRITER_START_PENDING`;
+- each `run/resume` RPC's run, `cancel_generation` and `resend` are recorded.
+
+Scenarios:
+- `replies`: an Abraham workflow run. Its analysis turn runs a command, and its implementation turn patches `a.txt`,
+  adds `b.txt` and runs three commands. Then: `run/result` while it runs and once it ended, `run/list`, a resume, a
+  resume of its parked writer through the server, seal refusals and a seal, a sealed resume through the server,
+  publication refusals, `unit/status`, and lead mail read and acknowledged through the server.
+- `scope`: restore and narrow refusals across two checkouts.
+- `blocking`: a unit whose two patches are quarantined, then its handback and seal.
+- `race`: a resume, through the server, of a run refused at admission; a detailed result's next page; and a resume of
+  a parked writer whose start outlasts its wait while a cancel completes before the server sends it again.
+- `recovery`: a resume that meets startup recovery while a cancel completes before the server sends it again, through
+  the server module of `--server-plugin` (installed 2.4.33 for a session that has not restarted since the switch).
+
+What the cases show (final runs below):
+- **replies, installed 2.4.33.** The result lists each custody operation. A listed claim is its whole record, printed in
+  the run and again in its participant. The resume reply carries the profile evidence (plugin catalog, plugin servers,
+  publish plugins and more). The validation refusals name neither the missing fields nor the accepted scopes, and the
+  seal reply echoes its rows, entries and proofs. A sealed resume's note says "reconcile ... before retrying". An absent
+  review is `NOT_FOUND`, and a seal id or a negative job reads "Missing, stale or mismatched completed review". The
+  unread notice sits beside the reply's own unread count, and there is no `acknowledge_before` (the server raises
+  `TypeError`, the daemon fails `KeyError`).
+- **replies, C.** A running result lists no attribution and says when it will. The ended result has one line per path
+  with its receipts, its custody as counts by state (4 reconciled) and no line for a settled operation; `detail` lists
+  every receipt and custody operation, through `codex_run_log` too. A listed claim is `{path}`, and the Codex Office
+  reads it. The resume reply's writer profile is its mode, names and enabled servers. `VALIDATION_EVIDENCE` names record 0
+  and `exit_code`, `inputs`, `scope`; `VALIDATION_SCOPE` names "isolated" and the two accepted; and neither starts a seal
+  attempt. The seal reply is its identity, candidate, digests and path count (2), and the ledger keeps both rows. The
+  sealed resume carries `sent: false`, and the server says "Not sent: the coordinator refused before the continuation
+  was submitted." `REVIEW_BINDING` names cause missing, kind (a seal) and verdict (`needs_changes`, with the
+  `Verdict: Ship it` rule). `unit/status` names the waiting message, chosen in SQL. An inbox read without a unit carries
+  no notice. `acknowledge_before` acknowledged 3 and left none unread, each recorded as an acknowledgement is, and a
+  time that is not one is refused `ACK_BEFORE`.
+- **scope.** 2.4.33 answers "UNKNOWN must belong to a participant" or the bare `CLAIM_CONFLICT`. C names the id that
+  names no UNKNOWN, the holder of an UNKNOWN outside the acting unit (`pass unit=<holder>`), and the unit to restore with
+  (`restore_with_unit`). Nothing is written, and the holder's restore resolves it.
+- **blocking.** 2.4.33's handback and seal name one of the unit's two quarantined operations. C's name both, with their
+  states and how to settle them.
+
+## Reply sizes
+
+Characters of a result's text, and bytes of the daemon's replies as the recorder serializes them (indented JSON), on the
+replies workflow (two paths written, four commands run; the fixture's writer profile lists one MCP server):
+
+| reply | 2.4.33 | 2.4.34 |
+|---|---|---|
+| `run/result` text of the ended workflow | 4,156 | 2,536 (with `detail`: 4,158) |
+| `run/list`, limit 10 | 5,301 | 2,130 |
+| a resume's reply | 6,253 | 2,429 |
+| the seal's reply | 2,090 | 670 |
+| `unit/status` | 9,304 | 3,771 |
+
+A completed run's writer is parked, so the resume of the replies scenario's parked writer through the server is a cold
+start. On installed 2.4.33 it was refused `WRITER_START_PENDING` after 20.0 s, and the same call again joined. On C it
+joined in one call after 26.5 s (26.8 s and 27.2 s in earlier final runs).
+
+## Review fix round — code_review turn 152
+
+Turn 152 (session 01a14eac, continued) answered Needs changes, with one HIGH and two MEDIUM. The lead fixed all three in
+`runs.py`, `daemon.py` and `server.py`:
+- **HIGH: the server's resend of a pending resume could clear a newer cancel.** Each attempt read the run's cancel
+  generation afresh. A cancel completed between the `WRITER_START_PENDING` answer and the resend therefore counted as
+  older than the resume, and the resend cleared `cancel_requested` and sent the continuation. Now the dispatch reads the
+  generation before any wait. `WRITER_START_PENDING` and `WRITER_RECOVERING` (the dispatch's recovery wait too) name it
+  (`cancel_generation`), as do the resume's other refusals raised before the continuation is sent. The server resends
+  only with it. The daemon refuses a changed one `RUN_CANCELLED` once it holds the run's control lock, before any
+  writer start, and again before saving the input. A generation the run has not reached, or one that is not an
+  integer, is refused `RUN_GENERATION`. A daemon older than 2.4.34 names none, and the server does not resend a resume
+  to it.
+- **MEDIUM: a detailed result's next-page hint dropped `detail=True`,** so following it paged the compact result with
+  the detailed result's cursor. The hint keeps it.
+- **MEDIUM: `RUN_NOT_STARTED` from the dispatch's early check missed `sent: false`,** so the server still said
+  "reconcile ... before retrying". It carries `sent: false`. The server's note says the call can be sent again only for
+  a retryable refusal; `RUN_NOT_STARTED`, `UNIT_FROZEN` and `RUN_CANCELLED` each say what to do instead.
+
+The race scenario ran on the code turn 152 refuted (`L/comp-final1`) and on C:
+
+| step | comp-final1 | C |
+|---|---|---|
+| resume, through the server, of a run refused at admission | `RUN_NOT_STARTED` with no `sent`, beside "reconcile the saved input identity before retrying" | `RUN_NOT_STARTED`, `sent: false`, "Not sent: the coordinator refused before the continuation was submitted.", next action "Dispatch a new run" |
+| a detailed result (2,314 characters; 1,548 compact) paged at 600 | the hint has no `detail`, and the pages do not join | the hint keeps `detail=True`, and the pages join into the detailed result |
+| resume of a parked writer: the start finished about 7 s after the 20 s wait, and the run was cancelled (generation 0 to 1) before the answer | the resend carried nothing, cleared the cancel (`cancel_requested` false) and sent the continuation (inputs 0 to 1) | the resend carried generation 0, once: `RUN_CANCELLED`, `sent: false`; the run stays cancelled, with no new input |
+| `cancel_generation` 7, then "one" | not run | `RUN_GENERATION`, `current` 1, and the run unchanged |
+
+## Review fix round 2 — code_review turn 153
+
+Turn 153 confirmed the three fixes above for a 2.4.34 server and daemon, and found one more HIGH, which predates
+2.4.34. **A server before 2.4.34 sends a resume refused `WRITER_RECOVERING` again unchanged.** Sessions keep the server
+they started with, so 2.4.33 servers talk to the 2.4.34 daemon until each session restarts. Without a
+`cancel_generation`, the daemon read the generation after a cancel made meanwhile, and the resend cleared that cancel.
+The lead fixed it in `daemon.py` and `server.py`. The 2.4.34 server now declares, on every attempt, that it resends a
+resume only with its generation (`resend: "cancel_generation"`). The daemon answers a resume that does not declare it
+`RUN_RECOVERING` instead of `WRITER_RECOVERING`: the same message with "nothing was sent", `sent: false` and a next
+action. An older server does not send that code again, so its lead resumes again once recovery is done.
+
+The recovery scenario ran with each server and daemon below:
+
+| server, daemon | attempts | outcome |
+|---|---|---|
+| installed 2.4.33, `L/comp-r152` (the code turn 153 refuted) | 2, neither with a generation | the resend cleared the cancel (`cancel_requested` false) and sent the continuation (inputs 0 to 1) |
+| installed 2.4.33, C | 1 | `RUN_RECOVERING`, `sent: false`, `cancel_generation` 0 and a next action naming `claude --resume`; the run stays cancelled, with no new input |
+| C, C | 2, both declaring it; the second carries generation 0 | `RUN_CANCELLED`, `sent: false`; the run stays cancelled, with no new input |
+
+The installed 2.4.33 server's own note still reads "Continuation not delivered or not confirmed; reconcile ...", its
+wording for every refusal; `RUN_RECOVERING`'s message says that nothing was sent.
+
+## Final runs
+
+C is `L/comp-r153`, a `git archive` of 824ed97 with the release files laid over it. Its `daemon.py` and `server.py` are
+the second review fix (SHA-256 `82abdcc059c83fac95e6e46db3e3e304de296aa7c109c1ff0d543aafaee635d6`,
+`e6d686c90c5bbaf5a6b2ce8cf937870f5cb61f5edc0f934e2a94437681834f6d`), its `runs.py` the first
+(`da1a38c12f09e01bb253228f110c7d845f48c94470b427412048298513b7da27`), and every other code file is byte-identical to
+`L/comp-final1`. `L/final_runs3.py` ran three cases at a time, each on fresh fixture repositories (final4, repos
+321–333):
+
+| case | daemon | server | checks |
+|---|---|---|---|
+| red-replies | installed 2.4.33 | its own | 27/27 |
+| red-scope | installed 2.4.33 | its own | 4/4 |
+| red-blocking | installed 2.4.33 | its own | 3/3 |
+| red-race | `L/comp-final1` | its own | 12/12 |
+| red-recovery-legacy | `L/comp-r152` | installed 2.4.33 | 5/5 |
+| green-replies | C | C | 42/42 |
+| green-scope | C | C | 6/6 |
+| green-blocking | C | C | 4/4 |
+| green-race | C | C | 15/15 |
+| green-recovery-legacy | C | installed 2.4.33 | 6/6 |
+| green-recovery | C | C | 6/6 |
+
+That is 11 cases and 130/130 checks. Every recorder exited 0 and removed its state and repositories, and no process
+remained. Earlier sets: before turn 152, `L/comp-final1` passed the six cases other than race and recovery (86/86,
+`L/final_runs.py`); after it, `L/comp-r152` passed the eight other than recovery (113/113, `L/final_runs2.py`). The
+first full set on C (final3) passed 10 of 11. Its red-race had its writer parked between the injected cancel and the
+resend, so the refuted code's resend stopped at a cold start's `WRITER_START_PENDING` before the save that clears the
+cancel. The parking hold in the recorder comes from that run, and final4 ran with it.
+
+**Static gates** (`L/lead_static.py`) ran on C with exit 0 and no gating failure:
+- Python 3.15 compiled all 98 files.
+- Under Python 3.9 the hook closure compiled and imported, and `coordinator/hooks.py --check` reported compatible,
+  `jsonl-v1`.
+- The hook-runtime modules imported under 3.9 with the codec modules blocked. The informational whole-closure variant
+  fails on `gzip`, as in 2.4.33.
+- Every release module (12) imported under 3.15.
+- Ruff: 31 findings on installed 2.4.33 and 30 on C, none added. The one removed is `messages.py`'s `asyncio` import,
+  which `acknowledge_before` now uses.
+- Strict plugin and marketplace validation passed, and the version is 2.4.34.
+
+They ran again on the final export (`L/comp-final3`), where only CHANGELOG.md, README.md and VERIFY.md differ from C,
+with the same results.
+
+## Historical 2.4.33 — settling a quarantined operation, and the gate's zsh patterns and `=name` — 2026-11-04
 
 Base is **055a58c52837ca8c9b023e40fa73459dd5486c1a** (2.4.32). The release has two changes. The lead wrote Change 1,
 the settlement of a quarantined operation (`recovery.py`, `daemon.py`, `server.py`), and the docs. The Codex writer

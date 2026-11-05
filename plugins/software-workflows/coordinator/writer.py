@@ -363,7 +363,7 @@ class Writer:
                 self.prepare(runid, "implementation")
                 await self.submit(runid)
 
-    def result(self, runid, cursor=0, limit=50000):
+    def result(self, runid, cursor=0, limit=50000, detail=False):
         run = self.store.get(runid)
         if not run.get("workflow"):
             raise CoordinatorError("WORKFLOW_REQUIRED", "This run has no Abraham workflow")
@@ -379,18 +379,79 @@ class Writer:
                    "admission": run.get("admission"), "refusal": run.get("refusal"),
                    # Why this phase's input may have run though nothing shows it: a resume sends it again, a cancel ends it.
                    "input_unproven": phase.get("unproven")}, sort_keys=True)
-        text += "\n\n" + phase.get("answer", "") + "\n\n[UNIT ATTRIBUTION]\n"
-        for row in self.store.db.execute("SELECT * FROM revisions WHERE unit=? ORDER BY created,id", (run["unit"],)):
-            operation = self.store.get(row["operation"])
-            author = self.store.get(operation["actor"])
-            text += json.dumps({"path": row["path"], "checkout": row["checkout"], "root": self.store.get(row["checkout"])["root"], "label": row["attribution"], "revision": row["id"],
-                       "operation": operation["id"], "actor": author["id"], "kind": author["kind"], "thread": author.get("thread")}) + "\n"
-        for operation in self.store.all("operation", run["unit"]):
-            if operation.get("custody"):
-                text += json.dumps({"label": "custody", "operation": operation["id"], "actor": operation["actor"],
-                           "native": operation["native"], "meaning": "possible effects; not exact authorship", "state": operation["state"]}) + "\n"
-        for unknown in [u for key in participants.checkout_ids(self.store, run["unit"]) for u in self.store.unresolved(key)]:
-            text += json.dumps(dict(unknown, label="UNKNOWN", meaning="unresolved checkout effects; not credited to this unit")) + "\n"
+        # Built once the run has ended (or on request): the abraham tool reads this result every second while it waits
+        # and shows it only then, and reading a unit's operations cost 0.9 s of the event loop for a unit with 3,089 of
+        # them (32 MB, live ledger 11-05), enough with three writers to run lead admissions past their 2 s.
+        ended = run["state"] in TERMINAL or run["state"] == "submission_uncertain"
+        text += "\n\n" + phase.get("answer", "") + "\n\n[UNIT ATTRIBUTION]\n" + (
+            self.attribution(run["unit"], detail) if ended or detail else
+            "Listed once the run ends; codex_run_log(run, result=True, detail=True) lists it now.\n")
         return {"run": runid, "unit": run["unit"], "state": run["state"], "phase": run.get("phase"),
                 "text": text[cursor:cursor + limit], "cursor": cursor,
                 "next_cursor": cursor + limit if cursor + limit < len(text) else None, "total_characters": len(text)}
+
+    def attribution(self, unitid, detail=False):
+        """A result's [UNIT ATTRIBUTION], one JSON line each: every path the unit wrote, once, at its latest receipt
+        (`receipts` counts them); its command custody as counts by state, with a line only for an operation not yet
+        settled; and the UNKNOWNs on its own paths (and checkout-wide ones), the rest counted by checkout. `detail`
+        lists every receipt, custody operation and UNKNOWN as through 2.4.33, when a five-file unit's result carried
+        hundreds of custody lines and was cut at 50 KB (Sales_Profiler, 11-05; one unit of the live ledger has 2,476
+        custody operations). The abraham tool reads a result every second while it waits, so only the records of the
+        lines written are decoded: custody is counted in SQL."""
+        from .ledger import key
+        cache = {}
+        def record(ident):
+            if ident not in cache:
+                cache[ident] = self.store.get(ident)
+            return cache[ident]
+        def written(row, receipts=None):
+            operation = record(row["operation"])
+            author = record(operation["actor"])
+            line = {"path": row["path"], "checkout": row["checkout"], "root": record(row["checkout"])["root"], "label": row["attribution"],
+                    "revision": row["id"], "operation": operation["id"], "actor": author["id"], "kind": author["kind"], "thread": author.get("thread")}
+            return json.dumps(line if receipts is None else dict(line, receipts=receipts))
+        def custody_line(operation):
+            return json.dumps({"label": "custody", "operation": operation["id"], "actor": operation["actor"], "native": operation["native"],
+                               "meaning": "possible effects; not exact authorship", "state": operation["state"]})
+        lines, latest, receipts = [], {}, {}
+        for row in self.store.db.execute("SELECT * FROM revisions WHERE unit=? ORDER BY created,id", (unitid,)):
+            where = (row["checkout"], row["path"])
+            receipts[where] = receipts.get(where, 0) + 1
+            if detail:
+                lines.append(written(row))
+            else:
+                latest[where] = row
+        lines.extend(written(row, receipts[where]) for where, row in latest.items())
+        custody = "kind='operation' AND parent=? AND coalesce(json_extract(data,'$.custody'),'')!=''"
+        if detail:
+            lines.extend(custody_line(operation) for operation in self.store.all("operation", unitid) if operation.get("custody"))
+        else:
+            states = dict(self.store.db.execute("SELECT json_extract(data,'$.state'), count(*) FROM records WHERE " + custody +
+                                                " GROUP BY 1 ORDER BY 1", (unitid,)).fetchall())
+            if states:
+                lines.append(json.dumps({"label": "custody", "operations": sum(states.values()), "states": states,
+                                         "meaning": "possible effects; not exact authorship"}))
+            for (ident,) in self.store.db.execute("SELECT id FROM records WHERE " + custody + " AND json_extract(data,'$.state') "
+                                                  "NOT IN ('verified','reconciled','resolved','denied') ORDER BY id", (unitid,)).fetchall():
+                lines.append(custody_line(self.store.get(ident)))
+        for checkoutid in participants.checkout_ids(self.store, unitid):
+            checkout = record(checkoutid)
+            # ledger.overlaps against every path of the unit, as sets: an UNKNOWN at one of them, under one or above one.
+            mine = {key(checkout, path) for (where, path) in receipts if where == checkoutid}
+            mine.update(claim["key"] for claim in self.daemon.custody.claims(checkoutid, unitid))
+            above = {"/".join(parts[:n]) for parts in (k.split("/") for k in mine) for n in range(1, len(parts))}
+            def own(path):
+                folded = key(checkout, path)
+                parts = folded.split("/")
+                return folded in mine or folded in above or any("/".join(parts[:n]) in mine for n in range(1, len(parts)))
+            others = 0
+            for unknown in self.store.unresolved(checkoutid):
+                if detail or unknown["path"] == "*" or own(unknown["path"]):
+                    lines.append(json.dumps(dict(unknown, label="UNKNOWN", meaning="unresolved checkout effects; not credited to this unit")))
+                else:
+                    others += 1
+            if others:
+                lines.append(json.dumps({"label": "UNKNOWN", "checkout": checkoutid, "root": checkout["root"], "count": others,
+                                         "meaning": "unresolved checkout effects on paths this unit has not written or claimed; "
+                                                    "coordinator_unit action=unknown lists them"}))
+        return "".join(line + "\n" for line in lines)

@@ -654,6 +654,8 @@ def _get_reasoning_effort() -> str:
 
 _DISPATCH_CWD = contextvars.ContextVar("coordinator_dispatch_cwd", default="")
 _LEAD_SESSION = contextvars.ContextVar("coordinator_lead_session", default="")
+# Set by a lead tool whose reply already carries this session's unread count: no footer repeats it (_coordinator_notice).
+_UNREAD_SHOWN = contextvars.ContextVar("coordinator_unread_shown", default=False)
 
 
 def _get_cwd() -> str:
@@ -4272,9 +4274,11 @@ def _lead_tool():
             token = _DISPATCH_CWD.set(folder if isinstance(folder, str) and os.path.isabs(folder) else "")
             session_id = arguments.get("session_id", "")
             session_token = _LEAD_SESSION.set(session_id)
+            shown_token = _UNREAD_SHOWN.set(False)
             try:
                 return await _coordinator_notice(await function(*args, **kwargs), session_id)
             finally:
+                _UNREAD_SHOWN.reset(shown_token)
                 _LEAD_SESSION.reset(session_token)
                 _DISPATCH_CWD.reset(token)
         return mcp.tool()(observed)
@@ -4809,15 +4813,29 @@ async def _coordinator_call(method: str, params: dict | None = None, *, start: b
     # carries no caller deadline), before any effect. It is sent again while this call's own time lasts: an attempt
     # only while a whole wait (the refusal's waited_seconds) and 5 s of the call's own work still fit in it, so the
     # refusal, not a lost answer, ends a call whose time runs out. Not a keyed call: the daemon keeps that answer as
-    # its key's.
+    # its key's. A resume refused WRITER_START_PENDING (raised before its continuation is sent: the writer's start
+    # outlasted one wait) is sent again the same way, and joins that start: through 2.4.33 the lead had to, after every
+    # resume of a completed write run (Sales_Profiler, 11-05, 5 of 5). A resume is sent again only with the cancel
+    # generation its first attempt began at, which the daemon names from 2.4.34 (Runs.resume): a cancel made between
+    # two attempts is newer than this call, and stands. Each attempt declares that (`resend`): to a resume that does not,
+    # as from a server before 2.4.34, the daemon answers RUN_RECOVERING, which such a server does not send again.
     deadline = time.monotonic() + timeout
+    if method == "run/resume":
+        params = dict(params or {}, resend="cancel_generation")
     while True:
         try:
             return await asyncio.to_thread(client.call, method, params, key)
         except CoordinatorError as exc:
-            wait = (exc.details or {}).get("waited_seconds", 20)
-            if exc.code != "WRITER_RECOVERING" or key is not None or time.monotonic() + wait + 5 > deadline:
+            details = exc.details or {}
+            wait, began = details.get("waited_seconds", 20), details.get("cancel_generation")
+            if method == "run/resume":
+                again = exc.code in ("WRITER_RECOVERING", "WRITER_START_PENDING") and type(began) is int
+            else:
+                again = exc.code == "WRITER_RECOVERING"
+            if not again or key is not None or time.monotonic() + wait + 5 > deadline:
                 raise
+            if method == "run/resume":
+                params = dict(params or {}, cancel_generation=began)
             await asyncio.sleep(0.2)  # never a hot loop, should a refusal come back early
 
 
@@ -4827,18 +4845,24 @@ async def _coordinator_notice(text: str, session_id: str | None = None) -> str:
     # concurrent request's mailbox union.
     if session_id is None:
         session_id = _LEAD_SESSION.get()
-    notice = "[Coordinator: unread lead messages; use coordinator_inbox to read and explicitly acknowledge.]"
-    if notice in text:
+    if _UNREAD_SHOWN.get() or "[Coordinator: " in text and " unread lead message" in text:
         return text
     try:
         # The folder scopes it as the session does: with neither, 2.4.4 has no project to read and finds no mail.
         inbox = await _coordinator_call("message/inbox", {"recipient": "lead", "limit": 1, "session_id": session_id,
                                                           "cwd": _get_cwd()}, timeout=2)
         if inbox["unread"]:
-            return text.rstrip() + "\n" + notice
+            # The count and its scope: beside a unit's inbox reading "unread": 0, a bare notice read as false
+            # (Sales_Profiler, 11-05: 325 old messages of the whole session).
+            return text.rstrip() + "\n" + _unread_notice(inbox["unread"])
     except Exception:
         pass
     return text
+
+
+def _unread_notice(count: int) -> str:
+    return (f"[Coordinator: {count} unread lead message{'' if count == 1 else 's'} across this session's mailboxes; "
+            "coordinator_inbox reads them, and acknowledges by id or acknowledge_before a time.]")
 
 
 async def _native_runs(limit: int = 50) -> dict:
@@ -4870,12 +4894,23 @@ async def _native_run_action(method: str, run: str, **params) -> str:
         if text is None:
             text = json.dumps(value, ensure_ascii=False, indent=2)
         elif value.get("next_cursor") is not None:
-            text += f"\n[Continue: codex_run_log(run='{run}', cursor={value['next_cursor']}, result=True).]"
+            # The cursor counts characters of this representation: the next page must ask for the same one.
+            more = ", detail=True" if params.get("detail") else ""
+            text += f"\n[Continue: codex_run_log(run='{run}', cursor={value['next_cursor']}, result=True{more}).]"
         return await _coordinator_notice(text)
     except Exception as exc:
         value = exc.envelope() if hasattr(exc, "envelope") else {"code": type(exc).__name__, "message": "Coordinator unavailable; durable state was not replayed"}
         if method == "run/resume" and (params.get("text") or params.get("images")):
-            value["delivery"] = "Continuation not delivered or not confirmed; reconcile the saved input identity before retrying."
+            # The daemon says when it refused before the continuation was sent (2.4.34: `sent` false); a writer start
+            # still pending, or startup recovery, refuses before that too. Anything else may have been sent. Only a
+            # retryable refusal can be sent again as it was; another says what to do instead (RUN_NOT_STARTED: dispatch
+            # a new run).
+            details = value.get("details") or {}
+            pending = value.get("code") in ("WRITER_START_PENDING", "WRITER_RECOVERING")
+            value["delivery"] = (("Not sent: the coordinator refused before the continuation was submitted" +
+                                  ("; the same call can be sent again." if pending or details.get("retryable") is True else "."))
+                                 if details.get("sent") is False or pending else
+                                 "Continuation not delivered or not confirmed; reconcile the saved input identity before retrying.")
         return await _coordinator_notice(json.dumps(value))
 
 
@@ -4894,7 +4929,7 @@ async def _require_publication_protocol(action: str) -> None:
 
 
 async def _lead_request(method: str, params: dict, cwd: str = "", session_id: str = "",
-                        own: bool = False, unit: str = "", project: str = "", dispatch_cwd: str = "") -> str:
+                        own: bool = False, unit: str = "", project: str = "", dispatch_cwd: str = "", notice: bool = True) -> str:
     """Select from the registered native catalog, refreshing on first use.
 
     Registration/abraham refresh membership; an existing lead unit remains pinned.
@@ -4964,10 +4999,13 @@ async def _lead_request(method: str, params: dict, cwd: str = "", session_id: st
                 elif method == "message/inbox":
                     params["recipient"] = box
         value = await _coordinator_call(method, params, timeout=180)
-        return await _coordinator_notice(json.dumps(value, ensure_ascii=False, indent=2), session_id)
+        text = json.dumps(value, ensure_ascii=False, indent=2)
     except Exception as exc:
         value = exc.envelope() if hasattr(exc, "envelope") else {"code": type(exc).__name__, "message": "Coordinator operation did not complete; inspect durable status"}
-        return await _coordinator_notice(json.dumps(value, ensure_ascii=False), session_id)
+        text = json.dumps(value, ensure_ascii=False)
+    # Without the unread footer (notice=False): a reply that already carries this session's unread count, or one the
+    # caller reads as JSON.
+    return await _coordinator_notice(text, session_id) if notice else text
 
 
 @_lead_tool()
@@ -5019,17 +5057,69 @@ async def coordinator_withdraw(message: str, cwd: str = "", session_id: str = ""
 
 @_lead_tool()
 async def coordinator_inbox(acknowledge: list[str] = [], cursor: str = "", limit: int = 100,
-                            cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "", unit: str = "") -> str:
+                            cwd: str = "", session_id: str = "", project: str = "", dispatch_cwd: str = "", unit: str = "",
+                            acknowledge_before: str = "") -> str:
     """Read lead messages with a cursor. Only IDs explicitly supplied in
     acknowledge are marked acknowledged; reading status/inbox never does that.
     Without unit, session_id reads all of this session's writer and lead mailboxes.
     An explicit unit restricts the inbox and acknowledgements to that unit.
+    acknowledge_before (an ISO 8601 time, or seconds since the epoch) acknowledges
+    every unread message of that inbox created before it. A call that
+    acknowledges answers with what it acknowledged and the unread count left,
+    not with the mailbox.
     """
+    scope = dict(unit=unit, project=project, dispatch_cwd=dispatch_cwd, notice=False)
+    acknowledged, bulk = [], None
     for message in acknowledge:
-        answer = await _lead_request("message/ack", {"message": message}, cwd, session_id, unit=unit, project=project, dispatch_cwd=dispatch_cwd)
+        answer = await _lead_request("message/ack", {"message": message}, cwd, session_id, **scope)
         if '"code"' in answer:
-            return answer
-    return await _lead_request("message/inbox", {"recipient": "lead", "cursor": cursor, "limit": limit}, cwd, session_id, unit=unit, project=project, dispatch_cwd=dispatch_cwd)
+            return await _coordinator_notice(answer, session_id)
+        acknowledged.append(json.loads(answer))
+    if acknowledge_before:
+        try:
+            before = _epoch(acknowledge_before)
+            await _require_daemon((2, 4, 34), "acknowledge_before")
+        except Exception as exc:
+            value = exc.envelope() if hasattr(exc, "envelope") else {"code": "ACK_BEFORE", "message":
+                    "acknowledge_before is an ISO 8601 time, such as 2026-11-05T01:00:00+05:30, or seconds since the epoch"}
+            return await _coordinator_notice(json.dumps(value), session_id)
+        answer = await _lead_request("message/ack", {"before": before}, cwd, session_id, **scope)
+        if '"code"' in answer:
+            return await _coordinator_notice(answer, session_id)
+        bulk = json.loads(answer)
+    # Without unit, the reply carries this session's own unread count: no footer repeats it.
+    _UNREAD_SHOWN.set(not unit)
+    if acknowledge or acknowledge_before:
+        # The unread count left, not the mailbox: through 2.4.33 an acknowledgement echoed the whole inbox, 223 KB
+        # for one lead's (Sales_Profiler, 11-05).
+        answer = json.loads(await _lead_request("message/inbox", {"recipient": "lead", "cursor": "", "limit": 1}, cwd, session_id, **scope))
+        return json.dumps({"acknowledged": acknowledged, **({"acknowledged_before": bulk} if bulk else {}),
+                           "unread": answer.get("unread"), **({"inbox": answer} if "unread" not in answer else {})}, indent=2)
+    return await _lead_request("message/inbox", {"recipient": "lead", "cursor": cursor, "limit": limit}, cwd, session_id,
+                               unit=unit, project=project, dispatch_cwd=dispatch_cwd, notice=bool(unit))
+
+
+def _epoch(value: str) -> float:
+    """Seconds since the epoch, from those seconds or an ISO 8601 time (a time without an offset is local)."""
+    try:
+        return float(value)
+    except ValueError:
+        from datetime import datetime
+        return datetime.fromisoformat(value).timestamp()
+
+
+async def _require_daemon(version: tuple, action: str) -> None:
+    from coordinator.client import CoordinatorError
+    running = str((await _coordinator_call("daemon/status", {"brief": True})).get("version", "unknown"))
+    try:
+        supported = tuple(int(part) for part in running.split(".")) >= version
+    except ValueError:
+        supported = False
+    if not supported:
+        needed = ".".join(map(str, version))
+        raise CoordinatorError("COORDINATOR_VERSION_SKEW", action + " needs coordinator " + needed + " or later; daemon " +
+                               running + " is running. Switch the daemon to " + needed + ", then retry.",
+                               {"needed": needed, "daemon": running, "action": action})
 
 
 @_lead_tool()
@@ -5098,6 +5188,11 @@ async def coordinator_seal(unit: str, validation: list[dict] = [], cwd: str = ""
     """Freeze this idle unit's receipt-backed candidate and validation evidence.
     UNKNOWN or unresolved effects refuse. Review the returned immutable candidate
     with code_review(sealed_unit=unit, project=project, dispatch_cwd=dispatch_cwd) before publication.
+    Each validation record is {"command": what ran, "exit_code": its exit status,
+    "inputs": what it read, "scope": "mixed-checkout" for a run in the shared
+    working checkout, or "candidate-objects" for one against the candidate's own
+    objects}; [] records none. The reply names the seal, its candidate, digests and
+    path count; coordinator_unit action=diff shows the paths and changes.
     """
     return await _lead_request("unit/seal", {"validation": validation, "publication_order": publication_order}, cwd, session_id, unit=unit, project=project, dispatch_cwd=dispatch_cwd)
 
@@ -6556,7 +6651,8 @@ def _run_log_lines(rec: dict[str, Any], lines: int) -> list[str]:
     return out[-lines:]
 
 
-async def _codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result: bool = False, session_id: str = "") -> str:
+async def _codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result: bool = False, session_id: str = "",
+                         detail: bool = False) -> str:
     """
     What a codex run is doing RIGHT NOW — its live log (reasoning summaries,
     commands, web searches, errors, retries), in-conversation, instead of
@@ -6571,7 +6667,8 @@ async def _codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result
     """
     if run.startswith("run_"):
         return await _native_run_action("run/result" if result else "run/events", run, cursor=cursor,
-                                        limit=50000 if result else max(1, min(int(lines or 40), 400)))
+                                        limit=50000 if result else max(1, min(int(lines or 40), 400)),
+                                        **({"detail": True} if result and detail else {}))
     discovery = await _native_runs()
     if not run and not discovery["available"]:
         return _native_unavailable(discovery) + " Automatic selection refused; supply an explicit run ID."
@@ -6582,7 +6679,8 @@ async def _codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result
             run = native_runs[-1]["run"]
     if run.startswith("run_"):
         return await _native_run_action("run/result" if result else "run/events", run, cursor=cursor,
-                                        limit=50000 if result else max(1, min(int(lines or 40), 400)))
+                                        limit=50000 if result else max(1, min(int(lines or 40), 400)),
+                                        **({"detail": True} if result and detail else {}))
     runs = _workspace_runs()
     if not runs:
         return "[No recorded codex runs for this workspace.]"
@@ -6896,7 +6994,8 @@ async def _codex_cancel_run(run: str = "", session_id: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 @_lead_tool()
-async def codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result: bool = False, session_id: str = "", dispatch_cwd: str = "") -> str:
+async def codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result: bool = False, session_id: str = "", dispatch_cwd: str = "",
+                        detail: bool = False) -> str:
     """What a codex run is doing RIGHT NOW — its live log (reasoning summaries,
     commands, web searches, errors, retries), in-conversation, instead of
     `tail -F` on ~/.claude/logs/codex-oracle. Works for running, detached and
@@ -6906,8 +7005,11 @@ async def codex_run_log(run: str = "", lines: int = 40, cursor: int = 0, result:
 
     Args:
         run: Run id ("codex7·21746"); omit for the most recent run here.
-        lines: How many trailing lines (default 40, max 400)."""
-    answer = await _codex_run_log(run=run, lines=lines, cursor=cursor, result=result, session_id=session_id)
+        lines: How many trailing lines (default 40, max 400).
+        result: A native run's result (its answer and unit attribution) instead of its events.
+        detail: With result, every receipt, custody operation and UNKNOWN of the
+            attribution, instead of one line per path and counts."""
+    answer = await _codex_run_log(run=run, lines=lines, cursor=cursor, result=result, session_id=session_id, detail=detail)
     if run and not run.startswith("run_"):
         discovery = await _native_runs()
         if not discovery["available"]:

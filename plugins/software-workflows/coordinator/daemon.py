@@ -3058,15 +3058,31 @@ class Daemon:
         if not self.ready:
             raise CoordinatorError("RECOVERING", "Coordinator is reconciling durable state before admitting work", operational=True)
         # These terminal preproduction refusals need no native history or recovery wait.
+        resume_generation = None
         if method == "run/resume":
             from .runs import refuse_unstarted
-            refuse_unstarted(self.runs.get(params["run"], params.get("cwd")))
+            resumed = self.runs.get(params["run"], params.get("cwd"))
+            refuse_unstarted(resumed)
+            # The cancel generation this resume began at, read before any wait; a retry carries its first attempt's.
+            resume_generation = params.get("cancel_generation", resumed.get("cancel_generation", 0))
         elif method == "unit/seal":
             from .runs import refuse_empty_seal
             refuse_empty_seal(self, self.store.get(params["unit"]))
         if self.recovering:
             from .recovery import recovered
-            await recovered(self, method, params)  # a call for a writer, unit or checkout still reconciling waits
+            try:
+                await recovered(self, method, params)  # a call for a writer, unit or checkout still reconciling waits
+            except CoordinatorError as exc:
+                if method == "run/resume":  # nothing was sent; the server's retry carries the generation (Runs.resume)
+                    exc.details = dict(exc.details, sent=False, cancel_generation=resume_generation)
+                    if exc.code == "WRITER_RECOVERING" and params.get("resend") != "cancel_generation":
+                        # A server before 2.4.34 does not declare that it resends only with the generation: it sends a
+                        # resume refused WRITER_RECOVERING again as it was, and after a cancel made meanwhile that
+                        # resend would clear the cancel (code_review turn 153). It is answered a code it does not resend.
+                        raise CoordinatorError("RUN_RECOVERING", str(exc) + "; nothing was sent", dict(
+                            exc.details, next_action="Resume again once recovery is done; a session restarted with "
+                            "claude --resume loads a server (2.4.34 or later) that waits for it"), exc.operational) from None
+                raise
         if method == "project/list":
             return await self.projects.listing(params)
         if method == "project/resolve":
@@ -3139,7 +3155,7 @@ class Daemon:
             return await self.runs.listing(params["cwd"], params.get("limit", 50))
         if method == "run/result":
             self.runs.get(params["run"], params.get("cwd"))
-            return self.writer.result(params["run"], params.get("cursor", 0), params.get("limit", 50000))
+            return self.writer.result(params["run"], params.get("cursor", 0), params.get("limit", 50000), params.get("detail") is True)
         if method == "run/events":
             return await self.runs.events(self.runs.get(params["run"], params.get("cwd")), params.get("cursor", 0), params.get("limit", 100))
         if method in ("run/interrupt", "run/resume"):
@@ -3151,7 +3167,8 @@ class Daemon:
                     raise CoordinatorError("RUN_LEAD_MODE", "A lead-mode run has no writer turns to cancel")
                 return await self.runs.cancel(run)
             # A resume reconciles the writer's app-server first, replacing one that is gone or not connected.
-            return await self.runs.resume(run, text=params.get("text", ""), deadline=params.get("deadline"), images=params.get("images"))
+            return await self.runs.resume(run, text=params.get("text", ""), deadline=params.get("deadline"), images=params.get("images"),
+                                          generation=resume_generation)
         if method in ("run/terminals", "run/terminate-terminal"):
             actor = self.store.get(self.store.get(params["run"])["root_actor"])
             listener = self.store.get(actor["listener"])
@@ -3304,6 +3321,8 @@ class Daemon:
             if (actor != "lead" and not actor.startswith("lead_mailbox_")
                     and (self.store.get(actor, required=False) or {}).get("kind") != "lead"):
                 raise CoordinatorError("NATIVE_BOUND", "Writer acknowledgements must originate from native actor metadata")
+            if "before" in params and not params.get("message"):
+                return await self.messages.ack_before(actor, params["before"], params.get("session_id", ""), params.get("cwd", ""))
             return self.messages.ack(actor, params["message"], params.get("session_id", ""), params.get("cwd", ""))
         if method.startswith("unit/"):
             unit = self.store.get(params["unit"])
@@ -3334,11 +3353,12 @@ class Daemon:
         publisher = Publisher(self)
         if method == "unit/status":
             unit = self.store.get(params["unit"])
+            # The unit's messages are chosen in SQL (store.messages): the server reads this status before each lead call
+            # that names a unit.
             return {"unit": unit, "run": self.runs.summary(self.store.get(unit["run"])),
                     "history": self.dormancy.gaps(unit["run"]),
                     "waiting_messages": [{"message": m["id"], **self.messages.eligibility(m)}
-                        for m in self.store.all("message") if m.get("unit") == unit["id"]
-                        and self.messages.eligibility(m)["state"] == "waiting"],
+                        for m in self.store.messages("unit", [unit["id"]]) if self.messages.eligibility(m)["state"] == "waiting"],
                     "unknown": self.store.unresolved(unit["checkout"]),
                     "publications": list(self.store.all("publication", unit["id"])), **participants.surface(self, unit)}
         if method == "unit/recover":
@@ -3368,7 +3388,8 @@ class Daemon:
             from .recovery import settle_operation
             return await settle_operation(self, params)
         if method == "unit/seal":
-            return await publisher.seal(params["unit"], params.get("validation", []), params.get("publication_order"))
+            from .publish import seal_reply
+            return seal_reply(await publisher.seal(params["unit"], params.get("validation", []), params.get("publication_order")))
         if method == "unit/review-record":
             return publisher.review(params["unit"], params["evidence"])
         if method == "unit/publish":

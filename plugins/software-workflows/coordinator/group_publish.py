@@ -5,7 +5,7 @@ import time
 from .locks import finish, finish_all, finish_thread
 from . import gitio, participants, transfers
 from .client import CoordinatorError
-from .publish import Publisher, binding
+from .publish import Publisher, binding, check_validation, review_refusal
 from .store import digest, uid
 
 
@@ -74,11 +74,7 @@ class GroupPublisher:
         order = ids if order is None else order
         if not isinstance(order, list) or len(order) != len(ids) or set(order) != set(ids):
             raise CoordinatorError("PUBLICATION_ORDER", "Publication order must be a complete permutation of participant checkout IDs")
-        for item in validation:
-            if not isinstance(item, dict) or not all(k in item for k in ("command", "exit_code", "inputs", "scope")):
-                raise CoordinatorError("VALIDATION_EVIDENCE", "Validation requires command, exit_code, actual inputs and scope")
-            if item["scope"] not in ("mixed-checkout", "candidate-objects"):
-                raise CoordinatorError("VALIDATION_SCOPE", "Validation must identify its actual scope")
+        check_validation(validation)
         await self.daemon.custody.acquire_pending(unitid)
         unit = self.store.get(unitid)
         if unit["state"] not in ("open", "sealed") or self.current(unitid):
@@ -256,9 +252,10 @@ class GroupPublisher:
         unit = self.store.get(unitid)
         if unit["state"] != "sealed":
             raise CoordinatorError("UNIT_NOT_SEALED", "Group publication needs a complete-vector seal")
-        seal, review = self.store.get(unit["seal"]), self.store.get(reviewid)
-        if review["_kind"] != "review" or review.get("valid") is False or review.get("verdict") != "pass" or any(review.get(k) != v for k, v in binding(seal).items()):
-            raise CoordinatorError("REVIEW_BINDING", "A current complete-vector review is required")
+        seal = self.store.get(unit["seal"])
+        refusal = review_refusal(self.store, reviewid, seal)
+        if refusal:
+            raise refusal
         required = {"message", "author_name", "author_email", "author_date", "committer_name", "committer_email", "committer_date"}
         if set(metadata) != required or any(not isinstance(v, str) or not v or "\0" in v for v in metadata.values()):
             raise CoordinatorError("PUBLICATION_METADATA", "Complete explicit commit metadata is required")

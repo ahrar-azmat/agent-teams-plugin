@@ -3,6 +3,103 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.34] — 2026-11-05
+
+Both changes come from the Sales_Profiler lead's field report on 2.4.33 (batch 1,
+11-05), from running three or four Codex writers in one shared checkout.
+
+### Change 1 — lead replies carry what a lead reads, and cost what they carry
+
+- A listed or summarised claim is its path alone (`{path}`): its unit, checkout
+  and root are the participant's. The whole record was about 400 B, printed twice
+  in each run of `run/list`, so `codex_runs` with `limit=2` answered 67.8 KB.
+  `claim/list` keeps the records. The Codex Office reads only the path.
+- A run's summary (a resume's reply, `unit/status`) names the writer's MCP mode
+  and servers, not the evidence behind them (plugin catalog, plugin servers,
+  publish plugins): about 10 KB in every resume reply. `run/events` and full
+  `daemon/status` keep it.
+- An abraham result's `[UNIT ATTRIBUTION]` is one line per path at its latest
+  receipt, with how many receipts it has; command custody as counts by state,
+  with a line only for an operation not yet settled; and the UNKNOWNs on the
+  unit's own paths, the rest counted by checkout. A five-file unit's result had
+  carried hundreds of custody lines and was cut at 50 KB.
+  `codex_run_log(result=True, detail=True)` lists everything, as before, and
+  its next-page hint keeps `detail=True`.
+- The attribution is built once the run has ended. The abraham tool reads the
+  result every second while it waits, and only shows it at the end. Building it
+  meant decoding every operation of the unit: 0.9 s of the daemon's event loop
+  for a unit with 3,089 operations (32 MB, live ledger). With three writers
+  waiting, that ran lead file admissions past their 2 s budget, which is how
+  lead Edits came back `LEAD_ADMISSION_BUSY`.
+- A seal answers its identity, candidate, digests and path count, not its rows,
+  entries and proofs (about 700 B a path: 15 KB for 21 paths). The ledger keeps
+  them for review and publication; `coordinator_unit action=diff` shows the
+  candidate's paths and changes.
+- `coordinator_inbox` with `acknowledge` answers what it acknowledged and the
+  unread count left, not the whole mailbox (223 KB for one lead).
+  `acknowledge_before` (an ISO 8601 time or seconds since the epoch) acknowledges
+  every unread message of that inbox created before it. A new lead had 325 old
+  messages and could clear them only one id at a time.
+- The unread notice names the count across the session's mailboxes. Beside a
+  unit-filtered inbox reading `"unread": 0`, the bare notice read as false. An
+  inbox read without a unit carries the count itself, and no notice.
+- `unit/status`, a dormant writer's quiet check (seal, publish, handback) and a
+  cancel pick a unit's messages in SQL. Decoding every message took 0.54 s
+  (7,030 messages, 14.4 MB), and the server reads `unit/status` before each lead
+  call that names a unit.
+
+### Change 2 — refusals name their cause
+
+- Seal validation is checked before any seal attempt, so a refusal leaves the
+  unit and its seal as they were. `VALIDATION_EVIDENCE` names the record and the
+  fields it lacks. `VALIDATION_SCOPE` names the scope given and the two accepted
+  (`mixed-checkout`, `candidate-objects`). It had answered "Do not label mixed
+  checkout validation isolated" for any other scope, though no record said
+  isolated. `coordinator_seal`'s description names the four fields.
+- `REVIEW_BINDING` names its cause: no such review; a review job, with its state
+  and verdict (only a completed answer opening `Verdict: Ship it` records a review,
+  so a Needs-changes or unparsed verdict records none); another kind of record; an
+  invalidated review; or a review of another candidate, naming the binding keys
+  that differ. Every cause had read "Missing, stale or mismatched completed
+  review", which sent a lead looking for a binding defect after a review that only
+  had findings.
+- A resume refused before its continuation is submitted carries `sent: false`,
+  and the server says it was not sent, and for a retryable refusal that the same
+  call can be sent again. That includes `RUN_NOT_STARTED`, whose guidance stays
+  "dispatch a new run". Before, every refusal read "Continuation not delivered or
+  not confirmed; reconcile the saved input identity before retrying", even beside
+  `WRITER_START_PENDING`'s "retry to join it".
+- The server sends a resume refused `WRITER_START_PENDING` again while its call
+  lasts, and so joins the start. A completed run's writer is parked, so resuming
+  it is a cold start that outlasts one 20 s wait: every resume of a completed
+  write run needed a second call (5 of 5 in the field). On the fixture, 2.4.33
+  refused after 20.0 s, and 2.4.34 joined in one call after 26.5 s. Each later
+  attempt carries the cancel generation the first one began at, so a cancel made
+  between attempts stands (`RUN_CANCELLED`) instead of being cleared by the retry.
+  A server before 2.4.34 sends a resume refused `WRITER_RECOVERING` again
+  unchanged, which would clear such a cancel. A resume that does not declare
+  generation-aware resends is therefore refused `RUN_RECOVERING`, which that
+  server does not resend; its lead resumes again once startup recovery is done.
+- `RESTORE_SCOPE` says which argument to change. Either the id names no UNKNOWN,
+  or the UNKNOWN is in a checkout the acting unit does not span, and then it names
+  the units claiming the path (`pass unit=<holder>`). A restore that meets another
+  unit's claim on its path names that unit (`restore_with_unit`). Both had read
+  "UNKNOWN must belong to a participant".
+- `UNVERIFIED_OPERATION` from handback, seal and publish names every operation
+  of the unit that is not settled, with its state, and how a quarantined one is
+  settled. It had named the first only: a unit with four took four
+  refuse-then-settle rounds.
+
+### Not changed
+
+- Writers keep full access with no off switch (user ruling, 10-18). The report
+  asks for a mechanism to keep a writer off `.env`. That is the user's decision.
+- Queued for 2.4.35: the push gate stops a `git commit` in a repository outside
+  the checkout, and its own coordinator check timed out. Batched lead Edits to one
+  file fail instead of queueing, measured here as admissions that start with
+  their 2 s budget already spent. Foreign dirt can only be allowed for all paths
+  (`allow_dirty`), not acknowledged per path.
+
 ## [software-workflows 2.4.33] — 2026-11-04
 
 ### Change 1 — settling a quarantined operation

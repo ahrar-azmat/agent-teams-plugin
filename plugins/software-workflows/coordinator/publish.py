@@ -27,6 +27,106 @@ def binding(seal):
     return {key: seal[key] for key in keys}
 
 
+VALIDATION_FIELDS = ("command", "exit_code", "inputs", "scope")
+# A command run in the shared working checkout, which may hold other units' work, or one run against the candidate's
+# own objects: running in a mixed checkout does not validate the frozen candidate in isolation.
+VALIDATION_SCOPES = ("mixed-checkout", "candidate-objects")
+
+
+def check_validation(validation):
+    """Refuse validation records that cannot say what they validated, before any seal attempt: naming the record, what
+    it lacks and the scopes accepted. Through 2.4.33 the refusal named no field, and any other scope read "Do not label
+    mixed checkout validation isolated" though no record said isolated (Sales_Profiler, 11-05)."""
+    if not isinstance(validation, list):
+        raise CoordinatorError("VALIDATION_EVIDENCE", "validation is a list of records, each with " + ", ".join(VALIDATION_FIELDS),
+                               {"required": list(VALIDATION_FIELDS), "scopes": list(VALIDATION_SCOPES)})
+    for index, item in enumerate(validation):
+        missing = [k for k in VALIDATION_FIELDS if k not in item] if isinstance(item, dict) else list(VALIDATION_FIELDS)
+        if missing:
+            raise CoordinatorError("VALIDATION_EVIDENCE", "Validation record " + str(index) + " lacks " + ", ".join(missing) +
+                                   ": each names the command that ran, its exit_code, the inputs it read and its scope (" +
+                                   " or ".join(VALIDATION_SCOPES) + ")",
+                                   {"record": index, "missing": missing, "required": list(VALIDATION_FIELDS), "scopes": list(VALIDATION_SCOPES)})
+        if item["scope"] not in VALIDATION_SCOPES:
+            raise CoordinatorError("VALIDATION_SCOPE", "Validation record " + str(index) + " has scope " + json.dumps(item["scope"]) +
+                                   ": use \"mixed-checkout\" for a command run in the shared working checkout, or "
+                                   "\"candidate-objects\" for one run against the candidate's own objects",
+                                   {"record": index, "scope": item["scope"], "scopes": list(VALIDATION_SCOPES)})
+
+
+def review_refusal(store, reviewid, seal):
+    """Why `reviewid` cannot publish `seal`, or None. A completed review is recorded only when its answer opens with
+    "Verdict: Ship it" (reviews.verdict); any other answer leaves its review job negative, with the verdict read, and
+    no review. Through 2.4.33 every cause read "Missing, stale or mismatched completed review", which sent a lead looking
+    for a binding defect after a review that only had findings (Sales_Profiler, 11-05)."""
+    review = store.get(reviewid, required=False) if isinstance(reviewid, str) and reviewid else None
+    if review is None:
+        return CoordinatorError("REVIEW_BINDING", "No review " + json.dumps(reviewid) + " exists: pass the review that "
+                                "code_review(sealed_unit=...) recorded", {"review": reviewid, "cause": "missing"})
+    if review["_kind"] == "review_job":
+        state, verdict = review.get("state"), review.get("verdict")
+        details = {"review": reviewid, "cause": "job", "job_state": state, "verdict": verdict}
+        if state == "recorded" and review.get("review"):
+            return CoordinatorError("REVIEW_BINDING", "Review job " + reviewid + " recorded review " + review["review"] +
+                                    ": publish with that review", dict(details, recorded_review=review["review"]))
+        if state == "negative":
+            return CoordinatorError("REVIEW_BINDING", "Review job " + reviewid + " recorded no review: its answer's verdict "
+                                    "read " + json.dumps(verdict) + ", and only an answer opening with \"Verdict: Ship it\" "
+                                    "records one. Reopen the unit, change it, seal it and review it again",
+                                    dict(details, cause="verdict", required="Verdict: Ship it"))
+        if state == "refused":
+            refusal = review.get("refusal") or {}
+            return CoordinatorError("REVIEW_BINDING", "Review job " + reviewid + " was refused when it completed (" +
+                                    str(refusal.get("code")) + ": " + str(refusal.get("message")) + ")", dict(details, refusal=refusal))
+        return CoordinatorError("REVIEW_BINDING", "Review job " + reviewid + " is " + str(state) + ": " +
+                                ("collect it with codex_resume_run first" if state in ("prepared", "dispatched") else
+                                 "review the current seal again"), details)
+    if review["_kind"] != "review":
+        return CoordinatorError("REVIEW_BINDING", json.dumps(reviewid) + " is a " + review["_kind"] + " record, not a review",
+                                {"review": reviewid, "cause": "kind", "kind": review["_kind"]})
+    if review.get("valid") is False:
+        return CoordinatorError("REVIEW_BINDING", "Review " + reviewid + " no longer holds (" + str(review.get("invalidation") or "invalidated") +
+                                "): review the current seal again", {"review": reviewid, "cause": "invalidated", "invalidation": review.get("invalidation")})
+    stale = [key for key, value in binding(seal).items() if review.get(key) != value]
+    if stale:
+        return CoordinatorError("REVIEW_BINDING", "Review " + reviewid + " is of another candidate: its " + ", ".join(stale) +
+                                " differ from the current seal's. Review the current seal (code_review(sealed_unit=...))",
+                                {"review": reviewid, "cause": "stale", "keys": stale, "review_seal": review.get("seal"), "seal": seal.get("seal")})
+    if review.get("verdict") != "pass":
+        return CoordinatorError("REVIEW_BINDING", "Review " + reviewid + " has verdict " + json.dumps(review.get("verdict")) +
+                                "; publication needs \"pass\"", {"review": reviewid, "cause": "verdict", "verdict": review.get("verdict")})
+    return None
+
+
+def seal_reply(seal):
+    """What a seal call answers: the seal's identity, candidate and digests, and how many paths it froze. Its rows,
+    entries and proofs stay in the ledger, where review and publication read them; echoed, they were ~700 B a path (15 KB
+    for 21 paths, Sales_Profiler 11-05). coordinator_unit action=diff shows the candidate's paths and changes."""
+    keys = (("binding_version", "unit", "seal", "project_revision", "generation", "publication_order", "vector")
+            if seal.get("binding_version") == 2 else ("repository", "unit", "seal", "branch", "base", "candidate", "provenance"))
+    reply = {key: seal[key] for key in keys if key in seal}
+    if "paths" in seal:
+        reply["path_count"] = len(seal["paths"])
+    return dict(reply, validation_digest=seal.get("validation_digest"), validation_records=len(seal.get("validation") or []),
+                created=seal.get("created"), detail="coordinator_unit action=diff shows the candidate's paths and changes")
+
+
+SETTLED = ("verified", "reconciled", "resolved", "denied")
+
+
+def unsettled(operations, message):
+    """One refusal naming every operation that is not settled, with its state and how a quarantined one is settled.
+    Through 2.4.33 a refusal named the first one only: a unit with four took four refuse-then-settle rounds
+    (Sales_Profiler, 11-05)."""
+    blocking = [{"operation": o["id"], "state": o["state"]} for o in operations]
+    quarantined = [b["operation"] for b in blocking if b["state"] == "quarantined"]
+    return CoordinatorError("UNVERIFIED_OPERATION", message + ": " + str(len(blocking)) + " operation" + ("s" if len(blocking) != 1 else "") +
+                            " not settled (" + ", ".join(b["operation"] + " " + b["state"] for b in blocking) + ")" +
+                            ("; settle a quarantined one with coordinator_unit action=settle-operation once native can no "
+                             "longer write for it" if quarantined else ""),
+                            {"operation": blocking[0]["operation"], "operations": blocking})
+
+
 class Publisher:
     def __init__(self, daemon):
         self.daemon, self.store = daemon, daemon.store
@@ -76,11 +176,11 @@ class Publisher:
         from .participants import checkout_ids
         for checkout in checkout_ids(self.store, unit["id"]):
             refuse(self.store, checkout, code="UNVERIFIED_OPERATION")
-        for operation in self.store.all("operation", unit["id"]):
-            if allow_quarantined and operation["state"] == "quarantined" and not operation.get("executing"):
-                continue  # Reopening permits restoration, never sealing or publication.
-            if operation["state"] not in ("verified", "reconciled", "resolved", "denied"):
-                raise CoordinatorError("UNVERIFIED_OPERATION", "Unit has a pending or quarantined operation", {"operation": operation["id"]})
+        # Reopening permits restoration, never sealing or publication.
+        blocking = [operation for operation in self.store.all("operation", unit["id"]) if operation["state"] not in SETTLED
+                    and not (allow_quarantined and operation["state"] == "quarantined" and not operation.get("executing"))]
+        if blocking:
+            raise unsettled(blocking, "Unit has a pending or quarantined operation")
         if any(r["state"] == "pending" for r in self.store.all("dynamic", unit["id"])):
             raise CoordinatorError("PENDING_TOOL", "Unit has a pending dynamic tool request")
         if any(r["state"] == "waiting" for r in self.store.all("custody_request", unit["id"])):
@@ -226,6 +326,7 @@ class Publisher:
         unit = self.store.get(unitid)
         from .runs import refuse_empty_seal
         refuse_empty_seal(self.daemon, unit)
+        check_validation(validation)  # before any seal attempt, so a refusal leaves the unit and its seal as they were
         if unit.get("project_revision"):
             from .group_publish import GroupPublisher
             return await GroupPublisher(self.daemon).seal(unitid, validation, order)
@@ -323,11 +424,6 @@ class Publisher:
                 raise CoordinatorError("BASE_SCOPE_CHANGED", "Branch advanced through this unit's paths; a new verified operation is required")
             unit["base"] = current_base
         proofs = await self.dependency_check(unit, operations, {checkout["id"]: current_base})
-        for item in validation:
-            if not isinstance(item, dict) or not all(k in item for k in ("command", "exit_code", "inputs", "scope")):
-                raise CoordinatorError("VALIDATION_EVIDENCE", "Validation records need command, exit_code, actual inputs and scope")
-            if item["scope"] not in ("mixed-checkout", "candidate-objects"):
-                raise CoordinatorError("VALIDATION_SCOPE", "Do not label mixed checkout validation isolated")
         self.store.save(unit)
         try:
             await self.verify_working(checkout, rows)
@@ -538,9 +634,9 @@ class Publisher:
         if unit["state"] != "sealed":
             raise CoordinatorError("UNIT_NOT_SEALED", "Publication requires a sealed unit")
         seal = self.store.get(unit["seal"])
-        review = self.store.get(reviewid)
-        if review["_kind"] != "review" or review.get("valid") is False or any(review.get(key) != seal[key] for key in BINDING) or review.get("verdict") != "pass":
-            raise CoordinatorError("REVIEW_BINDING", "Missing, stale or mismatched completed review")
+        refusal = review_refusal(self.store, reviewid, seal)
+        if refusal:
+            raise refusal
         required = {"message", "author_name", "author_email", "author_date", "committer_name", "committer_email", "committer_date"}
         if set(metadata) != required or any(not isinstance(value, str) or not value or "\0" in value for value in metadata.values()):
             raise CoordinatorError("PUBLICATION_METADATA", "Persist complete explicit commit identity, dates and message before publication")
