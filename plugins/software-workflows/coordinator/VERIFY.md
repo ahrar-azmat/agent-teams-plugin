@@ -22104,3 +22104,38 @@ Windows' `os.name` the item is not listed, since Windows has no launch gate.
   writers back, which is the only upgrade measured. The git shim was measured only through setup's
   push guard and this release's own commit and push.
 - The memory gate, the LaunchAgent and the hook's peer lookup have no Linux path (README, Linux).
+
+## software-workflows 2.4.38 — `code_review` honours `cwd` (2026-11-06)
+
+Real `code_review` runs on the server (Codex 0.166.0): the 2.4.37 column through the installed
+tool, the tree column through the tree's server over stdio with a disposable journal and state.
+Where a run ran comes from Codex's own rollout (`session_meta.cwd` and each `turn_context.cwd`) and
+the run journal, not from the model: the first run declined to run a command placed in the review
+block.
+
+| Call | 2.4.37 | Tree |
+| --- | --- | --- |
+| `cwd` = a folder that is not a repository, `session="new"` | rollout and journal name the session's folder; `tree:e7c96fa0e5cf`, this repository | rollout, `pwd` and journal name that folder; `tree:nogit`; `dispatch_cwd` is the session's folder |
+| The session filter, with only that run in the journal | the previous predicate finds 0, so `continue` would start fresh | finds its thread |
+| `session="continue"`, `cwd` = a second such folder | not run | `continued`, turn 2; that turn's `cwd` and `pwd` are the second folder |
+| `session="continue"`, no `cwd` | not run | same thread, turn 3 in the repository; `tree:17b49880116f` |
+| That thread's id, no `cwd` | not run | `continued`, turn 4 in the repository |
+| Relative `cwd`, `plugins/software-workflows/office` | not run | rollout names it under the repository; `tree:17b49880116f`, the repository's |
+| `cwd` = another git repository | not run | rollout names it; `tree:d82c3371a110`, that repository's |
+| `cwd` = a missing path, or a file | not run | refused before inference, no run recorded |
+| `project` with no `sealed_unit` | read: ignored | refused before inference, no run recorded |
+| `codex_runs` from the session's folder | not run | lists these runs, whichever folder each ran in |
+
+**Not a fence.** `codex sandbox -c 'sandbox_mode="read-only"'`, started inside such a folder: `cat` of
+a file outside it exits 0, and a write inside it fails with `Read-only file system`.
+
+**Limits of this evidence:**
+
+- The turn-3 and relative-path prompts let the model start reviewing the repository, and my client's
+  500 s limit ended their clients. The first finished detached, and its turn ended before turn 4
+  began. The second was cancelled. Both are read from the rollout and journal above, with no answer
+  returned. The relative-path run's folder is also in its live output (`sed … ../server.py`).
+- No sealed review ran through the tool. That branch gained a keyword and a docstring line only.
+  With no daemon it still refuses before inference.
+- `codex_query` given a `cwd` ran in the repository: the server drops an argument a tool does not
+  declare. That is unchanged and listed as a known limit.

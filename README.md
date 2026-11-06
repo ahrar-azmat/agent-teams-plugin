@@ -188,6 +188,12 @@ the session: thread id, turn, tokens, context size and compactions. Use `session
 independent opinion, or a thread id to continue a particular one. `research` and `codex_query` start
 fresh unless you pass `session="continue"` or an id.
 
+**A review in another folder.** `code_review(cwd=…)` runs the review in that folder: a checkout, or a
+frozen export that is not a repository. The answer's tree stamp is that folder's (`nogit` outside a
+repository, which vouches for no push), `session="continue"` carries the session there, and a path
+that is not a directory is refused. `cwd` is not a fence: a read-only run can still read any file you
+can, so a brief that needs a boundary has to state it.
+
 **Long runs survive.** Codex runs at max effort, so a call often takes many minutes. Claude Code then
 moves it to the background and it returns as a task notification; that is normal, so wait for it.
 A run lives on a file-backed spool, so `/mcp` → Reconnect or a server restart detaches it instead

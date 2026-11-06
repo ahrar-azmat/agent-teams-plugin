@@ -3,6 +3,31 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.38] — 2026-11-06
+
+`code_review` accepted `cwd` without a `sealed_unit` and did nothing with it. A review given a
+frozen folder ran in the session's folder, and stamped that folder's tree on its answer, with no
+sign to the caller. A SmartPay session reported this, and Codex's own rollouts confirm it.
+
+- Without a `sealed_unit`, `cwd` is now the folder the review runs in: a checkout, or a frozen
+  export that is not a repository. Codex starts there, and the answer's tree stamp is that
+  folder's. A relative path starts at the session's folder, and a path that is not a directory
+  is refused before inference. The run is listed from both folders. A sealed review is unchanged:
+  `cwd` locates the unit, and the run stays in the session's folder.
+- `session="continue"` now finds a review sent from this folder to another one, and carries the
+  session into the new folder, so a review of the next frozen export is that session's next turn.
+  An explicit session id works the same way.
+- `project` without a `sealed_unit` had the same defect, and is now refused before inference.
+- `cwd` is not a fence. A read-only run can still read any file the user can (measured), so a
+  brief that needs a boundary has to state it. The tool's description says so.
+
+### Known limits
+
+- `architect_review`, `research` and `codex_query` have no `cwd`. An argument a tool does not
+  declare is dropped with no error: `codex_query` given a `cwd` ran in the session's folder
+  (measured).
+- Every lead tool ignores a relative `dispatch_cwd` (read in `_lead_tool`, not run).
+
 ## [software-workflows 2.4.37] — 2026-11-06
 
 All work moved from a Mac to an Ubuntu 24.04 server on 11-05 and 11-06, and the plugin

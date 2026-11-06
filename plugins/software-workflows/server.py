@@ -3177,7 +3177,8 @@ async def _run_codex(
 
     ``workdir`` overrides the run's working tree (abraham targeting another
     git repo — below the server's cwd, as in a multi-repo project root that
-    is not itself a work tree, or anywhere else). Empty = the server cwd.
+    is not itself a work tree, or anywhere else; code_review's cwd, which
+    need not be a repository). Empty = the server cwd.
 
     Uses codex-cli 0.118.0+ features (live-view additions verified 0.144.1):
     - ``--json`` — JSONL ThreadEvents on stdout, streamed to the per-run
@@ -4214,9 +4215,11 @@ def _session_thread(tool: str, session: str) -> tuple[str, str, str, str]:
     done = [r for r in _journal_runs().values()
             if r.get("has_start") and r.get("has_end") and r.get("status") == "ok"
             and not r.get("write") and _UUID_RE.fullmatch(str(r.get("thread_id") or ""))
-            and _run_in_workspace(str(r.get("cwd") or ""), cwd)]
+            and _run_belongs(r, cwd)]
     if want.lower() == "continue":
-        mine = [r for r in done if r.get("tool") == tool and r.get("cwd") == cwd]
+        # Run here, or sent from here to another folder (code_review's cwd): a
+        # review of the next frozen export continues the same session.
+        mine = [r for r in done if r.get("tool") == tool and cwd in (r.get("cwd"), r.get("dispatch_cwd"))]
         if not mine:
             return "", "", "", ""
         rec = max(mine, key=lambda r: float(r.get("last_ts") or 0))
@@ -4244,7 +4247,7 @@ def _session_thread(tool: str, session: str) -> tuple[str, str, str, str]:
 
 async def _advise(prompt: str, tool_name: str, session: str, *, infra: bool,
                   ctx: Any, web_search: bool, reserve: int, images: list[str],
-                  result_out: dict | None = None, review_job: str = "") -> str:
+                  result_out: dict | None = None, review_job: str = "", workdir: str = "") -> str:
     """Run an advisory tool in the codex session ``session`` names, then put
     the session line right under the signed header (the push gate and
     abraham's gate read only the FIRST line)."""
@@ -4275,7 +4278,7 @@ async def _advise(prompt: str, tool_name: str, session: str, *, infra: bool,
             prompt, infra=infra, ctx=ctx, web_search=web_search,
             reserve=reserve + _SESSION_LINE_RESERVE, images=images,
             tool_name=tool_name, resume_tid=tid or None, parent_run=prev_run,
-            claim_key=claim, session_out=out, review_job=review_job)
+            claim_key=claim, session_out=out, review_job=review_job, workdir=workdir)
     finally:
         if result_out is not None:
             result_out.update(out)
@@ -4512,9 +4515,20 @@ async def code_review(
             reads its bound Git objects, every repository of the unit, in
             place of code_or_diff, and always in a fresh session: an explicit
             thread id in session is refused. cwd, project and dispatch_cwd
-            locate the unit as for the coordinator_* tools.
+            locate the unit as for the coordinator_* tools, and the run stays
+            in the session's folder.
+        cwd: Without sealed_unit, the folder this review runs in: a checkout,
+            or a frozen export that is not a git repository. A relative path
+            starts at the session's folder, and a path that is not a directory
+            is refused. Codex starts there and the answer's tree stamp is that
+            folder's (nogit outside a repository). session="continue" carries
+            the session into this folder. NOT A FENCE: a read-only run can
+            still read any file this user can, so a brief that needs a
+            boundary must state it.
+        project: Only locates a sealed_unit, and is refused without one.
     """
     job = None
+    workdir = ""
     if sealed_unit and session not in ("", "new", "continue"):
         return await _coordinator_notice("[Bound review refused before inference: a sealed_unit review always starts "
                                          "a fresh session; omit session or pass session=\"new\".]", session_id)
@@ -4540,6 +4554,14 @@ async def code_review(
             detail = ("COORDINATOR_VERSION_SKEW: " + str(exc) if getattr(exc, "code", "") == "COORDINATOR_VERSION_SKEW"
                       else str(getattr(exc, "code", type(exc).__name__)))
             return await _coordinator_notice("[Bound review refused before inference: " + detail + "]", session_id)
+    elif project:
+        return f"[code_review refused before inference: project '{project}' only locates a sealed_unit, and none was given.]"
+    elif cwd:
+        # Honoured or refused, never accepted and ignored (11-06: a review given a frozen folder ran in the session's).
+        target = (Path(_get_cwd()) / cwd).resolve()
+        if not target.is_dir():
+            return f"[code_review refused before inference: cwd '{cwd}' is not a directory.]"
+        workdir = str(target)
     hits = _detect_anchoring({"context": context, "focus": focus})
 
     prompt_parts = [
@@ -4603,7 +4625,7 @@ async def code_review(
     result = await _advise(
         "\n".join(prompt_parts), "code_review", session, infra=infra,
         ctx=ctx, web_search=web_search, reserve=reserve,
-        images=list(images or []), result_out=completion, review_job=job["job"] if job else "",
+        images=list(images or []), result_out=completion, review_job=job["job"] if job else "", workdir=workdir,
     )
     evidence = ""
     if job:
