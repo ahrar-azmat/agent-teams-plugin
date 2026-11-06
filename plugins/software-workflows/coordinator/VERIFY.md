@@ -22139,3 +22139,128 @@ a file outside it exits 0, and a write inside it fails with `Read-only file syst
   With no daemon it still refuses before inference.
 - `codex_query` given a `cwd` ran in the repository: the server drops an argument a tool does not
   declare. That is unchanged and listed as a known limit.
+
+## software-workflows 2.4.39 — the first real writers, sealed reviews and publishes on the server (2026-11-06)
+
+Everything here ran on the server: Codex 0.166.0, `gpt-6-astra` at max, git 2.56, real `code_review`,
+`abraham` and `coordinator_publish` through a real MCP server over stdio, a disposable coordinator state and
+scratch repositories, and the machine's real server registry, with load at 45 to 55 from other sessions.
+
+| Measure | 2.4.38 | Tree |
+| --- | --- | --- |
+| Real sealed reviews, nothing about the first line in the brief | 2 of 2 `ambiguous`: "**Verdict**: Ship it — candidate 013b…" | 14 of 14 `pass` |
+| A real sealed review whose brief asks for words after the verdict on the first line | not run | a lone verdict, `pass`, and it published. The prompt held |
+| The refusal for an unreadable verdict | "Reopen the unit, change it, seal it and review it again" | `ambiguous` and `missing` say it could not be read, to read the findings and otherwise review again; `needs_changes` and `do_not_ship` keep the old advice. `review_refusal` called directly: no real answer reached this branch |
+| Publish, Frontend's layout (its `.husky/_` copied, `core.hooksPath=.husky/_`, only `pre-push`) | `PUBLICATION_HOOK` | `fcb396a` |
+| The same with `.husky/pre-commit` present | not run | `PUBLICATION_HOOK` |
+| The same with a line added to the wrapper | not run | `PUBLICATION_HOOK` |
+| The same with a line first in `.husky/_/h` | not run | `PUBLICATION_HOOK` |
+| Publish with `core.hooksPath=/dev/null` | `GIT_FAILED`: `rev-parse` exit 128, "Invalid path '/dev/null/pre-commit'" | `6c0eb05` |
+| Publish with `core.hooksPath` at an empty folder | `189ef7a`, restored, status clean | not run: the guard reads the same way |
+
+The three refused cases used one sealed, reviewed unit, and the fourth call published it with the same review:
+the review stays valid across a refusal, as the new message says. All of the Frontend-layout rows are a scratch
+repository: nothing ran in SmartPay's checkouts. `git hook list` reports "hook from hookdir" for four events
+there, and `sha256` of `pre-commit` and `h` is the same in all four husky checkouts on the machine.
+
+**The hook decision alone.** `publication_guards` on real scratch repositories with real git, the pin and the
+conversion proof stubbed out, after the review's five findings were fixed. Each row answered at once:
+
+| Layout | Decision | Advice in the refusal |
+| --- | --- | --- |
+| Husky as generated, only `pre-push` | passes | |
+| A script behind the wrapper; a line added to the wrapper; a line first in `h` | `PUBLICATION_HOOK` | empty folder |
+| `h` is a FIFO (the earlier helper's `open()` was still blocked after 2 s); a plain hook with a FIFO named `h` beside it; the wrapper is a FIFO | `PUBLICATION_HOOK` | empty folder |
+| `core.hooksPath=/dev/null`; no hooks | passes | |
+| `core.hooksPath=" hooks"`, a real hook there | `PUBLICATION_HOOK`, and `path` keeps the space | empty folder |
+| A configured hook named `hook from hookdir`, a byte-matching wrapper with no executable bit | `PUBLICATION_HOOK` | unset its configuration |
+| The same with the wrapper executable (git lists two entries) | `PUBLICATION_HOOK` | both |
+| A plain configured hook | `PUBLICATION_HOOK` | unset its configuration |
+| An absolute `core.hooksPath` at husky's layout, nothing behind it | passes | |
+| A separate git directory, no hooks; the same with a real hook | passes; `PUBLICATION_HOOK` with the real path | empty folder |
+
+git 2.43 was not run: this server's `/usr/bin/git` is 2.56, so the path without `hook list` is read, not measured.
+
+**The writer path.** `abraham` on the tree's server, `cwd` the scratch repository: `backend: native`, sandbox
+`danger-full-access`, `verified` rollout readback, 375 s for one new file, `calc.py`, and `python3 -c` printing 5
+in my re-run. Seal, three reviews, publish: `f39abad`, with one path. Dispatched from a parent repository with a
+real `pre-commit` hook into a repository inside it, on the installed 2.4.38: about 5 minutes, only the child
+registered, the parent clean, the child's unit sealed. A real server on 2.4.36 was alive throughout, and the
+write barrier passed it: it is in the real registry. The barrier's earlier refusal of a writer here was my own
+disposable `CODEX_ORACLE_LOG_DIR`, which that server is not registered in.
+
+**Other dirt in the checkout.** With an UNKNOWN on an unrelated path: a finished writer's unit sealed, reviewed
+and published (`f1e60be`). `abraham` refused `DIRTY_UNEXPLAINED`, naming the path. With `allow_dirty=true` it ran
+natively in 140 s and its unit published (`be8ba42`). That path's bytes and its UNKNOWN stayed as they were. These
+writers recorded no read of that path; the next table has one that did.
+
+**A native project of three roots.** A scratch project on the real `CODEX_HOME`, made with `project/create` and
+removed with `project/delete`: a root repository with a real `pre-commit` hook, and inside it Backend and a
+husky-laid Frontend, with a session in the root, on the tree's server and daemon.
+
+| Step | Result |
+| --- | --- |
+| `abraham(cwd=Backend)`, dirt in all three | all three registered at once, every dirty path UNKNOWN, refused `DIRTY_UNEXPLAINED`, naming the first root's paths only |
+| `allow_dirty=true`, a task in both inner repositories | native, 226 s, both new files `exact`. It listed the folders, which recorded reads of the dirty paths, and the seal refused `UNKNOWN_DEPENDENCY` |
+| The dirt committed by path first, then `abraham(cwd=Backend)` | native, 262 s, no UNKNOWN, `exact` in both |
+| That unit's first seal, at once | `PARK_IN_PROGRESS`, "Retry after the writer's park finishes" |
+| Its seal later, one review, publish | `phase: complete`, a commit in each inner repository (`6f0d768`, `fb70b7f`). The root's hook did not run and did not refuse |
+| A write no hook saw, then `unknown/restore`, `lead-edit` under a new session, seal, review, publish | one commit in Backend (`4d4cbb1`), no UNKNOWN left |
+| A second writer, `cwd` = Frontend | native, 177 s, published in the husky-laid repository (`9ef7786`) |
+
+**The real project catalog, by `project/resolve` on a disposable state, nothing registered.** `Smartpay_Backend` and
+`Smartpay_POC` resolve to the three-root project `SmartPay`. `SmartPay_Frontend` resolves to it from a session in
+`Smartpay_POC`, and from a session inside it, or with no session folder, refuses `PROJECT_AMBIGUOUS`: the project
+`SmartPay_Frontend` holds it too.
+
+**What each Bash costs in that shape.** Shared local clones of the two real repositories, at their 1,340 and 1,532
+tracked files, inside a scratch root, with the real hook script fed Pre and Post payloads at load 54. No dirty paths.
+
+| `cwd` of the Bash | Pre, median | Post, median |
+| --- | --- | --- |
+| The root | 0.23 s | 0.19 s |
+| Backend | 0.74 s | 0.63 s |
+| Frontend | 0.81 s | 0.83 s |
+| Outside | 0.08 s | 0.08 s |
+| 7 sessions at once, 3 commands each from the root, nothing written | 0.32 s, at most 1.34 s | 0.24 s, and 0 UNKNOWN after |
+
+Registering took 0.2 s for the root, 22.5 s for Backend and 15.5 s for Frontend.
+
+**Sessions on older hooks, real `claude -p` sessions on `--plugin-dir` 2.4.36 against one daemon:**
+
+| Call in a registered checkout | Result, the same on 2.4.36 and 2.4.38 hooks |
+| --- | --- |
+| Edit | `exact`, in the session's own unit |
+| Bash alone | `lead-command` |
+| Bash overlapping another session's Bash | every changed path UNKNOWN, "possible lead Bash effects" |
+| Bash with `cwd` outside any registered checkout, writing outside | no hook |
+| The same writing into the checkout | not seen, then UNKNOWN at the next scan, "unexplained filesystem change" |
+| `git commit` of an UNKNOWN path | refused, no token |
+| `git commit` by path of `lead-command` bytes, with the husky wrappers | landed with the one-shot token |
+| Edit and Bash with the daemon stopped | allowed, the daemon stays down, each path UNKNOWN at the next start, "daemon recovery filesystem snapshot" |
+
+**A session on this release meeting a 2.4.38 daemon**, on a disposable state:
+
+| The daemon | First coordinator call from the tree | `abraham` from the tree |
+| --- | --- | --- |
+| A finished writer, an open UNKNOWN | answered in 8.1 s, the daemon replaced by the tree's. A 2.4.38 server's next call works against it | not run |
+| A writer running, before the fix | `DAEMON_OUTDATED`, `pending: {"workflows": 1, "writers": 1}`, the daemon left alone | "[Native admission/startup failed: DAEMON_OUTDATED. Using the exclusive legacy exec backend.]", then the legacy path's own refusal of a dirty tree. The legacy run itself was not run |
+| A writer running, with the fix | answered in 1 s by the 2.4.38 daemon, which stays | native, 138 s, no fallback note. Seal, a `pass`, published (`c5af011`), the daemon still 2.4.38 |
+| That older session's writer ended | the next call took 5 s, and the daemon is the tree's. A 2.4.38 server's next call works against it | |
+| 2.4.37, a writer running: below `OLDEST_USABLE_DAEMON` | `DAEMON_OUTDATED`, as before | not run |
+
+No RPC, parameter or record a client reads changed between 2.4.38 and this tree: `coordinator/` differs only in
+`publish.py`'s hook check and refusal text and in this `client.py` branch.
+
+**Limits of this evidence:**
+
+- SmartPay's two checkouts were only read. Their sizes are 1,340 and 1,532 tracked files, and the rehearsal
+  repository had 3,000.
+- A seal right after a writer ended answered `PARK_IN_PROGRESS` in 2 of 7 tries, which says to retry, and a later
+  call sealed. How long a park lasts was not measured.
+- The rows for the published husky layout and `/dev/null` are the final code. The three-root project and
+  other-dirt runs came before the review's fixes, which changed only the hook check's path handling, its no-op
+  test and two refusal texts.
+- `claude -p` reports a hook's `systemMessage` to nobody, so a daemon-down warning was read in the hook's code,
+  not seen.
+- A hook that is husky's with a different version's bytes is still a hook, which refuses: only `^9.1.7` was seen.

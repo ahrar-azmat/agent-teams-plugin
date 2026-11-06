@@ -3,6 +3,55 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.39] — 2026-11-06
+
+The first real writers, sealed reviews and publishes on the server found three dead ends. Two stopped
+reviewed work from landing, and the third stopped a session from using the coordinator at all.
+
+- **A sealed review could record nothing.** The prompt asked for the verdict to refer to the
+  candidate, so real answers read "**Verdict**: Ship it — candidate 013b…" (2 of 2). The verdict is
+  read only from a line that holds nothing else, so these recorded `ambiguous` and publish refused
+  them. The prompt now asks for the verdict alone on the first line: 14 of 14 real reviews recorded
+  `pass`, with no steering in the brief.
+- **That refusal gave the wrong advice.** It told the lead to change the unit even when the verdict
+  simply could not be read. It now says that this says nothing either way about the candidate: read
+  the answer's findings, change the unit if they call for it, and otherwise call
+  `code_review(sealed_unit=…)` again. A real "Needs changes" keeps the old advice.
+- **Publish refused every repository with husky.** Husky 9 generates a wrapper for each git event,
+  and a repository with no commit-time script still has them for `pre-commit` and the rest. Three of
+  this machine's checkouts have that layout. A wrapper that is husky's own to the byte, with no
+  script of its event's name behind it, exits 0 before anything else runs, so it no longer counts as
+  a hook. A script behind it, a changed wrapper or a changed start of husky's shared file still
+  refuses.
+- **The hook refusal now says how to publish anyway.** Run what the hook checks yourself, then for the
+  call point `core.hooksPath` at an empty folder (a hook in the hooks folder) or unset its configuration
+  (a `hook.<name>` hook, which `core.hooksPath` does not reach), and restore that before anything else
+  happens in the checkout. The review stays valid.
+- **`core.hooksPath=/dev/null` failed.** The hook check asked git for an absolute path, git 2.56
+  cannot resolve one under `/dev/null`, and the publish failed as `GIT_FAILED`. It now publishes.
+- **A writer on an older daemon held up every session on a newer release.** A newer session replaces an
+  older daemon at its first coordinator call, and while a writer ran on it, that replacement was
+  refused. So after an install, one project's writer gave every other new session `DAEMON_OUTDATED` on
+  every coordinator tool, and sent its `abraham` to the legacy exec backend with no receipts. That
+  session now works against the older daemon, 2.4.38 or later, and replaces it at the first call that
+  can. A daemon older than that is still refused, because the client cannot know what it lacks.
+
+**Where each takes effect.** The prompt is in the MCP server, so it applies in a session started after
+the install. The refusals and the hook check run in the daemon, so they apply once a session on this
+release has replaced the older daemon, which waits for any writer on it to end. Sessions on older
+releases keep working against the newer daemon.
+
+### Known limits
+
+- **`allow_dirty=true` lets a writer run, not land.** Output that depends on an UNKNOWN path, because
+  the writer read or listed it first, cannot be sealed (`UNKNOWN_DEPENDENCY`), even once the path is
+  resolved. That is the rule as designed, and `abraham`'s description and the README now say so.
+- A publish finds a hook only when it is called, after the review.
+- A seal right after a writer ends can answer `PARK_IN_PROGRESS`, which says to retry (2 of 7 here).
+- Two shell commands that overlap in a registered checkout make every path either of them changed
+  UNKNOWN, whichever plugin version each session runs (measured). The README already says to change
+  files with Edit and Write while others are working.
+
 ## [software-workflows 2.4.38] — 2026-11-06
 
 `code_review` accepted `cwd` without a `sealed_unit` and did nothing with it. A review given a

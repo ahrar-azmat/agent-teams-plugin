@@ -254,6 +254,19 @@ def superseded(running):
         return False
 
 
+# The oldest daemon this release works with while it cannot replace it. A release that changes what a client asks of a
+# daemon (an RPC, a parameter, a record a client reads) raises this to itself. 2.4.39 changed none of that.
+OLDEST_USABLE_DAEMON = (2, 4, 38)
+
+
+def usable(running):
+    """Whether this client can work with an older daemon that is still busy. An unreadable version cannot."""
+    try:
+        return tuple(map(int, running.split("."))) >= OLDEST_USABLE_DAEMON
+    except (AttributeError, ValueError):
+        return False
+
+
 def _held(path):
     import fcntl
     try:
@@ -484,7 +497,15 @@ class Client:
                     status = self.settled(self.start(timeout, python, inherited_fds), timeout)
                 if not superseded(status.get("version")):
                     return status
-                self.retire(status, timeout)
+                try:
+                    self.retire(status, timeout)
+                except CoordinatorError as exc:
+                    # One project's writer must not stop every other session on the machine after an install: through
+                    # 2.4.38 they got DAEMON_OUTDATED on every tool, and abraham left the coordinator for the exec backend.
+                    # The refused stop changes nothing on the daemon, and the next call here tries again.
+                    if exc.details.get("reason") == "NOT_QUIESCENT" and usable(status.get("version")):
+                        return status
+                    raise
         raise CoordinatorError("DAEMON_OUTDATED", "An older coordinator release kept taking the daemon's place",
                                {"running": status.get("version"), "pid": status.get("pid")}, True)
 

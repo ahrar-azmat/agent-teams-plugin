@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -70,9 +71,15 @@ def review_refusal(store, reviewid, seal):
             return CoordinatorError("REVIEW_BINDING", "Review job " + reviewid + " recorded review " + review["review"] +
                                     ": publish with that review", dict(details, recorded_review=review["review"]))
         if state == "negative":
+            # "ambiguous" and "missing": the first line was not a lone verdict, which says nothing either way. The answer
+            # can still name a defect ("Verdict: Needs changes — SQL injection" reads as ambiguous).
+            remedy = ("Reopen the unit, change it, seal it and review it again" if verdict in ("needs_changes", "do_not_ship")
+                      else "That verdict could not be read, which says nothing either way about the candidate. Read the "
+                           "answer's findings: change the unit if they call for it, and otherwise call "
+                           "code_review(sealed_unit=...) again")
             return CoordinatorError("REVIEW_BINDING", "Review job " + reviewid + " recorded no review: its answer's verdict "
-                                    "read " + json.dumps(verdict) + ", and only an answer opening with \"Verdict: Ship it\" "
-                                    "records one. Reopen the unit, change it, seal it and review it again",
+                                    "read " + json.dumps(verdict) + ", and only an answer whose first line is \"Verdict: "
+                                    "Ship it\" and nothing else records one. " + remedy,
                                     dict(details, cause="verdict", required="Verdict: Ship it"))
         if state == "refused":
             refusal = review.get("refusal") or {}
@@ -125,6 +132,36 @@ def unsettled(operations, message):
                             ("; settle a quarantined one with coordinator_unit action=settle-operation once native can no "
                              "longer write for it" if quarantined else ""),
                             {"operation": blocking[0]["operation"], "operations": blocking})
+
+
+# Husky 9 generates this wrapper for every git event, script or no script (four checkouts on the server, 11-06: all
+# byte-identical, from ^9.1.7, and three with no commit-time script).
+HUSKY_WRAPPER = b'#!/usr/bin/env sh\n. "$(dirname "$0")/h"'
+HUSKY_SHARED_START = (b'#!/usr/bin/env sh\n[ "$HUSKY" = "2" ] && set -x\nn=$(basename "$0")\n'
+                      b's=$(dirname "$(dirname "$0")")/$n\n\n[ ! -f "$s" ] && exit 0\n')
+
+
+def regular_start(path, size):
+    """The first `size` bytes of a regular file, or None. Never waits: a FIFO opens with no writer, and is no regular file."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        return os.read(fd, size) if stat.S_ISREG(os.fstat(fd).st_mode) else None
+    finally:
+        os.close(fd)
+
+
+def husky_wrapper_does_nothing(path):
+    """True only for husky's own wrapper with no script of its event's name beside the wrappers' folder: its shared
+    file then exits 0 before anything else runs. A changed wrapper, a changed start or a script behind it is a hook.
+    The executable bit is what makes the listing's one "hook from hookdir" this file: git lists a traditional hook only
+    when it is executable (measured on 2.56), and a configured hook may carry that very name, listed beside it."""
+    folder, event = os.path.split(path)
+    try:
+        return (os.access(path, os.X_OK) and regular_start(path, len(HUSKY_WRAPPER) + 1) == HUSKY_WRAPPER
+                and regular_start(os.path.join(folder, "h"), len(HUSKY_SHARED_START)) == HUSKY_SHARED_START
+                and not os.path.lexists(os.path.join(os.path.dirname(folder), event)))
+    except OSError:
+        return False
 
 
 class Publisher:
@@ -429,7 +466,9 @@ class Publisher:
         hooks = ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "reference-transaction", "post-index-change")
         for event in hooks:
             result = gitio.git(root, ["hook", "list", "-z", event], normal_config=True, check=False, extra_env={"LC_ALL": "C"})
-            path = gitio.text(root, ["rev-parse", "--path-format=absolute", "--git-path", "hooks/" + event], normal_config=True)
+            # No --path-format=absolute: it resolves the folder, and with core.hooksPath=/dev/null (hooks off) git 2.56 exits
+            # 128. Not gitio.text either: it strips, and a leading space is part of a relative core.hooksPath.
+            path = os.path.join(root, gitio.git(root, ["rev-parse", "--git-path", "hooks/" + event], normal_config=True).stdout.decode("utf-8").removesuffix("\n"))
             status, listed = result.returncode, result.stdout
             if status == 129 and b"unknown subcommand" in result.stderr:
                 # A git before `hook list`, which arrived with configured hooks (Ubuntu 24.04 ships 2.43). Measured on 2.43:
@@ -440,6 +479,8 @@ class Publisher:
             details = {"root": root, "event": event, "path": path, "exit_code": status}
             if status not in (0, 1):
                 raise CoordinatorError("PUBLICATION_HOOK_DISCOVERY", "Could not discover publication hooks", details)
+            if listed == b"hook from hookdir\0" and husky_wrapper_does_nothing(path):
+                continue
             if listed:
                 details["hooks"] = listed.decode("utf-8", "replace").rstrip("\0").split("\0")
                 # Configured hooks have friendly names, not necessarily an
@@ -453,7 +494,14 @@ class Publisher:
                     for name in details["hooks"]]
                 if "hook from hookdir" not in details["hooks"]:
                     details.pop("path")
-                raise CoordinatorError("PUBLICATION_HOOK", "Normal publication would run a hook", details)
+                # core.hooksPath reaches only the traditional hook: git finds a configured one wherever that points.
+                traditional = os.access(path, os.X_OK)
+                switch = ((["point core.hooksPath at an empty folder"] if traditional else []) +
+                          (["unset the configuration of each hook.<name> in details"] if len(details["hooks"]) > traditional else []))
+                raise CoordinatorError("PUBLICATION_HOOK", "Normal publication would run a hook, and a publish commits exactly "
+                                       "the reviewed bytes. To publish anyway: run what the hook checks yourself, " +
+                                       " and ".join(switch) + " for this call, and restore that before anything else happens "
+                                       "in this checkout. The review stays valid", details)
         settings = {}
         for key in ("commit.gpgSign", "core.autocrlf", "core.eol", "core.fsmonitor", "core.splitIndex", "index.sparse", "core.untrackedCache"):
             result = gitio.git(root, ["config", "--get", key], normal_config=True, check=False)

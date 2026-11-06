@@ -412,6 +412,11 @@ vector, including reused prefix journals.
 `PUBLICATION_HOOK` means a hook was discovered; `PUBLICATION_HOOK_DISCOVERY`
 means discovery failed. Details name the root, event, hook location and discovery
 exit code. Other guards name the root and relevant path or configuration key.
+Husky 9's own executable wrapper, to the byte, with its shared file starting as husky
+writes it and no script of the event's name beside the wrappers' folder, is not a hook:
+it exits 0 before anything else runs. Only when it is the event's sole hook. The
+refusal's advice follows the hook's source: `core.hooksPath` reaches only a hook in
+the hooks folder, and a `hook.<name>` hook needs its configuration unset.
 
 The push gate reads completed publication evidence through SQLite `mode=ro`,
 without starting a coordinator or migrating its store. The actual pushed commit
@@ -1333,7 +1338,7 @@ retired generation.
 | `unit/diff` | `unit`; object diff and exact review binding. |
 | `unit/dependencies` | `unit`, `report` (from a dependency refusal's `details.report`), optional `cursor` (the previous page's `next_cursor`); one page of that unit's dependency report: `digest`, `total`, `items`, the page's failing `paths`, `paths_total`, `next_cursor`. A read. Refused `PROVENANCE_MISSING` for another unit's report and `DEPENDENCY_CURSOR` for a cursor of another digest or out of range. |
 | `unit/review-record` | `unit`, `evidence`; lead-only completed review contract described below. |
-| `unit/publish` | `unit`, `review`, complete `metadata`; lead-only journaled publication. `REVIEW_BINDING` names its `cause`: `missing` (no such record), `job` (a review job: its state and verdict; a recorded job names the review it recorded), `verdict` (only a completed answer opening `Verdict: Ship it` records a review: any other verdict leaves the job negative and records none), `kind`, `invalidated`, or `stale` (the binding keys that differ from the current seal's). |
+| `unit/publish` | `unit`, `review`, complete `metadata`; lead-only journaled publication. `REVIEW_BINDING` names its `cause`: `missing` (no such record), `job` (a review job: its state and verdict; a recorded job names the review it recorded), `verdict` (only a completed answer whose first line is `Verdict: Ship it` and nothing else records a review: any other verdict leaves the job negative and records none, and a verdict that could not be read says to read the findings, rather than to change the unit), `kind`, `invalidated`, or `stale` (the binding keys that differ from the current seal's). |
 | `unit/reopen` | `unit`; reopen a sealed unit with no publication or only provably abandoned journals, invalidating its review. |
 | `admission/check` | `scratch`, optional `probes`; real native capability observations, never external model inference. |
 | `records/list` | `kind`, optional `cursor`, `limit`; paginated diagnostic records, not a way to adopt changes. |

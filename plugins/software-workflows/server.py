@@ -4549,7 +4549,7 @@ async def code_review(
                                        "switch the daemon to software-workflows 2.4.29 or later and reconnect this MCP server")
             session = "new"
             code_or_diff = job["packet"]
-            context += "\nReview the bound Git objects, including every non-inlined path in the complete manifest. Working-tree contents can belong to other writers. Every finding and verdict must refer to this candidate."
+            context += "\nReview the bound Git objects, including every non-inlined path in the complete manifest. Working-tree contents can belong to other writers. Every finding must refer to this candidate."
         except Exception as exc:
             detail = ("COORDINATOR_VERSION_SKEW: " + str(exc) if getattr(exc, "code", "") == "COORDINATOR_VERSION_SKEW"
                       else str(getattr(exc, "code", type(exc).__name__)))
@@ -4608,6 +4608,10 @@ async def code_review(
         "\n## Required output format (CONCISE — under 1500 words total)\n"
         "No preamble, no filler. Get straight to findings.\n\n"
         "**Verdict**: Ship it / Needs changes / Do not ship\n"
+        # reviews.verdict reads only a lone verdict line, and anything else records no review (11-06: real answers said
+        # "Ship it — candidate 013b…", because this prompt asked for the verdict to refer to the candidate).
+        + ("The answer's first line is that verdict and nothing else: no candidate id, description or condition "
+           "on it. Those go on later lines. A first line holding anything more records no review.\n" if job else "") +
         "**Findings** (highest severity first, one per line):\n"
         "  [CRITICAL/HIGH/MEDIUM/LOW] file:line — issue → fix\n"
         "  (include code snippets only for CRITICAL/HIGH fixes)\n"
@@ -5491,7 +5495,11 @@ async def abraham(
     A git work tree is required. Concurrent native writers coordinate path
     claims, exact edit receipts and process custody. Unexplained dirt refuses
     dispatch unless allow_dirty=true; this flag never grants attribution or
-    clears UNKNOWN. A supervisor-held compatibility lease excludes legacy exec
+    clears UNKNOWN. Work whose output depends on an UNKNOWN path, because the
+    writer read or listed it first, cannot be sealed, even once the path is
+    resolved: land dirt first, and use the flag only for work that will not be
+    published through a seal.
+    A supervisor-held compatibility lease excludes legacy exec
     writers. Native results identify the run/unit, policy and receipt authors;
     complete results and events remain retrievable through the run tools.
     Startup/admission failure before production execution can select the

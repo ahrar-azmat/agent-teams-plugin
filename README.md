@@ -227,7 +227,9 @@ What it guarantees:
 - The target (`cwd`) may be any git repository on the machine. The run is listed and resumable from
   the folder you dispatched it from and from the target.
 - A dirty tree is refused unless you pass `allow_dirty=true`. Uncommitted edits Codex touches have no
-  undo.
+  undo. Work whose output depends on a path the coordinator holds as UNKNOWN, meaning dirt it cannot
+  explain, cannot be sealed, even once that path is resolved, and a read or a directory listing before
+  the edit is such a dependency. So land dirty work first.
 - Several writers can share a checkout, each on its own **claims** (next section). A run on the
   fallback `codex exec` backend still holds its checkout alone, across both phases.
 - Codex must leave commits and pushes to the lead. Native command admission and an inherited
@@ -326,7 +328,9 @@ creates, changes or deletes one.
   unit, one seal and one review cover every repository it changed, and `coordinator_publish` checks
   them all before it commits in any. A unit stopped midway is **partly published**: its committed
   repositories keep their commits, `coordinator_unit(action="recover")` continues it, and none of its
-  repositories can be pushed until it is complete. The push gate
+  repositories can be pushed until it is complete. A publish refuses a repository whose commit would
+  run a hook, and the refusal says how to publish anyway; husky's own wrappers with no script behind
+  them are not hooks. The push gate
   refuses a plain `git commit` that would take another writer's paths or UNKNOWN content (see Push
   gate).
 - **UNKNOWN content.** `coordinator_unit(action="unknown")` lists it; `action="restore"` puts the last
@@ -337,7 +341,8 @@ creates, changes or deletes one.
 - **Updating.** The first `abraham` or lead tool call of a newer release replaces an older
   release's coordinator, which migrates the state. It stops only the daemon it checked, and only
   when nothing is in flight. While something is (a lead edit or command, a writer's turn, a
-  publication), that call is refused with `DAEMON_OUTDATED`, and the old daemon keeps serving.
+  publication), the old daemon keeps serving, the call works against it, and a later call tries again.
+  Against a daemon older than 2.4.38 the call is refused with `DAEMON_OUTDATED` instead.
   Lead edits made during the replacement wait for the new daemon; one that arrives while it is
   still recovering is refused as busy and retried. A coordinator from before 2.4.0 is
   never stopped by a call. Stop it once, when no session is editing, with the command the refusal
