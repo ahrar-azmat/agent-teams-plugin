@@ -434,7 +434,8 @@ def group_live_members(pgid, ps_bin=PS_BIN):
             pid, pg = int(parts[0]), int(parts[1])
         except ValueError:
             continue
-        if pg == pgid and not parts[2].startswith("Z"):
+        # procps' Zl: a leader that exited while another thread runs
+        if pg == pgid and (not parts[2].startswith("Z") or "l" in parts[2]):
             live.append(pid)
     return live
 

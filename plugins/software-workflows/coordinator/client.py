@@ -14,6 +14,26 @@ import time
 import uuid
 
 
+# The shell for a launch gate, whose redirections name a descriptor by number. Bash takes any descriptor. Ubuntu's
+# /bin/sh is dash, which takes one digit only ("Syntax error: Bad fd number", measured on dash 0.5.12): a gate there works
+# until the descriptor reaches 10. macOS's /bin/sh is bash, so nothing showed this there.
+# A gate runs nothing before it opens, and bash by that name would (each measured on 5.2.21 in a real launch or a -c shell):
+# -p ignores BASH_ENV, exported functions (the environment's `read` would answer for the gate's) and SHELLOPTS. --norc stops
+# the ~/.bashrc that Ubuntu's bash reads for a -c shell when SSH_CLIENT is set, which -p does not.
+GATE_SHELL = ("/bin/bash", "--norc", "--noprofile", "-p") if os.path.exists("/bin/bash") else ("/bin/sh", "-p")
+
+
+def gate_command(script, argv, environment):
+    """The command for a launch gate: script, ending in exec "$@", which starts argv with what it was given. Bash owns
+    SHELLOPTS and BASHOPTS: it rebuilds an exported one from its own options (measured: an exported pipefail lost, and
+    `privileged` in every shell below). The loader's LD_* and glibc's GCONV_PATH would load a library into the gate's
+    shell before it reads a line (measured: LD_PRELOAD's constructor, with the gate closed). So they go round it, taken
+    out of environment here. A gate guards against accidents: this is not a boundary against code set on running first."""
+    kept = [f"{key}={environment.pop(key)}" for key in sorted(environment)
+            if key in ("SHELLOPTS", "BASHOPTS", "GCONV_PATH") or key.startswith("LD_")]
+    return [*GATE_SHELL, "-c", script, "sw-gate", *(["/usr/bin/env", *kept] if kept else []), *argv]
+
+
 class CoordinatorError(RuntimeError):
     def __init__(self, code, message, details=None, operational=False, *, answered=False):
         super().__init__(message)
@@ -189,6 +209,30 @@ def clean_environment(source=None, *, codex=True):
         del environment["GIT_EXEC_PATH"]
     from . import push_guard
     return push_guard.environment(environment) if codex else push_guard.detach(environment)
+
+
+def own_scope(argv):
+    """argv, run in a systemd scope of its own, for a process that must outlive the session that starts it.
+
+    A new session does not leave a cgroup. T3 runs each agent in a scope with KillMode=control-group, and stopping that
+    scope ends everything in it (measured 11-06: the daemon, its worker and so every writer, and the office). systemd-run
+    --scope execs argv in place: the same PID, standard streams, descriptors and environment. Where no user manager
+    answers (macOS, a container, a sandbox) argv runs as given, which is no worse than before."""
+    if not sys.platform.startswith("linux"):
+        return argv
+    runner = shutil.which("systemd-run")
+    if not runner:
+        return argv
+    prefix = []
+    if not os.environ.get("XDG_RUNTIME_DIR"):  # how systemd-run --user finds the manager
+        prefix = ["/usr/bin/env", "XDG_RUNTIME_DIR=/run/user/" + str(os.getuid())]
+    scoped = [*prefix, runner, "--user", "--scope", "--quiet", "--collect"]
+    try:
+        probe = subprocess.run([*scoped, "--", "/bin/true"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return argv
+    return [*scoped, "--", *argv] if probe.returncode == 0 else argv
 
 
 def launch_environment():
@@ -490,8 +534,8 @@ class Client:
             from .leases import control
             control(self.state, "owner/status")  # socket activation, never a competing supervisor
         else:
-            subprocess.Popen([python or daemon_python(), "-B", "-m", "coordinator", "daemon", "serve",
-                          "--state", str(self.state)], stdin=subprocess.DEVNULL,
+            subprocess.Popen(own_scope([python or daemon_python(), "-B", "-m", "coordinator", "daemon", "serve",
+                          "--state", str(self.state)]), stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          start_new_session=True, close_fds=True, pass_fds=inherited_fds,
                              cwd=str(Path(__file__).resolve().parents[1]), env=environment)

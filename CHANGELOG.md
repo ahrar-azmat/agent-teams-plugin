@@ -3,6 +3,106 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.37] — 2026-11-06
+
+All work moved from a Mac to an Ubuntu 24.04 server on 11-05 and 11-06, and the plugin
+had never run a writer on Linux. On the server the coordinator daemon could not start,
+every oracle run lost its answer, and setup read all ready throughout. This release is
+what the move needed. It was measured on the server (x86-64, kernel 6.8, Codex 0.166.0,
+git 2.43 and 2.56) with real Codex writers on a disposable state: a patch through seal,
+review and publish to a commit (`coordinator/VERIFY.md`). macOS was not measured again,
+because the Mac cannot be reached from the server. What changes there is named below.
+
+### Change 1 — the daemon starts and runs writers on Linux
+
+- The supervisor watched its children with `select.kqueue`, which Linux does not have
+  (`AttributeError` at `owners.py:368`). `ExitWatch` uses kqueue where there is one and
+  a pidfd elsewhere, including for an adopted worker that `waitpid` cannot see.
+- A launch gate names a descriptor by number, and Ubuntu's `/bin/sh` is dash, which takes
+  one digit (`sw-gate: 1: Syntax error: Bad fd number`). The worker crashed in a loop once
+  a descriptor reached 10. Gates now run under `/bin/bash --norc --noprofile -p`, which shuts
+  out what plain bash by that name ran before a gate opened: `BASH_ENV` 42 times in one real
+  launch, `~/.bashrc` when `SSH_CLIENT` was set, and an exported `read` in place of the
+  gate's. `LD_*` and `GCONV_PATH` would load a library into the gate's shell, so they go round
+  it, as do `SHELLOPTS` and `BASHOPTS`, which bash would rewrite: the program the gate starts
+  gets them as given. This also changes macOS, where the gate was `/bin/sh`.
+- `kernel_id` was the start tick alone, and a tick is 10 ms: 333 of 665 processes shared
+  one. Another session's shell, born in a writer's tick, was taken into that writer's
+  family, and a family's cleanup can SIGKILL its members. It is now the tick and the PID
+  together, with 0 collisions on the same machine.
+- Admission's ownership probe looked for an orphan under PID 1. Linux gives an orphan to
+  the nearest subreaper, here the user's systemd. An orphan is now a process whose parent
+  is no longer in the family, which also holds on macOS.
+- That probe also ran its command under `/bin/zsh`, so a machine without zsh failed writer
+  admission (`ADMISSION_FAILED`, exit 127) while setup read ready. Without zsh it now uses
+  `/bin/sh`. A Mac has zsh, and keeps it.
+- Admission's exec-policy proof was pinned to Codex 0.163.0. `POLICY_PROVEN` adds 0.166.0,
+  after reading `is_empty` at that tag. This one also reaches a Mac on 0.166.0.
+- The daemon and the office now start in a systemd scope of their own (`own_scope`). A new
+  session does not leave a cgroup: T3 runs each agent in a scope with
+  `KillMode=control-group`, and stopping that scope ended the daemon, its worker, every
+  writer and the office. Where no user manager answers, they start as before.
+
+### Change 2 — oracle answers come back on Linux
+
+- The survivor scan refused to call a run finished if any process of ours hid its
+  environment, and on Linux 15 always do (`systemd --user`, `sshd`, `gpg-agent`, a
+  container's processes under our uid). So every read-only run ended "group still reads
+  alive", stayed `CANCELLING`, and returned without its text.
+- The scan now clears an unreadable process only on the kernel's evidence that it cannot
+  hold this run's marker: it is older than the run's leader, or its nearest readable
+  ancestor of ours lacks the marker, or no process of ours is above it (its line reaches
+  PID 1 through another user's processes, as an `sshd` session's and a container's do) and
+  it lives in another cgroup. Another cgroup alone proves nothing, since a descendant can
+  move itself, and neither does an adopter: an orphan under PID 1 or a user manager stays
+  unproven, and the scan then fails closed. So does an ancestor that reads empty (it is on
+  its way out), and a child that no longer names that parent after the read. Each run records
+  its leader's start tick, cgroup and boot id, and the watchdog passes the first two on. A
+  record from an earlier boot left nothing alive. Without both boot ids its ticks mean
+  nothing, and it stays unknown.
+- A leader that exited while another of its threads runs reads as a zombie, and was taken
+  for finished by the scan, the group checks, `_proc_info`, and the coordinator's process
+  identity and inventory. Now only a zombie with no other thread counts (`Threads` 1, `ps` `Z`
+  and not `Zl`).
+- When a scan cannot prove anything, the message now says that, instead of claiming the
+  process group is alive, and it carries the answer: the run had finished writing it. The
+  row stays `CANCELLING`, and `codex_cancel_run` closes it once the process has left. This
+  part also applies on macOS.
+
+### Change 3 — publication on a git without `git hook list`
+
+- `unit/publish` refused every publish on Ubuntu's git 2.43 with
+  `PUBLICATION_HOOK_DISCOVERY` (exit 129: the subcommand does not exist). Measured on 2.43,
+  a commit takes whatever `access(X_OK)` passes at the hooks path as its hook,
+  `core.hooksPath` included, and fails if that cannot run (an executable directory).
+  Nothing else counts, so that is what such a git is checked for. A git that has
+  `hook list` behaves as before, read under `LC_ALL=C`.
+- The push gate is unchanged. On such a git it reads hooks as unknown and drops its strong
+  wording on every commit and push.
+
+### Change 4 — setup says what is wrong
+
+- `/software-workflows:setup` and the SessionStart check now run Codex's read-only sandbox
+  on Linux, with the exact AppArmor fix on Ubuntu 24.04, and check that the launch shell
+  can pass a two-digit descriptor. Setup also says when git has no `hook list`.
+
+### Known limits on Linux
+
+- A launch gate guards against accidents. It is not a boundary against code set on running
+  before it: it shuts out the routes named above, and other ways to reach a shell's startup
+  are not covered.
+- The memory gate reads macOS's compressor only. `status` shows `supported: false`, and a
+  launch is never deferred under memory pressure.
+- The crash-cleanup LaunchAgent is macOS only. Orphans wait for the next client start.
+- A Pre hook's deadline counts from the request, not from when Codex started the hook,
+  because the peer lookup is macOS only.
+- A process of ours that hides its environment, born during a run and adopted by the user's
+  manager (a `gpg-agent` started on demand), leaves that run `CANCELLING` until it exits. The
+  answer still comes back. The kernel cannot tell it from the run's own orphan.
+- A run left over from an older server recorded no origin, and none can be worked out, since
+  a wall-clock timestamp can step past what the run left alive. On Linux `codex_cancel_run`
+  refuses it and keeps the intent, so its row stays `CANCELLING`. The row blocks nothing.
+
 ## [software-workflows 2.4.36] — 2026-11-05
 
 Change 1 comes from the Sales_Profiler lead's C0 seal (11-05). Change 2 comes from

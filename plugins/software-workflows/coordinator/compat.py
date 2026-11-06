@@ -78,7 +78,9 @@ def _proc_info(pid: int) -> tuple[str, str]:
             capture_output=True, text=True, timeout=5,
         ).stdout.split()
         if out:
-            return out[0][:1].upper(), "_".join(out[1:])
+            stat = out[0][:1].upper()
+            # procps' Zl: a leader that exited while another thread runs, and is still working.
+            return ("S" if stat == "Z" and "l" in out[0] else stat), "_".join(out[1:])
     return "", ""
 
 

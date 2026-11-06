@@ -1429,6 +1429,8 @@ _WATCHDOG_SH = (
     # unknown keeps the loop alive and is logged, never read as quiescence.
     'pid=$1; pgid=$2; deadline=$3; tag=$4; start=$5; flog=$6; '
     'maxu=${7:-60}; PS=${8:-/bin/ps}; PY=${9:-}; PE=${10:-}; s=; '
+    # The run's origin for the /proc scan (procenv.scan_proc); empty where there is none.
+    'born=${12:-}; cg=${13:-}; '
     # TICK BOUND (round 34): the wall clock (`date +%s`) can be rolled
     # back under a detached enforcer; ticks (one per 5 s poll) cannot —
     # the deadline fires on whichever comes first.
@@ -1440,7 +1442,7 @@ _WATCHDOG_SH = (
     '[ "$("$PS" -o lstart= -p "$pid" 2>/dev/null | '
     "awk '{$1=$1; gsub(/ /,\"_\"); print}')\" = \"$start\" ]; }; "
     'marked() { [ -n "$PY" ] && [ -n "$PE" ] || { echo U; return; }; '
-    'o=$("$PY" "$PE" --list "$tag" 2>/dev/null) || { echo U; return; }; printf "%s\\n" "$o"; }; '
+    'o=$("$PY" "$PE" --list "$tag" "$born" "$cg" 2>/dev/null) || { echo U; return; }; printf "%s\\n" "$o"; }; '
     # verified(): EXACT env check through procenv.py (round 30) — the text
     # scan above only nominates; a kill needs the marker in the process
     # ENVIRONMENT. No interpreter / no verifier = unverifiable = no kill.
@@ -1510,7 +1512,7 @@ def _spawn_watchdog(pid: int, pgid: int, deadline_ts: float,
                     run_tag: str = "", pid_start: str = "",
                     max_unknown: int = 60, ps_bin: str = "/bin/ps",
                     python_bin: str = "", procenv: str = "",
-                    max_ticks: int = 0) -> subprocess.Popen | None:
+                    max_ticks: int = 0, origin: tuple = (None, None)) -> subprocess.Popen | None:
     """POSIX: a tiny detached /bin/sh that SIGKILLs the codex process group
     at the run deadline, or exits within 5 s of codex ending on its own. The
     MAX_RUNTIME bound therefore holds with NO server alive — a detached run
@@ -1522,7 +1524,8 @@ def _spawn_watchdog(pid: int, pgid: int, deadline_ts: float,
             ["/bin/sh", "-c", _WATCHDOG_SH, "codex-oracle-watchdog",
              str(pid), str(pgid), str(int(deadline_ts)), run_tag, pid_start,
              str(LIVE_LOG_DIR / "watchdog-failures.log"), str(max_unknown), ps_bin,
-             python_bin or sys.executable, procenv or str(PROCENV_PATH), str(max_ticks)],
+             python_bin or sys.executable, procenv or str(PROCENV_PATH), str(max_ticks),
+             str(origin[0] if origin[0] is not None else ""), origin[1] or ""],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
             pass_fds=_VENV_LOCK_FDS,
@@ -1583,7 +1586,9 @@ def _proc_info(pid: int) -> tuple[str, str]:
             capture_output=True, text=True, timeout=5,
         ).stdout.split()
         if out:
-            return out[0][:1].upper(), "_".join(out[1:])
+            stat = out[0][:1].upper()
+            # procps' Zl: a leader that exited while another thread runs, and is still working.
+            return ("S" if stat == "Z" and "l" in out[0] else stat), "_".join(out[1:])
     return "", ""
 
 
@@ -1844,7 +1849,8 @@ def _pgid_alive(pgid: int) -> bool:
         for line in done.stdout.splitlines():
             parts = line.split(None, 1)
             if (len(parts) == 2 and parts[0].strip() == str(pgid)
-                    and not parts[1].strip().startswith("Z")):
+                    # procps' Zl: a leader that exited while another thread runs
+                    and (not parts[1].strip().startswith("Z") or "l" in parts[1])):
                 return True
         return False
     except Exception:
@@ -1906,7 +1912,33 @@ def _marked_survivors(run_tag: str) -> list[int]:
     it can never be mistaken for covered."""
     if os.name == "nt" or not run_tag:
         return []
-    return list(_procenv.marked_pids(run_tag))  # OSError propagates: fail closed
+    born_after, cgroup = _run_origin(run_tag)
+    # OSError propagates: fail closed
+    return list(_procenv.marked_pids(run_tag, born_after=born_after, cgroup=cgroup))
+
+
+# Each run's origin (procenv.run_origin) as this server spawned it: the FIRST attempt's, since a
+# retry keeps the tag and what an earlier attempt left behind carries the same marker.
+_RUN_ORIGINS: dict[str, tuple] = {}
+
+
+def _run_origin(run_tag: str) -> tuple:
+    """(start ticks, cgroup) for the /proc scan, as the leader had them when it was spawned: this server's own, or
+    another server's from its journal record. A record from before 2.4.37 has neither and stays unknown, since only the
+    kernel's reading bounds a birth (a wall-clock timestamp can step past what the run left alive). So do ticks without
+    both boots known, since they count from a boot. A record from an earlier boot left nothing alive, so every process
+    now counts as older than its leader (procenv.scan_proc)."""
+    if run_tag in _RUN_ORIGINS:
+        return _RUN_ORIGINS[run_tag]
+    rec = _journal_runs().get(run_tag) or {}
+    ticks, cgroup = rec.get("birth_ticks"), rec.get("cgroup")
+    recorded, current = rec.get("boot_id"), _procenv.boot_id()
+    if ticks is None or not recorded or not current:
+        return None, None
+    if recorded != current:
+        ticks = 1 << 62
+    _RUN_ORIGINS[run_tag] = (ticks, cgroup)
+    return ticks, cgroup
 
 
 def _kill_marked(run_tag: str, pids: list[int]) -> None:
@@ -2557,7 +2589,7 @@ async def _exec_codex_once(
     # read fails, and the child exits 97: fail closed, never an unpublished
     # writer racing a bridge that still names a dead server.
     barrier = bool(state.get("write") or state.get("custody_cwd")) and os.name != "nt"
-    from coordinator.client import CoordinatorError
+    from coordinator.client import CoordinatorError, gate_command
     prompt_file = None
     try:
         # A private, seekable file survives parent detachment without a pipe
@@ -2582,25 +2614,25 @@ async def _exec_codex_once(
         launch = {"argv_bytes": sum(len(os.fsencode(arg)) + 1 for arg in cmd),
                   "prompt_bytes": len(prompt_bytes), "stdin_bytes": len(transport),
                   "prompt_transport": "private-file-reference" if prompt_path else "private-file", "barrier": barrier}
+        from coordinator.push_guard import environment as guarded_environment
+        spawn_env = guarded_environment({**_codex_env(), **(extra_env or {}),
+                 # Round 16: descendants that setsid() out of our group are
+                 # findable/killable only by this inherited marker.
+                 RUN_MARKER_ENV: str(state.get("run_tag") or "")})
         if barrier:
             descriptor = prompt_file.fileno()
             inherited["pass_fds"] = tuple(sorted(set(inherited.get("pass_fds", ())) | {descriptor}))
-            cmd = ["/bin/sh", "-c", f'read _ok || exit 97; exec "$0" "$@" <&{descriptor}',
-                   cmd[0], *cmd[1:]]
+            cmd = gate_command(f'read _ok || exit 97; exec "$@" <&{descriptor}', cmd, spawn_env)
         launch["spawn_argv_bytes"] = sum(len(os.fsencode(arg)) + 1 for arg in cmd)
         state["launch"] = launch
         emit("Launch: " + json.dumps(launch, sort_keys=True))
-        from coordinator.push_guard import environment as guarded_environment
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=(asyncio.subprocess.PIPE if barrier else prompt_file),
             stdout=out_fh,
             stderr=err_fh,
             cwd=workdir or _get_cwd(),
-            env=guarded_environment({**_codex_env(), **(extra_env or {}),
-                 # Round 16: descendants that setsid() out of our group are
-                 # findable/killable only by this inherited marker.
-                 RUN_MARKER_ENV: str(state.get("run_tag") or "")}),
+            env=spawn_env,
             # Own process group so _kill_tree reaps the node shim AND the
             # vendored codex grandchild together (POSIX: setsid + killpg;
             # Windows: its own group, reaped via taskkill /T).
@@ -2642,6 +2674,7 @@ async def _exec_codex_once(
     deadline_ts = spawn_ts + attempt_budget
     leader_start = _proc_start(proc.pid)  # captured BEFORE the watchdog exists:
     # it anchors every group kill to THIS leader's identity (round 21).
+    origin = _RUN_ORIGINS.setdefault(str(state.get("run_tag") or ""), _procenv.run_origin(proc.pid))
     # TICK BOUND FROM THE PARENT (round 36): the enforcer's own wall clock
     # can be rolled back, so the tick count is derived HERE from the
     # monotonic attempt budget (one tick per 5 s poll, +2 slack) and passed
@@ -2649,7 +2682,7 @@ async def _exec_codex_once(
     max_ticks = int(attempt_budget // 5) + 2
     watchdog = _spawn_watchdog(proc.pid, pgid, deadline_ts,
                                str(state.get("run_tag") or ""), leader_start,
-                               max_ticks=max_ticks)
+                               max_ticks=max_ticks, origin=origin)
     watchdog_start = _proc_start(watchdog.pid) if watchdog is not None else ""
     if watchdog is not None and not watchdog_start:
         # An enforcer whose identity cannot be recorded cannot be verified
@@ -2665,6 +2698,7 @@ async def _exec_codex_once(
         "stdout": str(stdout_path), "stderr": str(stderr_path),
         "output_file": str(output_file),
         "spawn_ts": spawn_ts, "deadline_ts": deadline_ts, "max_ticks": max_ticks,
+        "birth_ticks": origin[0], "cgroup": origin[1], "boot_id": _procenv.boot_id(),
     }
     state.pop("detached", None)
     if (state.get("write") or state.get("custody_cwd")) and not _note_write_child(
@@ -2876,10 +2910,12 @@ async def _exec_codex_once(
                 # alive after the marker sweep is either an unmarked leak or
                 # a reused id, and both directions land in the nonterminal
                 # survivor path (fail closed, operator resolves).
+                scan_error = ""
                 try:
                     marked = _marked_survivors(str(state.get("run_tag") or ""))
-                except Exception:
+                except Exception as exc:
                     marked = [-1]  # unverifiable → fail closed below
+                    scan_error = str(exc)
                 _kill_marked(str(state.get("run_tag") or ""), [p for p in marked if p > 0])
                 sweep_end = time.monotonic() + 3.0
                 while time.monotonic() < sweep_end:
@@ -2887,16 +2923,20 @@ async def _exec_codex_once(
                     if marked:
                         try:
                             still_marked = _marked_survivors(str(state.get("run_tag") or ""))
-                        except Exception:
+                            scan_error = ""
+                        except Exception as exc:
                             still_marked = [-1]
+                            scan_error = str(exc)
                     if not _pgid_alive(pgid) and not still_marked:
                         marked = []
                         break
                     marked = still_marked or marked
                     await asyncio.sleep(0.1)
-                if _pgid_alive(pgid) or marked:
+                group_alive = _pgid_alive(pgid)
+                if group_alive or marked:
                     state["group_survivors"] = pgid
                     state["marked_survivors"] = [p for p in marked if p > 0]
+                    state["survivor_scan_error"] = "" if group_alive else scan_error
             if watchdog is not None:
                 # Reap it too — a signalled-but-unwaited child is a zombie
                 # that still answers kill(0) (measured in the detach suite).
@@ -3779,15 +3819,21 @@ async def _run_codex(
             _write_changes_report(write_before, eff_cwd)
             if write else ""
         )
+        unproven = str(state.get("survivor_scan_error") or "")
+        finding = (
+            f"the process scan could not prove it left nothing behind ({unproven})" if unproven
+            else f"its process group ({gp}) still reads alive after the marker sweep")
         return (
-            f"[Codex run {run_tag}: the codex leader exited but its process "
-            f"group ({gp}) still reads alive after the marker sweep — "
+            f"[Codex run {run_tag}: the codex leader exited but {finding} — "
             f"survivors may still be modifying files. NOT terminalized: "
             f"codex_cancel_run(run=\"{run_tag}\") kills MARKER-VERIFIED "
             f"survivors (list them: python3 procenv.py --list {run_tag}) "
             f"and records the terminal state once they are gone. Never signal "
             f"the bare group id — it may already belong to another process."
             f"{custody_note}]"
+            # The answer was finished before any of this: leaving it out cost every read run its result on a machine
+            # whose scan could not answer (nucleus, 11-06).
+            + (f"\n\n{final_message}" if final_message else "")
             + (f"\n\n{survivors_report}" if survivors_report else "")
             + log_note
         )

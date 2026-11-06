@@ -21999,3 +21999,108 @@ tests were added. This follow-up changed only `retention.py`, this evidence and
 the changelog; README semantics, plugin version and reclamation scope stayed
 unchanged. The earlier power-loss, alternate-SQLite and lifetime-soak proof
 limits still apply; the live coordinator was neither modified nor upgraded.
+
+## software-workflows 2.4.37 — Linux (2026-11-06)
+
+**Venue.** The server `nucleus`: Ubuntu 24.04 x86-64, kernel 6.8, 18 vCPU, 94 GB, no swap;
+Codex 0.166.0, Python 3.15, run by Claude Code under T3 (each agent in a systemd scope).
+Every daemon run used a disposable state and scratch repositories. Another session's lanes
+were writing two checkouts throughout, and those were never registered. macOS was not measured
+again: the Mac refuses SSH from the server.
+
+**Reds on 2.4.36, then the tree:**
+
+| Probe | 2.4.36 (or the machine before) | Tree |
+| --- | --- | --- |
+| Daemon start | `AttributeError: module 'select' has no attribute 'kqueue'` at `owners.py:368` | starts, with its worker |
+| A pidfd as the exit watch | not used | ready for a child and for a process of no relation once each exited; not ready while it lived; a reaped one handled |
+| Worker with a gate descriptor over 9 | crash loop, `sw-gate: 1: Syntax error: Bad fd number` (dash) | runs under `/bin/bash --norc --noprofile -p` |
+| A real launch with `BASH_ENV` set | plain bash: 42 runs named `sw-gate`, before any gate opened (a first review round found this) | 0 named `sw-gate`; the 24 under `/bin/bash` are the writer's own later shells, in both runs |
+| `bash -c` with `SSH_CLIENT`, `SHELLOPTS`, an exported `read` (5.2.21) | `~/.bashrc` ran, `read` was hijacked, xtrace on; `-p` alone still ran `~/.bashrc` | nothing ran, `read` read `GO`, no xtrace; the program inherits `BASH_ENV`, `SSH_CLIENT` and the function |
+| `LD_PRELOAD` with a constructor that logs, the gate held closed | `bash` ran it before `GO` (a third review round found this) | nothing before `GO`; after it the program runs under the library and sees `LD_PRELOAD` and `LD_LIBRARY_PATH` as given |
+| `GCONV_PATH` naming a module whose constructor logs, `LC_ALL=C.UTF-8` | `bash` ran it (a fourth review round found this), and did not under `C` | taken out of the gate's shell; the program sees it as given |
+| A marked descendant in its own session whose main thread exits while a thread keeps writing, its marked parent gone or alive | state `Z`, `Threads` 2, the file growing, scan listed nothing (a third review round found this) | scan refuses in both; `identity` not a zombie; `_pgid_alive` and `group_live_members` read it live, and a plain zombie dead |
+| `inventory` with a listener's child in that state, and that child's own child | with only the predicate reversed: neither held, the list empty (a fourth review round found this) | both held, and nothing once both exit |
+| `_proc_info` in `server.py` and `compat.py` on such a leader (`ps` `Zsl`) | with only that line reversed: `Z`, the state `_pid_alive` reads as dead (a fourth review round found this) | `S`, `_pid_alive` true; a plain zombie still `Z` and not alive |
+| An exported `SHELLOPTS` with `pipefail`, and `BASHOPTS` with `extglob` | under `-p` (a second review round found this): a failing pipeline read rc 0, `privileged` in the program's `SHELLOPTS` | rc 1, as with no gate; a real writer's app-server holds both exactly as given, and neither when none were exported |
+| Admission's ownership probe through the real `admission/check`, `/bin/zsh` absent by a fault injected at import | `ADMISSION_FAILED`: the command exits 127 (a closing review found this; this machine's bootstrap had installed zsh) | passes on `/bin/sh`, and a whole writer path publishes `5a998b1`; with zsh present, still zsh (`72f40cf`) |
+| Admission, exec policy | `ADMISSION_EXEC_POLICY_UNOBSERVABLE` on 0.166.0 | passes; `is_empty` reads `rules` at both tags |
+| Admission, ownership | failed: the orphan's parent is `systemd --user`, not PID 1 | all probes pass |
+| `kernel_id` | 333 of 665 processes shared a birth tick; another session's shell was in a writer's family | 0 collisions, same machine |
+| `codex_query` | answer withheld, run `CANCELLING`; `--list` exits 2 with 15 unreadable same-uid processes | `status:ok` with the answer |
+| A tagged, non-dumpable orphan moved to its own scope with `systemd-run --scope` | an earlier form of the tree cleared it: `--list` exit 0, nothing listed (a first review round found this) | `--list` exit 2 while it lives, also with its parent alive and in the run's own cgroup; exit 0 once it is gone |
+| A run with such a process born during it | not separated from the above | caller gets the answer and "could not prove"; row `CANCELLING`; cancel refused while it lives, then `cancelled` |
+| A record whose boot id is blank or missing, or this server cannot read its own | under the earlier form (second review round): birth bound `1 << 62`, so every process counted as older | `(None, None)`, and not cached; same boot keeps its ticks; another boot's valid id gives the bound |
+| Stop the scope that started the daemon | daemon DEAD | daemon ALIVE, clean stop later, scope collected |
+| Stop the scope that started the office | office DEAD when `systemd-run` is hidden from it (the calibration) | office ALIVE in its own scope, page 200 |
+| `unit/publish`, git 2.43 | `PUBLICATION_HOOK_DISCOVERY`, exit 129 | commit `45ed536`, tree clean, unit `published` |
+
+The sandbox red came from the machine, not the plugin: `bwrap: loopback: Failed RTM_NEWADDR:
+Operation not permitted` until an AppArmor profile was loaded for `/usr/bin/bwrap`. An
+unconfined copy of bwrap first on PATH gives the same red without touching that profile,
+and setup's check was calibrated on it. The fix setup prints produced a profile
+byte-identical to the loaded one, comments aside, and `apparmor_parser -Q -K` accepted it.
+
+**A writer's whole path.** Real Codex writers from a fixture provider, in a scratch repository,
+on each git: `run/start`, a verified patch, `unit/seal`, `unit/review-record`, `unit/publish`.
+
+| | Refused first | Commit |
+| --- | --- | --- |
+| git 2.43.0 | `PUBLICATION_HOOK` for an executable `pre-commit` in `.git/hooks`, for an executable `commit-msg` through `core.hooksPath`, and for an executable directory at `hooks/pre-commit` | `45ed536`, then `36d0660` on the final form, `a.txt` only |
+| git 2.56.0 | `PUBLICATION_HOOK` for an executable `pre-commit`, and for a configured `hook.cfgprobe` (`hook.cfgprobe.command` named) | `4a4b4ef`, `a34c61e`, `f523f70` with `SHELLOPTS` and `BASHOPTS` exported and `630c67c` without, then `f3a5d9a` with `LD_PRELOAD`, `LD_LIBRARY_PATH` and `SHELLOPTS` exported and `f2db0a8` with `GCONV_PATH`, `LD_LIBRARY_PATH` and `SHELLOPTS` (the writer's app-server holding each as given), `a.txt` only; `run/start` took 39–47 s |
+
+Before the fallback was written, real commits on 2.43.0 showed what it has to hold: an executable
+hook-directory file ran, a configured `hook.*` did not, and a file without the executable bit
+did not. The first form also required a regular file, and published past an executable directory
+at the hook path (`40f6de6`), where a plain `git commit` fails with `cannot exec` on both versions
+and 2.56 lists a hook. The 2.43.0 runs used that release's own binary, extracted to a scratch
+directory after the machine moved to 2.56.0. A lead call that never settled also refused publish,
+correctly: a fake Edit `PreToolUse` left `UNVERIFIED_OPERATION` on `b.txt` until that call's own
+`PostToolUseFailure` settled it.
+
+**One unreadable process at a time.** A `/proc` of only that process and its ancestors, with the
+birth bound at its own start so only the chain decides, on the machine as it stood: the container's
+`auto-setup.sh` and 11 Android processes (each under `containerd-shim`) and an `sshd` session were
+cleared. `gpg-agent`, `systemd --user` and `(sd-pam)` were unproven, and they clear by age for any
+run newer than them.
+
+**An ancestor's read.** Measured on kernel 6.8: a descriptor on `environ` opened while a process
+lived reads 0 bytes after it exits, and a leader that exited while a thread lives is a zombie that
+its child still names as parent, with an `environ` that refuses. The exit race itself cannot be held
+open from outside, so these branches ran on a built `/proc` whose files behave that way, against
+the scan as the second review round saw it and then the tree:
+
+| Case | Earlier form | Tree |
+| --- | --- | --- |
+| Parent readable, lacks the marker (control) | clear | clear |
+| Parent readable, holds the marker (control) | unproven | unproven |
+| Parent reads empty | **clear** | unproven |
+| Child no longer names that parent after the read | **clear** | unproven |
+| Parent is a zombie leader, its parent lacks the marker | **clear** | unproven |
+
+**Lead hooks and an unregistered checkout**, with a daemon running: Edit Pre and Post, Bash Pre and
+`PostToolBatch` each returned rc 0 with no output, and the ledger stayed at 103 records. The same
+Edit Pre on a registered checkout answered `Coordinator lead operation` and the ledger went to 113.
+
+**Push gate.** `_active_hooks` on 2.43.0 read `['<hooks unknown>']` for `pre-commit` and `pre-push`.
+On 2.56.0 it read `[]`, and `['hook from hookdir']` with a hook in place.
+
+**Setup.** On this machine 10 of 10 ready. Reds: the unconfined bwrap gives `MISSING Codex sandbox`
+with the AppArmor fix, and the quick subset reports it in 0.47 s; another failure on a kernel
+without the AppArmor restriction gives the generic fix; a git answering 2.43's `hook -h` usage gives
+the note and the fix; a `/bin/sh` gate gives `MISSING launch shell` (dash rc 127, bash rc 0); with
+Windows' `os.name` the item is not listed, since Windows has no launch gate.
+
+**Limits of this evidence.**
+
+- `codex_cancel_run` on a run started by 2.4.36 refused here, as it now will every time: `survivor
+  scan failed (15 same-user process(es) unreadable …)`, a record with no origin. An earlier form of
+  the tree worked out an origin from the record's first timestamp, which a review round refused: at a
+  3-day-old timestamp, or after a 2-hour backward clock step, every process now counted as older than
+  the run (measured by computing it). Nothing was journaled and the intent stayed. Three such rows
+  exist on this machine.
+- A live checkout's first registration was not measured: nothing on the server has run on the live
+  state yet. The daemon was restarted on the disposable state across the version bump and read its
+  writers back, which is the only upgrade measured. The git shim was measured only through setup's
+  push guard and this release's own commit and push.
+- The memory gate, the LaunchAgent and the hook's peer lookup have no Linux path (README, Linux).

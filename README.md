@@ -636,8 +636,18 @@ built when the requirements or the interpreter change.
 ## Platforms
 
 - **macOS:** everything, measured.
-- **Linux:** the same code. The git shim's Linux-specific paths have not yet been measured end to end
-  for 2.0, nor the writer coordinator's process inventory for 2.3.
+- **Linux:** measured in 2.4.37 on Ubuntu 24.04 x86-64 (kernel 6.8, Codex 0.166.0, git 2.43 and 2.56):
+  the oracle tools and a writer's whole path, from patch through seal and review to a commit.
+  - Ubuntu 24.04 refuses bubblewrap the namespaces Codex's sandbox needs, and a read-only run then
+    reads no file. Setup checks this and prints the fix.
+  - A git without `git hook list` publishes, and the push gate reads its hooks as unknown. Setup says
+    so.
+  - On a server, set `SOFTWARE_WORKFLOWS_OFFICE=background` so the office opens no browser there. The
+    office answers on `127.0.0.1` only and refuses a foreign Host, so a proxy that reaches it has to
+    rewrite Host, and should accept only your own names.
+  - Not on Linux yet: the memory gate (a launch is never deferred under memory pressure), the
+    crash-cleanup agent (orphans wait for the next client start), and a Pre hook's deadline counted
+    from when Codex started the hook (it counts from the request).
 - **Windows:** no WSL needed for the agent teams and the Codex tools.
   - Set `CODEX_ORACLE_PYTHON=python`: python.org builds ship no `python3.exe`.
   - The hooks need `python3` on PATH. Create a `python3` alias next to `python.exe`, or use the

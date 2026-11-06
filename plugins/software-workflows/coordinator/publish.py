@@ -428,13 +428,20 @@ class Publisher:
             raise CoordinatorError("PUBLICATION_REPLACE_REFS", "Replacement objects change normal Git interpretation", {"root": root, "ref": "refs/replace/"})
         hooks = ("pre-commit", "prepare-commit-msg", "commit-msg", "post-commit", "reference-transaction", "post-index-change")
         for event in hooks:
-            result = gitio.git(root, ["hook", "list", "-z", event], normal_config=True, check=False)
+            result = gitio.git(root, ["hook", "list", "-z", event], normal_config=True, check=False, extra_env={"LC_ALL": "C"})
             path = gitio.text(root, ["rev-parse", "--path-format=absolute", "--git-path", "hooks/" + event], normal_config=True)
-            details = {"root": root, "event": event, "path": path, "exit_code": result.returncode}
-            if result.returncode not in (0, 1):
+            status, listed = result.returncode, result.stdout
+            if status == 129 and b"unknown subcommand" in result.stderr:
+                # A git before `hook list`, which arrived with configured hooks (Ubuntu 24.04 ships 2.43). Measured on 2.43:
+                # a commit takes whatever access(X_OK) passes at this path as its hook, core.hooksPath included, and fails
+                # if that cannot run (an executable directory), and nothing else counts: no configured hook.<name>, no
+                # file without the executable bit.
+                status, listed = 0, b"hook from hookdir\0" if os.access(path, os.X_OK) else b""
+            details = {"root": root, "event": event, "path": path, "exit_code": status}
+            if status not in (0, 1):
                 raise CoordinatorError("PUBLICATION_HOOK_DISCOVERY", "Could not discover publication hooks", details)
-            if result.stdout:
-                details["hooks"] = result.stdout.decode("utf-8", "replace").rstrip("\0").split("\0")
+            if listed:
+                details["hooks"] = listed.decode("utf-8", "replace").rstrip("\0").split("\0")
                 # Configured hooks have friendly names, not necessarily an
                 # executable pathname. Report only names and origins; command
                 # values can contain credentials and are deliberately omitted.

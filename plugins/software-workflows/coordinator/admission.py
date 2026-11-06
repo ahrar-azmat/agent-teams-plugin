@@ -33,6 +33,9 @@ PROBES = ("hooks", "evidence", "dynamic", "delivery", "tty", "receipts", "reconn
 # any time) or "idle" (while no turn runs), and holds it where the probe found it absent (None). A probe that raised or
 # timed out (each of its steps is bounded) proves neither: its binding takes FALLBACK, recorded with the error.
 CAPABILITIES = ("inject",)
+# Releases whose null `configRequirements/read` proves no managed rules overlay, each read at its own tag:
+# read_requirements answers None only when ConfigRequirementsToml::is_empty, and is_empty reads `rules`.
+POLICY_PROVEN = ("codex-cli 0.163.0", "codex-cli 0.166.0")
 FALLBACK = {"inject": None}
 
 
@@ -267,7 +270,7 @@ class Admission:
                                                                    finish_thread(gitio.text, listener.repo, ["--version"]),
                                                                    finish_thread(native.adapter_digest))
         config = effective.get("config", {})
-        complete_policy = version == "codex-cli 0.163.0" and requirements.get("requirements") is None and bool(listener.trace_rules)
+        complete_policy = version in POLICY_PROVEN and requirements.get("requirements") is None and bool(listener.trace_rules)
         result = {"binary": binary, "binary_digest": binary_digest, "version": version,
                 "user_agent": listener.initialized["userAgent"], "methods": sorted(set(inventory)),
                 "schema_digest": schema_digest, "config_digest": digest(config), "requirements_digest": digest(requirements),
@@ -278,7 +281,7 @@ class Admission:
                                   "compact_limit": config.get("model_auto_compact_token_limit")},
                 "exec_policy": {"complete": complete_policy, "trace_digests": sorted(set(listener.trace_rules)),
                                 "managed_requirements_absent": requirements.get("requirements") is None,
-                                "basis": "0.163.0 requirements null proves requirements_toml.is_empty including rules; trace is the resulting complete policy" if complete_policy else
+                                "basis": version + " requirements null proves requirements_toml.is_empty including rules; trace is the resulting complete policy" if complete_policy else
                                          "post-managed-overlay effective execution policy is not exposed"},
                 "git": git_version, "sqlite": sqlite3.sqlite_version,
                 "python": sys.version.split()[0], "os": platform.platform(),
@@ -604,7 +607,9 @@ class Admission:
 
     async def probe_ownership(self, directory):
         spawn = "import subprocess,time; subprocess.Popen(['/bin/sleep','4'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); time.sleep(1)"
-        command = shlex.join(["/bin/zsh", "-f", "-c", "/usr/bin/true; " + shlex.join([sys.executable, "-B", "-c", spawn]) + "; /usr/bin/true"])
+        # A shell that stays the parent of what it runs. A Linux machine need not have zsh; any /bin/sh does this too.
+        shell = ["/bin/zsh", "-f"] if os.path.exists("/bin/zsh") else ["/bin/sh"]
+        command = shlex.join([*shell, "-c", "/usr/bin/true; " + shlex.join([sys.executable, "-B", "-c", spawn]) + "; /usr/bin/true"])
         async with serving(steps_router([function("exec_command", {"cmd": command, "login": False, "yield_time_ms": 1000}), message()])) as provider:
             async with listening(directory, provider, config={"features.unified_exec_tty": False}) as listener:
                 await listener.start_thread()
@@ -631,8 +636,10 @@ class Admission:
                                 processes.markers(process["pid"])
                             except (CoordinatorError, OSError):
                                 marker_failures.add(process["pid"])
-                            if process["ppid"] == 1:
-                                reparented.append(process)
+                        # Its parent left: no process of this family is its parent now. macOS gives an orphan to launchd,
+                        # PID 1; Linux gives it to the nearest subreaper, under systemd the user's manager (measured 11-06).
+                        family = {process["pid"] for process in seen.values()} | {owner["pid"]}
+                        reparented.extend(process for process in found if process["ppid"] not in family)
                         owner["process_lineage"] = list(seen.values())
                         if seen and not found:
                             break
@@ -824,4 +831,4 @@ class Admission:
         changed_trace = bool(observations[0]["trace"] and observations[1]["trace"] and observations[0]["trace"][-1] != observations[1]["trace"][-1])
         return {"negative_observed": observations[0]["config"] == observations[1]["config"], "positive_observed": changed_trace,
                 "cases": observations, "complete_effective_policy": all(o["managed_requirements_absent"] for o in observations),
-                "basis": "For supported native 0.163.0, null requirements proves absence of a managed rules overlay; non-null requirements remain a named admission refusal"}
+                "basis": "For a native release in POLICY_PROVEN, null requirements proves absence of a managed rules overlay; non-null requirements remain a named admission refusal"}

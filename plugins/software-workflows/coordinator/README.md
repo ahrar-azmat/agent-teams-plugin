@@ -2010,7 +2010,10 @@ signing, filesystem-monitor helpers and unsupported index extensions. Conversion
 and filter settings refuse only if actual check-in or checkout conversion changes
 a candidate's bytes, or Git cannot establish the result. Hooks are discovered
 with the real `git hook list`, without masking hooksPath; a discovered hook and
-failed discovery have distinct codes and repository/event/location details.
+failed discovery have distinct codes and repository/event/location details. A git
+without `hook list` (Ubuntu 24.04's 2.43) runs no configured hooks (measured), so
+there the check is for what `access(X_OK)` passes at the hooks path, `core.hooksPath`
+included. An executable directory counts: a commit fails on it, on 2.43 and on 2.56.
 
 Installed Git 2.56 rejects the proposed transaction combining `symref-verify HEAD`
 and a named-branch update. C1 instead prepares an update through HEAD, acquiring
@@ -6132,3 +6135,39 @@ and 27 installed-runtime transport gaps during drain.
 The user deferred N2 pairs, the 14-case F matrix and the full catalog until after
 the next resource-handling round. No qualifying N2 pair or Round 19 F acceptance
 is claimed; the earlier measurements and all failed attempts remain retained.
+
+## Linux (2.4.37)
+
+Measured on Ubuntu 24.04 x86-64, kernel 6.8, Codex 0.166.0, git 2.43 and 2.56, with real
+writers on a disposable state (VERIFY.md). The earlier measurements in this file are macOS.
+They were not repeated here, apart from what VERIFY.md's 2.4.37 section names. What differs
+from macOS:
+
+- **Exits.** The supervisor's `ExitWatch` uses a pidfd, which reads ready once its process
+  has exited, whoever's child it is. A pidfd stays ready, so it is closed when it fires. The
+  daemon's asyncio children need no `ExitWatcher`: `children.installable` is false on Linux,
+  where the loop's own pidfd watcher waits for the exit only.
+- **Process identity.** `kernel_id` is the start tick and the PID together. There is no
+  unique id to read, and one tick (10 ms) held half the machine's processes.
+- **Orphans.** An orphan goes to the nearest subreaper, under systemd the user's manager, and
+  not to PID 1. Code that needs an orphan asks whether its parent left the family.
+- **Launch gates.** They run under `/bin/bash --norc --noprofile -p`. Dash takes one-digit
+  descriptors only, and bash without those flags can run `BASH_ENV`, `~/.bashrc` or an
+  exported function before the gate opens. `gate_command` takes `LD_*` and `GCONV_PATH`, which
+  would load a library into the gate's shell, and `SHELLOPTS` and `BASHOPTS`, which it would
+  rewrite, round that shell, and the program gets them as given. A gate guards against
+  accidents. It is not a boundary against code set on running before it.
+- **Zombies.** A leader that exited while another thread runs reads as a zombie and is still
+  working: `Threads` above 1, `ps` `Zl`, its pidfd not ready. Only a zombie with no other thread
+  counts as finished.
+- **Lifetime.** A new session does not leave a cgroup, so the daemon and the office start in a
+  scope of their own (`client.own_scope`). A process the daemon starts lives in that scope
+  too, so stopping a Claude session's scope no longer ends any of them.
+- **Lead hooks.** They only act on a checkout in `<state>/checkouts.json`. `abraham` and the
+  `coordinator_*` tools add one, from a call with its cwd inside that checkout. On any other
+  checkout the hooks return at once and write nothing, with a daemon running (measured).
+
+Not on Linux yet: `memory.py` reads macOS's compressor only (`status` shows
+`supported: false`, and a launch is never deferred under memory pressure);
+`launch_agent.py` is macOS only; `admissions.py`'s peer lookup is macOS only, so a Pre
+hook's deadline counts from the request; and direct ownership (above) is still not claimed.

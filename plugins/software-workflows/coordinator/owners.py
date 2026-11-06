@@ -13,7 +13,7 @@ import sys
 import time
 
 from . import processes
-from .client import CoordinatorError, launch_environment, validate_state, venv_fds
+from .client import CoordinatorError, gate_command, launch_environment, validate_state, venv_fds
 from .leases import MAX_FRAME, Custodian, RecoveryEndpoint, receive, send
 from .owner_journal import Journal
 
@@ -77,7 +77,7 @@ class Owner:
             argv = list(request["argv"])
             for index, descriptor in request.get("fd_arguments", {}).items():
                 argv[int(index)] = str(descriptors[descriptor])
-            process = subprocess.Popen(["/bin/sh", "-c", script, "sw-gate", *argv],
+            process = subprocess.Popen(gate_command(script, argv, environment),
                 cwd=request.get("cwd"), env=environment, stdin=options.get("stdin", subprocess.DEVNULL),
                 stdout=options.get("stdout", subprocess.DEVNULL), stderr=options.get("stderr", subprocess.DEVNULL),
                 pass_fds=(read_fd, *descriptors), close_fds=True, start_new_session=True)
@@ -316,6 +316,51 @@ def activated_socket():
         lib.free(descriptors)
 
 
+class ExitWatch:
+    """Wakes the owner's selector when a watched process exits, whoever's child it is: an adopted worker is not this
+    process's child, so waitpid cannot see it. macOS has kqueue's EVFILT_PROC. Linux has no kqueue: there a pidfd reads
+    ready once its process has exited (measured on 6.8, on a child and on a process of no relation)."""
+
+    def __init__(self, selector, data):
+        self.selector, self.data, self.pidfds = selector, data, {}
+        self.queue = select.kqueue() if hasattr(select, "kqueue") else None
+        if self.queue:
+            selector.register(self.queue, selectors.EVENT_READ, data)
+
+    def add(self, pid):
+        if self.queue:
+            try:
+                self.queue.control([select.kevent(pid, select.KQ_FILTER_PROC, select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                                                  select.KQ_NOTE_EXIT)], 0)
+            except ProcessLookupError:
+                pass  # it has exited already; the owner's next exit_evidence reads that
+            return
+        if pid in self.pidfds:
+            return
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return
+        self.pidfds[pid] = fd
+        self.selector.register(fd, selectors.EVENT_READ, self.data)
+
+    def fired(self, key):
+        """Consume a wake. A pidfd stays ready for good, so it is closed; kqueue's event was one-shot."""
+        if self.queue:
+            self.queue.control(None, 128, 0)
+            return
+        self.selector.unregister(key.fd)
+        os.close(key.fd)
+        self.pidfds = {pid: fd for pid, fd in self.pidfds.items() if fd != key.fd}
+
+    def close(self):
+        if self.queue:
+            self.queue.close()
+        for fd in self.pidfds.values():
+            os.close(fd)
+        self.pidfds = {}
+
+
 def supervise(root):
     from .stop_control import StopControl
     with StopControl() as control:
@@ -365,17 +410,12 @@ def _supervise(root, control):
         os.set_blocking(wake_write, False)
         control.wake_fd = wake_write
         selector.register(wake_read, selectors.EVENT_READ, "stop")
-        queue = select.kqueue()
-        selector.register(queue, selectors.EVENT_READ, "exit")
+        exits = ExitWatch(selector, "exit")
         selector.register(endpoint, selectors.EVENT_READ, "accept")
 
         def watch(record):
             if record and not processes.exit_evidence(record):
-                try:
-                    queue.control([select.kevent(record["pid"], select.KQ_FILTER_PROC,
-                                  select.KQ_EV_ADD | select.KQ_EV_ONESHOT, select.KQ_NOTE_EXIT)], 0)
-                except ProcessLookupError:
-                    return
+                exits.add(record["pid"])
 
         def register(connection):
             connection.settimeout(20)
@@ -524,7 +564,7 @@ def _supervise(root, control):
                             pass
                         continue
                     if key.data == "exit":
-                        queue.control(None, 128, 0)
+                        exits.fired(key)
                         continue
                     if key.data == "accept":
                         candidate, _ = endpoint.accept()
@@ -667,7 +707,7 @@ def _supervise(root, control):
             selector.close()
             os.close(wake_read)
             os.close(wake_write)
-            queue.close()
+            exits.close()
             if rescue:
                 rescue.close()
             else:

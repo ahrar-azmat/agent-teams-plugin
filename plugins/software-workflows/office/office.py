@@ -1333,6 +1333,7 @@ def spawn_detached(argv, log_path):
     the current folder first on sys.path, and a project holding a subprocess.py would run it here.
     That project is wherever the session's first Codex call happened, since the hook starts the
     office from there."""
+    argv = coordinator_module("client").own_scope(argv)  # a new session does not leave the session's cgroup
     middle = ("import os, subprocess, sys\n"
               "p = subprocess.Popen(%r, stdin=subprocess.DEVNULL, stdout=open(%r, 'ab'),\n"
               "                     stderr=subprocess.STDOUT, start_new_session=True)\n"

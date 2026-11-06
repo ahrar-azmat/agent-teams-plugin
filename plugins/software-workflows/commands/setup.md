@@ -17,8 +17,9 @@ hook bypasses and replaced environments can escape an inherited guard. Report ev
 "not covered" and "unverified" result; publishing remains the lead's responsibility.
 The binary is ready when ordinary, path and file-URL pushes are refused; its detail
 still lists measured limitations. SessionStart stays silent for those limitations
-and for a missing or stale cache. It reports a cached ordinary-route failure or a
-missing Codex launch guard.
+and for a missing or stale cache. It reports a cached ordinary-route failure, a
+missing Codex launch guard, a Codex sandbox that does not run (Linux), or a launch
+shell that cannot pass a gate's descriptor.
 
 1. Show the result as a short table: item, ready or not, detail.
 2. Under "Setup can do these itself":

@@ -136,9 +136,15 @@ def identity(pid, _attempt=0):
         directory = Path("/proc") / str(pid)
         try:
             parts = (directory / "stat").read_text().rsplit(")", 1)[1].split()
+            # kernel_id must name one process: inventory reads a match as "this is the writer's", and what it holds can be
+            # signalled. Linux has no unique id to read, and a start time counts 10 ms ticks, so two processes forked in one
+            # tick share it (measured 11-06: another session's shell, born in the same tick as a writer's command, was
+            # taken into that writer's family). Start time and PID together are unique: a PID is not reused within a tick,
+            # and PIDs stay under 2**22 (kernel.pid_max's ceiling).
             return {"pid": pid, "birth": parts[19], "ppid": int(parts[1]),
-                    "uid": directory.stat().st_uid, "zombie": parts[0] == "Z", "stopped": parts[0] in ("T", "t"),
-                    "kernel_id": int(parts[19]), "version": 0, "boot_session": boot_session(), "pgid": int(parts[2])}
+                    # A leader that exited while another thread runs reads Z too, and is still working (field 20, threads).
+                    "uid": directory.stat().st_uid, "zombie": parts[0] == "Z" and parts[17] == "1", "stopped": parts[0] in ("T", "t"),
+                    "kernel_id": int(parts[19]) << 22 | pid, "version": 0, "boot_session": boot_session(), "pgid": int(parts[2])}
         except (FileNotFoundError, ProcessLookupError):  # a process reaped while its entry is read reads ESRCH
             return None
         except PermissionError:
@@ -378,7 +384,7 @@ def baseline(vanished=None):
     for line in result.stdout.splitlines():
         fields = line.split()
         pid, user = map(int, fields[:2])
-        if user == os.getuid() and not fields[2].startswith("Z"):
+        if user == os.getuid() and (not fields[2].startswith("Z") or "l" in fields[2]):  # procps: Zl, threads still run
             record = identity(pid)
             if record and not record["zombie"]:
                 records.append(record)
@@ -507,7 +513,7 @@ def inventory(listener, root_thread, known=(), operation=None, services=(), ambi
         if len(fields) != 4:
             raise CoordinatorError("PROCESS_SCAN", "Unrecognized process inventory row")
         pid, parent, user = map(int, fields[:3])
-        if user == os.getuid() and not fields[3].startswith("Z"):
+        if user == os.getuid() and (not fields[3].startswith("Z") or "l" in fields[3]):  # procps: Zl, threads still run
             candidates[pid] = parent
     parent_identity = identity(listener["pid"]) if listener.get("pid") else None
     listener_tree = {listener["pid"]} if parent_identity and parent_identity["birth"] == listener["birth"] and not parent_identity["zombie"] else set()

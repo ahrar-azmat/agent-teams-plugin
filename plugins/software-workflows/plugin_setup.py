@@ -68,6 +68,29 @@ def _python_fix():
     return "install Python 3.11 or newer from https://www.python.org/downloads/ or your package manager"
 
 
+def _codex_sandbox(codex):
+    """Codex's read-only sandbox on Linux, run for real. Ubuntu 24.04 refuses bubblewrap the namespaces
+    it needs (bwrap: loopback: Failed RTM_NEWADDR), and every read-only Codex run then reads no file,
+    while codex --version and codex login stay fine (measured 11-06: this check list read all ready)."""
+    rc, text = _run([codex, "sandbox", "-c", 'sandbox_mode="read-only"', "--", "/bin/true"])
+    if rc == 0:
+        return ("Codex sandbox", True, "the read-only sandbox runs", "", "")
+    first = text.splitlines()[0] if text else f"codex sandbox exited {rc}"
+    try:
+        restricted = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").read_text().strip() == "1"
+    except OSError:
+        restricted = False
+    bwrap = shutil.which("bwrap")
+    if restricted and bwrap:
+        fix = (r"printf 'abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile bwrap %s flags=(unconfined) {\n"
+               r"  userns,\n\n  include if exists <local/bwrap>\n}\n' | sudo tee /etc/apparmor.d/bwrap >/dev/null"
+               r" && sudo apparmor_parser -r /etc/apparmor.d/bwrap") % bwrap
+    else:
+        fix = ("Codex's Linux sandbox needs bubblewrap (sudo apt install bubblewrap) and unprivileged user "
+               "namespaces; update Codex if it is older than the version above")
+    return ("Codex sandbox", False, first, fix, "")
+
+
 def checks(data_dir=None, quick=False):
     """[(item, ready, detail, fix, action)]. `action` names what setup may do itself, with the
     person's OK. `quick` is the session-start subset: no codex version run, and no server venv
@@ -114,6 +137,8 @@ def checks(data_dir=None, quick=False):
             out.append(("codex login", False, first,
                         "type  ! codex login  in the Claude prompt (it opens a browser), "
                         "or run  codex login  in a terminal", ""))
+        if sys.platform.startswith("linux"):
+            out.append(_codex_sandbox(codex))
 
     launcher = _launcher()
     python, info = launcher._find_python()
@@ -161,11 +186,21 @@ def checks(data_dir=None, quick=False):
         out.append(("git", False, "git is not on PATH",
                     "xcode-select --install" if sys.platform == "darwin"
                     else "install git with your package manager", ""))
-    else:
+    elif "hook list" in _run([git, "hook", "-h"])[1]:
         out.append(("git", True, git, "", ""))
+    else:
+        out.append(("git", True, f"{git} has no `git hook list`: the push gate reads hooks as unknown on every commit "
+                    "and push, and drops its strong wording (2.56 was measured)",
+                    "on Ubuntu: sudo add-apt-repository -y ppa:git-core/ppa && sudo apt install -y git", ""))
     from coordinator.push_capabilities import report
-    from coordinator.client import clean_environment
+    from coordinator.client import GATE_SHELL, clean_environment
     from coordinator import push_guard
+    if os.name != "nt":  # Windows has no launch gate
+        if _run([*GATE_SHELL, "-c", "exec 12</dev/null"])[0] == 0:
+            out.append(("launch shell", True, GATE_SHELL[0], "", ""))
+        else:
+            out.append(("launch shell", False, f"{GATE_SHELL[0]} cannot open a two-digit file descriptor, and every "
+                        "coordinator launch gate passes one", "install bash", ""))
     try:
         push_guard.verify({}, clean_environment(), configuration=False)
     except Exception as exc:
