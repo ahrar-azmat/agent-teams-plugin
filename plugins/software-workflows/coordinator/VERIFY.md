@@ -22264,3 +22264,28 @@ No RPC, parameter or record a client reads changed between 2.4.38 and this tree:
 - `claude -p` reports a hook's `systemMessage` to nobody, so a daemon-down warning was read in the hook's code,
   not seen.
 - A hook that is husky's with a different version's bytes is still a hook, which refuses: only `^9.1.7` was seen.
+
+## software-workflows 2.4.40 — writers on a Codex CLI that updates itself (2026-11-11)
+
+On the server: Codex 0.167.0 (standalone install, updated itself 2026-11-06 23:46), a disposable coordinator
+state, `python -m coordinator --state … admission --scratch …`.
+
+| Measure | 2.4.39 | Tree |
+| --- | --- | --- |
+| Writer admission on 0.167.0 | `ADMISSION_EXEC_POLICY_UNOBSERVABLE` (every `abraham` since 11-07) | refusal `None`, `completed` true |
+| The 11 probes (hooks, evidence, dynamic, delivery, tty, receipts, reconnect, terminals, ownership, policy, validation) | not reached by a writer | 11 of 11 pass |
+| `exec_policy` | `complete` false | `complete` true, `assumed` false, `proof` `source`, `managed_requirements_absent` true, 1 trace digest |
+| The same run with 0.167.0 off `POLICY_PROVEN` (set at import by a `sitecustomize`) | — | 11 of 11, refusal `None`, `complete` false, `assumed` true, `proof` `floor`, basis "…ASSUMED… not verified complete" |
+| `policy_proof` | — | 0.163.0, 0.166.0, 0.167.0 `source`; 0.168.0, 1.0.0 `floor`; 0.162.9, 0.168.0-alpha.1, empty, text `None` |
+
+- Read at tag `rust-v0.167.0`: `app-server/src/config_manager_service.rs` `read_requirements` answers `None`
+  only when `requirements.is_empty()`; `config/src/config_requirements.rs` `ConfigRequirementsToml::is_empty`
+  includes `self.rules.is_none()`.
+- The review's findings are in, and both rows above ran after them: an answer without the `requirements` key
+  no longer counts as none, in the fingerprint and in the `exec_policy` diagnostic; an unread release records
+  `assumed`, never `complete`, and the gate admits either (`policy_admits`).
+- Not measured: a `floor` release with managed rules present, which needs root for
+  `/etc/codex/requirements.toml`, so a `floor` admission rests on an assumption (CHANGELOG, "What this gives up");
+  a release newer than 0.167.0 (none exists), so the `floor` case ran on 0.167.0 with the list shortened;
+  a listener that outlives a CLI update (the fingerprint reads the installed binary, not the listener's);
+  a real writer turn on 0.167.0 (the live daemon was still 2.4.38 when this was written).

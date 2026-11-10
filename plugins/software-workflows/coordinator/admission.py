@@ -35,8 +35,30 @@ PROBES = ("hooks", "evidence", "dynamic", "delivery", "tty", "receipts", "reconn
 CAPABILITIES = ("inject",)
 # Releases whose null `configRequirements/read` proves no managed rules overlay, each read at its own tag:
 # read_requirements answers None only when ConfigRequirementsToml::is_empty, and is_empty reads `rules`.
-POLICY_PROVEN = ("codex-cli 0.163.0", "codex-cli 0.166.0")
+POLICY_PROVEN = ("codex-cli 0.163.0", "codex-cli 0.166.0", "codex-cli 0.167.0")
+# The Codex CLI updates itself, and an exact list refused every writer the day a new release arrived (0.167.0, 2026-11-07).
+# A stable release at or above the oldest tag read is admitted too. That is an assumption, not a proof: nothing here can
+# show that such a release still reports managed rules (it needs a root-owned /etc/codex/requirements.toml), so the
+# fingerprint says which case held ("source" or "floor"). Below the floor, or a pre-release: refused.
+POLICY_FLOOR = (0, 163, 0)
 FALLBACK = {"inject": None}
+
+
+def policy_proof(version):
+    if version in POLICY_PROVEN:
+        return "source"
+    stable = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)", version)
+    return "floor" if stable and tuple(map(int, stable.groups())) >= POLICY_FLOOR else None
+
+
+def requirements_absent(answer):
+    """Only an explicit null counts as "no managed requirements"; an answer without the key is no evidence."""
+    return isinstance(answer, dict) and "requirements" in answer and answer["requirements"] is None
+
+
+def policy_admits(exec_policy):
+    """complete: verified at a tag that was read. assumed: an unread stable release, admitted so a CLI update stops no writer."""
+    return bool(exec_policy.get("complete") or exec_policy.get("assumed"))
 
 
 class ProbeListener:
@@ -270,7 +292,10 @@ class Admission:
                                                                    finish_thread(gitio.text, listener.repo, ["--version"]),
                                                                    finish_thread(native.adapter_digest))
         config = effective.get("config", {})
-        complete_policy = version in POLICY_PROVEN and requirements.get("requirements") is None and bool(listener.trace_rules)
+        proof = policy_proof(version)
+        absent = requirements_absent(requirements)
+        observed = absent and bool(listener.trace_rules)
+        complete_policy, assumed_policy = observed and proof == "source", observed and proof == "floor"
         result = {"binary": binary, "binary_digest": binary_digest, "version": version,
                 "user_agent": listener.initialized["userAgent"], "methods": sorted(set(inventory)),
                 "schema_digest": schema_digest, "config_digest": digest(config), "requirements_digest": digest(requirements),
@@ -279,9 +304,11 @@ class Admission:
                 "runtime_modes": {"web_search": config.get("web_search"), "agents_enabled": (config.get("agents") or {}).get("enabled"),
                                   "effort": config.get("model_reasoning_effort"), "reasoning_summary": config.get("model_reasoning_summary"),
                                   "compact_limit": config.get("model_auto_compact_token_limit")},
-                "exec_policy": {"complete": complete_policy, "trace_digests": sorted(set(listener.trace_rules)),
-                                "managed_requirements_absent": requirements.get("requirements") is None,
+                "exec_policy": {"complete": complete_policy, "assumed": assumed_policy, "trace_digests": sorted(set(listener.trace_rules)),
+                                "managed_requirements_absent": absent, "proof": proof,
                                 "basis": version + " requirements null proves requirements_toml.is_empty including rules; trace is the resulting complete policy" if complete_policy else
+                                         version + " is a stable release at or above the floor whose tag was not read; requirements null is ASSUMED to mean what it means"
+                                         " at the tags read (" + ", ".join(POLICY_PROVEN) + "); the policy is not verified complete" if assumed_policy else
                                          "post-managed-overlay effective execution policy is not exposed"},
                 "git": git_version, "sqlite": sqlite3.sqlite_version,
                 "python": sys.version.split()[0], "os": platform.platform(),
@@ -335,7 +362,7 @@ class Admission:
                     (("hooks", True), ("multi_agent_v2", True), ("unified_exec_tty", False)))):
             raise CoordinatorError("ADMISSION_RUNTIME_MODE", "Effective native modes do not honor live web, V2 agents, hooks and disabled TTY",
                                    {"modes": modes, "features": {name: features.get(name) for name in ("hooks", "multi_agent_v2", "unified_exec_tty")}})
-        if not fingerprint["exec_policy"]["complete"]:
+        if not policy_admits(fingerprint["exec_policy"]):
             raise CoordinatorError("ADMISSION_EXEC_POLICY_UNOBSERVABLE", "Native effective execution policy is incomplete",
                                    {"exec_policy": fingerprint["exec_policy"]})
         binding = digest(fingerprint)
@@ -445,7 +472,7 @@ class Admission:
                             "error": getattr(exc, "code", type(exc).__name__), "details": getattr(exc, "details", {})})
         value = {"fingerprint": fingerprint, "fingerprint_digest": digest(fingerprint), "cases": results,
                  "evidence": str(directory), "completed": all(r["passed"] for r in results),
-                 "production_admitted": False, "production_refusal": None if fingerprint["exec_policy"]["complete"] else "ADMISSION_EXEC_POLICY_UNOBSERVABLE"}
+                 "production_admitted": False, "production_refusal": None if policy_admits(fingerprint["exec_policy"]) else "ADMISSION_EXEC_POLICY_UNOBSERVABLE"}
         (directory / "report.json").write_text(encoded(value))
         # report.json is evidence only. The fingerprint-only listener did not
         # measure the preceding controls, so it cannot name a capability cache.
@@ -825,10 +852,10 @@ class Admission:
                     requirements = await listener.connection.call("configRequirements/read", {})
                     await asyncio.sleep(0.1)
                     observations.append({"trace": listener.trace_rules, "config": digest(config.get("config", {})),
-                                         "managed_requirements_absent": requirements.get("requirements") is None})
+                                         "managed_requirements_absent": requirements_absent(requirements)})
                 finally:
                     await listener.close()
         changed_trace = bool(observations[0]["trace"] and observations[1]["trace"] and observations[0]["trace"][-1] != observations[1]["trace"][-1])
         return {"negative_observed": observations[0]["config"] == observations[1]["config"], "positive_observed": changed_trace,
-                "cases": observations, "complete_effective_policy": all(o["managed_requirements_absent"] for o in observations),
-                "basis": "For a native release in POLICY_PROVEN, null requirements proves absence of a managed rules overlay; non-null requirements remain a named admission refusal"}
+                "cases": observations, "managed_requirements_absent": all(o["managed_requirements_absent"] for o in observations),
+                "basis": "For a native release in POLICY_PROVEN, null requirements proves absence of a managed rules overlay; for an unread stable release at or above POLICY_FLOOR that is assumed, not proven; non-null or missing requirements remain a named admission refusal"}

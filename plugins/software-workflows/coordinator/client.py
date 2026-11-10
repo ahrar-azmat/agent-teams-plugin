@@ -255,7 +255,7 @@ def superseded(running):
 
 
 # The oldest daemon this release works with while it cannot replace it. A release that changes what a client asks of a
-# daemon (an RPC, a parameter, a record a client reads) raises this to itself. 2.4.39 changed none of that.
+# daemon (an RPC, a parameter, a record a client reads) raises this to itself. 2.4.39 and 2.4.40 changed none of that.
 OLDEST_USABLE_DAEMON = (2, 4, 38)
 
 

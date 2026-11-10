@@ -3,6 +3,39 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.40] — 2026-11-11
+
+A Codex CLI update stopped every Codex writer for four days. Reviews kept working.
+
+- **A new Codex release refused every writer.** Writer admission accepted two exact releases, 0.163.0
+  and 0.166.0. The CLI updated itself to 0.167.0 on 2026-11-07, and from then each `abraham` start
+  ended in `ADMISSION_EXEC_POLICY_UNOBSERVABLE`. The list exists because one fact is read from Codex's
+  source and cannot be probed without root: a null `configRequirements/read` means no managed rules.
+  That fact is unchanged at the 0.167.0 tag (`read_requirements` answers null only when `is_empty`,
+  and `is_empty` reads `rules`), so 0.167.0 joins the list.
+- **The next update will not do this again.** A stable release at or above 0.163.0 is admitted even
+  when its tag has not been read. The fingerprint keeps the two apart: a tag that was read records
+  `exec_policy.complete` true and `proof` `source`; any other records `complete` false, `assumed` true
+  and `proof` `floor`, and its basis says the meaning of a null answer is assumed and the policy is
+  not verified complete. A writer is admitted on either. A release below 0.163.0, a pre-release and
+  an unreadable version are refused as before.
+- **What this gives up.** For a release whose tag was not read, nothing checks that Codex still
+  reports managed rules: that needs a root-owned `/etc/codex/requirements.toml`, and no admission
+  probe exercises it. If such a release stopped reporting them, a writer would be admitted on a
+  machine with managed rules. The other admission probes still run on the installed binary at each
+  writer start, and they cover what they measure, not this.
+- **A missing answer is no longer read as "none".** `configRequirements/read` must answer an explicit
+  null. An answer without the `requirements` key counted as no managed requirements, and now refuses.
+  The `exec_policy` diagnostic probe reads it the same way, and its `complete_effective_policy` field
+  is now `managed_requirements_absent`, which is all it ever measured.
+- Measured on the server with Codex 0.167.0 and a disposable state: all 11 admission probes pass and
+  the refusal is `None`, where 2.4.39 refused. The same run with 0.167.0 taken off the list, as a
+  release nobody has read would be, also passes 11 of 11 and records `assumed`. The takeover needs
+  the daemon on this release.
+- Known and not fixed here: the fingerprint reads the installed Codex binary again, not the one a
+  running listener started with, so a listener that outlives a CLI update can record the new version
+  beside the old process's answers. Found by the review; it predates this release.
+
 ## [software-workflows 2.4.39] — 2026-11-06
 
 The first real writers, sealed reviews and publishes on the server found three dead ends. Two stopped

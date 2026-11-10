@@ -87,7 +87,9 @@ nobody has to edit `settings.json` by hand.
 - **A recent Claude Code.** Tested on 2.1.302. The skill needs at least 2.1.178 (agent teams without
   `TeamCreate`/`TeamDelete`), and moving a 1.x install over needs 2.1.193 or newer (the marketplace's
   `renames` entry).
-- **Codex CLI, logged in.** Tested with codex-cli 0.163.0. Codex uses the model set in your
+- **Codex CLI, logged in.** Needs codex-cli 0.163.0 or newer; measured on 0.163.0, 0.166.0 and 0.167.0.
+  The CLI may update itself: a newer stable release is admitted, and every writer start still runs the
+  capability probes on the installed binary. Codex uses the model set in your
   `~/.codex/config.toml` (gpt-6-astra by default) at reasoning effort `max`. The server pins the
   effort, so the Codex app's slider cannot lower it.
 - **Python.** The Codex Oracle server needs Python 3.11 or newer, which setup finds for you. The
