@@ -1392,6 +1392,9 @@ async def recover_writers(daemon, plan):
             if checkout.get("ready") and not checkout.get("quarantine") and checkout.get("identity") in daemon.ledger.ownership:
                 try:
                     await daemon.ledger.reconcile(checkout, reason="daemon recovery filesystem snapshot")
+                    # Evidence for a follow-up delivered before the start (lead_batches.recovered_before): this
+                    # checkout's bytes are observed. A skipped or failed snapshot leaves none, and that follow-up observes.
+                    daemon.recovery_snapshots.add(checkoutid)
                 except Exception as exc:
                     checkout = store.get(checkoutid)
                     checkout["quarantine"] = getattr(exc, "code", type(exc).__name__)

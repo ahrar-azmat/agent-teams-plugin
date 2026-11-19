@@ -3,6 +3,7 @@
 Only literal replacement semantics are admitted. Fuzzy matching and notebook
 serialization have no measured full-image adapter and receive a concrete refusal.
 """
+import asyncio
 import codecs
 import hashlib
 import os
@@ -135,6 +136,10 @@ def quiet(daemon, checkout, mine, ident):
     `mine` are this session's lead actors. Only this hook's own record updates
     are subtracted from the durable clock; its operations still invalidate it.
     """
+    if SETTLING or not getattr(daemon, "ready", True) or getattr(daemon, "recovering", None) or foreign_observation(daemon, ident):
+        # An observation not this call's own may record what a credited command writes as UNKNOWN: an uncredited
+        # completion's (settle_uncredited), recovery's snapshot, a failed observation's repair (scans.Manager.repairs).
+        return None
     clock = daemon.store.window_state(ident, mine, time.time())
     if clock is None:
         return None
@@ -144,7 +149,21 @@ def quiet(daemon, checkout, mine, ident):
         if busy:
             return None
         marks.append([registered["id"], stamp])
-    return digest([daemon.store.generation, clock, marks])
+    # Observations started by anyone but this call: one that starts after the window and commits before its Post
+    # leaves no pending row and moves no durable clock, yet may have recorded the command's writes as UNKNOWN.
+    scans = daemon.ledger.scans
+    epoch = scans.started - scans.started_by.get(ident, 0)
+    return digest([daemon.store.generation, clock, marks, epoch])
+
+
+def foreign_observation(daemon, ident):
+    """Whether an observation other than this call's own credited one is pending or running (partial index)."""
+    for (operation,) in daemon.store.db.execute(
+            "SELECT json_extract(data,'$.owner.operation') FROM records INDEXED BY observation_pending "
+            "WHERE kind='observation' AND json_extract(data,'$.state')='pending'"):
+        if operation != ident:
+            return True
+    return False
 
 
 async def window(daemon, checkout, mine, ident):
@@ -185,14 +204,27 @@ async def arm(daemon, params):
 
 
 def invalidate_windows(daemon):
-    """Fence every outstanding Bash call before recovery can admit hooks."""
+    """Fence every outstanding Bash call before recovery can admit hooks. A call past its deadline whose completion
+    never arrived is settled here: nothing can credit it any more, and the next reconcile of its checkouts (recovery's
+    snapshot, which runs in the background once the daemon serves, or any later one) records the bytes it left as
+    UNKNOWN; what it changed and changed back before then is not recovered, as it was not by 2.4.40, whose follow-up
+    for it never ran. A completion that arrives later still observes (settle_uncredited), and one whose observation
+    was owed when the daemon stopped stays owed (retry_owed). Through 2.4.40 these calls stayed observed for good,
+    and this read decoded every lead_hook record (73,000 on the live ledger, 29,476 of them observed Bash calls,
+    11-19); it now reads the observed ones through their index."""
+    from .store import WINDOW_ACTIVE
+    now = time.time()
     with daemon.store.transaction():
-        for record in list(daemon.store.all("lead_hook")):
+        for record in list(daemon.store.selected("SELECT * FROM records INDEXED BY window_lead_hook WHERE " +
+                                                 WINDOW_ACTIVE["lead_hook"] + " ORDER BY id")):
             if record.get("tool") != "Bash" or record.get("state") != "observed":
                 continue
             record.setdefault("armed_before_recovery", bool(record.get("armed")))
             record.update(armed=False, arm=None, window=None, arrival=None,
                           window_invalidated_generation=daemon.store.generation)
+            if record.get("deadline", 0) < now and not record.get("completion"):
+                record.update(state="reconciled", attribution="UNKNOWN-context-only",
+                              settlement={"source": RECOVERED, "scan": "recovery snapshot", "at": now})
             daemon.store.save(record)
     # The calls remain observed until Post/deadline: an old command may still
     # write, but cannot attribute bytes using a lost pre-restart hidden listing.
@@ -233,8 +265,11 @@ async def dispatch(daemon, payload):
                                                 (call, session)), None)
             if record:
                 ident, checkout = record["id"], daemon.store.get(record["checkout"])
-        if not record or record["state"] not in ("observed", "received", "prepared"):
-            return {"coordinated": bool(record), "settled": True, **({"state": record["state"]} if record else {})}
+        # A call with no record (its Pre failed before recording it, its Post was lost) is observed like any other
+        # uncredited completion: the batch may be the only evidence that the command ran.
+        if record and (record["state"] not in ("observed", "received", "prepared")
+                       and (record.get("settlement") or {}).get("source") != RECOVERED):
+            return {"coordinated": True, "settled": True, "state": record["state"]}
         event = "PostToolUse"
     from .lead import reach as reached
     reach = [daemon.store.get(key) for key in sorted(reached(daemon.store, checkout["id"]))]
@@ -260,7 +295,7 @@ async def dispatch(daemon, payload):
             fields["arrival"] = quiet(daemon, checkout, set(fields["session_actors"]), ident)
         daemon.store.put("lead_hook", ident, fields)
         record = None
-        if tool == "Bash":
+        if fields.get("arrival") is not None:
             # What exists outside git's view, listed next, before anything here can wait: the command may
             # already be running, and what it makes visible from there must not pass for its own. What
             # becomes visible before the reconcile below is settled there as not its doing.
@@ -268,78 +303,267 @@ async def dispatch(daemon, payload):
                 del HIDDEN[key]
             listings = await finish_all(*(finish_thread(hidden, c) for c in reach))
             HIDDEN[ident] = (deadline, dict(zip([c["id"] for c in reach], listings)))
+    if event != "PreToolUse" and not creditable(daemon, daemon.store.get(ident, required=False), batch):
+        # Decided before attaching the session: settling it needs no actor, and a new session's attach creates its
+        # run and unit, which waits behind every other.
+        return await settle_uncredited(daemon, ident, reach, batch, checkout, payload, signature)
     from .lead import attach
     mapping = await attach(daemon, checkout["id"], session, cwd=payload.get("cwd"), hook=True)
     actor = daemon.store.get(mapping["actor"])
-    if tool == "Bash":
-        async with BASH_TRANSITIONS.hold("global"):
-            if fresh:
-                from .participants import contains, published_participant
-                receipt_units = {}
-                for participant in reach:
-                    if contains(daemon.store, actor["unit"], participant["id"]):
-                        receipt_units[participant["id"]] = actor["unit"]
-                    else:
-                        # Reach includes older revisions too. Keep their receipts
-                        # in a unit that owns that checkout, without repinning the
-                        # current unit or widening its publication membership.
-                        sibling = await attach(daemon, participant["id"], session,
-                                               cwd=participant["root"], hook=True)
-                        receipt_units[participant["id"]] = sibling["unit"]
-                # What changed before this command is not its doing: settle that first, so only changes
-                # made inside the window can become the lead's.
-                await daemon.ledger.reconcile_many(reach, reason="before lead Bash: " + ident, target=checkout["id"])
-                record = daemon.store.get(ident)
-                mine = set(record.get("session_actors") or []) | {actor["id"]}
-                now = await window(daemon, checkout, mine, ident)
-                held = now is not None and now == record.get("arrival")
-                # The window counts only once the hook has the answer before the command runs (`arm`).
-                record.update(unit=actor["unit"], actor=actor["id"], session_actors=sorted(mine),
-                              receipt_units=receipt_units,
-                              published_participants=[published for key, unitid in receipt_units.items()
-                                  if (published := published_participant(daemon.store, unitid, key))],
-                              window=now if held else None, arm=uid("arm") if held else None)
-                daemon.store.save(record)
-            if event != "PreToolUse" and record and record["state"] == "reconciled":
-                # A second completion for the same call (Post and Failure, or a retried hook) names nobody:
-                # its window closed with the first.
-                result = await daemon.ledger.reconcile_many(reach, reason="possible lead Bash effects: " + ident, target=checkout["id"])
-                return dict(result, attribution="UNKNOWN-context-only", executed_again=False, duplicate=True)
-            if event != "PreToolUse":
-                # A command that ran while nothing else could change files here is the lead's: what it
-                # changed outside other units' claims is recorded as the lead's, not UNKNOWN. Otherwise
-                # every `sed -i`, formatter or lockfile update by the lead left content that no commit
-                # or native resume could take (measured, 2.3.0). Another unit's claimed paths stay UNKNOWN.
-                attribute = None
-                mine = set(record.get("session_actors") or []) | {actor["id"]} if record else {actor["id"]}
-                # PostToolBatch is no evidence that the command ran (a hook, a permission or the user refused it, or
-                # its Post was lost): what changed in its window is nobody's, as at its deadline.
-                if (not batch and record and record.get("window") is not None and record.get("armed")
-                        and record.get("generation") == daemon.store.generation
-                        and time.time() <= record["deadline"] and record["window"] == await window(daemon, checkout, mine, ident)):
-                    attribute = {"attribution": "lead-command", "operation": ident, "unit": actor["unit"],
-                                 "checkouts": {c["id"]: {
-                                     "unit": record.get("receipt_units", {}).get(c["id"], actor["unit"]),
-                                     "hidden": (HIDDEN.get(ident, (None, {}))[1] or {}).get(c["id"]),
-                                     "excluded": [normalize(c, claim["path"])["key"] for claim in daemon.custody.claims(c["id"])
-                                         if claim["unit"] != record.get("receipt_units", {}).get(c["id"], actor["unit"])]}
-                                     for c in reach if c["id"] in record.get("receipt_units", {})
-                                     and c["id"] in (HIDDEN.get(ident, (None, {}))[1] or {})},
-                                 # checked again after the scan: anything that started meanwhile voids it
-                                 "still_quiet": lambda: quiet(daemon, checkout, mine, ident) == record["window"]}
-                result = await daemon.ledger.reconcile_many(reach, reason="possible lead Bash effects: " + ident, target=checkout["id"], attribute=attribute)
-                HIDDEN.pop(ident, None)
-                if record:
-                    record["state"] = "reconciled"
-                    daemon.store.save(record)
-                return dict(result, attribution="lead-command" if "attributed" in result else "UNKNOWN-context-only", executed_again=False)
-            answer = {"coordinated": True, "observed": ident, "executed_again": False}
-            from .lead_calls import blockers
-            waiting = blockers(daemon.store)
-            if waiting:
-                answer["quiet_window_blocked_by"] = waiting
-            if record and record.get("published_participants"):
-                answer["published_participants"] = record["published_participants"]
-            if fresh and record.get("arm"):
-                answer["arm"] = record["arm"]
-            return answer
+    if event == "PreToolUse":
+        current = daemon.store.get(ident, required=False)
+        if not fresh or current is None or current.get("arrival") is None:
+            # A call that arrives while anything else could change files can never be credited: its window must equal
+            # its arrival, and `quiet` gave it none. Only bookkeeping serves it, so it neither waits for the global lock
+            # nor scans. Through 2.4.40 every such call listed hidden files, queued for that lock and scanned every
+            # checkout it reaches; with ~25 sessions running Bash the queue outgrew it from 17 Nov 21:47 IST, and no
+            # later completion settled (VERIFY 2.4.41). A repeated Pre only answers again.
+            if fresh and current is not None:
+                receipt_units = await units_of(daemon, actor, session, reach)
+                current = daemon.store.get(ident)
+                current.update(unit=actor["unit"], actor=actor["id"],
+                               session_actors=sorted(set(current.get("session_actors") or []) | {actor["id"]}),
+                               receipt_units=receipt_units, published_participants=published(daemon, receipt_units),
+                               window=None, arm=None)
+                daemon.store.save(current)
+            return pre_answer(daemon, ident, current, fresh)
+    async with BASH_TRANSITIONS.hold("global"):
+        if fresh:
+            receipt_units = await units_of(daemon, actor, session, reach)
+            # What changed before this command is not its doing: settle that first, so only changes
+            # made inside the window can become the lead's.
+            await daemon.ledger.reconcile_many(reach, reason="before lead Bash: " + ident, target=checkout["id"],
+                                               owner={"kind": "operation", "operation": ident})
+            record = daemon.store.get(ident)
+            mine = set(record.get("session_actors") or []) | {actor["id"]}
+            now = await window(daemon, checkout, mine, ident)
+            held = now is not None and now == record.get("arrival")
+            # The window counts only once the hook has the answer before the command runs (`arm`).
+            record = daemon.store.get(ident)
+            record.update(unit=actor["unit"], actor=actor["id"], session_actors=sorted(mine),
+                          receipt_units=receipt_units, published_participants=published(daemon, receipt_units),
+                          window=now if held else None, arm=uid("arm") if held else None)
+            daemon.store.save(record)
+            return pre_answer(daemon, ident, record, fresh)
+        record = daemon.store.get(ident, required=False)
+        mine = set((record or {}).get("session_actors") or []) | {actor["id"]}
+        # A window that changed while this waited (its deadline passed, another completion settled it, anything
+        # started) credits nothing: that completion is settled the durable way, after the lock (settle_uncredited).
+        if creditable(daemon, record, batch) and record["window"] == await window(daemon, checkout, mine, ident):
+            # A command that ran while nothing else could change files here is the lead's: what it
+            # changed outside other units' claims is recorded as the lead's, not UNKNOWN. Otherwise
+            # every `sed -i`, formatter or lockfile update by the lead left content that no commit
+            # or native resume could take (measured, 2.3.0). Another unit's claimed paths stay UNKNOWN.
+            attribute = {"attribution": "lead-command", "operation": ident, "unit": actor["unit"],
+                         "checkouts": {c["id"]: {
+                             "unit": record.get("receipt_units", {}).get(c["id"], actor["unit"]),
+                             "hidden": (HIDDEN.get(ident, (None, {}))[1] or {}).get(c["id"]),
+                             "excluded": [normalize(c, claim["path"])["key"] for claim in daemon.custody.claims(c["id"])
+                                 if claim["unit"] != record.get("receipt_units", {}).get(c["id"], actor["unit"])]}
+                             for c in reach if c["id"] in record.get("receipt_units", {})
+                             and c["id"] in (HIDDEN.get(ident, (None, {}))[1] or {})},
+                         # checked again after the scan: anything that started meanwhile voids it
+                         "still_quiet": lambda: quiet(daemon, checkout, mine, ident) == record["window"]}
+            try:
+                result = await daemon.ledger.reconcile_many(reach, reason="possible lead Bash effects: " + ident,
+                                                            target=checkout["id"], attribute=attribute)
+            except Exception as exc:
+                # Owed the durable way from here: the credit is lost, the observation is not (retry_owed).
+                current = daemon.store.get(ident, required=False)
+                if current and current["state"] == "observed":
+                    current.update(completion={"source": "PostToolBatch" if batch else "Post", "at": time.time()},
+                                   observing={"attempt": 1, "at": time.time(), "retry_at": time.time() + OWED_RETRY_SECONDS,
+                                              "failure": getattr(exc, "code", type(exc).__name__)})
+                    daemon.store.save(current)
+                raise
+            HIDDEN.pop(ident, None)
+            daemon.ledger.scans.started_by.pop(ident, None)
+            current = daemon.store.get(ident, required=False)
+            if current:
+                current["state"] = "reconciled"
+                daemon.store.save(current)
+            return dict(result, attribution="lead-command" if "attributed" in result else "UNKNOWN-context-only", executed_again=False)
+    return await settle_uncredited(daemon, ident, reach, batch, checkout, payload, signature)
+
+
+def creditable(daemon, record, batch):
+    """Whether this Bash completion can still credit what its command changed to the lead: a delivered Post (a
+    PostToolBatch is no evidence that the command ran) for a call still observed, armed by this daemon generation
+    with a window, before the call's deadline. The window itself is compared under the global lock."""
+    return bool(not batch and record and record.get("state") == "observed" and record.get("window") is not None
+                and record.get("armed") and record.get("generation") == daemon.store.generation
+                and time.time() <= record.get("deadline", 0))
+
+
+async def units_of(daemon, actor, session, reach):
+    """The unit that receives this session's records in each reached checkout."""
+    from .lead import attach
+    from .participants import contains
+    units = {}
+    for participant in reach:
+        if contains(daemon.store, actor["unit"], participant["id"]):
+            units[participant["id"]] = actor["unit"]
+        else:
+            # Reach includes older revisions too. Keep their receipts in a unit that owns that
+            # checkout, without repinning the current unit or widening its publication membership.
+            sibling = await attach(daemon, participant["id"], session, cwd=participant["root"], hook=True)
+            units[participant["id"]] = sibling["unit"]
+    return units
+
+
+def published(daemon, receipt_units):
+    from .participants import published_participant
+    return [found for key, unitid in receipt_units.items() if (found := published_participant(daemon.store, unitid, key))]
+
+
+def pre_answer(daemon, ident, record, fresh):
+    answer = {"coordinated": True, "observed": ident, "executed_again": False}
+    from .lead_calls import blockers
+    waiting = blockers(daemon.store)
+    if waiting:
+        answer["quiet_window_blocked_by"] = waiting
+    if record and record.get("published_participants"):
+        answer["published_participants"] = record["published_participants"]
+    if fresh and record and record.get("arm"):
+        answer["arm"] = record["arm"]
+    return answer
+
+
+# The completions whose shared observation is in flight, by call: `quiet` gives no window while any is.
+SETTLING = {}
+SETTLED_REASON = "possible lead Bash effects"
+RECOVERED = "recovery: deadline passed"
+# A live Post waits this long for its observation, then answers `settling` while the observation goes on; the call is
+# settled when it commits. It leaves room in the hook's 3 s RPC (coordinator_lead.CALL_SECONDS) for the lease ping and
+# the host lock before it, and for the event loop's own stalls and queue: with 2.5 s, 48 of 120 Posts on an
+# 8,000-file checkout passed 3 s, and with 1.5 s, 20 of 120 on 300 files under 30 concurrent sessions (VERIFY 2.4.41).
+POST_WAIT_SECONDS = 1.0
+# A failed observation is owed again after this long, doubling to OWED_RETRY_MAX_SECONDS.
+OWED_RETRY_SECONDS, OWED_RETRY_MAX_SECONDS = 5, 300
+
+
+async def settle_uncredited(daemon, ident, reach, batch, checkout, payload, signature):
+    """Settle a completion that cannot credit anything, without the global lock. What its command changed is recorded
+    UNKNOWN-context-only by an observation of every checkout it reaches that begins after the completion arrived, and
+    the call is marked reconciled only once that observation commits. The completion is written on the call first
+    (`completion`), so the observation is owed durably: a failure, a stop or a reply the hook took as final leaves it
+    for retry_owed. Concurrent completions share each scan (scans.Producer) and one commit (scans.compatible), so a
+    thousand of them cost one scan per checkout, not one each. While any runs no window holds (`quiet`), and each
+    attempt moves the durable clock before it scans, so a window armed earlier cannot pass still_quiet either: its
+    scan never takes a credited command's changes. A live Post waits up to POST_WAIT_SECONDS for the commit, and a
+    PostToolBatch item for the attempt in flight; either may then answer `settling` while retry_owed, which owns the
+    call's observation, goes on. A completion for a call another completion settled scans nothing; one for a call
+    recovery settled by its deadline observes, since the command may have run after it (a late permission)."""
+    current = daemon.store.get(ident, required=False)
+    answer = {"coordinated": True, "observed": ident, "attribution": "UNKNOWN-context-only", "executed_again": False}
+    if current and current["state"] == "reconciled" and (current.get("settlement") or {}).get("source") != RECOVERED:
+        return dict(answer, settled=True, duplicate=True)
+    completion = {"source": "PostToolBatch" if batch else "Post", "at": time.time()}
+    if current is None:
+        # A completion whose Pre never arrived: recorded whole first, so a repeated completion finds it and joins.
+        current = daemon.store.put("lead_hook", ident, {
+            "tool": "Bash", "state": "observed", "input_digest": signature, "generation": daemon.store.generation,
+            "session_id": payload.get("session_id"), "tool_use_id": payload.get("tool_use_id"), "checkout": checkout["id"],
+            "reach": [c["id"] for c in reach], "window": None, "deadline": time.time(), "arm_deadline": time.time(),
+            "session_actors": [], "completion": completion})
+    elif not current.get("completion") or current["state"] == "reconciled":
+        current.update(state="observed", completion=completion)
+        daemon.store.save(current)
+    task = owe(daemon, ident, reach, current)
+    try:
+        if task is not None:
+            # A PostToolBatch item waits for the attempt in flight; a live Post up to POST_WAIT_SECONDS.
+            await (asyncio.shield(task) if batch else asyncio.wait_for(asyncio.shield(task), POST_WAIT_SECONDS))
+    except Exception:
+        pass  # a failed or slower observation stays owed on the call (retry_owed); this delivery is done
+    settled = daemon.store.get(ident)["state"] == "reconciled"
+    return dict(answer, settled=settled, **({} if settled else {"settling": True}))
+
+
+def owe(daemon, ident, reach, record):
+    """The call's observation in flight, started now unless one already runs; None while a failed one backs off."""
+    task = SETTLING.get(ident)
+    if task is not None and not task.done():
+        return task
+    if (record.get("observing") or {}).get("retry_at", 0) > time.time():
+        return None
+    task = SETTLING[ident] = daemon.background(observe_uncredited(daemon, ident, reach, record.get("completion") or {}))
+    return task
+
+
+async def observe_uncredited(daemon, ident, reach, completion):
+    try:
+        current = daemon.store.get(ident, required=False)
+        if current is None or current["state"] != "observed":
+            return
+        # Moves the durable clock (store.window_state) before anything is scanned, with no await between.
+        attempt = (current.get("observing") or {}).get("attempt", 0) + 1
+        current["observing"] = {"attempt": attempt, "at": time.time()}
+        daemon.store.save(current)
+        try:
+            await finish_all(*(daemon.ledger.reconcile(checkout, reason=SETTLED_REASON) for checkout in reach))
+        except Exception as exc:
+            # Owed again after a backoff (retry_owed): a busy checkout's git view can keep moving (UNSTABLE_SNAPSHOT,
+            # 706 of 3,000 completions in an 8,000-file run with live writes, VERIFY 2.4.41).
+            code = getattr(exc, "code", type(exc).__name__)
+            current = daemon.store.get(ident, required=False)
+            if current and current["state"] == "observed":
+                delay = min(OWED_RETRY_SECONDS * 2 ** (attempt - 1), OWED_RETRY_MAX_SECONDS)
+                current["observing"] = {"attempt": attempt, "at": time.time(), "retry_at": time.time() + delay, "failure": code}
+                daemon.store.save(current)
+                daemon.store.event("lead_bash/observation_failed", ident, {"code": code, "attempt": attempt, "retry_seconds": delay})
+            return
+        current = daemon.store.get(ident, required=False)
+        if current and current["state"] == "observed":
+            current.update(state="reconciled", attribution="UNKNOWN-context-only",
+                           settlement=dict(completion, scan="observed", at=time.time()))
+            current.pop("observing", None)
+            daemon.store.save(current)
+        HIDDEN.pop(ident, None)
+        daemon.ledger.scans.started_by.pop(ident, None)
+    finally:
+        if SETTLING.get(ident) is asyncio.current_task():
+            del SETTLING[ident]
+
+
+OWED_CURSOR = {"after": ""}
+# The owed observations retry_owed started that are still running, as tasks (a replacement for the same call is
+# another task, so a finished one's callback never drops it): its reserve is concurrent places, not per pass.
+OWED_ACTIVE = set()
+
+
+def retry_owed(daemon, limit):
+    """Start at most `limit` of the observations owed to completions that arrived but did not settle (a failed
+    attempt once its retry is due, one a stop interrupted), resuming where the last pass stopped. They are the
+    observed Bash calls that carry a completion, read by index."""
+    from .lead import reach as reached
+    from .store import WINDOW_ACTIVE
+    now, started = time.time(), 0
+    # A call's own-observation count matters only while it can still be credited (quiet): forget the rest.
+    started_by = daemon.ledger.scans.started_by
+    for operation in list(started_by):
+        record = daemon.store.get(operation, required=False)
+        if not record or record.get("state") != "observed" or record.get("deadline", 0) < now:
+            del started_by[operation]
+    if limit <= 0:
+        return
+    rows = list(daemon.store.selected("SELECT * FROM records INDEXED BY window_lead_hook WHERE " + WINDOW_ACTIVE["lead_hook"] +
+                                      " AND json_extract(data,'$.completion') IS NOT NULL AND id>? ORDER BY id LIMIT ?",
+                                      (OWED_CURSOR["after"], limit * 4)))
+    # The next pass resumes after the last row read here, or from the start once a pass reads to the end.
+    OWED_CURSOR["after"] = rows[-1]["id"] if len(rows) == limit * 4 else ""
+    for index, record in enumerate(rows):
+        if started >= limit:
+            OWED_CURSOR["after"] = rows[index - 1]["id"]
+            break
+        if (record.get("tool") != "Bash" or record.get("state") != "observed" or record["id"] in SETTLING
+                or (record.get("observing") or {}).get("retry_at", 0) > now):
+            continue
+        checkout = daemon.store.get(record["checkout"], required=False)
+        if checkout is None:
+            continue
+        task = owe(daemon, record["id"], [daemon.store.get(key) for key in sorted(reached(daemon.store, checkout["id"]))], record)
+        if task:
+            OWED_ACTIVE.add(task)
+            task.add_done_callback(OWED_ACTIVE.discard)
+            started += 1

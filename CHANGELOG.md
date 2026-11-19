@@ -3,6 +3,72 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.4.41] — 2026-11-19
+
+From 17 Nov 21:47 IST no lead Bash call made after that time had its follow-up settled. The coordinator ran at
+250–420% CPU, lead edits answered `LEAD_ADMISSION_BUSY` and needed 5 to 8 tries, and 29,246 follow-ups were pending
+by 19 Nov evening. SmartPay (one lead with ~13 teammates) and Sales_Profiler (~10 sessions) share the daemon.
+
+- **Every lead Bash call waited in one queue for the whole machine.** Its Pre and its Post each took one lock that
+  every project shares (`BASH_TRANSITIONS`), and scanned every checkout the call reaches while holding it: 11–42 s
+  for Sales_Profiler, three checkouts for a call at the SmartPay root. With ~1,000 calls an hour the queue outgrew
+  the lock. The 8,342 follow-ups settled in the two days after were all for calls made before 21:47.
+- **The lock now serves only calls that can be credited.** A command's changes are credited to the lead only when
+  nothing else could change files anywhere while it ran (`quiet`), and with this many agents that never held. A call
+  that cannot be credited no longer takes the lock, and its Pre lists and scans nothing. Its completion is written
+  on the call first, then an observation of every checkout it reaches, begun after it arrived, records what changed
+  as UNKNOWN, and the call is settled only when that commits. Concurrent completions share each scan and one commit
+  (`scans.compatible`), so a thousand of them cost one scan per checkout, not one each. While any runs, no window
+  holds, and each attempt moves the durable clock before it scans, so it never takes a credited command's changes.
+  A failed observation stays owed on the call and is tried again after 5 s, doubling to 5 minutes (`retry_owed`, at
+  most as many running at once as the retry loop's places, plus 4 that live traffic cannot take). A live Post waits up to 1 s for the commit, a PostToolBatch
+  item for the attempt in flight; either may then answer `settling` while the call-owned retry goes on. A second
+  completion for a call already settled scans nothing. A call that can be credited takes the old path; one whose
+  window no longer matches when its Post comes, or whose credited scan fails, is settled the durable way.
+- **No credit when another observation could have taken a command's changes.** A window now also holds the count
+  of observations started by anyone but the call itself, so one that starts after it voids it even if it commits
+  before the Post; and `quiet` gives no window while recovery is still observing checkouts or while another owner's
+  observation is pending (a failed observation's repair, another lead's scan). Through 2.4.40 such an observation
+  could record a credited command's writes as UNKNOWN while its Post still reported `lead-command`. A session's first
+  Bash call in a checkout is therefore no longer credited (attaching the session scans it); its later calls are.
+- **A PostToolBatch for a call with no record is observed.** Its Pre may have failed before recording it and its Post
+  been lost; the batch was settled with no observation.
+- **A completion that cannot be credited no longer attaches its session first.** A new session's attach creates its
+  run and unit, and that waited behind every other.
+- **The retry loop starved the daemon.** Every 0.25 s it read every pending follow-up on the event loop and started
+  one task for each: 2,402 of 6,269 loop-stall samples in 6 h. It now runs 64 at a time
+  (`SOFTWARE_WORKFLOWS_BATCH_ATTEMPTS`), reads only as many rows as it can start, and splits each tick between items
+  retried after a failure and fresh ones; items a hook's own batch starts do not take its places. None is dropped.
+- **Start-up settles what can never be credited.** A Bash call past its deadline whose completion never arrived is
+  settled when the daemon starts: nothing can credit it, and the next reconcile of its checkouts (recovery's
+  background snapshot, or any later one) records the bytes it left as UNKNOWN. What it changed and changed back
+  before then is not recovered, as it was not by 2.4.40, whose follow-up never ran. A follow-up delivered before the
+  start closes once recovery's snapshot of each checkout the call reaches has committed (one it skipped or failed
+  leaves the item to observe); a completion that arrives later still observes, since the command may have run
+  after its deadline (a late permission). This read now goes through an index, not every lead_hook record (73,000); on a
+  copy of the live ledger it settled 30,029 calls in 16.2 s and left the 31 still in their deadline.
+- **A deferral the code did not set is released at start.** On 19 Nov the SmartPay lead deferred 22,923 stuck items
+  to 26 Nov by hand to relieve the stall. A retry time more than an hour out is now released in chunks of 500
+  (6.2 s on the same copy); a failed release is tried again 30 s later.
+- Measured on the server against a real daemon on a disposable state and a scratch repository; 2.4.40 is the red
+  (VERIFY.md has the full runs, including two earlier builds of this release that Codex's review sent back):
+
+  | 30 sessions × 4 concurrent Bash calls | 2.4.40 | 2.4.41 |
+  | --- | --- | --- |
+  | 300 files: calls past the hook's 3 s | 114 of 120 Pre, 120 of 120 Post | 1 Pre, 3 Post; p99 1.82 s Pre, 3.00 s Post |
+  | 300 files: all settled | after 85 s | after 21.7 s; 120 of 120 files recorded; 0 loop stalls |
+  | 300 files, first 60 observations failed on purpose (20 sessions) | — | all 80 settled after 21.8 s (102 failures, 60 of them injected) |
+  | 300 files: restart with 200 expired calls and their items deferred by hand | — | all settled after 9.9 s; a late Post observes |
+  | 8,000 files: calls past 3 s (build C, 1.5 s wait) | 120 of 120 Pre and Post | 20 Pre, 20 Post |
+  | 8,000 files: settled (build C) | 1 of 120 after 115 s | 120 of 120 after 55.7 s |
+  | Quiet calls credited (300 files) | 31 of 31 | a session's first: 0; its second and third: 2 of 2 |
+
+- Not changed: a quiet call on a large checkout still scans under the lock before it can be credited, and its Pre
+  can pass the 3 s budget (8,000 files). Applying an observation of a large checkout still holds the event loop
+  (0.8–0.9 s for 8,000 paths), so Posts on such a checkout can pass 3 s under load; moving that off the loop is the
+  next release (Codex architect review, 19 Nov). Every start still decodes every lead_hook record once in
+  `lead_calls.recover`.
+
 ## [software-workflows 2.4.40] — 2026-11-11
 
 A Codex CLI update stopped every Codex writer for four days. Reviews kept working.

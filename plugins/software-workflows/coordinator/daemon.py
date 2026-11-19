@@ -176,6 +176,7 @@ class Daemon:
         # (kind, id) -> asyncio.Event: a run, unit or checkout startup recovery is still reconciling while calls are
         # admitted (recovery.recover_writers); the event is set, and the entry removed, once it is done.
         self.recovering = {}
+        self.recovery_snapshots = set()  # checkouts whose recovery snapshot committed in this daemon (recovery.recover_writers)
         self.answer_probes = {}  # listener -> (when, task) of maintenance's last probe (recovery.answer_watch)
         self.silent = {}  # listener -> since when, and why, its app-server has not answered (reported, never ended)
         self.ended = {}  # reason -> how many writer app-servers this daemon ended (recovery.end_wedged)

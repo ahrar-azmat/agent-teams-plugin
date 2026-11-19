@@ -884,7 +884,7 @@ class Ledger:
             result["attributed"] = attributed
         return result
 
-    async def reconcile_many(self, checkouts, reason, target=None, attribute=None):
+    async def reconcile_many(self, checkouts, reason, target=None, attribute=None, owner=None):
         applications = []
         for checkout in checkouts:
             proof = None
@@ -897,7 +897,7 @@ class Ledger:
                     proof = attribute
             applications.append({"caller": "reconcile_many", "checkout": checkout, "paths": None, "attribute": proof})
         results = await self.scans.observe(applications, reason,
-            owner={"kind": "operation", "operation": attribute["operation"]} if attribute else None)
+            owner={"kind": "operation", "operation": attribute["operation"]} if attribute else owner)
         result = dict(results.get(target, {}))
         result["participants"] = [{"checkout": c["id"], "root": c["root"], **results[c["id"]]} for c in checkouts]
         return result

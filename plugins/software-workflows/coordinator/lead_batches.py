@@ -1,6 +1,7 @@
 """Persist-first batch delivery with independent, compact completion items."""
 import asyncio
 import json
+import os
 import time
 
 from .locks import finish, finish_thread
@@ -11,11 +12,31 @@ from .store import digest, encoded, LEAD_BATCH_ITEM_PENDING, LEAD_BATCH_LEGACY
 # bounds outbox polling and a failed bookkeeping write's in-memory cooldown;
 # it is a retry interval, never an expiry or a limit on completion lifetime.
 RETRY_SECONDS = 3
+# How many pending items the observer settles at once; the rest wait, durable, for a later tick. Threat: event-loop
+# starvation. Through 2.4.40 the observer started one task per due item every 0.25 s, and with 6,380 due items on
+# 11-19 its row loop alone was 2,402 of 6,269 loop-stall samples in 6 h, while every lead edit waited behind it
+# (LEAD_ADMISSION_BUSY). Size: since 2.4.41 an item either returns at once (its call already settled) or waits on
+# its checkout's shared scan with every other (intents.settle_uncredited), so a waiting item is an idle task and
+# more of them only make each scan's cohort larger; 64 keeps a tick's own work far under the 0.75 s stall threshold
+# (VERIFY 2.4.41 measures the drain). It queues work, never drops it, and SOFTWARE_WORKFLOWS_BATCH_ATTEMPTS adjusts
+# it. A submit's own items start at once and do not count against it.
+try:
+    ATTEMPTS = max(1, int(os.environ.get("SOFTWARE_WORKFLOWS_BATCH_ATTEMPTS", "64")))
+except ValueError:
+    ATTEMPTS = 64
+# A failed release of deferrals is tried again this long after.
+RELEASE_RETRY_SECONDS = 30
+# Owed observations that may run even while live completions fill ATTEMPTS, so none waits for good.
+OWED_RESERVE = 4
+# The code defers a failed item by RETRY_SECONDS. A deferral beyond this was not set by it (on 11-19 the SmartPay
+# lead deferred 22,923 stuck Bash items to 26 Nov by hand, to relieve 2.4.40's stall): each start releases it, so
+# that item settles through the same path as every other.
+FOREIGN_DEFERRAL_SECONDS = 3600
 
 
 def runtime(daemon):
     if not hasattr(daemon, "lead_batches"):
-        daemon.lead_batches = {"jobs": {}, "after": {}, "problems": {}, "scan": None, "scan_after": 0}
+        daemon.lead_batches = {"jobs": {}, "after": {}, "problems": {}, "scan": None, "scan_after": 0, "observer_jobs": set()}
     return daemon.lead_batches
 
 
@@ -98,6 +119,30 @@ def owner(daemon, item):
     return None
 
 
+def recovered_before(daemon, item, batch):
+    """A Bash item for a call recovery settled by its deadline (intents.invalidate_windows), delivered before that
+    settlement: the command had ended before its batch was made, and the restart's snapshot of every checkout records
+    what it left, so it needs no observation of its own. One delivered after observes (intents.settle_uncredited)."""
+    if item["identity"].get("tool_name") != "Bash":
+        return False
+    from .intents import RECOVERED
+    from .lead_calls import find
+    record = find(daemon.store, item["identity"].get("session_id"), item["identity"].get("tool_use_id"))
+    settlement = (record or {}).get("settlement") or {}
+    created = (daemon.store.get(batch, required=False) or {}).get("created")
+    if not (record and record["state"] == "reconciled" and settlement.get("source") == RECOVERED
+            and isinstance(created, (int, float)) and created <= settlement.get("at", 0)):
+        return False
+    # Only with evidence that recovery observed every checkout the call reaches (recovery_snapshots): "wait" while
+    # recovery runs; a checkout it skipped or failed leaves the item to observe (intents.settle_uncredited).
+    reach = record.get("reach") or [record.get("checkout")]
+    if all(key in getattr(daemon, "recovery_snapshots", ()) for key in reach):
+        return True
+    if not getattr(daemon, "ready", True) or any(("checkout", key) in (getattr(daemon, "recovering", None) or ()) for key in reach):
+        return "wait"
+    return False
+
+
 def acknowledge(daemon, item, batch, **outcome):
     """Compact the item and decrement the small header in one transaction."""
     compact = {k: item[k] for k in ("id", "_kind", "_revision", "ordinal", "identity")}
@@ -122,8 +167,13 @@ async def attempt(daemon, ident):
         batch = daemon.store.db.execute("SELECT parent FROM records WHERE id=?", (ident,)).fetchone()[0]
         try:
             held = owner(daemon, item)
+            recovered = None if held else recovered_before(daemon, item, batch)
             if held:
                 outcome = {"state": "owned", "owner": held}
+            elif recovered == "wait":
+                return  # recovery has not observed its checkouts yet: the item waits for that (cooldown in start)
+            elif recovered:
+                outcome = {"state": "complete", "result": {"coordinated": True, "settled": True, "recovered": True}}
             else:
                 result = await finish(daemon.dispatch("lead-hook/dispatch", {"payload": item["payload"]}))
                 if (not isinstance(result, dict) or item["identity"]["tool_name"] in FILES and result.get("settled") is not True):
@@ -149,11 +199,13 @@ async def attempt(daemon, ident):
             forget_marker(daemon.store, item["identity"])
 
 
-def start(daemon, ident):
+def start(daemon, ident, observer=False):
     state = runtime(daemon)
     existing = state["jobs"].get(ident)
     if existing:
         return existing
+    if observer:
+        state["observer_jobs"].add(ident)
     async def guarded():
         try:
             await finish(attempt(daemon, ident))
@@ -170,6 +222,7 @@ def start(daemon, ident):
             else:
                 state["after"].pop(ident, None)
             state["jobs"].pop(ident, None)
+            state["observer_jobs"].discard(ident)
     task = daemon.background(guarded())
     state["jobs"][ident] = task
     return task
@@ -238,19 +291,91 @@ async def scan(daemon):
         problem(daemon, "outbox", exc)
 
 
+async def release_deferrals(daemon):
+    """Release deferrals the code did not set (FOREIGN_DEFERRAL_SECONDS), in chunks, each compare-and-set on the
+    bytes read so a concurrent attempt's own write is kept. Once per daemon start."""
+    released, after = 0, ""
+    while not daemon.closing:
+        rows = daemon.store.db.execute(
+            "SELECT id,data FROM records INDEXED BY lead_batch_item_pending WHERE " + LEAD_BATCH_ITEM_PENDING +
+            " AND coalesce(json_extract(data,'$.retry_after'),0)>? AND id>? ORDER BY id LIMIT 500",
+            (time.time() + FOREIGN_DEFERRAL_SECONDS, after)).fetchall()
+        if not rows:
+            break
+        after = rows[-1]["id"]
+        def rewrite():
+            out = []
+            for row in rows:
+                data = json.loads(row["data"])
+                data.pop("retry_after", None)
+                out.append((encoded(data), row["id"], row["data"]))
+            return out
+        changes = await finish_thread(rewrite)
+        with daemon.store.transaction():
+            for data, ident, old in changes:
+                released += daemon.store.db.execute("UPDATE records SET data=?,revision=revision+1 WHERE id=? AND data=?",
+                                                    (data, ident, old)).rowcount
+        await asyncio.sleep(0)
+    if released:
+        daemon.store.event("lead_batch/deferrals_released", None, {"items": released})
+
+
+async def release_once(daemon):
+    """release_deferrals until it completes once in this daemon; a failure is retried RELEASE_RETRY_SECONDS later."""
+    state = runtime(daemon)
+    try:
+        await release_deferrals(daemon)
+        state["released"] = True
+    except Exception as exc:
+        problem(daemon, "release", exc)
+        state["release_after"] = time.monotonic() + RELEASE_RETRY_SECONDS
+
+
 async def observe(daemon):
-    """Only schedule isolated attempts; never await one item's filesystem work."""
+    """Only schedule isolated attempts; never await one item's filesystem work. At most ATTEMPTS run at once, and a
+    tick reads only as many due rows as it can start (plus those it must skip: running, or cooling after a failure).
+    Items failed before and due again get half of a tick's free places and fresh items the other half, each in its
+    own index order, so neither kind can keep the other waiting."""
     state = runtime(daemon)
     try:
         now = time.monotonic()
         if now >= state["scan_after"] and (state["scan"] is None or state["scan"].done()):
             state["scan_after"] = now + RETRY_SECONDS
             state["scan"] = daemon.background(scan(daemon))
-        for row in daemon.store.db.execute("SELECT id FROM records INDEXED BY lead_batch_item_pending WHERE " +
-                LEAD_BATCH_ITEM_PENDING + " AND coalesce(json_extract(data,'$.retry_after'),0)<=?", (time.time(),)):
+        release = state.get("release")
+        if not state.get("released") and (release is None or release.done()) and now >= state.get("release_after", 0):
+            state["release"] = daemon.background(release_once(daemon))
+        if now >= state.get("owed_after", 0):
+            state["owed_after"] = now + RETRY_SECONDS
+            from .intents import retry_owed, SETTLING, OWED_ACTIVE
+            # Owed observations share the observer's bound, with OWED_RESERVE concurrent places that live traffic
+            # cannot take.
+            retry_owed(daemon, max(OWED_RESERVE - len(OWED_ACTIVE), ATTEMPTS - len(SETTLING)))
+        # A submit's own items run beside these and never take their places: retried items always get some.
+        free = ATTEMPTS - len(state["observer_jobs"])
+        if free <= 0:
+            return
+        cooling = [key for key, until in state["after"].items() if until > now]
+        skip = len(state["jobs"]) + len(cooling)
+        retried = list(daemon.store.db.execute(
+            "SELECT id FROM records INDEXED BY lead_batch_item_pending WHERE " + LEAD_BATCH_ITEM_PENDING +
+            " AND coalesce(json_extract(data,'$.retry_after'),0)>0 AND coalesce(json_extract(data,'$.retry_after'),0)<=? "
+            "ORDER BY coalesce(json_extract(data,'$.retry_after'),0), id LIMIT ?", (time.time(), free + skip)))
+        fresh = list(daemon.store.db.execute(
+            "SELECT id FROM records INDEXED BY lead_batch_item_pending WHERE " + LEAD_BATCH_ITEM_PENDING +
+            " AND coalesce(json_extract(data,'$.retry_after'),0)=0 ORDER BY coalesce(json_extract(data,'$.retry_after'),0), id LIMIT ?",
+            (free + skip,)))
+        def startable(rows):
+            return [row["id"] for row in rows if row["id"] not in state["jobs"] and now >= state["after"].get(row["id"], 0)]
+        retried, fresh = startable(retried), startable(fresh)
+        # Ticks alternate which kind gets the odd place, so a single free place serves both in turn.
+        prefer = state["prefer_retried"] = not state.get("prefer_retried", False)
+        taken = retried[:(free + 1) // 2 if prefer else free // 2]
+        chosen = taken + fresh[:free - len(taken)]
+        chosen += retried[len(taken):len(taken) + free - len(chosen)]
+        for ident in chosen:
             if daemon.closing:
                 break
-            if now >= state["after"].get(row["id"], 0):
-                start(daemon, row["id"])
+            start(daemon, ident, observer=True)
     except Exception as exc:
         problem(daemon, "scheduler", exc)

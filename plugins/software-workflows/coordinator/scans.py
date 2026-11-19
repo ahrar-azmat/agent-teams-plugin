@@ -188,6 +188,10 @@ class Manager:
         self.producers = {}
         self.live = {}
         self.retry_needed = False
+        # Observations started in this daemon, and those a lead Bash call started for itself (owner.operation): a
+        # credited window holds the difference (intents.quiet), so an observation that starts after it, even one
+        # that commits before its Post, voids it. In memory: a restart voids every window anyway.
+        self.started, self.started_by = 0, {}
 
     def status(self):
         return [p.status() for p in self.producers.values()]
@@ -198,6 +202,10 @@ class Manager:
         return self.producers[checkout["id"]]
 
     async def observe(self, applications, reason, action=None, on_observed=None, _replay=None, owner=None):
+        self.started += 1
+        operation = owner.get("operation") if isinstance(owner, dict) else None
+        if isinstance(operation, str) and operation.startswith("lead_hook_"):
+            self.started_by[operation] = self.started_by.get(operation, 0) + 1
         record = {"generation": self.store.generation,
             "state": "pending", "created": time.time(), "causal_point": time.monotonic(), "incarnation": uid("application"),
             "caller": dict(telemetry.identity(), entry=applications[0].get("caller", "observe")), "reason": reason, "action": action,
@@ -507,6 +515,7 @@ class Manager:
 
 
 def compatible(record):
-    return (record["reason"] in ("opaque command effects", "turn-end observation")
+    # "possible lead Bash effects": the completions of lead Bash calls that cannot be credited (intents.settle_uncredited).
+    return (record["reason"] in ("opaque command effects", "turn-end observation", "possible lead Bash effects")
             and all(p["ignore_pending"] and not p["attribute"] and not p["guard"]
                     and not p["preserve_leads"] and not p["settling_operation"] for p in record["policy"]))

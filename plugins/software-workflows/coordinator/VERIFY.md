@@ -22289,3 +22289,83 @@ state, `python -m coordinator --state … admission --scratch …`.
   a release newer than 0.167.0 (none exists), so the `floor` case ran on 0.167.0 with the list shortened;
   a listener that outlives a CLI update (the fingerprint reads the installed binary, not the listener's);
   a real writer turn on 0.167.0 (the live daemon was still 2.4.38 when this was written).
+
+## software-workflows 2.4.41 — lead Bash calls that cannot be credited stop queueing for the whole machine (2026-11-19)
+
+**The live incident, read-only on the live ledger (19 Nov, daemon 2.4.40, pid 137345):**
+- 29,246 `lead_batch_item` rows pending, every one a Bash follow-up; 22,864 deferred to 26 Nov by the SmartPay lead
+  that morning, 6,380 due. 29,476 Bash `lead_hook` records `observed`. Pending items by creation hour start at
+  17 Nov 22:00 IST (146) and run at 600–1,900 an hour while agents work.
+- Of the 8,342 `possible lead Bash effects` observations committed from 17 Nov 19:47 IST, every one belonged to a
+  call created before 21:47 IST, the creation time of the last Bash `lead_hook` that ever reached `reconciled`
+  (found by the SmartPay lead). The single global `BASH_TRANSITIONS` lock was serving a backlog of old calls.
+- Full-checkout scans: Sales_Profiler 11.6–42.1 s (3,595 paths, 0 bytes hashed); 460 scans an hour.
+- Event loop: 6,269 stall samples (>0.75 s) in 6 h, 6,667 s of stall. Entry frames: `lead_calls.py:886 observe`
+  2,513 (2,402 at `lead_batches.py:249`, the per-tick row loop), maintenance 631, `tail_native_log` ~930,
+  `intents.py:291` (the Pre's reconcile under the lock) 396.
+
+**Probe:** `r2441/probe.py` in the session scratchpad (deleted after), a real coordinator daemon started by
+`Client.ensure` from the plugin under test, on a disposable 0700 state and a scratch git repository, with
+`CODEX_GATE_*` and the gitshim removed from the environment. Each call is the hook's own sequence over RPC: Pre with
+a 3 s client timeout, `lead-hook/armed` when the Pre answered with an arm token, the command's write, then Post with
+a 3 s timeout. The burst runs 30 sessions × 4 calls on 30 threads after one sequential warm-up call per session
+(production sessions are long-lived; a new session's attach creates its run and unit). 2.4.40 = the installed
+cache. Five builds of 2.4.41 ran (A–E), the first four sent back by Codex's review:
+- A: a completion settled at once and asked for a detached, coalesced reconcile per checkout (5 s gap). Review turn 1
+  (HIGH): acknowledged before observing, and a delayed scan could take a later credited command's changes.
+- B: a completion awaits a shared observation and is settled when it commits; `quiet` is None while one runs.
+  Review turn 2 (HIGH): a `settling` reply lets the hook drop its retry marker, a partial failure could leave a
+  window intact, and recovery's settlement skipped a later real completion.
+- C: the completion is written on the call first (durable obligation, `retry_owed` with backoff), each attempt
+  moves the durable clock before scanning, recovery settles only calls with no completion and items delivered
+  before it, a live Post waits 1.5 s, the scheduler splits retried and fresh items. Review turn 3: recovery's
+  snapshot and the scans' generic repair of a failed observation could still take a credited command's writes,
+  owed retries were unbounded, and an armed Post whose window had changed lost its retry.
+- D: `quiet` gives no window during recovery or while another owner's observation is pending; recovered items
+  close only once recovery is done with their checkouts; owed retries share the observer's bound and resume where
+  they stopped; a changed window or a failed credited scan is settled the durable way. Runs at a 1.5 s and a 1 s
+  Post wait. Review turn 4: an observation that starts after a window and commits before its Post leaves no trace
+  (pre-existing), recovery's absence is not evidence of a snapshot, a batch with no record skipped observation
+  (pre-existing), live traffic could starve owed retries.
+- E (this tree): a window holds the count of observations started by others (`scans.Manager.started`, minus the call's
+  own `started_by`, the Pre's before-scan included); recovered items need `recovery_snapshots` evidence for every
+  reached checkout; a batch with no record is observed; 4 concurrent owed retries are reserved; a live Post waits
+  1 s. Review turn 5 (Codex): the reserve counted per pass, not running retries, and `started_by` kept settled calls;
+  both fixed after the E runs below. The final tree's own run (300 files): one session's 3 calls: 1st not credited,
+  2nd and 3rd `lead-command`; 30 sessions × 4: 1 Pre and 0 Post past 3 s, p99 1.78 s / 2.77 s, all 120 reconciled
+  after 16.4 s, 0 loop stalls, 120 of 120 UNKNOWN; restart: 200 items closed as recovered, all settled after
+  13.5 s, a late Post observed; no `background/failure` event.
+
+| Measure | 2.4.40 | A | B | C | D | E |
+| --- | --- | --- | --- | --- | --- | --- |
+| 300 files, quiet call (a new session's first) | armed, `lead-command` | same | same | same | same | not credited: `UNKNOWN-context-only` |
+| 300 files, one session's 3 sequential calls | — | — | — | — | — | 1st not credited; 2nd and 3rd armed, `lead-command` |
+| 300 files, 30 warm-up calls, each a new session's first | 30 credited | 30 | 30 | 30 | 30 | 0 |
+| 300 files, burst: Pre / Post past 3 s | 114 / 120 of 120 | 1 / 0 | 1 / 0 | 0 / 2 | 1 / 20 (1.5 s wait); 27 / 42 (1 s, host load 22) | 1 / 3 |
+| 300 files, burst: Pre p99, Post p99 | — | 1.18 s, 1.15 s | 1.69 s, 2.53 s | 1.77 s, 3.01 s | 0.96 s, 3.04 s; 3.05 s, 3.12 s at load 22 | 1.82 s, 3.00 s |
+| 300 files, burst: all `reconciled` | after 85.2 s | 6.7 s | 9.7 s | 16.2 s | 11.2 s; 27.6 s at load 22 | 21.7 s; 0 loop stalls |
+| 300 files, burst: files recorded UNKNOWN | 120 of 120 | 120 | 120 | 120 | 120 | 120 |
+| 300 files, 20 sessions, first 60 observations fail (injected, `sitecustomize`) | — | — | — | 60 `observation_failed` (retry 5 s); 80 reconciled after 11.9 s | 60; 80 reconciled after 9.6 s, 0 Post past 3 s | 102 `observation_failed` (60 injected, the rest `UNSTABLE_SNAPSHOT` from the burst's own writes; the 20 warm-up calls are uncredited first calls now); all 80 burst calls reconciled after 21.8 s, source `Post`; 25 Posts past 3 s |
+| Restart: 200 calls past deadline, their items deferred 7 days by hand | — | 200 settled after 6.4 s | after 7.7 s | after 5.5 s | after 8.3 s | after 9.9 s; 200 items closed as recovered; `deferrals_released` 200 |
+| A Post after recovery settled its call (late permission) | — | — | — | observed, file recorded UNKNOWN | same | same |
+| 8,000 files, burst: Pre / Post past 3 s | 120 / 120 of 120 | 12 / 12 | 24 / 48 | 20 / 20 | not run | not run |
+| 8,000 files, burst: `reconciled` | 1 of 120 after 114.6 s | 120 after 39.7 s | 120 after 75.0 s | 120 after 55.7 s; 8 loop stalls, worst 0.87 s | not run | not run |
+| 8,000 files, 3,000 Pres then 60 outbox batches of their PostToolBatch (25 unwarmed sessions) | — | items drained 85.2 s | items drained 847 s; 769 calls left observed (706 items refused `UNSTABLE_SNAPSHOT`, never retried) | not run | not run | not run |
+
+- B's 769 calls left observed are the gap C closes: in C a refused or failed observation stays owed on the call and
+  `retry_owed` takes it up (the injected run above).
+- B's 8,000-file Posts waited 2.5 s for their observation and then crossed the hook's 3 s with the lease ping and
+  loop stalls before the timer: hence C's 1.5 s.
+- The 8,000-file stall stacks (A): 24 in an observation's commit (`ledger.apply_observation` → `store.heads`,
+  `scans.tokens`) and 16 in a new session's attach. Both read every head of the checkout on the loop: next release.
+- **Start-up on a copy of the live ledger** (`r2441/prod_check.py`: SQLite backup of the live file, `Store` and the two
+  functions only, no daemon; the copy deleted after; build A's `invalidate_windows`, whose only difference from C is
+  sparing calls that carry a completion, which no 2.4.40 record does): 30,029 observed Bash calls;
+  `invalidate_windows` 16.21 s, leaving 31 still in their deadline; `release_deferrals` 6.19 s for 22,857 items;
+  the observer's tick query 0.0002 s for 16 rows, against 0.0288 s for all 29,809 rows (2.4.40, before its per-row
+  loop and task creation).
+- Host load varied between runs (load average ~8–22 on 18 cores, other sessions working); D's 1 s run was at 22.
+- A new session's first call is not credited in E: attaching the session commits an `unexplained filesystem change`
+  observation of the checkout, which the window now counts (seen in the 3-call run's observation list).
+- Not measured: the switch of the live daemon with writers mid-edit; D or E at 8,000 files; a 3,000-item backlog after B;
+  a recovery delayed by another checkout while a quiet Bash writes; Watchman or inotify (not built).
