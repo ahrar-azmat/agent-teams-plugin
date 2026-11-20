@@ -129,7 +129,7 @@ Prefer a 3-teammate variant first:
 
 Use the 4+ teammate pattern only when backend, frontend, and validation are genuinely independent.
 
-Writers share the checkout (SKILL.md rule 9): `implementer-1` and `implementer-2` charter Codex writers that run at the same time in the same repository on disjoint claims, and settle it by message when their work meets. On a machine where the coordinator is not admitted, writers in one repository run one after another, as before. The `verifier` starts once both units are sealed.
+Writers share the checkout (SKILL.md rule 9). The lead starts two writers as T3 child tasks (`references/writers.md`), each on its own files, and they run at the same time in the same repository. Where their work meets, the lead orders it, or soft-steers one writer to wait. The `verifier` starts once both writers have reported and the lead has read both diffs.
 
 Tasks:
 - "Design architecture with Codex input, create task breakdown" → `architect` (plan mode)

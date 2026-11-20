@@ -28,8 +28,7 @@ WORKTREE STATUS (round 36). The same walk also yields a porcelain-shaped
 status — `XY path` lines, X = index vs HEAD, Y = worktree vs index — from
 the index listing, HEAD's tree listing and this module's own byte reads
 (git's own blob ids, `sha1("blob <n>\\0" + bytes)` or sha256 in a sha256
-repository), so server.py's write-mode snapshot and the hook's index/HEAD
-consistency check run no `git status` either. Vocabulary: `A `/`M `/`D `/
+repository). The push gate uses these for its index/HEAD consistency check. Vocabulary: `A `/`M `/`D `/
 `T ` staged, ` M`/` D`/` T` unstaged, `??` untracked (every file, never a
 collapsed directory), `UU` unmerged, and ` ~` = the worktree bytes differ
 from the index blob but a conversion attribute (filter / text / eol / ident /
@@ -541,7 +540,7 @@ def _read_bounded_thread(proc, end, cap):
     return chunks, why
 
 
-def run_contained(argv, timeout_s, cap=1 << 20, payload=None, grace_s=GRACE_S):
+def run_contained(argv, timeout_s, cap=1 << 20, payload=None, grace_s=GRACE_S, *, env=None, cwd=None):
     """Run `argv` in its OWN session and return (returncode, stdout bytes,
     why) with why = "" | "timeout" | "cap" | "spawn: …" | "read: …" |
     "sweep: …". stdout is streamed under select() until EOF, the deadline, or
@@ -555,7 +554,7 @@ def run_contained(argv, timeout_s, cap=1 << 20, payload=None, grace_s=GRACE_S):
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE if payload is not None else subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                start_new_session=(os.name != "nt"))
+                                start_new_session=(os.name != "nt"), env=env, cwd=cwd)
     except Exception as exc:
         return -1, b"", f"spawn: {exc}"
     writer = _start_writer(proc, payload) if payload is not None else None
@@ -783,39 +782,20 @@ def _display(rel):
     return rel.decode("utf-8", "backslashreplace")
 
 
-def _path_ids(parts, within):
-    """{display path: 16 hex} from the digest's parts, each with what `within`
-    adds for its path (a submodule's inside). Two byte paths that display alike
-    share one entry made of both, so a change to either shows (review of
-    2026-10-18)."""
-    ids = {}
-    for p in parts:
-        rel = p.split(b"\0", 1)[0]
-        key = _display(rel)
-        h = hashlib.sha256(p + b"\0" + within[rel] if rel in within else p).hexdigest()[:16]
-        ids[key] = hashlib.sha256((ids[key] + h).encode()).hexdigest()[:16] if key in ids else h
-    return ids
-
-
-def inspect(cwd, *, want_status=False, inner_paths=False, deadline_s=DEADLINE_S, git_timeout_s=GIT_TIMEOUT_S,
+def inspect(cwd, *, want_status=False, deadline_s=DEADLINE_S, git_timeout_s=GIT_TIMEOUT_S,
             max_file_bytes=MAX_FILE_BYTES, max_total_bytes=MAX_TOTAL_BYTES,
             max_files=MAX_FILES, max_git_bytes=MAX_GIT_BYTES, _depth=0):
-    """ONE walk of the worktree → {"digest", "repo", "lines", "paths", "strict",
+    """ONE walk of the worktree → {"digest", "repo", "lines", "strict",
     "strict_commit", "head", "binding", "reason"}. digest: 12 hex | "nogit" |
     "unknown". repo: inside a work tree. lines: the display status set
-    (want_status) or None when it could not be established. paths: {display
-    path: 16 hex} over the same per-path identity the digest is made of
-    (content, exec bit, symlink target, gitlink head; never the index state),
-    or None when the digest is void; with want_status and inner_paths, a
-    checked-out submodule's entry also covers what is inside it (its paths
-    and its status, recursively), which the digest never does. strict /
+    (want_status) or None when it could not be established. strict /
     strict_commit: {path: reason} the strong wording must be free of (push /
     commit). head: HEAD's object id ("" on an unborn branch). binding: 16
     hex over toplevel + HEAD + the raw index listing. Computed IN THIS
     PROCESS with soft deadlines (every blocking step is followed by a
     check); use digest_hard() where nothing above this process holds a kill."""
     deadline = time.monotonic() + deadline_s
-    result = {"digest": "unknown", "repo": False, "lines": None, "paths": None, "index": None,
+    result = {"digest": "unknown", "repo": False, "lines": None,
               "strict": None, "strict_commit": None, "head": "", "binding": "", "reason": ""}
 
     def check():
@@ -844,7 +824,6 @@ def inspect(cwd, *, want_status=False, inner_paths=False, deadline_s=DEADLINE_S,
             raise Budget("untracked listing failed")
         entries = {}   # path → (kind, extra) ; gitlinks carry the index oid — the DIGEST's view
         index = {}     # path → (tag, mode, oid) — the STATUS's view (last stage wins)
-        stages = {}    # path → every stage's identity — the change reports' view
         conflicted = set()
         for raw in tracked.split(b"\0"):
             if not raw:
@@ -856,7 +835,6 @@ def inspect(cwd, *, want_status=False, inner_paths=False, deadline_s=DEADLINE_S,
             tag, mode, oid, stage = fields
             entries[rel] = (b"g", oid) if mode == GITLINK_MODE else (b"t", b"")
             index[rel] = (tag, mode, oid)
-            stages.setdefault(rel, []).append(b"\0".join((stage, tag, mode, oid)))
             if stage != b"0":
                 conflicted.add(rel)
         for rel in others.split(b"\0"):
@@ -926,7 +904,6 @@ def inspect(cwd, *, want_status=False, inner_paths=False, deadline_s=DEADLINE_S,
                 top_b + b"\0" + head.encode("ascii") + b"\0" + tracked).hexdigest()[:16]
         check()
         parts = []
-        within = {}  # gitlink → its submodule's inside, for `paths` only (inner_paths)
         lines = set()
         strict = {}         # every reason the PUSHED objects may not be the reviewed bytes
         strict_commit = {}  # the subset that concerns the INDEX (what a commit records)
@@ -971,23 +948,16 @@ def inspect(cwd, *, want_status=False, inner_paths=False, deadline_s=DEADLINE_S,
                 parts.append(rel + b"\0g\0" + extra + b"\0" + sub_head)
                 check()
                 inner = None
-                # its status, when its HEAD is the gitlink; with inner_paths, always
-                if want_status and not frozen and sub_head != b"absent" and (
-                        inner_paths or (settled and ie is not None and sub_head == ie[2])):
+                if settled and not frozen and sub_head != b"absent" and sub_head == ie[2]:
                     if _depth >= MAX_SUBMODULE_DEPTH:
                         raise StatusUnreadable("submodule nesting too deep")
                     inner = inspect(fp.decode("utf-8", "surrogateescape"), want_status=True,
-                                    inner_paths=inner_paths, deadline_s=max(0.0, deadline - time.monotonic()),
+                                    deadline_s=max(0.0, deadline - time.monotonic()),
                                     git_timeout_s=git_timeout_s, max_file_bytes=max_file_bytes,
                                     max_total_bytes=max_total_bytes, max_files=max_files,
                                     max_git_bytes=max_git_bytes, _depth=_depth + 1)
-                    if inner["lines"] is None or inner["paths"] is None:
+                    if inner["lines"] is None:
                         raise StatusUnreadable("submodule status unreadable: " + inner["reason"])
-                    if inner_paths:
-                        # its staged identities too: a staged-only change inside it shows (review of
-                        # 2026-10-18, turn 8)
-                        within[rel] = json.dumps([sorted(inner["paths"].items()), sorted(inner["lines"]),
-                                                  sorted((inner["index"] or {}).items())]).encode()
                     check()
                 if settled and not frozen and sub_head != b"absent":
                     assert ie is not None
@@ -1118,22 +1088,11 @@ def inspect(cwd, *, want_status=False, inner_paths=False, deadline_s=DEADLINE_S,
                     note(rel, "staged deletion", commit_too=False)
         check()
         result["digest"] = hashlib.sha256(b"\0".join(parts)).hexdigest()[:12]
-        result["paths"] = _path_ids(parts, within)
         result["head"] = head
         if want_status:
             result["lines"] = lines
             result["strict"] = strict
             result["strict_commit"] = strict_commit
-            # per-path staged identity (tag, mode, oid), for the change reports only — so a staged
-            # blob swapped on an already-`MM` file, worktree bytes and status letters unchanged, is
-            # still seen (review of 2026-10-18, turn 7). Every conflict stage counts, not only the
-            # last (turn 8). NOT part of the digest. Collisions combine.
-            idx = {}
-            for rel, recs in stages.items():
-                key = _display(rel)
-                h = hashlib.sha256(b"\n".join(sorted(recs))).hexdigest()[:16]
-                idx[key] = hashlib.sha256((idx[key] + h).encode()).hexdigest()[:16] if key in idx else h
-            result["index"] = idx
         return result
     except StatusUnreadable as exc:
         # STATUS-ONLY failure: the content digest still stands — recomputed by
@@ -1144,7 +1103,6 @@ def inspect(cwd, *, want_status=False, inner_paths=False, deadline_s=DEADLINE_S,
                         max_total_bytes=max_total_bytes, max_files=max_files,
                         max_git_bytes=max_git_bytes, _depth=_depth)
         result["digest"] = again["digest"]
-        result["paths"] = again["paths"]
         result["lines"] = None
         result["strict"] = None
         result["strict_commit"] = None
@@ -1155,7 +1113,6 @@ def inspect(cwd, *, want_status=False, inner_paths=False, deadline_s=DEADLINE_S,
         # void digest only makes the gate more conservative — and the status.
         result["digest"] = "unknown"
         result["lines"] = None
-        result["paths"] = None
         result["strict"] = None
         result["strict_commit"] = None
         result["reason"] = f"{type(exc).__name__}: {exc}"[:200]
@@ -1168,23 +1125,14 @@ def workspace_digest(cwd, **kw):
     return inspect(cwd, want_status=False, **kw)["digest"]
 
 
-def worktree_status(cwd, **kw):
-    """(ok, porcelain-shaped lines, HEAD oid or "", reason) — ok is False
-    outside a work tree or whenever the status could not be established
-    (budget, unreadable listing, unresolvable submodule); `reason` says why."""
-    r = inspect(cwd, want_status=True, **kw)
-    ok = bool(r["repo"]) and r["lines"] is not None
-    return ok, (r["lines"] or set()), r["head"], r["reason"]
-
-
-def digest_hard(cwd, deadline_s=DEADLINE_S, grace_s=GRACE_S, python=None):
+def digest_hard(cwd, deadline_s=DEADLINE_S, grace_s=GRACE_S, python=None, *, env=None, process_cwd=None):
     """The digest computed in a CHILD (its own process group) under a HARD
     deadline: the parent waits deadline + grace and SIGKILLs the whole group
     — a hung git or a stalled mount can no longer hold the hook past its
     timeout. Anything but a well-formed answer is "unknown"."""
     argv = [python or sys.executable, os.path.abspath(__file__),
             "--deadline", str(deadline_s), "--", str(cwd)]
-    rc, out, why = run_contained(argv, deadline_s + grace_s, cap=4096, grace_s=grace_s)
+    rc, out, why = run_contained(argv, deadline_s + grace_s, cap=4096, grace_s=grace_s, env=env, cwd=process_cwd)
     if rc != 0 or why:
         return "unknown"
     text = out.decode("ascii", "replace").strip()

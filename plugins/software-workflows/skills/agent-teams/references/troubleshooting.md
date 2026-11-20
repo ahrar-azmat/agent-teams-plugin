@@ -14,7 +14,9 @@ Read this when a team call fails or before you start or wrap up a team.
 
 **Task stuck as blocked:** Check if the blocking task is actually done but wasn't marked completed. Use `TaskUpdate` to fix.
 
-**File conflicts:** a writer's patch into another unit's claim is refused with the holder named. Let the two writers settle it by message (the holder releases, or the second waits), or run the overlapping work in sequence. Never isolate a writer in a git worktree (SKILL.md rule 9).
+**File conflicts:** two writers need the same file. Order them: soft-steer one to leave that file until the other is done, or run the overlapping work in sequence. Read each writer's diff by its own paths before committing. Never isolate a writer in a git worktree (SKILL.md rule 9).
+
+**A writer went the wrong way:** hard-steer it (`t3_thread_send(mode="restart")`) with what to do instead, and say whether to redo the step that was stopped. Its task and earlier instructions still stand (SKILL.md rule 12). Cancel it (`task_cancel`) only when the task itself is no longer wanted.
 
 **A worktree appeared anyway** (a teammate ran `git worktree add`, or an `Agent` call carried `isolation: "worktree"`): stop that teammate, save the tree's changes as a patch (`git -C <tree> diff` plus any untracked files), apply the patch in the real checkout by path, then `git worktree remove <tree>` and `git worktree prune`. Never delete a tree with plain `rm`.
 
@@ -41,7 +43,8 @@ Before starting a team:
 - [ ] Task calls use ONLY documented params — NO `team_name` or `blockedBy` on `TaskCreate`/`TaskUpdate`; set dependencies via `TaskUpdate(taskId=..., addBlockedBy=[...])`
 - [ ] `SendMessage` calls use `to` / `message` / `summary` — never `recipient` / `type` / `content` / `broadcast`; protocol `type` goes inside the `message` object
 - [ ] Tasks are specific and self-contained with full context in description
-- [ ] No two writers will write the same paths: writers in one checkout hold disjoint claims (SKILL.md rule 9)
+- [ ] No two writers will write the same paths: each writer's charter names its own files (SKILL.md rule 9)
+- [ ] Each writer's charter says LEAD STEER messages add information and never cancel its task (SKILL.md rule 12)
 - [ ] NO git worktrees: no `isolation: "worktree"`, no `EnterWorktree`, no `git worktree add` in any prompt or script (SKILL.md rule 9)
 - [ ] Each `Agent()` call has `description`, `name`, `model: "opus"`, `subagent_type`, `run_in_background: true`, `prompt` — and NO `team_name`
 - [ ] Teammate prompts START with a `ToolSearch(query="select:TaskList,TaskGet,TaskUpdate,TaskCreate,SendMessage")` step

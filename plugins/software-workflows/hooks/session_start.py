@@ -72,7 +72,7 @@ def _drop_dead_mirrors(state, now):
 
 
 def _setup_notice(source):
-    """The SessionStart output naming what is not ready, or None when everything is."""
+    """Report missing setup and any advisory limit of the installed Git."""
     if source not in ("startup", "resume"):
         return None
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "plugin_setup.py")
@@ -81,18 +81,23 @@ def _setup_notice(source):
         raise ImportError(path)
     setup = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(setup)
-    missing = [(c[0], c[2]) for c in setup.checks(quick=True) if not c[1]]
-    if not missing:
+    items = setup.checks(quick=True)
+    missing = [(c[0], c[2]) for c in items if not c[1]]
+    limits = [c[2] for c in items if c[0] == setup.GIT_GUARD_NOTICE]
+    if not missing and not limits:
         return None
-    return {
-        "systemMessage": "software-workflows: %s not ready. Run /software-workflows:setup"
-                         % ", ".join(item for item, _ in missing),
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": "software-workflows setup is incomplete on this machine: "
-                                 + "; ".join(f"{item}: {detail}" for item, detail in missing)
-                                 + ". Tell the user once, briefly, that /software-workflows:setup explains "
-                                   "these checks and measured coverage limitations (it asks before changing any setting)."}}
+    message = []
+    context = []
+    if missing:
+        message.append("software-workflows: %s not ready. Run /software-workflows:setup"
+                       % ", ".join(item for item, _ in missing))
+        context.append("software-workflows setup is incomplete on this machine: "
+                       + "; ".join(f"{item}: {detail}" for item, detail in missing)
+                       + ". Tell the user once, briefly, that /software-workflows:setup explains "
+                         "these checks (it asks before changing any setting).")
+    return {"systemMessage": " ".join(message + limits),
+            "hookSpecificOutput": {"hookEventName": "SessionStart",
+                                   "additionalContext": " ".join(context + limits)}}
 
 
 def main():

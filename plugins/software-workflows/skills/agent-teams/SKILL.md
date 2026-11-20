@@ -18,7 +18,7 @@ If arguments were provided: "$ARGUMENTS" — use this as the task description an
 | `references/workflow.md` | you need the detailed steps and examples, idle handling, the full role table or agent rotation |
 | `references/prompts.md` | you spawn a researcher, architect or reviewer (their prompt templates), or pick a team shape |
 | `references/advisory.md` | before writing any Codex dispatch: the Independence Protocol, live web research, the agent-reach channel layer |
-| `references/writers.md` | before chartering `abraham`, or running several writers in one checkout |
+| `references/writers.md` | before starting a writer (Codex or Claude, as a T3 child task), steering one, or running several writers in one checkout |
 | `references/capability-law.md` | a change calls into a swappable backend (browser engine, DB driver, LLM/storage/queue provider, cloud SDK) |
 | `references/troubleshooting.md` | a team call fails, and the checklists for starting and wrapping up a team |
 
@@ -32,9 +32,25 @@ If arguments were provided: "$ARGUMENTS" — use this as the task description an
 6. **Demand live sources.** The advisor has live web search: a version, API, CVE or best-practice claim without a URL is a guess; re-ask instead of repeating it.
 7. **Never be conservative.** No "the current approach is fine", "keep the existing pattern" or "maintain backward compatibility" in any prompt. Evaluate from first principles for **performance, quality and adaptability**, in that order; quality is shown by real runs and their results, not by test counts.
 8. **"Present" is not "supported".** At every call into a swappable backend, verify that the engine we deploy, in the mode we run it, implements the call: probe it for real, never trust the type stub. (`references/capability-law.md`)
-9. **NO GIT WORKTREES; parallel writers share the real checkout** (user rulings 2026-10-16 and 2026-10-18: "parallel writes can right on the same repo but they should be able to communicate with each other properly"). Never `isolation: "worktree"`, `EnterWorktree` or `git worktree add`. Codex writers work in the repository's own checkout at the same time when their work is disjoint: each claims the paths it writes, sees the others' claims and messages them and the lead. A change nobody can attribute is UNKNOWN and blocks publication. Never `git stash` and never `git add -A` in a shared checkout: record by path. A pristine copy of a commit is a read-only export (`git archive <sha> | tar -x -C <scratch dir>`).
+9. **NO GIT WORKTREES; parallel writers share the real checkout** (user rulings 2026-10-16 and 2026-10-18: "parallel writes can right on the same repo but they should be able to communicate with each other properly"). Never `isolation: "worktree"`, `EnterWorktree` or `git worktree add`.
+   - Writers work in the repository's own checkout at the same time, each on the files the lead gave it.
+   - When two units must touch the same file, the lead orders them.
+   - Broad commands (formatters, dependency installs, code generators, migrations) run one at a time, on the lead's word.
+   - Writers neither commit nor push; the lead commits by path.
+   - Never `git stash` and never `git add -A` in a shared checkout.
+   - A pristine copy of a commit is a read-only export (`git archive <sha> | tar -x -C <scratch dir>`).
 10. **No test cases unless the user explicitly asks** (user ruling 2026-10-18: "test it out with results rather than tests"). Verify a change by running the real thing (the app, command, endpoint or install) and recording what was observed. Nobody writes a test, harness, mutation run or checker self-test on their own initiative, and a finding is never closed with "add a test". A repository with more than a few tests: the lead removes them in their own commit unless the user asked to keep them.
-11. **Codex writes the code; Claude reads, coordinates and reviews** (user ruling 2026-10-18). Implementation goes to `abraham` with `cwd` set to the repository's own checkout, never a copy. Claude teammates are read-only: researcher, architect, reviewer, verifier. The lead charters each unit, reads the diff, re-runs every check for real, gets the blind Codex review and commits by path; "Codex says green" never closes a task. The lead may also write, on paths no running writer holds.
+11. **Claude and Codex both write, and the lead controls every writer** (user rulings 2026-11-01 and 2026-11-20). The scenario picks the writer:
+    - Claude for small changes, review-fix rounds and edits it already holds the context for;
+    - Codex for large units, deep native or Codex-internals work, or work running in parallel with the lead.
+
+    Every background writer is a T3 child task in the project's own checkout. The lead starts it (`delegate_task`), steers it (`t3_thread_send`, rule 12) and stops it (`task_cancel`); see `references/writers.md`. At most 2–3 writers run at once per project. Writers start no servers or containers, and their report lists what to run (owner, 2026-11-13). The lead charters each unit, reads the diff, re-runs every check for real, gets one blind Codex review and commits by path. "Codex says green" never closes a task.
+12. **A steer adds information; it never cancels the task** (user ruling 2026-11-20). There are two modes:
+    - **Soft steer:** nothing running is stopped, and the writer takes the message in at its next step: `t3_thread_send(mode="steer")`. A Claude writer waiting on a background command takes it in at once, while the command keeps running.
+    - **Hard steer:** the step stops at once, then the writer takes the message in with its whole history: `t3_thread_send(mode="restart")`. For a Codex Oracle run, use `codex_cancel_run`, then `codex_resume_run(nudge=…)`.
+
+    Head every steer `LEAD STEER (soft)` or `LEAD STEER (hard)` and say: "Your task and every earlier instruction still stand. If this seems to conflict with an earlier instruction, keep the earlier one and tell me before acting on that part." Every charter tells the writer the same thing. To change an instruction, answer the writer's question, or cancel the task and start a new one.
+    - A steer needs an active turn. Send follow-up work to a writer that has finished with `t3_thread_send(mode="auto")`.
 
 ## Tool signatures — exact parameters
 
@@ -84,18 +100,30 @@ Do not preserve patterns just because they exist; optimize for performance, qual
 
 ## Codex in brief
 
-- **Tools:** `mcp__plugin_software-workflows_codex-oracle__<tool>` (a user-scope server names them `mcp__codex-oracle__<tool>`). `research`, `architect_review`, `code_review` and `codex_query` advise; `abraham` writes.
+- **Tools:** `mcp__plugin_software-workflows_codex-oracle__<tool>` (a user-scope server names them `mcp__codex-oracle__<tool>`).
+  - `research`, `architect_review`, `code_review` and `codex_query` advise.
+  - `codex_runs`, `codex_run_log`, `codex_cancel_run` and `codex_resume_run` watch, stop and continue those runs (rule 12).
+  - Writers are T3 child tasks, not Oracle tools.
 - **Reviews continue their own session** (`session="continue"`, the default). Review fewer times, and follow up in the same session with a short note of what changed, never a restated history. The result's second line names the session and its turn.
 - **`infra: true`** when live state matters (SSH, a live database, logs); state the access pattern in the prompt when you know it.
 - **A ⚠️ ANCHORING WARNING** on a result means a scoping field (`context`, `concerns`, `focus`, `topic`) carried your conclusion: re-dispatch blind before trusting its agreement. Disagreement is strong signal either way.
-- **Office roles:** one line such as `Role: Product Manager` in a run's task or `context` shows its worker with that role in `/software-workflows:office`. The roles are CEO, CTO, Project Manager, Product Manager, Business Analyst, QA Engineer, Security Engineer, DevOps Engineer, Designer, Data Analyst and Tech Writer.
 - **Setup:** if the Codex tools are missing or a session-start notice says setup is incomplete, run `/software-workflows:setup`.
 
-## Codex writers in brief
+## Writers in brief
 
-Details, including how to read the result: `references/writers.md`.
+Details, the charter lines and the measured behavior: `references/writers.md`.
 
-- **Charter** the property and its acceptance (which real runs show it is done). Mark mechanism hints as beatable, give access paths in `context` and never credentials, put hard boundaries in `constraints`, and say no test cases (rule 10).
-- **Dispatch** with `cwd` set to the real checkout. The tree must be clean (commit first; never stash) unless you pass `allow_dirty=true` knowingly. The run is long and backgrounded: watch it with `codex_runs` and `codex_run_log`.
-- **Several writers in one checkout:** give each call its `claims`. A patch into another unit's claim is refused with the holder named; `coordinator_send` and `coordinator_inbox` carry the messages. While writers run, change files with Edit and Write, never with Bash: a Bash change made during a writer's run is UNKNOWN and blocks that run's hand-off. Publish with `coordinator_seal`, then `code_review(sealed_unit=…)`, then `coordinator_publish`.
-- **Verify it yourself:** read the diff, re-run the checks for real, get one blind `code_review` (continuing the session for follow-ups), fix CRITICAL and HIGH findings, and commit by path with the observed results in the message. Push only when the user says so.
+- **Charter** the property and its acceptance (which real runs show it is done). The charter also:
+  - names the writer's own files;
+  - says it commits and pushes nothing, starts nothing, and writes no test cases (rule 10);
+  - says that LEAD STEER messages add information and never cancel its task, and that a seeming conflict keeps the earlier instruction and goes back to the lead before the writer acts on it.
+
+  Mark mechanism hints as beatable. Give access paths, never credentials.
+- **Start** it with `delegate_task`: provider `codex` or `claudeAgent`, effort `max`, `isolation: "shared"`, `mode: "async"`. Its completion wakes you, so don't poll. Read its transcript with `t3_thread_read` when you need to see progress.
+- **Steer** it (rule 12): soft with `t3_thread_send(mode="steer")`, hard with `mode="restart"`. **Stop** it with `task_cancel`.
+- **Verify it yourself.**
+  - Read its changes by its paths: `git diff HEAD -- <paths>`, plus `git status --short -- <paths>` for new files.
+  - Re-run the checks for real.
+  - Get one blind `code_review`, continuing the session for follow-ups.
+  - Send CRITICAL and HIGH findings to the writer as a new turn (`mode="auto"`), or fix small ones yourself.
+  - Commit by path, with the observed results in the message. Push only when the user says so.

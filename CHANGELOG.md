@@ -3,6 +3,171 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.5.0] — 2026-11-20
+
+The writer coordinator, the `abraham` writer and the Codex Office are retired (owner, 20 Nov: "go ahead with
+everything please"). Why:
+- Every one of the 43 commits since 2.4.0 changed the coordinator.
+- Its hooks ran on every lead Bash and Edit call. In a registered checkout, a coordinated call added a note to the
+  lead's context.
+- Its central promise could not be kept by scanning: knowing which writer changed which bytes in a shared checkout.
+
+Writers are now T3 child tasks that the lead starts, steers and stops. Reviews stay with the Codex Oracle.
+
+- **Removed.**
+  - Folders and hooks: `coordinator/` (35,212 lines of Python, 63,761 lines in all), `office/` (3,911), `spike/`, `hooks/coordinator_lead.py`,
+    `hooks/office_autostart.py` and `hooks/live_view_nudge.py`.
+  - Tools and commands: the `abraham` tool, every `coordinator_*` tool, and the `abraham` and `office` commands.
+  - Sealed (bound) reviews. `code_review` keeps its `sealed_unit` and `project` parameters only to refuse them.
+  - The coordinator's and the Office's plugin options and environment entries.
+  - The push gate's coordinator checks: unit ownership, publication blocks, sealed-review lookup and reconciliation.
+  - `PLAN_1.18_ORACLE_DAEMON.md` and `PLAN_ABRAHAM_WRITE_MODE.md`.
+
+  No hook runs on Edit, Write or MultiEdit any more.
+- **Kept.**
+  - `architect_review`, `code_review`, `research` and `codex_query`, with their prompts, scoping lint, signed first
+    line, session continuation and run budget.
+  - `codex_runs`, `codex_run_log`, `codex_cancel_run` and `codex_resume_run`, which serve the Oracle's own runs.
+  - The push gate and its git shim. Ordinary decisions are unchanged: all 18 compared cases match 2.4.41. The
+    branch that refused a commit of coordinator-owned paths is gone.
+  - The OS file-lock helpers that stop two calls continuing one Codex thread, now in `run_claims.py`.
+  - A new small hook, `hooks/dispatch_cwd.py`, which passes the session's folder to the four advisory tools and
+    the run tools, so a relative `cwd` still resolves against it.
+- **Oracle runs keep the push guard.** The push guard and the plugin-MCP restriction that the coordinator gave the
+  Oracle's own runs now live in `oracle_policy.py`. Its limits are listed under "Also known" below.
+  - The guard uses the same Git settings, byte for byte, and keeps `hooks/codex-publish/git-remote-sw-codex-no-push`.
+  - Before inference, each run reads its effective Codex config through a short metadata-only
+    `codex app-server --listen stdio://`. That process is time-limited and reaped, and it starts no model turn and
+    no network listener.
+  - A run whose Codex config or plugin policy can't be verified is refused before inference, with a reason. When
+    the metadata process itself fails, the reason names the failed step, the exit status and an error category
+    (read-only filesystem, permission denied, not logged in, other), never raw stderr.
+  - The Git check has three outcomes:
+    - Git would run the bundled refusal helper: the run passes.
+    - The child's Git can't be identified from trusted paths: the run gets a warning.
+    - Git's helper search would pick a different copy of the helper, even a byte-identical one: the run is
+      refused.
+  - `infra` runs keep the user's named MCP servers.
+  - The bundled helper comes first on the run's `PATH`, so Git runs the helper the check verified, even when a
+    same-named copy sits in `~/.local/bin`.
+  - Plugin MCP server names are cached by Codex binary and plugin identity, as in 2.4.41. A local plugin's entry is
+    also bound to a fingerprint of its MCP declarations, so a reinstall that adds a server refreshes it. On nucleus
+    a cold check took 13.7 s with 14 `plugin/read` calls, a warm one 0.98 s with none, and one after such a
+    reinstall 1.15 s with one. The effective policy is read back once per dispatch that starts a model attempt.
+    Automatic retries reuse the first attempt's restrictions. A stored answer, or the collection of a detached run,
+    runs no new check.
+  - Git is inspected only through absolute `PATH` entries of the Oracle's own process, never a `git` the reviewed
+    folder could plant. The Git subprocesses run off the MCP event loop, within the remaining deadline, and their
+    whole process group is killed on timeout or cancellation. The path scans around them do not; see "Also known".
+  - The metadata process's whole process group is killed on every exit, timeout and cancellation, even when its
+    launcher has already exited. On Windows its job is set to kill on close. That path was checked with a Linux
+    test double, not on Windows.
+  - The pre-push hook entries, which cover a remote with an explicit `pushurl`, need Git 2.54 or newer. On an older
+    Git the run still starts, and an explicit-`pushurl` push is not refused. Setup and the session-start notice say
+    so for the host's Git. Each run says so, below the signed header and the session line, for the Git selected in
+    its own child environment, and the same goes for a child Git that cannot be verified from trusted paths.
+- **Fixed from the release review.**
+  - `code_review` refuses `sealed_unit` and `project` before inference, with a migration note. FastMCP would have
+    dropped them silently and reviewed the current checkout instead.
+  - Oracle run records from before the `tool` field stay listed, as `[unknown]`. Old `abraham` analysis runs are
+    left out, even when project notes in them contain headings like `## Build [Linux]`.
+  - Relative image paths come from the folder the review runs in, not the server's startup folder, on fresh
+    calls and on resumes. Only a fresh thread loads `ADVISOR_CONTEXT.md`, from that folder. A continuation keeps
+    the context it was first given, even when it now reviews a different folder.
+  - `architect_review`, `research` and `codex_query` now follow the session's folder too, so the run tools find
+    their runs after the session changes directory. This was wrong before 2.5.0 too.
+  - An anchoring warning or missing-verdict notice now goes below the signed header and the session line. A warned
+    review used to lose its push-gate evidence, before 2.5.0 too.
+- **Steering.** The owner, 20 Nov: "there should be two modes hard steer (stop and steer) and soft steer(wait for
+  current process to complete) none of the steer doesn't mean the previous instructions are invalidated".
+  - Soft: `codex_resume_run(run, nudge=…)` after the run answers. For a T3 writer, `t3_thread_send(mode="steer")`.
+    A Claude writer waiting on a background command takes a soft steer in at once. When the order matters, wait for
+    that command to finish, then send the steer.
+  - Hard: `codex_cancel_run`, then `codex_resume_run(nudge=…)` on the same thread. For a T3 writer,
+    `t3_thread_send(mode="restart")`.
+  - On Windows, `codex_resume_run` cannot continue a run, as before. There a hard steer of an Oracle run stops it,
+    with no way to continue it, so check the platform before cancelling.
+  - Every delivered nudge reaches Codex headed "[Additional information from the lead] The original task and every earlier
+    instruction still stand. If this seems to conflict with an earlier instruction, keep the earlier one and say so
+    before acting on that part." Collecting a detached run can return its answer with a notice that the nudge was
+    not delivered; send it again in another call.
+  - The agent-teams skill gives writers the same rule (rules 9, 11 and 12, `references/writers.md`). Every charter
+    says LEAD STEER messages add information, and every steer says so again.
+  - A steer needs an active turn. A writer that has finished gets follow-up work with `t3_thread_send(mode="auto")`.
+- **Outside the plugin, on the author's machine.**
+  - The coordinator daemon was stopped at 11:51 IST. Its registry and hook markers were set aside, so sessions still
+    on 2.4.41 skip it.
+  - The Office's tailnet proxy (`codex-office-web.service`) is disabled.
+  - Codex's model is now gpt-6.2-astra.
+  - T3 Codex writers get the push refusal from `~/.codex/config.toml`
+    (`shell_environment_policy.set.GIT_CONFIG_PARAMETERS`, the same settings) and `~/.local/bin/git-remote-sw-codex-no-push`.
+    The coordinator used to add it when it launched a writer. The README gives the recipe.
+
+Known, for the next release. All four were the same before 2.5.0:
+- After an MCP reconnect, collecting a continued run that is still running reports another collector until its
+  Codex child exits. The run keeps its thread lock across the reconnect.
+- An `infra` retry reuses the policy verified for the first attempt, even if the Codex config changed during the
+  backoff.
+- `research(web_search=False)` turns native search off, but its prompt still asks for web research.
+- A `shell_environment_policy` whose `filters` allowlist drops a variable the guard needs refuses launch. `PATH`
+  alone is refused. `PATH` with `GIT_CONFIG_PARAMETERS` and `SOFTWARE_WORKFLOWS_PUSH_GUARD_PATH` passes, and so
+  does a table with only excludes.
+
+Also known, for 2.5.1. These are edge cases of the restored Oracle push guard from the last turn of the release
+review (which said "Do not ship"). They are documented rather than holding the release, under the owner's standing
+rule that guardrail hardening does not hold a release:
+- For an enabled local plugin, MCP server names come from its marketplace source, not the installed copy. A server
+  declared only in the installed copy is not disabled, in read-only and `infra` runs alike. 2.4.41 also read the
+  source, and its warm cache could keep an older list.
+- Host-side Git lookups skip `PATH` folders inside the reviewed checkout, but not ones inside the checkout that
+  dispatched the review. That `git` is used only when the review target is outside the dispatching checkout and an
+  absolute folder of the dispatching checkout comes before system Git on the Oracle's `PATH`. For example, a review
+  of `/usr/share` dispatched from this repository resolves this repository's `hooks/gitshim/git`. 2.4.41's digest
+  used the unfiltered host `PATH`, so this narrows an exposure it already had.
+- Two synchronous path scans run on the event loop, both new in 2.5.0:
+  - one in `host_environment()`, before the check's deadline is set;
+  - about 200 filesystem calls inside `verify()`, after it is set.
+
+  A stalled mount on `PATH` can delay other calls.
+- New in 2.5.0, on macOS with Python 3.11 or 3.12: there is no `os.waitid`, so the Git checks return nothing and
+  every run carries the unverified-Git warning.
+- New in 2.5.0, on macOS with a minimal `PATH`: `/opt/homebrew/bin` is used to find Codex but dropped from its
+  environment. A launcher that finds its interpreter through `PATH`, with no other usable copy there, then fails the
+  metadata check, and the run is refused. 2.4.41 kept that folder.
+
+Upgrading:
+- A session keeps the plugin's MCP server version it started with until it restarts. `/reload-plugins` reloads
+  hooks and skills, not the MCP server. Restart for a complete upgrade.
+- In a session still on 2.4.41, don't call `abraham` or a `coordinator_*` tool: they would start the coordinator
+  again.
+- That session's Office hook may restart the Office until the session itself restarts.
+
+Measured on nucleus (Ubuntu 24.04, Codex 0.170.0, T3 0.1.10, Claude Code 2.1.328):
+
+| Check | Result |
+|---|---|
+| Every remaining Python file compiles | 12 files |
+| Tools the server registers | 8: architect_review, code_review, research, codex_query, codex_runs, codex_run_log, codex_cancel_run, codex_resume_run |
+| `claude plugin validate`, plugin and marketplace | passed |
+| Push gate against 2.4.41: fresh, acknowledged and reused tokens; plain and lease pushes; current, stale and missing reviews | all 18 decisions and their messages match |
+| Live `codex_query` and `code_review` through the new server (sandboxed home, login read-only) | signed `status:ok` first lines, gpt-6.2-astra at max |
+| Hard steer of an Oracle run: cancel, then resume with a nudge | same thread; the answer covered the original question and the nudge |
+| Soft steer of an Oracle run: resume a finished query with a nudge | same thread; the original answer plus the addition |
+| T3 Codex writer, soft steer during a running command | the command finished, then the writer followed the steer and completed its task |
+| T3 Codex and Claude writers, hard steer | the running command was gone within 1 s; the writer redid the step and completed its task with the addition |
+| T3 Codex writer, `task_cancel` | its command and its MCP servers stopped |
+| T3 Codex writer, `git push` | refused with exit 128: `LEAD_PUBLISHES: the lead (Claude) pushes; Codex cannot publish commits.` |
+| Live `infra` Oracle run, `git push` to a plain remote and to one with an explicit `pushurl` | refused with `LEAD_PUBLISHES`: Git exited 128 after the helper refused, and 1 after the pre-push hook refused |
+| Oracle policy on real Codex metadata | a fixture plugin keeps its skill, its MCP server is disabled; a named `infra` MCP server keeps the guarded environment; Git settings byte-identical to 2.4.41 |
+| `code_review` with `sealed_unit` or `project` (non-empty, empty, null) | refused, with no inference and no journal entry |
+| Push gate parser on a live review that carries a warning | finds the signed digest |
+| Git 2.43.0 (no configuration-defined hooks) | the live query ran; setup, session start and the policy line reported the explicit-`pushurl` limit |
+| Policy checks: cold, warm, and after a local plugin reinstall that adds an MCP server | 13.696 s, 0.983 s and 1.149 s, with 14, 0 and 1 `plugin/read` calls; the next dispatch disabled the new server |
+| A `git` planted in a relative `PATH` entry of the reviewed folder | never run: its marker file stayed absent, and the unverified-Git warning came on line 3 of the result |
+| Another request during a slow Git check | `codex_runs` answered in 0.0005 s; a 0.400 s deadline returned in 0.403 s |
+| Images from the dispatch folder, the review folder and a resume | the CLI's image payloads matched each folder's image |
+| A metadata process whose launcher exits first | its descendant was killed and reaped after a normal exit, a timeout and a cancellation |
+
 ## [software-workflows 2.4.41] — 2026-11-19
 
 From 17 Nov 21:47 IST no lead Bash call made after that time had its follow-up settled. The coordinator ran at

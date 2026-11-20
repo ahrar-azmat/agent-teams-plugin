@@ -1,28 +1,141 @@
-# Agent Teams — Codex writers (abraham) and the writer coordinator
+# Agent Teams — writers: start, steer, stop
 
-Read this before chartering an abraham run or running several writers in one checkout.
+Read this before you start a writer, steer one, or run several writers in one checkout.
 
-### Codex writers (abraham)
+A writer is a **T3 child task** that the lead starts, steers and stops. Codex writers use provider
+`codex`, and Claude writers use provider `claudeAgent`. Both work in the project's own checkout:
+`isolation: "shared"`, never a worktree (SKILL.md rule 9). Call `orchestrator_capabilities` once per
+thread before your first `delegate_task`; it lists the providers, models and effort options.
+Writers run at effort `max`.
 
-`abraham` is the one tool that edits files. It runs two Codex phases in one call, both with **full access**: no sandbox, network, live web search, your MCP servers and live infrastructure. The analysis phase, read-only by instruction, writes an implementation brief; the implementation phase carries it out, runs the project's real checks and reports their real results. There is no sealed mode: `false` for `full_access`, `infra` or `web_search` is refused.
+### 1. Charter the unit
 
-1. **Charter the unit.** State the property and its acceptance: what must be true afterwards, and which real runs show it. Mark mechanism hints as beatable. Put what you already know in `context`, including the access paths (a key-based SSH host, a `docker exec` target, a local test database) and never credentials. Put hard boundaries in `constraints`: files not to touch, APIs to keep. Tell it to write no test cases unless the user asked for them (SKILL.md rule 10).
-2. **Dispatch** with `cwd` set to the target repository's own checkout: any git repository on the machine. The tree must be clean, so commit the work first (never `git stash`), or pass `allow_dirty=true` knowingly. The call runs long and is backgrounded. Watch it with `codex_runs` and `codex_run_log`; stop it with `codex_cancel_run`; continue a dead or cancelled run with `codex_resume_run`, after checking `git status`, because a partial run may have written files.
-3. **Read the result.**
-   - The `[CHANGED FILES]` block separates this run's changes from what was dirty before. A `HEAD MOVED` line means audit `git log` first.
-   - The **effective mode** line is what Codex recorded for each turn; anything but full access is flagged.
-   - A `⚠ the tree changed during the ANALYSIS phase` note means files changed while it was only meant to read: review them in the diff.
-4. **Verify it yourself.** Read the diff. Re-run the build, the linters and the changed app, command or endpoint for real, and record what you saw. Then run one blind `code_review` of the final change, continuing the review session for follow-ups, and fix CRITICAL/HIGH findings (with abraham again).
-5. **Record.** Commit by path (`git add <paths>`, never `add -A`), with the observed results in the message. Push only when the user says so.
+State the property and its acceptance: what must be true afterwards, and which real runs show it.
+- Mark mechanism hints as beatable.
+- Give access paths (a key-based SSH host, a `docker exec` target, a local database), never
+  credentials.
+- Put hard boundaries in plain words: files not to touch, APIs to keep.
 
-#### Several writers in one checkout (the writer coordinator)
+Every charter also carries these lines:
 
-When the machine admits it, abraham runs on the **writer coordinator**: a daemon the plugin starts on demand, which hosts each writer as a Codex app-server thread in the real checkout. The first admission takes tens of seconds, and the result says so. When admission fails, abraham runs as before, holding the checkout alone, and its result says which check failed.
+- **Your files:** `<paths>`. Edit nothing else; if you must, ask the lead first.
+- **Don't commit or push.** The lead commits by path. (Codex's shell refuses `git push` on this
+  machine anyway.)
+- **Start nothing** (owner, 2026-11-13): no servers, containers or databases. Put what must run,
+  and how to see it, under WHAT TO RUN in your report.
+- **No test cases** unless the user asked for them (SKILL.md rule 10).
+- **Steering:** messages headed LEAD STEER add information. Your task and every earlier instruction
+  still stand. If a steer seems to conflict with an earlier instruction, keep the earlier one and tell
+  the lead before acting on that part.
 
-- **Dispatch several at once.** Give each call its `claims`: the paths it will write. A patch into another unit's claim is refused with the holder named, and the writers can message each other and the lead. A dirty tree is refused as before, except for paths that live units or the lead's recorded edits account for.
-- **Read the attribution.** In place of `[CHANGED FILES]`, the result lists each path with its label: exact (a verified receipt names the writer), custody (a command that may have changed it) or UNKNOWN (nobody can account for it).
-- **Talk to the writers.** `coordinator_claims` lists, acquires and releases claims. `coordinator_send` messages a run, a unit or the lead. `coordinator_inbox` reads the lead's messages, and a coordinator-aware result carries a one-line unread notice. `coordinator_unit` shows a unit's status, its object diff and its UNKNOWN paths, and reconciles, restores, reopens or recovers.
-- **Your own edits count.** In a coordinated checkout, an Edit, Write or NotebookEdit to a path a live unit holds is refused. Any other Edit or Write is recorded as yours; a NotebookEdit is not recorded, so what it wrote reads UNKNOWN (use Write for notebooks). A Bash command that changes files is recorded as yours only when, while it ran, no writer was working, no command was held, and no other lead Bash command was running in that checkout. Otherwise what it changed is UNKNOWN, and a change made during a writer's run blocks that run's hand-off. So while writers run, change files with Edit and Write, never with Bash.
-- **Publish through the unit tools.** `coordinator_seal` freezes an idle unit's candidate. `code_review(sealed_unit=…)` reviews exactly those objects, and only a "Ship it" counts. `coordinator_publish` then commits that candidate and refuses without the passing review, with UNKNOWN content, or on a stale parent. No acknowledgement opens it.
-- **The git gate agrees.** A plain `git commit` that would take another live unit's paths, or UNKNOWN content, is refused with the units and paths named, and no acknowledgement opens it. Leave those paths out, or publish the unit. A push is gated as before.
-- **Watch them.** `codex_runs`, `codex_run_log`, `codex_cancel_run` and `codex_resume_run` handle coordinator writers too, across MCP restarts, from the dispatch folder and from the target. `/software-workflows:office` shows them, and its pause and continue act on them.
+### 2. Start it
+
+```
+delegate_task(
+    title="<unit>",
+    task="<the charter>",
+    role="implementation",
+    isolation="shared",
+    mode="async",
+    target={"providerInstanceId": "codex", "model": "<from orchestrator_capabilities>",
+            "options": {"reasoningEffort": "max"}},
+)
+```
+
+- For a Claude writer, use `{"providerInstanceId": "claudeAgent", "model": "claude-opus-5-5",
+  "options": {"effort": "max"}}`.
+- Keep the `taskId` and `childThreadId`. The child's completion wakes your thread, so don't poll
+  it. To see its progress, read its transcript with `t3_thread_read`.
+
+### 3. Steer it: soft or hard
+
+A steer **adds information**. It never cancels the writer's task or its earlier instructions. If a
+steer seems to conflict with one, the writer keeps the earlier instruction and tells the lead before
+acting on that part. To change an instruction, answer the writer's question, or cancel the task and
+start a new one with a new charter. Say this in every steer, and head the steer with its mode:
+
+```
+LEAD STEER (soft): additional information for your current task. Your task and every earlier
+instruction still stand. If this seems to conflict with an earlier instruction, keep the earlier one
+and tell me before acting on that part.
+<the information>
+```
+
+```
+LEAD STEER (hard): I stopped your current step to give you this now. Your task and every earlier
+instruction still stand. If this seems to conflict with an earlier instruction, keep the earlier one
+and tell me before acting on that part.
+<the information; say whether to redo the step that was stopped>
+```
+
+| Mode | What happens | Call |
+|---|---|---|
+| **Soft** | Nothing running is stopped. A Codex writer takes the message in after the step it is on. A Claude writer waiting on a background command takes it in at once, while the command keeps running. | `t3_thread_send(threadId=<child>, mode="steer", message=…)` |
+| **Hard** | The step it is on stops at once, then the writer takes the message in with its whole history. | `t3_thread_send(threadId=<child>, mode="restart", message=…)` |
+
+- Use **soft** for context, corrections and additions that can wait for the current command.
+- Use **hard** when the current step is wrong or wasteful: a long build against the wrong target, a
+  command touching the wrong files.
+- A steer needs an active turn. A writer that has finished is idle: send it follow-up work, such as
+  review findings, with `t3_thread_send(mode="auto")`. That starts a new turn in the same thread, with
+  its history.
+- `mode="queue"` is not a steer. It runs as a new turn after the current one ends.
+
+Measured on 2026-11-20 (T3 0.1.10, Codex 0.170.0, gpt-6.2-astra and claude-opus-5-5):
+- **Soft:** a steer sent during a `sleep` left the command running. The writer finished it, then
+  followed the steer and carried on with its remaining rounds.
+- **Hard:** the running command was gone within 1 s, for Codex and Claude children alike. The writer
+  redid the stopped round, added what the steer asked, and carried on.
+- **Claude writers and long commands:** Claude Code refuses a standalone foreground `sleep` and runs
+  long commands as background tasks.
+  - A Claude writer that is waiting on one takes a soft steer in at once, while the background command
+    keeps running.
+  - When the steer must not reach the writer before that command finishes, wait for the command to
+    finish, then send the steer. Asking the writer in the steer to wait does not delay delivery.
+  - A hard steer stopped the background command too.
+
+### 4. Stop it
+
+`task_cancel(taskId)` stops the child's running and queued turns. It stopped the running command
+within the cancel and unloaded the thread's tool servers (measured 2026-11-20). Never call
+`t3_thread_interrupt` on a child.
+
+### 5. Several writers in one checkout
+
+- At most 2–3 writers run at once per project (owner, 2026-11-13). The project's one shared test
+  copy goes to one writer at a time, first in, first out, and only the lead starts it.
+- Give each writer its own files. When two units must touch the same file, order them: the second
+  starts when the first is done, or you soft-steer one to wait.
+- Broad commands (formatters, dependency installs, code generators, migrations) run one at a time,
+  and only when you say so.
+- Read each writer's changes by its own paths:
+  - tracked files: `git diff HEAD -- <paths>`;
+  - new files: `git status --short -- <paths>`, then open each untracked file it lists.
+- Never `git stash` and never `git add -A` in a shared checkout.
+
+### 6. Verify and record
+
+- **Read the diff, and re-run the checks yourself for real:** the build, the linters, and the changed
+  app, command or endpoint. Record what you saw.
+- **Get one blind `code_review` of the final change.** Continue the review session for follow-ups.
+- **Fix CRITICAL and HIGH findings.** Send them to the same writer as a new turn
+  (`t3_thread_send(mode="auto")`; a finished writer is idle), or fix small ones yourself.
+- **Commit by path** (`git add <paths>`, never `add -A`), with the observed results in the message.
+  Only Claude pushes, through the push gate.
+
+### Reviews and other Codex Oracle runs
+
+`code_review`, `architect_review`, `research` and `codex_query` run in the lead's own session. Watch
+them with `codex_runs` and `codex_run_log`. Steer them like writers:
+- **Soft:** after the run answers, continue it with the added information, using
+  `codex_resume_run(run, nudge=…)` or the tool's own `session="continue"`.
+- **Hard:** `codex_cancel_run(run)`, then `codex_resume_run(run, nudge=…)` on the same thread. Its
+  reasoning and reads so far are kept.
+
+The server heads every nudge with the same rule: it adds information, and the original question and
+earlier instructions stand.
+
+### Cost
+
+Each Codex writer starts its own copy of every MCP server in `~/.codex/config.toml`: about 20
+processes and 1.2 GB on nucleus (measured 2026-11-20). A review starts none unless `infra: true`.

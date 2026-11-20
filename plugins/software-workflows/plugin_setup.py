@@ -8,9 +8,8 @@ SessionStart hook runs the quick checks and points to setup when one fails.
   plugin_setup.py prepare [--data DIR]  build the Codex Oracle server's venv now (DIR is the
                                         plugin's data directory, ${CLAUDE_PLUGIN_DATA})
 
-It runs under any python3 from 3.9 on (what macOS ships). `check` measures push refusal
-using disposable local repositories and retains a capability cache in plugin data.
-`apply` adds one key to one settings file and leaves everything else as it was."""
+It runs under any python3 from 3.9 on (what macOS ships). `apply` adds one key to
+one settings file and leaves everything else as it was."""
 import ctypes
 import errno
 import importlib.util
@@ -26,17 +25,16 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))  # SessionStart loads this module by path.
 TEAMS = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
 MEASURED_CODEX = (0, 163, 0)  # the codex-cli this release was measured on
+GIT_GUARD_NOTICE = "Oracle Git guard"
 
 
-def _launcher():
-    """run_server.py, loaded by path: the interpreter search and venv layout the server uses."""
-    spec = importlib.util.spec_from_file_location("sw_run_server", ROOT / "run_server.py")
+def _sibling(name):
+    path = ROOT / (name + ".py")
+    spec = importlib.util.spec_from_file_location("sw_" + name, path)
     if spec is None or spec.loader is None:
-        raise ImportError(ROOT / "run_server.py")
+        raise ImportError(path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -52,9 +50,9 @@ def settings_path():
     return Path(base) / "settings.json"
 
 
-def _run(argv):
+def _run(argv, *, cwd=None, env=None):
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL, cwd=cwd, env=env)
         return p.returncode, (p.stdout + p.stderr).strip()
     except (OSError, subprocess.SubprocessError) as exc:
         return None, str(exc)
@@ -140,7 +138,7 @@ def checks(data_dir=None, quick=False):
         if sys.platform.startswith("linux"):
             out.append(_codex_sandbox(codex))
 
-    launcher = _launcher()
+    launcher = _sibling("run_server")
     python, info = launcher._find_python()
     if python is None:
         out.append(("Python 3.11+", False, info, _python_fix(), ""))
@@ -180,53 +178,25 @@ def checks(data_dir=None, quick=False):
 
     # the real git: in the Bash tool the push gate's shim comes first on PATH
     shim = os.path.realpath(ROOT / "hooks" / "gitshim")
-    git = shutil.which("git", path=os.pathsep.join(
-        d for d in os.environ.get("PATH", "").split(os.pathsep) if d and os.path.realpath(d) != shim))
+    policy = _sibling("oracle_policy")
+    paths = policy.trusted_git_paths(os.getcwd())
+    git = next((exe for entry, exe in paths.items()
+                if exe and os.path.realpath(entry) != shim), None)
+    git_env = policy.git_probe_environment(paths)
     if git is None:
         out.append(("git", False, "git is not on PATH",
                     "xcode-select --install" if sys.platform == "darwin"
                     else "install git with your package manager", ""))
-    elif "hook list" in _run([git, "hook", "-h"])[1]:
+    elif "hook list" in _run([git, "hook", "-h"], cwd=os.path.dirname(git), env=git_env)[1]:
         out.append(("git", True, git, "", ""))
     else:
         out.append(("git", True, f"{git} has no `git hook list`: the push gate reads hooks as unknown on every commit "
                     "and push, and drops its strong wording (2.56 was measured)",
                     "on Ubuntu: sudo add-apt-repository -y ppa:git-core/ppa && sudo apt install -y git", ""))
-    from coordinator.push_capabilities import report
-    from coordinator.client import GATE_SHELL, clean_environment
-    from coordinator import push_guard
-    if os.name != "nt":  # Windows has no launch gate
-        if _run([*GATE_SHELL, "-c", "exec 12</dev/null"])[0] == 0:
-            out.append(("launch shell", True, GATE_SHELL[0], "", ""))
-        else:
-            out.append(("launch shell", False, f"{GATE_SHELL[0]} cannot open a two-digit file descriptor, and every "
-                        "coordinator launch gate passes one", "install bash", ""))
-    try:
-        push_guard.verify({}, clean_environment(), configuration=False)
-    except Exception as exc:
-        out.append(("Codex launch guard", False, str(getattr(exc, "code", type(exc).__name__)),
-                    "The Codex launch environment or refusal helper is unavailable; reinstall the plugin.", ""))
-    try:
-        capabilities = report(data_dir, quick=quick)
-    except Exception as exc:
-        capabilities = [{"binary": {"path": "git"}, "cases": [],
-                         "error": "unverified: " + str(getattr(exc, "code", type(exc).__name__))}]
-    for result in capabilities:
-        cases = [row for row in result["cases"] if row["case"] != "control"]
-        ordinary = [row for row in cases if row["case"] in ("ordinary", "url", "file_url")]
-        limits = [row for row in cases if row not in ordinary]
-        # SessionStart reports a measured ordinary failure, never missing/stale
-        # evidence or the documented ways unrestricted programs escape a guard.
-        if quick and not any(row["status"] != "refused" for row in ordinary):
-            continue
-        detail = result.get("version", result["binary"]["path"]) + ": " + (result.get("error") or
-                 ", ".join(row["case"] + "=" + row["status"] for row in ordinary))
-        if limits:
-            detail += "; measured limitations: " + ", ".join(row["case"] + "=" + row["status"] for row in limits)
-        ready = (len(ordinary) == 3 and not result.get("error")
-                 and all(row["status"] == "refused" for row in ordinary))
-        out.append(("Codex push guard: " + result["binary"]["path"], ready, detail,
-                    "The lead (Claude) pushes. Review measured limitations with /software-workflows:setup; unrestricted descendants are not a security boundary." if not ready else "", ""))
+    if git:
+        notice = policy.git_hook_notice(_run([git, "--version"], cwd=os.path.dirname(git), env=git_env)[1])
+        if notice:
+            out.append((GIT_GUARD_NOTICE, True, notice, "", ""))
     return out
 
 
@@ -448,7 +418,7 @@ def main(argv):
     if argv[:1] == ["prepare"]:
         if data_dir:
             os.environ["CLAUDE_PLUGIN_DATA"] = data_dir
-        return _launcher().main(prepare=True)
+        return _sibling("run_server").main(prepare=True)
     print(str(__doc__).split("\n\n")[1])
     return 2
 

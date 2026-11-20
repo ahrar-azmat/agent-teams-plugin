@@ -1,6 +1,6 @@
 {
   "name": "agent-teams",
-  "description": "Multi-agent orchestration for Claude Code with Codex as the cross-model advisor and writer — one plugin, software-workflows",
+  "description": "Multi-agent orchestration for Claude Code with Codex as the cross-model reviewer, architect and researcher — one plugin, software-workflows",
   "owner": {
     "name": "Ahrar Ahmad"
   },
@@ -12,7 +12,7 @@
     {
       "name": "software-workflows",
       "source": "./plugins/software-workflows",
-      "description": "Agent-teams orchestration skill — spawn, coordinate and shut down Claude Code agent teams with schema-validated tool signatures — plus the Codex Oracle MCP server: Codex (the strongest configured OpenAI model, reasoning pinned to max, live web search forced on with mandatory sources) as blind cross-model architect, reviewer and researcher, and through abraham as a writer. Anti-anchoring is built in: caller_hypothesis is refuted rather than confirmed, and a lint flags conclusions smuggled into scoping fields. Run tools survive MCP restarts; hooks gate plan mode and git push on a Codex review.",
+      "description": "Agent-teams orchestration skill — spawn, coordinate and shut down Claude Code agent teams with schema-validated tool signatures — plus the Codex Oracle MCP server: Codex (the strongest configured OpenAI model, reasoning pinned to max, live web search forced on with mandatory sources) as blind cross-model architect, reviewer and researcher. Anti-anchoring is built in: caller_hypothesis is refuted rather than confirmed, and a lint flags conclusions smuggled into scoping fields. Run tools watch, stop and continue Oracle runs (soft and hard steering) and survive MCP restarts; hooks gate plan mode and git push on a Codex review. Writers run as T3 child tasks that the lead starts, steers and stops; the skill says how.",
       "category": "workflow",
       "keywords": [
         "agent-teams",

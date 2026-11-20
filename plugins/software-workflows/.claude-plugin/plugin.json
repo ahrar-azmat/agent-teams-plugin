@@ -1,88 +1,13 @@
 {
   "name": "software-workflows",
-  "description": "Agent-teams orchestration with Codex as the cross-model advisor and writer: the Codex Oracle MCP server (architect_review, code_review, research, codex_query, abraham and its run tools) and the hooks that gate plan mode and git push on a Codex review.",
-  "version": "2.4.41",
+  "description": "Cross-model reviews, research and queries through the Codex Oracle, with tools to watch, stop and continue runs and hooks for plan mode and Git pushes.",
+  "version": "2.5.0",
   "author": {
     "name": "Ahrar Ahmad"
   },
   "homepage": "https://github.com/ahrar-azmat/agent-teams-plugin",
   "repository": "https://github.com/ahrar-azmat/agent-teams-plugin",
   "license": "PolyForm-Noncommercial-1.0.0",
-  "userConfig": {
-    "office": {
-      "type": "string",
-      "title": "Codex Office: when to show it",
-      "description": "The Codex Office is the live pixel view of your Codex runs, in your browser at http://127.0.0.1:8765/; watching it costs no tokens. open (default): start it the first time a session uses a Codex tool, and open it in your browser once per session. background: start it the same way, but never open the browser. off: never start it automatically; /software-workflows:office still starts it. The SOFTWARE_WORKFLOWS_OFFICE environment variable, when set, overrides this for the sessions that have it.",
-      "default": "open",
-      "options": ["open", "background", "off"]
-    },
-    "writer_mcp_servers": {
-      "type": "string",
-      "title": "Writer MCP servers",
-      "description": "Writer MCP servers: all (default), or a JSON list of exact server names. Changes apply at the next coordinator start.",
-      "default": "all"
-    },
-    "writer_park_idle_seconds": {
-      "type": "string",
-      "title": "Writer idle parking delay",
-      "description": "Seconds of native inactivity before verified unload and parking. Default 1800; 0 disables idle-timer parking. Finished quiet writers and memory-pressure candidates are still reclaimed. SOFTWARE_WORKFLOWS_WRITER_PARK_IDLE_SECONDS overrides this setting.",
-      "default": "1800"
-    },
-    "writer_reclaim_concurrency": {
-      "type": "string",
-      "title": "Concurrent writer reclamations",
-      "description": "Maximum simultaneous verified writer parks and quarantine retirements. Must be a positive integer; default 2. Excess candidates remain queued. SOFTWARE_WORKFLOWS_WRITER_RECLAIM_CONCURRENCY overrides this setting. Changes apply at the next coordinator start.",
-      "default": "2"
-    },
-    "retention_rows": {
-      "type": "string",
-      "title": "Archive selection rows",
-      "description": "Positive scheduling slice for lossless archive selection; default 1024. Byte and elapsed budgets also apply. No evidence is discarded at this limit. Changes apply at coordinator start; SOFTWARE_WORKFLOWS_RETENTION_ROWS overrides this setting.",
-      "default": "1024"
-    },
-    "retention_bytes": {
-      "type": "string",
-      "title": "Archive selection bytes",
-      "description": "Positive logical-byte scheduling slice; default 8388608 (8 MiB). A larger row runs alone asynchronously and is reported. SOFTWARE_WORKFLOWS_RETENTION_BYTES overrides this setting.",
-      "default": "8388608"
-    },
-    "retention_delete_rows": {
-      "type": "string",
-      "title": "Archive deletion rows",
-      "description": "Positive maximum rows per short delete transaction; default 64, also bounded by the selection byte and elapsed budgets. SOFTWARE_WORKFLOWS_RETENTION_DELETE_ROWS overrides this setting.",
-      "default": "64"
-    },
-    "retention_seconds": {
-      "type": "string",
-      "title": "Compaction cooperative slice",
-      "description": "Positive seconds before yielding or ending a delete transaction; default 0.05. An individual SQLite statement or commit cannot be preempted; actual maxima are reported. SOFTWARE_WORKFLOWS_RETENTION_SECONDS overrides this setting.",
-      "default": "0.05"
-    },
-    "retention_wal_high_bytes": {
-      "type": "string",
-      "title": "Compaction WAL pause threshold",
-      "description": "Pause compaction at this many outstanding WAL bytes; default 134217728 (128 MiB). Observed without checkpointing. Must exceed the low threshold. SOFTWARE_WORKFLOWS_RETENTION_WAL_HIGH_BYTES overrides this setting.",
-      "default": "134217728"
-    },
-    "retention_wal_low_bytes": {
-      "type": "string",
-      "title": "Compaction WAL resume threshold",
-      "description": "Resume compaction below this many outstanding WAL bytes; default 33554432 (32 MiB). Positive and below the high threshold. SOFTWARE_WORKFLOWS_RETENTION_WAL_LOW_BYTES overrides this setting.",
-      "default": "33554432"
-    },
-    "memory_warn_ratio": {
-      "type": "string",
-      "title": "Memory compression warning ratio",
-      "description": "Pause new native launches at this compressor ratio; kernel warning pressure alone parks idle writers without pausing launches. Default 0.50; must be below the critical ratio.",
-      "default": "0.50"
-    },
-    "memory_critical_ratio": {
-      "type": "string",
-      "title": "Memory compression critical ratio",
-      "description": "Refuse new native launches at this compressor ratio, or kernel critical pressure. Default 0.62.",
-      "default": "0.62"
-    }
-  },
   "keywords": [
     "agent-teams",
     "multi-agent",

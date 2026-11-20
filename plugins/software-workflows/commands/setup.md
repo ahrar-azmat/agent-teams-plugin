@@ -9,19 +9,8 @@ The setup check ran on this machine:
 
 Take the person through it:
 
-The Git capability check creates disposable local repositories, performs successful
-control pushes only to their local bare remotes, then removes them. It retains a
-binary/guard-identity cache in plugin data. SessionStart reads that cache without
-running pushes. A reported limitation is not fixed by setup: explicit push URLs,
-hook bypasses and replaced environments can escape an inherited guard. Report every
-"not covered" and "unverified" result; publishing remains the lead's responsibility.
-The binary is ready when ordinary, path and file-URL pushes are refused; its detail
-still lists measured limitations. SessionStart stays silent for those limitations
-and for a missing or stale cache. It reports a cached ordinary-route failure, a
-missing Codex launch guard, a Codex sandbox that does not run (Linux), or a launch
-shell that cannot pass a gate's descriptor.
-
-1. Show the result as a short table: item, ready or not, detail.
+1. Show each item's readiness and detail in a short table. Include the Oracle's explicit-pushurl
+   limitation when the installed Git lacks config hooks, even when every item is ready.
 2. Under "Setup can do these itself":
    - **agent-teams**: ask the person with AskUserQuestion whether to turn agent teams on now. Say
      exactly what changes: one key, `env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS = "1"`, is added to the
@@ -36,11 +25,3 @@ shell that cannot pass a gate's descriptor.
    ("Check again: …"), exactly as printed, and show what is ready now. If agent teams were turned on, tell the person they start in
    their next Claude Code session. If the server environment was just built, or Python or Codex
    was just installed, `/mcp` → codex-oracle → Reconnect starts the server without a restart.
-6. Explain the optional macOS owner LaunchAgent only if crash cleanup at login or
-   after a supervisor crash is wanted. Do not install it as part of normal setup.
-   From the plugin directory, the person can run the configured daemon Python
-   with `-B -m coordinator daemon install-agent --state <coordinator-state>`;
-   it asks for explicit consent. `daemon uninstall-agent --state <coordinator-state>`
-   removes it. The agent uses a private activated socket and respects a durable
-   requested-stop inhibit. Without it, orphan cleanup happens on the next client
-   start. State must be the person's chosen coordinator state, not an invented path.

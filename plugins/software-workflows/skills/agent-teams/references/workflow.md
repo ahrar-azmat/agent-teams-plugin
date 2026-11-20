@@ -166,7 +166,7 @@ Pick roles based on what the work needs. Not every team needs all roles. **All r
 |------|---------|---------------|------|-------|
 | `researcher` | Deep research, codebase exploration, web research | `general-purpose` | — | `opus` |
 | `architect` | Design, patterns, architecture — uses Codex during design | `general-purpose` | `plan` | `opus` |
-| `implementer` | Charter one unit and dispatch it to a Codex writer (`abraham`), watch it, read the diff, re-run the checks for real, report — writes no product code itself (SKILL.md rule 11) | `general-purpose` | — | `opus` |
+| `implementer` | Read a writer's diff by its paths, re-run the checks for real, and report. Writers themselves are T3 child tasks the lead starts and steers (SKILL.md rules 11–12, `references/writers.md`) | `general-purpose` | — | `opus` |
 | `reviewer` | Code review with Codex cross-model analysis | `general-purpose` | — | `opus` |
 | `verifier` | Run the change for real and report the observed results (no test suites — SKILL.md rule 10) | `general-purpose` | — | `opus` |
 | `db-specialist` | Migrations, schema, queries | `general-purpose` | — | `opus` |
