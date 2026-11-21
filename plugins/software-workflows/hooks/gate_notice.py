@@ -1,19 +1,11 @@
 #!/usr/bin/env python3
-"""PostToolUse and PostToolUseFailure on Bash: the git shim prints a denial on stderr, which the
-command can redirect away (`2>/dev/null`, a `| tail` that cuts it). Each denial is also appended
-to this session's notice file (push_gate.py `_write_notice`); after every Bash call this hook puts
-into Claude's context each denial its output does not already show. A denial exits 1, and a Bash
-call that fails gets PostToolUseFailure, with its output in `error`, never PostToolUse (measured
-2026-10-18, Claude Code 2.1.302).
+"""Deliver a pre-push refusal once if Bash hid its stderr.
 
-Bash calls run side by side (review of 2026-10-18). Readers and writers take one lock file that is
-never removed (NOTICE_LOCK); a reader writes what it keeps to a new file and renames it over the
-notice, so a reader that dies midway leaves the notice as it was. A denial from before this call
-started stays for the call that made it, until no foreground Bash call can still be running (the
-Bash tool's longest timeout); the next call then shows it as an earlier command's.
-
-It also removes the passes the PreToolUse gate left for this call's acknowledged git (push_gate.py
-`_issue_pass`): the shim removes the one it uses, but cannot inside Claude Code's sandbox."""
+PostToolUseFailure carries its output in error. Parallel Bash calls share the
+session notice, so readers and writers lock the same stable inode and leave
+earlier refusals for the call that produced them.
+"""
+import contextlib
 import json
 import os
 import re
@@ -22,33 +14,37 @@ import time
 
 try:
     import fcntl
-except ImportError:  # Windows: the shim refuses there and writes no notice
+except ImportError:  # Windows has no pre-push review hook
     fcntl = None
 
-SLACK_S = 2.0  # the hook starts a moment after its call ended
-NOTICE_LOCK = "notices.lock"  # push_gate.py NOTICE_LOCK; hooks/session_start.py never removes it
-PASS_NONCE_RE = re.compile(r"CODEX_PUSH_ACK\s*=\s*['\"]?([0-9a-f]{16})")  # push_gate.py ACK_ENV
-
-
-def _ack_dir():
-    # push_gate.py `_ack_dir`
-    return os.environ.get("CODEX_PUSH_ACK_DIR") or os.path.join(
-        os.path.expanduser("~"), ".claude", "logs", "codex-oracle", "push-ack")
+SLACK_S = 2.0
+SESSION = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 
 def _state_dir():
-    # push_gate.py `_shim_state_dir`: beside the token store
-    return os.path.join(os.path.dirname(_ack_dir()), "gitshim")
+    return os.path.join(os.path.expanduser("~"), ".claude", "logs", "codex-oracle", "push-notices")
 
 
-def _drop_passes(data):
-    tool_input = data.get("tool_input")
-    command = str(tool_input.get("command") or "") if isinstance(tool_input, dict) else ""
-    for nonce in set(PASS_NONCE_RE.findall(command)):
-        try:
-            os.unlink(os.path.join(_ack_dir(), nonce + ".pass.json"))
-        except OSError:
-            pass
+@contextlib.contextmanager
+def _locked(state):
+    lock = os.open(os.path.join(state, "notices.lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(lock)
+
+
+def write_notice(session, token, message):
+    if not session or not SESSION.fullmatch(session) or fcntl is None:
+        return
+    state = _state_dir()
+    os.makedirs(state, mode=0o700, exist_ok=True)
+    with _locked(state):
+        path = os.path.join(state, session + ".notice")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="ascii") as fh:
+            fh.write(json.dumps({"ts": time.time(), "nonce": token, "text": message}) + "\n")
 
 
 def _longest_call_s():
@@ -62,9 +58,8 @@ def _longest_call_s():
 
 def main():
     data = json.loads(sys.stdin.read(64 << 20) or "{}")
-    _drop_passes(data)
     session = str(data.get("session_id") or "")
-    if fcntl is None or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session):
+    if fcntl is None or not SESSION.fullmatch(session):
         return
     state = _state_dir()
     notice = os.path.join(state, session + ".notice")
@@ -80,9 +75,7 @@ def main():
     now = time.time()
     since = now - float(data.get("duration_ms") or 0) / 1000 - SLACK_S  # this call's start
     stale = now - _longest_call_s() - SLACK_S  # no foreground call still running began before this
-    lock = os.open(os.path.join(state, NOTICE_LOCK), os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with _locked(state):
         try:
             with open(notice, encoding="utf-8", errors="replace") as fh:
                 lines = fh.read().splitlines()
@@ -113,11 +106,14 @@ def main():
             os.unlink(notice)
         elif len(keep) < len(lines):
             tmp = f"{notice}.{os.getpid()}.tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.writelines(keep)
-            os.replace(tmp, notice)
-    finally:
-        os.close(lock)
+            try:
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.writelines(keep)
+                os.replace(tmp, notice)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(tmp)
 
 
 if __name__ == "__main__":

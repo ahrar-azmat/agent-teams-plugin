@@ -1,10 +1,10 @@
-# Agent Teams — cross-model advisory (Codex)
+# Cross-model advisory (Codex)
 
 Read this before writing any Codex dispatch: what Codex is for, how to dispatch blind, live web research, the channel layer and how to treat its output.
 
 ## Cross-Model Advisory (Codex, in Every Phase)
 
-Teammates inherit all MCP servers from the project. **Codex must be used in ALL phases of work, not just final review.** Codex Oracle is the sole cross-model advisor — a second model reviewing what a Claude built:
+Subagents and T3 children inherit the MCP servers of their session. **Codex must be used in ALL phases of work, not just final review.** Codex Oracle is the sole cross-model advisor — a second model reviewing what a Claude built:
 
 > ### Codex is the advisor. Its verdict governs.
 >
@@ -93,14 +93,14 @@ recall:
 
 Advisor web search reaches ordinary pages; it cannot read YouTube subtitles, RSS feeds,
 semantic-search indexes, or JS-heavy pages that need a rendering reader. When the `agent-reach`
-CLI is installed (check: `command -v agent-reach`), the orchestrator and teammates may use it as
+CLI is installed (check: `command -v agent-reach`), the lead and its helpers may use it as
 a **fetch channel layer** — web pages via Jina reader, YouTube subtitles via yt-dlp, Exa
 semantic search, RSS, GitHub. If it is absent, skip this section; nothing else changes.
 
 Three rules keep it safe and honest:
 
 1. **Fetching happens on the CALLER's side — never the advisor's.** Run the CLI yourself
-   (orchestrator or teammate), curate the output, and pass it to Codex as context
+   (the lead or a helper), curate the output, and pass it to Codex as context
    *data* with its origin URL stated. NEVER give an advisor a network-enabled sandbox so it can
    fetch for itself: untrusted web content + full-disk read + network egress in one process is
    an exfiltration triangle. (Measured on codex 0.147.0: there is no mechanism for network

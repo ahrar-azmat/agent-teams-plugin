@@ -1,4 +1,4 @@
-# Agent Teams — the Runtime Capability Law
+# The Runtime Capability Law
 
 Read this when a change calls into a swappable backend: a browser engine, DB driver, storage/LLM/queue provider, cloud SDK, container binary or any configurable vendor SDK.
 
@@ -21,7 +21,7 @@ type-checked — and raised *"PDF generation is only supported for Headless Chro
 page**, silently costing runs their bill evidence **for a month** before anyone noticed. No
 amount of static checking would have caught it. Running it once on the real engine would have.
 
-**Every teammate — researcher, architect, implementer, reviewer — applies this:**
+**Every agent — researcher, architect, writer, reviewer — applies this:**
 
 1. **At every call crossing into a swappable backend** — browser engine, DB driver/dialect,
    storage/LLM/queue provider, cloud SDK against a compatible-but-not-identical endpoint,

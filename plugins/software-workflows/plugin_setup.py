@@ -89,7 +89,22 @@ def _codex_sandbox(codex):
     return ("Codex sandbox", False, first, fix, "")
 
 
-def checks(data_dir=None, quick=False):
+def git_capability():
+    """The Git used for plumbing reads and the limits of its measured version."""
+    policy = _sibling("oracle_policy")
+    paths = policy.trusted_git_paths(os.getcwd())
+    git = next((exe for exe in paths.values() if exe), None)
+    if git is None:
+        return None, "The push review gate is inactive: Git could not be found."
+    _, version = _run([git, "--version"], cwd=os.path.dirname(git),
+                      env=policy.git_probe_environment(paths))
+    limit = policy.git_hook_notice(version)
+    if limit:
+        limit += " The Bash push review gate is inactive with this Git."
+    return git, limit
+
+
+def checks(data_dir=None, quick=False, git_info=None):
     """[(item, ready, detail, fix, action)]. `action` names what setup may do itself, with the
     person's OK. `quick` is the session-start subset: no codex version run, and no server venv
     check (the MCP server is building it while the session starts)."""
@@ -176,27 +191,15 @@ def checks(data_dir=None, quick=False):
     else:
         out.append(("codex-oracle registration", True, "only the plugin's own", "", ""))
 
-    # the real git: in the Bash tool the push gate's shim comes first on PATH
-    shim = os.path.realpath(ROOT / "hooks" / "gitshim")
-    policy = _sibling("oracle_policy")
-    paths = policy.trusted_git_paths(os.getcwd())
-    git = next((exe for entry, exe in paths.items()
-                if exe and os.path.realpath(entry) != shim), None)
-    git_env = policy.git_probe_environment(paths)
+    git, limit = git_info if git_info is not None else git_capability()
     if git is None:
         out.append(("git", False, "git is not on PATH",
                     "xcode-select --install" if sys.platform == "darwin"
                     else "install git with your package manager", ""))
-    elif "hook list" in _run([git, "hook", "-h"], cwd=os.path.dirname(git), env=git_env)[1]:
-        out.append(("git", True, git, "", ""))
     else:
-        out.append(("git", True, f"{git} has no `git hook list`: the push gate reads hooks as unknown on every commit "
-                    "and push, and drops its strong wording (2.56 was measured)",
-                    "on Ubuntu: sudo add-apt-repository -y ppa:git-core/ppa && sudo apt install -y git", ""))
-    if git:
-        notice = policy.git_hook_notice(_run([git, "--version"], cwd=os.path.dirname(git), env=git_env)[1])
-        if notice:
-            out.append((GIT_GUARD_NOTICE, True, notice, "", ""))
+        out.append(("git", True, git, "", ""))
+    if limit:
+        out.append((GIT_GUARD_NOTICE, True, limit, "", ""))
     return out
 
 

@@ -3,6 +3,432 @@
 All notable changes to the plugins in this marketplace are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [software-workflows 2.5.1] — 2026-11-21
+
+Four changes:
+- the push gate checks what a push carries, and leaves commits alone;
+- cleanup is enforced by hooks and systemd;
+- writers may use worktrees;
+- every writer, Claude or Codex, is a T3 child task, and quick helpers are native foreground subagents.
+
+The owner asked on 21 Nov:
+- "look into the issues smartpay lead has to face due to the previous codex review hook and update it as well";
+- "clearing working trees and deleting them is important so we need a hook for it even cleaning up resources(CPU,
+  RAM, Diskspace) is important after testing so we need a hook for it as well … via claude native along with codex
+  native";
+- "hooks or whatever is best and can act as a rule rather than just suggestion which LLM model can forget";
+- "I think worktrees are fine but most of the time we will be working with 5-10 parallel writers".
+
+### The push gate checks what is pushed; commits are never gated
+
+**Why.** The SmartPay lead's transcripts from the last 5 days (156 files) held these gate outcomes:
+- 214 accepted acknowledgements;
+- 202 STALE;
+- 19 "no review";
+- 16 "verified, but not a lone command";
+- 7 other;
+- exactly **1** REVIEW VERIFIED.
+
+The old gate denied every `git commit` and `git push`. Its proof of review was a digest of the whole worktree,
+so other writers' edits in a shared checkout, untracked files, and that lead's habit of publishing from a fresh
+clone all made it "stale". It verified nothing in practice and cost two tool calls per commit and per push.
+
+That lead's own list, 21 Nov, had five problems:
+1. Local commits were gated, and a transcript scan that ran out of time counted as "no review".
+2. Staging something invalidated the token.
+3. The token was bound to the exact command text, so pipes and redirects broke it.
+4. The coordinator kept printing lines in 2.4.41: that session predates 2.5.0.
+5. An interrupted review gave no run id.
+
+1–3 are fixed here; 4 goes away when that session restarts on 2.5.x; 5 is listed below.
+
+**What it is now.** A Codex writer built it (a T3 child, gpt-6.2-astra at max), and the lead diff-read and
+re-ran it. Old → new:
+
+| Before 2.5.1 | Now |
+|---|---|
+| `hooks/push_gate.py` (2,918 lines), PreToolUse on Bash/PowerShell | `hooks/push_review.py`, a **git pre-push hook** that git runs for every push, from any git on any path, scripts included |
+| `hooks/gitshim/` on PATH | the hook installed into Claude's Bash environment by SessionStart (`GIT_CONFIG_COUNT/KEY/VALUE`), appended after any existing config slots |
+| the token bound to the command and a whole-tree digest | the token bound to the remote URL and git's ref-update lines, with the same store and 10-minute TTL |
+
+- **What git hands the hook:** the exact ref updates.
+- **What it checks:** for each commit the push transfers, every (path, blob) it introduces must have been in the
+  tree of a completed Codex `code_review`:
+  - a non-merge commit: its diff to its parent;
+  - a merge: its combined diff;
+  - deletions: the path absent from that tree.
+- **Commits in a reviewed HEAD's history count as reviewed**, as HEAD's content always did. This is what lets
+  "commit first, then review the range" pass. The lead added it after its own re-run: the strict per-commit
+  rule refused exactly that SmartPay workflow over an earlier version of a file.
+- **Where the evidence comes from:** `review_ledger.py`. At dispatch, the Oracle records the HEAD commit and tree,
+  the root commits, and the git blob ids of every file whose bytes differ from HEAD. It hashes the bytes itself,
+  with no filters. On a completed review it publishes that record to `~/.claude/logs/codex-oracle/reviews/`
+  (0600, pruned after 30 days). The hook accepts the last 14 days' reviews of repositories that share a root
+  commit, so clones count.
+- **The outcomes:**
+  - Covered: the push goes through with one line.
+  - Otherwise: refused, with the paths and two ways forward: `CODEX_PUSH_ACK=<token>`, or
+    `CODEX_PUSH_UNREVIEWED="<reason>"` up front.
+  - Every decision is logged to `push-log.jsonl`, URLs redacted.
+- **Bounds:** 50,000 pairs and 30 s. A push over either is refused as too large to check, never passed silently.
+- **Resumed sessions.** Claude keeps a hook's env file across resumes and appends to it. One session's file held
+  7 old shim blocks, from 2.4.40, 2.4.41 and 2.5.0. SessionStart now replaces its own file atomically. If it can
+  only append, it appends a block that removes old shims, exec-path mirrors and `CODEX_GATE_*`.
+- **Unchanged:**
+  - The gate is a guardrail against forgetting.
+  - `--no-verify` skips it, as it skips every pre-push hook.
+  - Git older than 2.54 ignores it, and the session-start notice says so with the measured version.
+  - Windows has no gate.
+
+Measured on nucleus, 2026-11-21 (git 2.56.0). The writer's runs:
+
+| Check | Result |
+|---|---|
+| A fresh clone pushed by URL, and the original checkout with an unrelated dirty file | both exit 0: `all 5 changed paths in this push were in completed Codex reviews (1 review)` |
+| An unreviewed file | exit 1, `1 uncovered path: 'unreviewed.txt'` |
+| The token | exact retry passes. Refused: replay, a changed URL, a changed ref set, a 601-second-old token. Two concurrent consumers: one wins. |
+| `CODEX_PUSH_UNREVIEWED="docs only"` | passes, logged as `unreviewed-with-reason` |
+| Branch, tag, deletion, force push, merge | as specified. The merge refused only its new conflict resolution. |
+| 50,001 pairs; a stalled worker | refused in 0.65 s; refused at 30.14 s |
+| Stderr redirected away | the refusal still reached Claude through PostToolUseFailure's notice |
+| Old shim blocks in a resumed session's env file (bash, zsh, dash, sourced twice) | both the rewrite and the append fallback ended with a silent `git commit` |
+
+The lead's re-run, with the generated env file sourced and real ledger entries:
+
+| Check | Result |
+|---|---|
+| `git commit` | no output |
+| Two commits that touch `a.txt` twice, then a review at HEAD, then a push | passes: `the 2 commits in this push were all in the history of a completed Codex review's HEAD` |
+| A review of a dirty tree, then that change committed in two steps after the review | refused, `1 uncovered path: 'a.txt'`: the intermediate version was never reviewed |
+| The same change squashed to the reviewed bytes | passes |
+| A new unreviewed commit after reviewed ones | refused, naming only `z.txt` |
+| Token, replay, up-front reason, a clone pushed by URL | pass, refused, pass, pass |
+
+### Cleanup that runs by itself
+
+Codex's blind architect_review (session 01a1f773, turn 3) REJECTED the first design, which was hooks that
+reconstruct ownership at turn end. Its reasons:
+- a hook cannot tell who owns a running process;
+- Docker containers belong to the daemon;
+- "merged and clean" can still destroy work.
+
+Its advice: put ownership and limits where things start, and keep the hooks small. The build follows that:
+
+- **Each call is tagged where it starts.**
+  - Claude: a PreToolUse hook prefixes each Bash call with `export SW_CALL=<tool_use_id> SW_AGENT=<agent id or
+    lead>;` (`updatedInput`, no permission decision). It does this only in bypassPermissions sessions, where no
+    permission rule reads the command text.
+  - Codex: it already sets `CODEX_THREAD_ID` and `CODEX_TOOL_CALL_ID` on every command it runs (measured below).
+- **What a call leaves running is stopped when it returns.** PostToolUse (Claude) and a user-level PostToolUse
+  hook (Codex) stop each process that:
+  - still carries the call's tag;
+  - has been adopted by `systemd --user` (its shell is gone);
+  - is still in the session's own cgroup.
+
+  Its children go too: SIGTERM, then SIGKILL after 3 s, through pidfds checked against the start time. The agent
+  is told what was stopped and how to keep something on purpose. Never stopped:
+  - a process in another systemd unit, such as SmartPay's walk database scope;
+  - a process matched by the janitor's keep file, read again right before SIGTERM and again before SIGKILL. An
+    unreadable or malformed keep file stops nothing.
+- **Backstops:**
+  - SubagentStop and Stop stop leftovers of finished calls.
+  - SessionEnd hands a final sweep to a detached `systemd-run` unit, since a plugin's SessionEnd hook has 1.5 s.
+  - `sw-sweep.timer` runs every 10 minutes. It stops what ended sessions left in their cgroup (sessions recorded
+    at SessionStart) and stale calls' orphans, removes `swctl run` environment files that no unit uses any more, and
+    re-trusts the Codex hooks when `~/.codex/hooks.json` changes. It never touches a worktree.
+- **Kept on purpose:** `swctl run --name N --ttl 2h -- CMD`. Each start gets its own environment file,
+  without the cleanup's call and session tags and without an inherited Compose project name; the file is
+  removed when the service stops. It is a transient systemd user service in `sw.slice`, with:
+  - `RuntimeMaxSec` and `KillMode=control-group`;
+  - memory, CPU and task limits per service (8G, 400% by default) and for the whole slice (56G, 1200%);
+  - `--compose` teardown;
+  - `swctl run list|logs|stop`.
+
+  A TTL over 24 h is refused, with the cap and how to raise it.
+- **Worktrees: enforced, never deleted by the cleanup.**
+  - At a Claude lead's turn end the stop is refused once while the session's own finished native writers'
+    worktrees hold work not yet in the main checkout: uncommitted changes, or commits the main checkout lacks.
+    Ownership comes from the session's `subagents/agent-<id>.meta.json`, and a writer marked `finished` is
+    reported at once.
+  - Landing is git-native. A worktree writer commits on the worktree's own branch and never pushes. Before its
+    final reply it checks for ignored files and flag-hidden edits and copies out what the lead needs, since
+    Claude may remove a native writer's worktree first. The lead follows the skill's `references/writers.md`
+    §5, and the turn-end message carries the same steps:
+    - see everything the worktree holds (`git status --short --ignored`, `git ls-files -v`);
+    - note the main checkout's HEAD and the writer's tip as literal SHAs;
+    - `swctl wt check <branch>`: the ignored files landing would overwrite or delete, over every commit picked;
+    - `git cherry-pick <base>..<branch>`, or `git merge --squash` and `git commit`;
+    - review `git diff <noted HEAD>`;
+    - then `git worktree remove <path>`, and the branch once its content is confirmed in HEAD.
+  - `swctl wt list` shows every worktree with Git's lock state and the writer's own state. Claude removes a
+    writer's clean worktree itself.
+  - A custom `swctl wt land|drop` with a 7-day trash was built and taken through four review rounds. Each round
+    closed cases and opened new ones (assume-unchanged edits, submodules, listings that skip a folder with a
+    warning, late writes, symlinked trash paths, short writes). It is held back for 2.5.2 rather than shipped as
+    destructive tooling the review would not clear.
+- **Codex hook trust.** Codex 0.171.0 runs a user-level hook only once it is trusted, and skips an untrusted one
+  without a word. The installer trusts exactly our four entries through Codex's own app-server:
+  `hooks/list` gives each `currentHash`, and `config/batchWrite` upserts `hooks.state."<key>".trusted_hash`.
+- **Installed by** the first session start, or `swctl install`:
+  - `~/.local/share/software-workflows/swclean.py`, `~/.local/bin/swctl`;
+  - `sw-sweep.timer`, `sw.slice`;
+  - the Codex entries, with `hooks.json.before-software-workflows` kept once.
+
+  It never downgrades a newer copy.
+
+Measured on nucleus, 2026-11-21 (Claude Code 2.1.329, Codex CLI 0.171.0, systemd 255, git 2.56.0):
+
+| Check | Result |
+|---|---|
+| Red, Claude: `cmd &`, `setsid`, `nohup` from a Bash call with no hooks | all three outlived the call, adopted by `systemd --user`, still in the session's cgroup, carrying CLAUDE_CODE_SESSION_ID |
+| Green, Claude: headless `claude -p` (haiku, bypassPermissions) with the hooks; the call ran `timeout 100 tail -f /dev/null & echo started` | PostToolUse stopped `timeout` and `tail` (call `toolu_01M7…`); the model quoted the `[cleanup]` note |
+| Red, Codex: `codex exec` with a new, untrusted PostToolUse hook | the hook never ran (`hooks/list`: `untrusted`), and the leftover lived |
+| Green, Codex: the same after trusting through `config/batchWrite` | PostToolUse stopped `timeout` and `tail` (call `exec-86378d15…`); the model quoted the note; SessionEnd's detached sweep ran |
+| Codex's env on a command | `CODEX_THREAD_ID` = `CODEX_SESSION_ID` = the hook's `session_id`; `CODEX_TOOL_CALL_ID` = `exec-<uuid>` = the hook's `tool_use_id`; the tool name is `Bash` |
+| Native worktree, Claude 2.1.329 | `.claude/worktrees/agent-<id>` on `worktree-agent-<id>`, locked `claude agent agent-<id> (pid … start …)` while running, removed with its branch at once when clean |
+| `swctl run` | service in `sw.slice`: RuntimeMaxUSec 90 s, MemoryMax 256M, CPUQuota 50%, `KillMode=control-group`; duplicate name, 30-day TTL and bad name refused; stopped with nothing left behind |
+| The turn-end check on a scratch repo with four writers' worktrees | Stop blocked once, listing only the worktrees with work that belong to its own session (owner meta). The locked one was skipped. The second Stop (`stop_hook_active`) was silent. Another session's worktree was never listed. Nothing was deleted. |
+| Hook cost, 636 processes | PreToolUse about 0.09 s, PostToolUse about 0.12 s per Bash call |
+| The turn-13 probe | 18/18. Keep-file resolution: 5 checks. The keep check before SIGKILL: 4 (a survivor that walked into a kept folder during the grace period was left; one that did not was killed; a victim whose new child is kept was spared). `swctl run` environment-file ownership and the timer's reconcile: 4. The turn-end check: ownership first, no Git call in another session's worktree, a flag-hidden edit reported, the new steps; and the `wt list` labels: 5 |
+| The turn-14 probe | 28/28, the turn-13 checks included. Janitor: found through the user manager; a drop-in's `--keep`, a relative `--keep=` and an unreadable unit each handled. A 70 KB command line with the keep token at its end: kept. A zombie child: its parent not kept. `timeout` with its child in its own scope: not signalled. `swctl run` environment file: activating unit `running`, queued start job `pending`, path holding ` (` parsed whole. Turn end: a failed flag scan reported as not fully inspected. `swctl wt check`: listed a path a picked commit added and a later one removed, an ignored file where the branch needs a folder, an ignored folder where it puts a file, and a file inside an ignored folder; the old end-point check missed the first |
+| The push gate after turn 14 | a new ref wholly in a reviewed HEAD's history: covered, `3 commits … were in the history of a completed Codex review's HEAD`, 0 reviews credited |
+| The turn-15 probe | 37/37, every earlier check included. A kept supervisor and its unkept worker: both spared. Janitor arguments with spaces, a `--kee=` abbreviation, a relative path, a `$` and a failed busctl: each handled. A runtime folder with a space: refused before anything was written. A failed worktree listing: reported. `wt check` on a fully integrated branch: 0 commits; with `--base <fork>`: 6 commits, the added-then-removed path listed; a file that a picked `.gitignore` change would expose: listed |
+| The push gate, file to submodule | a review only at the parent: refused, `sub` uncovered; a review at the new HEAD: covered |
+| The push gate's reviewed-history count | one new ref over a review at its third commit: 3 exact, 2 checked; two new refs: 3 as a lower bound, 3 checked; a known old tip past the review: 0 |
+
+The blind review (session 01a1f4e3, turn 9) said "Do not ship": 1 critical, 8 high and 2 medium findings, all
+fixed and re-probed before the release:
+- **Worktrees:** auto-removal deleted ignored files such as `.env`; a failed untracked listing archived nothing
+  before a forced removal; a land could overwrite a path the target had gained since the fork.
+- **Push gate:** a push to a new URL subtracted every remote-tracking ref, so it could pass while checking
+  nothing.
+- **Kept services:** a `swctl run` service kept the call and session tags, so it could be swept as a leftover.
+- **SessionEnd:** a sweep could act on a session that had resumed meanwhile.
+- **PostToolUse:** it ignored that Claude had moved a foreground call to the background.
+- **Keep-file evidence:** read in the hook's own network namespace; an unreadable command line counted as "not
+  kept"; the cgroup was not re-checked before signalling.
+- **Codex hooks:** the installer could drop a matcher group holding someone else's handler.
+- **Smaller:** an owned worktree went unreported for 2 minutes after its writer finished; an inherited
+  `COMPOSE_PROJECT_NAME` won over `--compose`; the install stamp was written even when the timer or Codex trust
+  had failed.
+
+The follow-up (turn 10) confirmed most of those fixes and found deeper cases. Turn 11 found more ways an
+archive-then-delete could miss work: assume-unchanged edits, populated submodules, Git listings that skip an
+unreadable folder with only a warning, and edits saved during the archive. Turn 12 found more in the trash
+design that replaced it. So `swctl wt land|drop` and the trash were cut from this release (above). Everything else
+below is fixed and re-probed:
+- **Worktrees:**
+  - Automatic worktree deletion was removed outright, since an assume-unchanged index flag can hide changes.
+  - A nested repository was archived as an empty folder.
+  - `--into` a subfolder let `git apply` skip the patch and still exit 0.
+  - A file a concurrent writer created could be overwritten.
+- **Push gate:** a named remote whose push URL differs from its fetch URL subtracted the fetch side's history.
+- **Keep file:** a permission error on it disabled every protection.
+- **Codex scope:**
+  - Any `codex*` process made its whole cgroup eligible. Each Codex thread's scope is now recorded by a Codex
+    SessionStart hook.
+  - A call id is now required.
+- **Installer:** an edit saved during the install was lost. It is now serialized, and the displaced file is
+  pinned and compared.
+- **Install health:** a success could hide missing or disabled handlers. Each of the four is now verified by
+  event, source, enabled and trusted.
+- **`swctl run`:** a failed Compose teardown skipped removing the environment file.
+- **SessionEnd:** a refused `systemd-run` left no final sweep. It now falls back.
+- **Turn 11:**
+  - **Push gate:** it no longer subtracts remote-tracking refs at all, since they describe the fetch side, can
+    outlive a deletion on the server, and a push URL can differ. A new ref is checked over its history minus the
+    reviewed HEADs'.
+  - **Keep file:** read with the janitor's own rules (kinds, dates, ports, absolute paths, the 90-day cap), and
+    any problem spares every process, as the janitor refuses. One deliberate difference: an unknown kind whose
+    expiry has passed is ignored.
+  - **Signals:** each process's cgroup is re-checked right before SIGTERM, as before SIGKILL.
+  - **Timer:** no repository-wide `git worktree prune`; Git's own gc does that.
+  - **`swctl run`:** a launch that fails, or times out without a running unit, removes its environment file.
+- **Turn 13** (5 high, 5 medium, 1 low; no critical):
+  - **Landing steps.** The turn-end message and the docs said Git refuses `git worktree remove` while anything is
+    uncommitted. Measured on Git 2.56.0:
+    - `git worktree remove` deleted an ignored file and an assume-unchanged edit without asking, while
+      `git status --short` showed nothing;
+    - a cherry-pick, and a squash merge that was not a fast-forward, overwrote an ignored file in the main
+      checkout, even with `--no-overwrite-ignore` (it guards only a fast-forward);
+    - after a cherry-pick, `git diff HEAD` showed 0 lines and `git diff $pre` 14;
+    - `git branch -d` refused after a cherry-pick, and `git cherry` showed the commit as `-`.
+
+    The steps now inspect first, protect ignored files, review `git diff $pre`, and say how to delete the branch.
+    The blind review is given the landed range.
+  - **Keep check.** It is read again right before SIGTERM and before SIGKILL, over the victims and their current
+    descendants.
+  - **Keep file.**
+    - A missing `SW_KEEP_FILE` spares everything.
+    - The janitor is found by its unit, whose `--keep` names its file, or by its settings. It is no longer found
+      through the keep file's folder.
+  - **`swctl run`.** After a failed or timed-out start, the environment file goes only when systemd confirms that
+    no unit uses it. The timer removes any file that no unit uses later.
+  - **Turn end.**
+    - Ownership is checked before any Git call.
+    - A finished writer's worktree is not walked, and inspection stops at 40 s.
+    - Edits hidden by index flags count as unlanded work.
+  - **`swctl wt list`.** It shows Git's lock state and the writer's state, no longer calling every unlocked
+    worktree "finished".
+  - **Push gate.** The reviewed-history count comes from Git's `rev-list --count`, so the commit ids are no longer
+    held in memory: a 1.6 M-commit new ref overflowed the listing cap.
+- **Turn 14** (7 high, 4 medium, 1 low; no critical). It confirmed the turn-13 fixes, then:
+  - **The ignored-file check compared only the end points.** A cherry-pick applies every commit, so a path one
+    commit adds and a later one removes is written, then deleted. `swctl wt check <branch>` now takes every
+    path any picked commit touches, plus file-versus-folder clashes.
+  - **Native auto-removal.** Claude Code removes a native writer's worktree when plain `git status` is empty and
+    no commit is ahead, possibly before the lead reads the reply. So the worktree writer's charter now checks for
+    ignored and flag-hidden work before its final reply.
+  - **`$pre` does not survive between Bash calls.** In a new shell, `git diff $pre` is a plain diff. The steps
+    now note literal SHAs once, before the first landing.
+  - **Branch deletion.** `git cherry` matches patch text, so a reverted change or an indentation-only difference
+    still shows `-`, and `git branch -d` can pass against an upstream. A branch now goes only once
+    `git diff <writer tip> HEAD -- <its paths>` shows nothing but later changes.
+  - **Keep check.**
+    - The whole command line is read. A 64 KiB read missed a keep token at 70 KB.
+    - A zombie protects nothing. Its empty command line had made its live parent look protected.
+    - A process outside the stopping scope spares its parent chain, since `timeout` passes its SIGTERM on to it.
+    - The check runs for each process right before its own signal. It walks only that process's subtree,
+      through `/proc/<pid>/task/<tid>/children` (0.08 ms a read, against 27 ms for a scan of 561 processes).
+  - **Janitor discovery** reads the unit's effective `ExecStart` from the user manager, drop-ins included. A unit
+    whose command cannot be read spares everything.
+  - **`swctl run` environment file.** The path is parsed from the right, and a queued job counts as in use.
+  - **Turn end.** Every Git step gets only the time left. A failed or skipped step reports the worktree as not
+    fully inspected instead of clean.
+  - **Docs.** The checklist no longer tells worktree writers not to commit.
+  - **Push gate.** The review count covers only reviews whose content covered a path. Reviewed history is
+    reported by its commit count.
+- **Turn 15** (9 high; no critical). It confirmed the turn-14 fixes, found one regression in them, and found more
+  partial cases. All but one are fixed here; that one is a known item below.
+  - **Regression: a kept supervisor's workers.** The per-process check looked only at the recipient's
+    descendants, so a worker lost the protection of its kept parent. Each check now covers the process, its
+    current ancestors up to the user's manager, and its current descendants, from a fresh full /proc scan. A
+    process's own list of children can omit a live child while another one exits.
+  - **`swctl wt check`.**
+    - It checks exactly the range to land (`--base`, defaulting to the fork point), not `HEAD..branch`, and prints
+      that range for the cherry-pick.
+    - It lists every untracked file, not only ignored ones, because a picked commit can change `.gitignore`
+      before the next one writes.
+    - It inspects folders with `lstat`.
+  - **Branch deletion.** `git update-ref -d refs/heads/<branch> <checked tip>` deletes only at the tip that was
+    checked.
+  - **Janitor discovery.** It reads the user manager's structured argument lists (busctl JSON), so argument
+    boundaries are kept. A relative or still-expandable `--keep` path spares everything, and so does an unreadable
+    one. The janitor's argparse prefixes (`--k`, `--ke`, `--kee`) count.
+  - **`swctl run`.** A runtime folder that is not a plain path is refused. Its environment-file path goes into
+    `ExecStopPost`, where systemd splits on spaces, so a path with spaces would have become several `rm`
+    operands.
+  - **Push gate.** A file or symlink replaced by a submodule now needs review coverage for the file's removal.
+    Before, the gate dropped the record and could pass such a push as changing no file.
+  - **Turn end.**
+    - A failed worktree listing is reported. It is no longer read as empty.
+    - The idle walk checks its deadline inside large folders too.
+
+Not covered, and said so in the docs:
+- Docker containers: `swctl run --compose`, or Platform's run-guard.
+- Processes that clear their environment.
+- Claude sessions not in bypassPermissions.
+- macOS and Windows.
+
+### Worktrees are allowed
+
+The owner, 21 Nov: "I think worktrees are fine". Writers may use `isolation: "worktree"` (native) or T3's
+worktree isolation. Never a hand-made `git worktree add`, and never a custom `WorktreeCreate` hook: it turns off
+Claude's automatic removal of clean subagent worktrees. SKILL.md rule 6, `references/writers.md` §5 and the
+troubleshooting entries say how to land or drop one. Up to 5–10 writers may run at once (the owner's figure),
+replacing 2–3 per project. The lead tests, in the project's one shared test copy, first in, first out.
+
+### Writers are T3 children; native subagents for quick helpers
+
+The night's first plan made Claude writers native background subagents. The owner tried that inside T3 and
+chose T3 children instead, for what T3's Lineage panel gives them: each writer listed, its thread open to
+follow live, a Stop button. The owner, about 01:50 IST: "not background but not forground either I mean
+current background doesn't offer me visibilty as t3 with this".
+
+So every writer, Claude (`claudeAgent`, `claude-opus-5-5`, effort max) or Codex, is a `delegate_task`
+child, steered with `t3_thread_send` (soft `steer`, hard `restart`) and stopped with `task_cancel`.
+Native `Agent` stays for quick helpers the lead waits for, and for writers in a plain terminal without
+T3. The measurements below still describe native steering, used outside T3.
+
+What follows was written for the native plan and holds for native subagents wherever they are used.
+
+Claude writers were to be native Claude Code subagents. The `agent-teams` skill no longer runs Agent Teams. The
+owner, 21 Nov:
+- "isn't claude background agent handling update a lot do we need to manage them like what we are doing we are
+  not even allowing things superior to what claude already has … I think claude has matured a lot for us to use
+  it properly and directly";
+- then "go ahead and do these things please and complete it".
+
+What Claude Code 2.1.329 does natively, from its changelog and docs (code.claude.com/docs/en/sub-agents):
+- A background subagent keeps Bash, Edit, Write and the MCP tools, so it can be a writer.
+- `SendMessage` to a running background agent reaches it without stopping its command (2.1.317).
+- `TaskStop`, then `SendMessage`, resumes a stopped agent with its full history.
+- `/tasks` lists finished agents, even after a restart (2.1.319).
+
+The docs also say that in an Agent SDK session, which is how T3 runs Claude, teammates never spawn and a named
+agent is a plain subagent. So the skill's team ceremony (`TaskCreate` and `TaskUpdate` boards, `shutdown_request`,
+and preloading the team tools in every prompt) did nothing useful here.
+
+- **Which tool for which agent**, as the skill now sets it, after the owner's visibility ruling above:
+  - every writer, Claude or Codex, and any helper longer than a few minutes: a T3 child task;
+  - a quick helper the lead waits for: a foreground `Agent`;
+  - a writer in a plain terminal without T3: a background `Agent`;
+  - reviews, architecture and research: the Codex Oracle.
+
+  Native background writers inside T3 were the first plan; the owner replaced them with T3 children the same night.
+- **Steering a native subagent** (outside T3):
+  - Soft: `SendMessage(to=<name>)`.
+  - Hard: `TaskStop(task_id=<name>)`, then `SendMessage` once the stop notice arrives.
+  - Stop: `TaskStop`.
+
+  The `LEAD STEER (soft|hard)` header and its rule are unchanged: a steer adds information, and a seeming conflict
+  keeps the earlier instruction and goes back to the lead.
+- **The skill, rewritten.**
+  - `SKILL.md`: the tool table and 12 rules.
+  - `references/writers.md`: T3 children first, native subagents outside T3, with the measured behavior.
+  - `references/prompts.md`: the researcher, architect and reviewer templates without team steps, plus native
+    shapes of work.
+  - `references/troubleshooting.md`: native and T3 failure cases.
+  - `references/workflow.md` is gone; it was all team ceremony.
+- **Unchanged:**
+  - writers start nothing (now enforced);
+  - one blind Codex review closes each change;
+  - only Claude pushes.
+
+Known, for 2.5.2:
+- **Directory rename detection while landing** (turn 15). When the main checkout renamed a folder the writer added
+  files to, Git can place them in the renamed folder. `swctl wt check` does not see that destination. The
+  landing steps say to look at where the files land before removing anything.
+- **Git 2.56.0 on nucleus.** Codex cites a three-way merge advisory (CVE-2026-105437) fixed in 2.56.1. Upgrading
+  the system's Git is the owner's call.
+- **An interrupted review gives no run id** (SmartPay's item 5). A caller-cancelled call cancels its Codex run, and
+  the thread stays resumable; `codex_runs` lists it. The next call on that session should say so itself.
+- **`swctl wt land|drop`** (cut after four review rounds, above): redesign with exclusive ownership of the source
+  and verified copies before anything is removed.
+- **Reviewed history is taken on trust:** a completed review at a HEAD makes that HEAD's whole history count as
+  reviewed at the push gate. The gate cannot see which range the reviewer was asked about. The docs now name the
+  landed range for every review.
+- **Worktree ownership:** the turn-end check covers only native worktrees. A T3 child's worktree is landed by the
+  lead when the child finishes; nothing enforces that yet.
+- **Docker containers** belong to dockerd. Only `swctl run --compose` takes a project down; Platform's run-guard
+  owns the rest.
+- **Disk:** transcripts (90 GB in `~/.claude/projects`) and Codex sessions (11 GB) have no retention owner. That
+  belongs to the janitor.
+- **2.4.x sessions still running** (the SmartPay lead, a Sales_Profiler child) keep the retired coordinator daemon
+  and Office alive. Stop them once those sessions resume on 2.5.x.
+- **The nine known items from 2.5.0** are still open.
+
+Measured on nucleus, 2026-11-21, Claude Code 2.1.329 inside a T3 0.1.10 session. The probe was a native background
+writer running `python3 -c 'import time; time.sleep(41)'` in the foreground four times:
+
+| Check | Result |
+|---|---|
+| `SendMessage` (soft) while round 1 ran | the command kept running; the writer took the message in after round 1 finished; the change applied from round 1 on |
+| `TaskStop` during round 2 | the running command was gone at once |
+| `SendMessage` (hard) after the stop notice | the writer resumed with its history, redid round 2, and finished rounds 3 and 4 with the addition |
+| The whole task | all four rounds completed, about 68,000 tokens and 251 s, nothing left running |
+| T3 `steer` to a Claude child running a foreground command (2026-11-20 evening) | not interrupted; it arrived after the command ended. Codex's reading of T3's source had predicted an interrupt. |
+
 ## [software-workflows 2.5.0] — 2026-11-20
 
 The writer coordinator, the `abraham` writer and the Codex Office are retired (owner, 20 Nov: "go ahead with

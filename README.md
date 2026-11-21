@@ -1,22 +1,31 @@
 # agent-teams-plugin
 
-A Claude Code plugin marketplace, **`agent-teams`**, with one plugin, **`software-workflows`** (2.5.0).
+A Claude Code plugin marketplace, **`agent-teams`**, with one plugin, **`software-workflows`** (2.5.1).
 
-2.5.0 removes the writer coordinator, the `abraham` writer and the Codex Office. Writers are now T3
-child tasks that the lead starts, steers (soft or hard) and stops, in the project's own checkout (see
-[Writers and steering](#writers-and-steering)). What changed, and how it was checked, is in
-[CHANGELOG.md](./CHANGELOG.md).
+2.5.0 removed the writer coordinator, the `abraham` writer and the Codex Office. The lead now starts,
+steers (soft or hard) and stops writers itself (see [Writers and steering](#writers-and-steering)).
+2.5.1 brings four changes:
+- Every writer, Claude or Codex, is a T3 child task, visible in T3's Lineage panel. Quick helpers are native
+  foreground subagents.
+- Writers may work in worktrees.
+- The push gate checks what a push carries and leaves commits alone.
+- Cleanup is enforced by hooks and systemd: [Cleanup](#cleanup).
 
-It adds three things to Claude Code:
+What changed, and how it was checked, is in [CHANGELOG.md](./CHANGELOG.md).
 
-- **Agent teams that work.** A skill that runs multi-agent work through Claude Code's
-  [Agent Teams](https://code.claude.com/docs/en/agent-teams), with every tool signature pinned so
-  runs don't fail on malformed calls.
+It adds four things to Claude Code:
+
+- **Multi-agent work you can watch.** A skill that says which agent goes on which tool: T3 child tasks
+  for writers, native subagents for quick helpers. It also says how the lead starts, steers, stops and
+  verifies them.
 - **Codex as the second model.** The bundled **Codex Oracle** MCP server puts OpenAI Codex, at
   maximum reasoning effort with live web search, beside Claude, as a blind reviewer, architect and
   researcher.
-- **Guards.** Hooks that ask for a Codex architecture review before plan mode, and that stop every
-  `git commit` and `git push` Claude runs until the review state has been read.
+- **Guards.** Hooks that ask for a Codex architecture review before plan mode, and a git pre-push
+  check that lets a push through when Codex reviewed everything it carries.
+- **Cleanup that runs by itself.** Whatever a command leaves running is stopped when it returns.
+  Finished writers' worktrees are landed or dropped. A timer catches what slips through. See
+  [Cleanup](#cleanup).
 
 Marketplace `agent-teams` · plugin `software-workflows` ·
 [PolyForm Noncommercial 1.0.0](./LICENSE)
@@ -44,9 +53,9 @@ and gives you the exact command for the rest:
 | codex-oracle registration | Finds a codex-oracle server you once added by hand (the 1.x way) and prints the `claude mcp remove` command for it. Two registrations give two tool sets. |
 | git | Checks git is on PATH. |
 
-Writers (see [Writers and steering](#writers-and-steering)) run as child tasks of
-[T3 Code](https://github.com/pingdotgg/t3code), which starts, steers and stops them. Reviews and the
-guards need only Claude Code and the Codex CLI.
+Claude writers are native Claude Code subagents. Codex writers run as child tasks of
+[T3 Code](https://github.com/pingdotgg/t3code) (see [Writers and steering](#writers-and-steering)).
+Reviews and the guards need only Claude Code and the Codex CLI.
 
 Agent teams start in your next Claude Code session. After that, just ask, for example *"Create an
 agent team to review this PR from security, performance and correctness angles"*, or *"Have Codex
@@ -55,17 +64,20 @@ nobody has to edit `settings.json` by hand.
 
 ### Requirements
 
-- **A recent Claude Code.** Tested on 2.1.328. The skill needs at least 2.1.178 (agent teams without
-  `TeamCreate`/`TeamDelete`), and moving a 1.x install over needs 2.1.193 or newer (the marketplace's
-  `renames` entry).
+- **A recent Claude Code.** Tested on 2.1.329. Native steering needs 2.1.317 or newer (a message to a running
+  background agent arrives without stopping its command), and moving a 1.x install over needs 2.1.193 or newer
+  (the marketplace's `renames` entry).
 - **Codex CLI, logged in.** Needs codex-cli 0.163.0 or newer; in daily use on 0.170.0, and the CLI
   may update itself. Codex uses the model set in your `~/.codex/config.toml` (gpt-6.2-astra on the
   author's machine) at reasoning effort `max`. The server pins the effort, so the Codex app's slider
   cannot lower it.
 - **Python.** The Codex Oracle server needs Python 3.11 or newer, which setup finds for you. The
   hooks run with whatever `python3` is on PATH, 3.9 or newer (the one macOS ships is fine).
-- **git** with the CVE-2024-32465 fix: 2.39.4, 2.40.2, 2.41.1, 2.42.2, 2.43.4, 2.44.1, 2.45.1, or
-  anything from 2.46 on. The push gate refuses older gits.
+- **git 2.54 or newer** for the push gate: it is a configuration-defined pre-push hook, which older
+  git ignores. Then the session-start notice says the gate is inactive.
+- **For the cleanup:** Linux with a systemd user manager (`systemctl --user`). The cleanup does nothing
+  on macOS and Windows yet. Codex hooks need Codex CLI 0.171.0 or newer, where hooks are trusted
+  through its config.
 
 ## Updating
 
@@ -101,25 +113,18 @@ named `mcp__plugin_software-workflows_codex-oracle__<tool>`.
 
 | Part | What it does |
 |---|---|
-| Skill `agent-teams` | Runs every multi-agent task: spawns named teammates, wires tasks and dependencies, messages, shuts the team down. Includes role templates (researcher, architect, implementer, reviewer, verifier), team patterns (research, implementation, debug, review) and a troubleshooting table that maps each tool error to its fix. |
+| Skill `agent-teams` | Runs every multi-agent task: which agent goes on which tool (native Claude subagents, T3 child tasks for Codex, the Codex Oracle for reviews), and how the lead starts, steers (soft or hard), stops and verifies them. Includes researcher, architect and reviewer prompt templates with the Codex phase built in, and a troubleshooting table. |
 | Skill `codex-planning` | Before a feature or non-trivial change: consult Codex independently before building. |
 | Skill `codex-review` | Before committing or pushing: Codex reviews the change independently. |
 | Agent `code-reviewer` | Dispatches a blind Codex review, verifies its findings and writes one report. |
 | `/software-workflows:setup` | The setup above. |
 | MCP server `codex-oracle` | The Codex tools below. The plugin registers it itself (`.mcp.json`); do not add a second `mcpServers` entry for it. |
-| Hooks | The plan gate, the push gate and its git shim, the session-start check, and one that passes the session's folder to the Codex tools. |
+| Hooks | The plan gate, the push gate (a git pre-push hook installed for the session), the cleanup hooks, the session-start check, and one that passes the session's folder to the Codex tools. |
+| `swctl` | The cleanup's command line, installed in `~/.local/bin`: `swctl run` (kept processes with a deadline), `swctl wt list`, `swctl wt check <branch>` (untracked files a landing would overwrite), `swctl leftovers`, `swctl sweep`. |
 
-### Pinned tool signatures
+### Agent tools
 
-Agent Teams tools are deferred and schema-checked (`additionalProperties: false`), and the usual way
-orchestration fails is a parameter they don't accept. The skill pins them:
-
-- `TeamCreate` and `TeamDelete` are gone. The team forms with the first `Agent` call, and
-  `team_name` is ignored.
-- `TaskCreate` has no `blockedBy`. Create the task, then `TaskUpdate(taskId, addBlockedBy=[…])`.
-- `SendMessage` is `to` + `message` (+ optional `summary`). There is no `recipient`, `type` or
-  `content`, and no broadcast.
-- Deferred tools load per context, so every teammate prompt loads them first.
+Writers use T3's `delegate_task`, `t3_thread_send`, `t3_pending_request` and `task_cancel`. Quick helpers use Claude Code's own `Agent`, plus `SendMessage` and `TaskStop` outside T3. The skill doesn't use Agent Teams: T3 runs Claude as an Agent SDK session, where teammates never spawn. Deferred tools load per context, so an agent loads the tools it needs with `ToolSearch` first.
 
 Optional: with the [agent-reach](https://github.com/Panniantong/agent-reach) CLI installed, the
 skill uses it to fetch what web search can't read, such as subtitles, RSS and semantic-search
@@ -178,47 +183,72 @@ stopped run tells you to `codex_resume_run` its thread instead of asking again.
 
 ## Writers and steering
 
-The plugin writes no code itself. A writer is a **T3 child task** that the lead starts, steers and
-stops: a Codex writer (provider `codex`) or a Claude writer (provider `claudeAgent`), at effort
-`max`, in the project's own checkout (`isolation: "shared"`, never a worktree). The `agent-teams`
-skill's `references/writers.md` has the charter lines and the exact calls.
+The plugin writes no code itself. The lead starts, steers and stops writers. The `agent-teams` skill
+says which tool to use; its `references/writers.md` has the charter lines and the exact calls.
 
-| The lead wants to | Call |
+| Agent | How it runs |
 |---|---|
-| Start a writer | `delegate_task(task=<charter>, target={providerInstanceId, model, options}, isolation="shared", mode="async")` |
-| **Soft steer:** nothing running is stopped; the writer takes the message in at its next step | `t3_thread_send(threadId, mode="steer", message)` |
-| **Hard steer:** the step stops at once, then the writer takes the message in | `t3_thread_send(threadId, mode="restart", message)` |
-| Stop it | `task_cancel(taskId)` |
+| Every writer, Claude or Codex, and any helper longer than a few minutes | A [T3 Code](https://github.com/pingdotgg/t3code) child task: `delegate_task(title=…, task=<charter>, isolation="shared"\|"worktree", target=…)`. Claude: `claudeAgent` / `claude-opus-5-5`, effort max. Codex: `codex` / `gpt-6.2-astra`, effort max. The owner sees each one in T3's Lineage panel, can open its thread, follow it live and stop it. It also survives the lead's restarts. |
+| A quick helper the lead waits for | A native foreground subagent: `Agent(…, run_in_background=false)`. |
+| A writer in a plain terminal (no T3) | A native background subagent: `Agent(name=…, model="opus", …)`. |
+
+On 2026-11-21 the owner tried native background writers inside T3 and chose T3 children for that
+visibility: "current background doesn't offer me visibilty as t3 with this".
+
+| The lead wants to | T3 child (every writer) | Codex Oracle run | Native subagent (outside T3) |
+|---|---|---|---|
+| **Soft steer:** nothing running is stopped; the writer takes the message in at its next step | `t3_thread_send(mode="steer")` | `codex_resume_run(nudge=…)` after it answers | `SendMessage(to=<name>)` |
+| **Hard steer:** the step stops at once, then the writer takes the message in | `t3_thread_send(mode="restart")` | `codex_cancel_run`, then `codex_resume_run(nudge=…)` | `TaskStop(task_id=<name>)`, then `SendMessage` |
+| Stop it | `task_cancel` (or Stop in the Lineage panel) | `codex_cancel_run` | `TaskStop` |
 
 **A steer adds information; it never cancels the task.** Head it `LEAD STEER (soft)` or
-`LEAD STEER (hard)`, and say that the task and every earlier instruction still stand. If a steer seems
-to conflict with an earlier instruction, the writer keeps the earlier one and tells the lead before
-acting on that part. To change an instruction, the lead answers that question, or cancels the task and
-starts a new one. Every charter tells the writer the same thing.
+`LEAD STEER (hard)`, and say that the task and every earlier instruction still stand. If a steer
+seems to conflict with an earlier instruction, the writer keeps the earlier one and tells the lead
+before acting on that part. To change an instruction, the lead answers that question, or stops the task
+and starts a new one. Every charter tells the writer the same thing, and the server heads every Oracle
+nudge with it.
 
-A steer needs an active turn. Send follow-up work to a writer that has finished with
-`t3_thread_send(mode="auto")`.
+**Agent teams are not used.** Teammates and the shared task board need an interactive CLI with
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`. T3 runs Claude as an Agent SDK session, where Claude never
+spawns teammates and a named agent is a plain subagent.
 
-Measured on 2026-11-20 (T3 0.1.10, Codex 0.170.0):
-- **Soft steer:** a Codex writer finished its running command, then followed the steer in the same
-  turn. A Claude writer waiting on a background command took the steer in at once, while the command kept
-  running. When a steer must not arrive before a command finishes, wait for the command, then send it.
-- **Hard steer:** the running command was gone within a second, for Codex and Claude children alike.
-  The writer carried on with its task plus the new information.
+**Measured on nucleus:**
+- **Native subagent** (2026-11-21, Claude Code 2.1.329 in T3 0.1.10): `SendMessage` left the running
+  command alone, and the writer took it in after that command finished. `TaskStop` stopped the running
+  command at once. A `SendMessage` then resumed the writer, which redid the stopped round and finished
+  its task with the addition.
+- **T3 children** (2026-11-20, T3 0.1.10, Codex 0.170.0):
+  - **Soft steer:** the running command finished, then the writer followed the steer, Claude children
+    included.
+  - **Hard steer:** the running command was gone within a second.
+- **Session release:** a native writer lives inside the lead's session. T3 keeps that session open for
+  up to 4 hours while it runs. After a release, `SendMessage` resumes it with its memory, but the command
+  it was running is lost.
 
-Codex Oracle runs (reviews and the rest) steer the same way:
-- **Soft:** `codex_resume_run(nudge=…)` after the run answers.
-- **Hard:** `codex_cancel_run`, then `codex_resume_run(nudge=…)` on the same thread.
-
-The server heads every nudge with the same rule.
-
-**Several writers in one checkout:**
-- Each writer gets its own files, and the lead orders work that meets.
-- Broad commands (formatters, installs, generators) run one at a time.
-- The lead reads each writer's changes by its paths (`git diff HEAD -- <paths>`, plus
-  `git status --short -- <paths>` for new files) and commits by path.
-- At most 2–3 writers run at once per project, since the project's one shared test copy goes to one
-  writer at a time.
+**Several writers.** Up to 5–10 writers may run at once (owner, 2026-11-21), each on its own files or in
+its own worktree.
+- **In the shared checkout,** the lead orders work that meets. Broad commands (formatters, installs,
+  generators) run one at a time.
+- **A writer in a worktree** gets `isolation: "worktree"` on `Agent` or `delegate_task`. When it is done:
+  - the writer commits its work on the worktree's own branch (never pushes);
+  - before its final reply, the writer checks for ignored files and flag-hidden edits and copies out what
+    the lead needs: Claude may remove a native writer's worktree before the lead reads the reply;
+  - the lead sees everything the worktree holds (`git status --short --ignored`, `git ls-files -v`),
+    notes the main checkout's HEAD and the writer's tip as literal SHAs, and runs
+    `swctl wt check <branch>`, which lists the untracked files that landing would overwrite or delete,
+    across every commit picked, and prints the exact range to land;
+  - the lead lands that range with `git cherry-pick <base>..<tip>` (or `git merge --squash` and
+    `git commit`) and reviews `git diff <noted HEAD>`;
+  - then `git worktree remove <path>`, and the branch once its content is confirmed in HEAD, at that tip
+    (`git update-ref -d refs/heads/<branch> <tip>`).
+    `git worktree remove` deletes ignored files and edits hidden by index flags without asking, and Git
+    overwrites ignored files on a cherry-pick even with `--no-overwrite-ignore` (Git 2.56.0, measured).
+    The full steps: the skill's `references/writers.md` §5.
+- **The lead reads** each writer's changes by its paths (in the shared checkout `git diff HEAD -- <paths>`,
+  plus `git status --short -- <paths>` for new files; for landed commits `git diff <noted HEAD> -- <paths>`)
+  and commits by path.
+- **The lead tests.** Writers run only quick checks that end by themselves. The project's one shared
+  test copy is the lead's, used first in, first out.
 
 **Codex never pushes; the lead does, through the push gate.** The Oracle's own Codex runs carry Git
 settings that refuse every push. A T3 Codex writer needs the same settings in `~/.codex/config.toml`,
@@ -253,57 +283,78 @@ design in `caller_hypothesis`.
 
 ### Push gate
 
-Every `git commit` and `git push` Claude runs is **denied once**, with the review state in the
-reason and a one-shot token. Re-run the same command with the token in front to go ahead:
+**Commits are never gated.** Every `git push` Claude runs (the lead, its subagents, scripts, any git
+on any path) runs one check as a git **pre-push hook**. Git hands that hook the exact commits the push
+carries.
+
+- **It goes through in one call** when every file those commits change, at exactly the pushed bytes,
+  was in the tree of a completed Codex `code_review`. A commit that was already in the history of a
+  reviewed HEAD counts as reviewed, so you can commit first and then review the committed range. One
+  line on stderr says so.
+- **Otherwise git refuses the push.** The message names the unreviewed paths and gives the ways
+  forward:
 
 ```text
-CODEX_PUSH_ACK=<token> git push …                  # Bash
-$env:CODEX_PUSH_ACK='<token>'; git push …          # PowerShell
+# run code_review on the change, then push again; or re-run the same push with the one-shot token:
+CODEX_PUSH_ACK=<token> git push …
+# or say it up front, for a push that needs no review (tooling, docs):
+CODEX_PUSH_UNREVIEWED="<reason>" git push …
 ```
 
-The token is bound to that command and tree, lives 10 minutes and works once. The gate denies
-rather than asks, because a hook's "ask" is honoured only in some permission modes, while "deny"
-works in all of them. The review states are:
+The token is bound to those exact ref updates (remote and commits), not to the command text, so pipes
+and redirects don't matter. It lives 10 minutes and works once. Every decision goes to
+`~/.claude/logs/codex-oracle/push-log.jsonl`, unreviewed pushes and their reasons included.
 
-- **REVIEW VERIFIED.** A completed Codex review in this session whose signed content digest matches
-  the tree, and a command that records exactly what was reviewed:
-  - for a commit, a form that records the whole index, with its message given so no editor runs;
-  - for a push, HEAD, index and worktree equal, nothing untracked, at most one commit on top of the
-    remote-tracking ref, and the push bound to that ref:
-    `git push --force-with-lease=refs/heads/<branch>:<oid> <remote> <branch>`.
-- **VERIFIED-BUT.** A review exists, but something the gate cannot vouch for is present, and the
-  reason names it. Examples: another command form, a hook or signer that would run, configuration
-  that names a program, an environment that re-aims git, or a rewritten history.
-- **STALE.** The tree changed after the review.
-- **PENDING / none.** No completed review covers this change.
+**Where the review evidence comes from.** For every `code_review`, the Codex Oracle server records
+what it was dispatched on: the HEAD commit, plus the bytes of every file that differed from it. On
+a completed review it writes that record to `~/.claude/logs/codex-oracle/reviews/`. The hook accepts
+reviews from the last 14 days of the same repository, found by its root commit. So a review counts
+for a push from a fresh clone, and another writer's unrelated edit in the checkout no longer makes it
+"stale".
 
-When acknowledgement is required, it is yours to make. The token binds the whole decision: command, content,
-HEAD, index, branch, configuration, tracking ref, environment and review evidence.
+**Where it runs.** A session-start hook adds the hook to the session's environment, as a git
+configuration hook (`GIT_CONFIG_COUNT`). It removes the 2.0–2.5.0 git shim from a resumed session's
+environment. `git push --no-verify` skips it, as it skips every pre-push hook. The gate checks that
+Codex saw the content, not what Codex concluded: acting on its findings is the lead's job. It is a
+guardrail against forgetting, not a barrier against code that sets out to get around it.
 
-The gate checks that a completed review of the exact tree exists, not what the review concluded:
-acting on its findings is the lead's job.
+## Cleanup
 
-**Where it runs.** A session-start hook puts the plugin's git shim first on the Bash tool's PATH,
-for the session, its subagents and teammates. `git commit` and `git push` reach the gate with their
-exact arguments, directory and environment. Aliases, scripts and tools that run git are seen too, and
-so is a git that git itself starts (through an alias, an external command or a step of its own).
-Every other git command runs at once, adding about 3 ms. Once the shim is live, a grep, `sed` or
-heredoc that merely mentions push or commit is never denied. A denial that a command's own output
-hides (`2>/dev/null`) still reaches Claude through the notice hook. A git run by its full path is
-not seen. The gate is a guardrail for Claude's own commands, not a barrier against code that sets
-out to get around it.
+The owner's rule, "stop what you start", is enforced by mechanisms that run every time, not by
+instructions (owner, 2026-11-21). Linux with a systemd user manager. All of it lives in
+`plugins/software-workflows/cleanup/swclean.py`.
 
-**It never fails open.** The hook evaluates under a hard deadline (`CODEX_PUSH_GATE_EVAL_DEADLINE_S`,
-60 s by default, under the 90 s hook timeout). A stall, a crash, an unusable token store or a git
-without the CVE fix is a deny that names the cause. Its reads never run repository-controlled
-programs: no `git diff` or `git status`, and fsmonitor and hooks forced off.
+| When | What happens |
+|---|---|
+| A Bash command returns | Every process it left running is stopped, with its children, and the agent is told. Claude: a PreToolUse hook tags each call (`SW_CALL`, bypassPermissions sessions only), and PostToolUse stops what carries the tag. A call Claude moved to the background keeps its processes. Codex: it tags every command itself (`CODEX_TOOL_CALL_ID`), and a user-level PostToolUse hook does the same. |
+| A subagent finishes, a turn ends | Leftovers of finished calls are stopped. At a Claude lead's turn end, the stop is refused once while the session's own finished writers' worktrees hold unlanded work. Nothing in the cleanup deletes a worktree: Claude removes a writer's clean one itself, and the lead removes the rest with `git worktree remove` after landing their commits. |
+| A session ends | A detached sweep (systemd-run) stops what the session left. |
+| Every 10 minutes | `sw-sweep.timer` stops leftovers of ended sessions and stale calls, removes `swctl run` environment files no unit uses any more, and re-trusts the Codex hooks when `~/.codex/hooks.json` changed. It never touches a worktree. |
 
-**With Claude Code's Bash sandbox on**, Bash can read the gate's state but not write it. Every git
-command still runs. Run a commit or push as one plain git command in its own Bash call (`git commit
--F <file>` for a long message); it is denied with a token as usual and runs once acknowledged. A
-commit or push the shim must decide inside the sandbox (an alias, a script, a push a hook starts) is
-refused with what to do. Once a git command of the session has run outside the sandbox, a commit or
-push inside it can no longer be acknowledged, so run that one outside the sandbox too.
+**Kept on purpose:**
+- `swctl run --name N --ttl 2h [--mem 8G] [--cpu 400%] [--compose P] -- CMD` starts a systemd user
+  service in `sw.slice`, with a deadline (`RuntimeMaxSec`), memory, CPU and task limits, and
+  `KillMode=control-group`. `--compose` takes its Compose project down when it stops.
+- `swctl run list|logs|stop`.
+- Anything in another systemd unit, and anything matched by `~/.config/janitor/keep`, is never stopped,
+  and neither are its parents and children: a parent such as `timeout` passes its signal on, and a kept
+  supervisor keeps its workers. The keep file is read again right before every signal.
+
+**Installed by** the first 2.5.1 session start, or `swctl install`:
+- `~/.local/share/software-workflows/swclean.py`, `~/.local/bin/swctl`;
+- `sw-sweep.timer`, `sw.slice`;
+- four entries in `~/.codex/hooks.json` (SessionStart, PostToolUse, Stop, SessionEnd), trusted through Codex's
+  own `config/batchWrite` and verified one by one through `hooks/list`. Codex skips an untrusted user hook
+  without a word (measured on 0.171.0).
+
+The log is `~/.local/state/software-workflows/cleanup/cleanup.log`: pids, names and reasons, never
+command lines.
+
+**Not covered:**
+- Docker containers, which belong to dockerd: use `swctl run --compose`, or Platform's run-guard.
+- Processes that clear their environment (`env -i`, `sudo`).
+- Calls in a Claude session that does not run with bypassPermissions, since the tag would change the
+  command text that permission rules read.
 
 ## Configuration
 
@@ -314,8 +365,14 @@ Set these in the environment Claude Code starts with. Every one is optional.
 | `CODEX_ORACLE_PYTHON` | The Python (3.11+) for the Codex Oracle server. Windows: `python`. |
 | `CODEX_ORACLE_CODEX_BIN` | A specific `codex` executable, for example the one bundled with ChatGPT.app. |
 | `CODEX_ORACLE_MAX_RUNTIME_S` | A run's wall-clock budget, 300–12600 s (default 10800). |
-| `CODEX_PUSH_GATE_EVAL_DEADLINE_S` | The push gate's evaluation deadline (default 60 s). |
 | `CODEX_PUSH_ACK_DIR` | Where the push gate keeps its tokens (default `~/.claude/logs/codex-oracle/push-ack`). |
+| `CODEX_REVIEW_WINDOW_DAYS` | How old a review the push gate still accepts (default 14). |
+| `CODEX_PUSH_GATE_MAX_PAIRS` | The most changed (path, content) pairs one push is checked for before it is refused as too large to check (default 50,000). |
+| `SW_RUN_MAX_TTL_S` | The longest `swctl run --ttl` (default 86400). |
+| `SW_RUN_DEFAULT_MEM`, `SW_RUN_DEFAULT_CPU` | `swctl run` defaults (8G, 400%). |
+| `SW_SLICE_MEM`, `SW_SLICE_CPU` | The caps on all `swctl run` services together (56G, 1200%). |
+| `SW_KEEP_FILE` | The keep file the cleanup honours (default: the janitor's own, from its unit's `--keep`, else `~/.config/janitor/keep`). If the file named here is missing, nothing is stopped. |
+| `SW_CLEANUP_TAG=always` | Tag Bash calls in any permission mode, not only bypassPermissions. |
 
 The server's venv lives in the plugin's data directory
 (`~/.claude/plugins/data/software-workflows-agent-teams/venv/`) and survives updates. A new one is
@@ -324,18 +381,17 @@ built when the requirements or the interpreter change.
 ## Platforms
 
 - **macOS:** everything, measured.
-- **Linux:** in daily use on Ubuntu 24.04 x86-64 (kernel 6.8, Codex 0.170.0, git 2.56): the oracle
-  tools, the push gate, and T3 writers with soft and hard steering.
+- **Linux:** in daily use on Ubuntu 24.04 x86-64 (kernel 6.8, systemd 255, Codex 0.171.0, git 2.56): the
+  oracle tools, the push gate, the cleanup, and T3 writers with soft and hard steering.
   - Ubuntu 24.04 refuses bubblewrap the namespaces Codex's sandbox needs, and a read-only run then
     reads no file. Setup checks this and prints the fix.
-  - A git without `git hook list` publishes, and the push gate reads its hooks as unknown. Setup says
-    so.
+  - Git older than 2.54 ignores configuration-defined hooks. There, setup and the session-start notice
+    say the push gate is inactive, naming the measured version.
 - **Windows:** no WSL needed for the agent teams and the Codex tools.
   - Set `CODEX_ORACLE_PYTHON=python`: python.org builds ship no `python3.exe`.
   - The hooks need `python3` on PATH. Create a `python3` alias next to `python.exe`, or use the
     Store alias; without one the hooks do not fire.
-  - The git shim is not used on Windows. The push gate refuses every commit and push Claude runs,
-    because its token store is not verified there, so commit and push yourself in a terminal.
+  - The push gate and the cleanup are not active on Windows.
   - Optional: Developer Mode gives the `latest.log` live-view symlink; without it, use `stream.log`.
 
 ## Troubleshooting
@@ -345,8 +401,10 @@ built when the requirements or the interpreter change.
 | No Codex tools after installing or updating | Restart Claude Code, then check `/mcp`. `/reload-plugins` does not restart MCP servers. |
 | "Server timed out" on the first start | The venv was still building. Run `/mcp` → codex-oracle → Reconnect; the next start finishes the build from pip's cache. |
 | Two sets of Codex tools | A hand-added registration from 1.x. Run `/software-workflows:setup` and use the `claude mcp remove` command it prints. |
-| A commit or push was denied | That is the push gate. Read the review state, then re-run the same command with the token. |
-| A commit inside the sandbox can't be acknowledged | Run it as one plain git command in its own Bash call, or outside the sandbox. |
+| A push was refused: `push gate: review coverage incomplete` | Run `code_review` on the change and push again; or re-run with `CODEX_PUSH_ACK=<token>` from the message; or `CODEX_PUSH_UNREVIEWED="<reason>"`. |
+| "This command left N process(es) running … they were stopped" | The cleanup at work. Keep a process with `swctl run --name … --ttl … -- …`. |
+| The turn end was refused over worktrees | For each one listed, follow the steps in the hook's message (also in the skill's `references/writers.md` §5): see what it holds, run `swctl wt check <branch>`, land, review `git diff <noted HEAD>`, then remove it. |
+| Codex hooks don't run | `swctl install` re-adds and re-trusts them; see `cleanup.log`. |
 | A Codex call seems stuck | `codex_runs` and `codex_run_log`, or `tail -F ~/.claude/logs/codex-oracle/stream.log`. Max-effort runs often take many minutes. |
 | A run shows DETACHED after a reconnect | `codex_resume_run(run=<id>)` collects its answer. |
 | Hooks never fire on Windows | Add a `python3` alias (see Platforms). |
@@ -355,14 +413,14 @@ built when the requirements or the interpreter change.
 
 - **Layout.** The marketplace is `.claude-plugin/marketplace.json`, and the plugin is
   `plugins/software-workflows/`. In it: `server.py` (the Codex Oracle server), `run_server.py`
-  (its launcher), `hooks/`, `skills/`, `agents/`, `commands/`, and `treedigest.py`, the content
-  digest the server and the push gate share.
+  (its launcher), `review_ledger.py` (the review records the push gate reads), `cleanup/swclean.py`
+  (the cleanup), `hooks/`, `skills/`, `agents/` and `commands/`.
 - **The record.** `CHANGELOG.md` holds what changed in each release and how it was verified. There
   is no test harness, by decision: every change is verified by real runs, with the results recorded
   there.
 - **Checks before a release:** `claude plugin validate --strict plugins/software-workflows` and
   `claude plugin validate --strict .`, then a fresh install in an empty `CLAUDE_CONFIG_DIR`. Bump
-  `version` in `plugin.json`, because teammates get a new copy only when it changes. Then tag with
+  `version` in `plugin.json`, because sessions get a new copy only when it changes. Then tag with
   `claude plugin tag plugins/software-workflows`.
 - **The Codex source as reference.** `python3 scripts/codex_src.py` keeps
   `~/Documents/codex-installed` pointing at a read-only export of the release tag that matches

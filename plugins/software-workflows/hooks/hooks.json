@@ -27,19 +27,6 @@
         ]
       },
       {
-        "matcher": "Bash|PowerShell",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "python3",
-            "args": [
-              "${CLAUDE_PLUGIN_ROOT}/hooks/push_gate.py"
-            ],
-            "timeout": 90
-          }
-        ]
-      },
-      {
         "matcher": "mcp__.*(software-workflows|codex-oracle).*__(architect_review|code_review|research|codex_query|codex_runs|codex_run_log|codex_cancel_run|codex_resume_run)$",
         "hooks": [
           {
@@ -49,6 +36,22 @@
               "${CLAUDE_PLUGIN_ROOT}/hooks/dispatch_cwd.py"
             ],
             "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "-S",
+              "${CLAUDE_PLUGIN_ROOT}/cleanup/swclean.py",
+              "hook",
+              "pre"
+            ],
+            "timeout": 10
           }
         ]
       }
@@ -65,6 +68,22 @@
             ]
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "-S",
+              "${CLAUDE_PLUGIN_ROOT}/cleanup/swclean.py",
+              "hook",
+              "post"
+            ],
+            "timeout": 30
+          }
+        ]
       }
     ],
     "PostToolUseFailure": [
@@ -77,6 +96,73 @@
             "args": [
               "${CLAUDE_PLUGIN_ROOT}/hooks/gate_notice.py"
             ]
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "-S",
+              "${CLAUDE_PLUGIN_ROOT}/cleanup/swclean.py",
+              "hook",
+              "post"
+            ],
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "-S",
+              "${CLAUDE_PLUGIN_ROOT}/cleanup/swclean.py",
+              "hook",
+              "subagent-stop"
+            ],
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "-S",
+              "${CLAUDE_PLUGIN_ROOT}/cleanup/swclean.py",
+              "hook",
+              "stop"
+            ],
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3",
+            "args": [
+              "-S",
+              "${CLAUDE_PLUGIN_ROOT}/cleanup/swclean.py",
+              "hook",
+              "session-end"
+            ],
+            "timeout": 5
           }
         ]
       }

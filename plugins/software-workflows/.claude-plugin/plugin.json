@@ -1,7 +1,7 @@
 {
   "name": "software-workflows",
-  "description": "Cross-model reviews, research and queries through the Codex Oracle, with tools to watch, stop and continue runs and hooks for plan mode and Git pushes.",
-  "version": "2.5.0",
+  "description": "Cross-model reviews, research and queries through the Codex Oracle; a skill for writers as T3 child tasks; a git pre-push review gate; and enforced cleanup of leftover processes and worktrees.",
+  "version": "2.5.1",
   "author": {
     "name": "Ahrar Ahmad"
   },

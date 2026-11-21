@@ -588,41 +588,42 @@ def _get_cwd() -> str:
     return _DISPATCH_CWD.get() or os.environ.get("CLAUDE_CWD", os.getcwd())
 
 
-def _workspace_digest(cwd: str) -> str:
-    """12-hex CONTENT digest of the worktree — ONE implementation,
-    treedigest.py (loaded by path, shared with hooks/push_gate.py), computed
-    here in a child under a HARD deadline (round 31: no in-process deadline
-    can interrupt a blocking read); it reads bytes itself (no `git diff` /
-    `git status`, round 34: those run configured helper commands) and
-    ignores HEAD. Stamped into answer headers by ``_answer_sig`` and
-    recomputed by the push-gate hook at push time: a mismatch means the
-    CONTENT changed after the answer. "unknown" on any budget breach or failure.
-    """
+def _dispatch_snapshot(cwd: str, tool: str) -> tuple[str, dict | None, str]:
+    """Read the dispatch tree once, under a hard deadline outside the server process."""
     try:
-        cwd = os.path.abspath(cwd)
-        paths = _policy.trusted_git_paths(cwd)
+        paths = _policy.trusted_git_paths(os.path.abspath(cwd))
         git = next((exe for exe in paths.values() if exe), None)
         if not git:
-            return "unknown"
-        return _treedigest.digest_hard(cwd, env={**os.environ, "PATH": os.pathsep.join(paths)},
-                                       process_cwd=os.path.dirname(git))
-    except Exception:
-        return "unknown"
+            raise ValueError("Git unavailable")
+        snapshot = _review_ledger.dispatch_snapshot(cwd, git, tool == "code_review", _treedigest.run_contained)
+        return snapshot["digest"], snapshot["manifest"], ""
+    except Exception as exc:
+        return "unknown", None, f"{type(exc).__name__}: {exc}"
 
-def _answer_sig(tool_name: str, status: str, tree: str | None = None) -> str:
-    """Machine-verifiable answer signature, appended inside the result header.
 
-    hooks/push_gate.py recognizes an exact-tree review by ``tool:code_review |
-    status:ok`` and the dispatch-time digest. The hook describes the review
-    evidence when it requests the acknowledgement for the push.
-    """
+def _publish_review(run_id, tool, status, manifest, snapshot_error, manifest_file=None):
+    """Use the dispatch evidence on both attached completion and detached collection."""
+    if tool != "code_review" or status != "ok":
+        return ""
+    if manifest_file:
+        try:
+            manifest = json.loads(Path(manifest_file).read_text(encoding="ascii"))
+        except (OSError, ValueError) as exc:
+            snapshot_error = str(exc)
+    try:
+        _review_ledger.write_review(run_id, manifest, tool=tool, status=status)
+    except (OSError, ValueError) as exc:
+        return f"\n[push review evidence could not be written: {exc}]"
+    if manifest is None:
+        return f"\n[push review evidence unavailable at dispatch: {snapshot_error or 'no recorded manifest'}]"
+    return ""
+
+
+def _answer_sig(tool_name: str, status: str, tree: str) -> str:
+    """Include the informational dispatch-time digest in the result header."""
     if not tool_name:
         return ""
-    # ``tree`` = the digest taken at DISPATCH (journaled with the run): the
-    # answer vouches for the tree the model actually read, not for whatever
-    # the workspace looks like when the answer is delivered (review of
-    # 1.17.0: adoption stamped the collection-time tree).
-    return f" | tool:{tool_name} | status:{status} | tree:{tree or _workspace_digest(_get_cwd())}"
+    return f" | tool:{tool_name} | status:{status} | tree:{tree}"
 
 
 # ---------------------------------------------------------------------------
@@ -1584,6 +1585,7 @@ _claims = _load_sibling("codex_oracle_claims", Path(__file__).with_name("run_cla
 _procenv = _load_sibling("codex_oracle_procenv", PROCENV_PATH)
 TREEDIGEST_PATH = Path(__file__).resolve().with_name("treedigest.py")
 _treedigest = _load_sibling("codex_oracle_treedigest", TREEDIGEST_PATH)
+_review_ledger = _load_sibling("codex_oracle_review_ledger", Path(__file__).with_name("review_ledger.py"))
 RUN_MARKER_ENV = _procenv.RUN_MARKER_ENV  # ONE definition, shared with the watchdog CLI
 
 
@@ -1732,6 +1734,26 @@ IMAGES_NUDGE = (
 _journal_lock = threading.Lock()
 
 
+def _journal_manifest(rec):
+    """Keep a large manifest with the run without rotating the shared 5 MiB journal."""
+    if rec.get("manifest") is None:
+        return rec
+    data = json.dumps(rec["manifest"], ensure_ascii=True, separators=(",", ":")).encode("ascii")
+    if len(data) <= 128 * 1024:
+        return rec
+    # runs/ already owns private per-run files and their retention. Only
+    # publish the reference after the complete snapshot is on disk.
+    directory = _run_dir_root() / (rec["run"].replace("·", "-") + "-manifest")
+    directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+    path = directory / "dispatch.json"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    return {**rec, "manifest": None, "manifest_file": str(path)}
+
+
 def _journal(rec: dict[str, Any]) -> bool:
     """Append one record to runs.jsonl, flushed so a kill cannot lose it.
     Returns False when the append could not be made durable — callers that
@@ -1742,12 +1764,13 @@ def _journal(rec: dict[str, Any]) -> bool:
         with _journal_lock:
             LIVE_LOG_DIR.mkdir(parents=True, exist_ok=True)
             _private(LIVE_LOG_DIR, 0o700)
+            rec = _journal_manifest(rec)
             with contextlib.suppress(OSError):
                 if RUNS_JOURNAL.exists() and RUNS_JOURNAL.stat().st_size > RUNS_JOURNAL_MAX_BYTES:
                     RUNS_JOURNAL.replace(RUNS_JOURNAL.with_suffix(".jsonl.1"))
             with RUNS_JOURNAL.open("a", encoding="utf-8") as fh:
                 _private(RUNS_JOURNAL, 0o600)
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fh.write(json.dumps(rec, ensure_ascii=("manifest" in rec)) + "\n")
                 fh.flush()
                 os.fsync(fh.fileno())
         return True
@@ -2114,21 +2137,12 @@ def _codex_env() -> dict[str, str]:
     other platforms the parent PATH passes through untouched (the previous
     unconditional '/opt/homebrew/bin:' prefix corrupted the first PATH entry
     on Windows, where the separator is ';')."""
-    # Child tool calls must use their own Codex session. The Claude session's
-    # git shim and exec-path mirror belong only to its Bash tool.
+    # Child tool calls must use their own Codex session.
     excluded = {"CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_TOOL_CALL_ID",
                 "CLAUDECODE", "CLAUDE_PID", "CLAUDE_ENV_FILE", "CLAUDE_EFFORT",
                 "CLAUDE_PROJECT_DIR", "CLAUDE_PLUGIN_ROOT", "CLAUDE_PLUGIN_DATA", "CLAUDE_JOB_DIR"}
     env = {k: v for k, v in os.environ.items()
            if k not in excluded and not k.startswith(("CLAUDE_CODE_", "CODEX_GATE_", "CLAUDE_PLUGIN_OPTION_"))}
-    if "PATH" in env:
-        env["PATH"] = os.pathsep.join(
-            entry for entry in env["PATH"].split(os.pathsep)
-            if not os.path.isabs(entry) or (not os.path.isfile(os.path.join(entry, ".codex-gate-farm"))
-                and not (os.path.isfile(os.path.join(entry, "git"))
-                         and os.path.isfile(os.path.join(entry, "..", "push_gate.py")))))
-    if os.path.isabs(env.get("GIT_EXEC_PATH", "")) and os.path.isfile(os.path.join(env["GIT_EXEC_PATH"], ".codex-gate-farm")):
-        del env["GIT_EXEC_PATH"]
     if sys.platform == "darwin":
         env["PATH"] = "/opt/homebrew/bin" + os.pathsep + env.get("PATH", "")
     return env
@@ -2828,12 +2842,12 @@ async def _run_codex(
         prompt = LEAD_NUDGE_HEADER + "\n\n" + prompt
     t0 = time.monotonic()
     # Stamp the tree that the model reads, which may differ from the session folder.
-    digest = asyncio.create_task(asyncio.to_thread(_workspace_digest, eff_cwd))
+    snapshot = asyncio.create_task(asyncio.to_thread(_dispatch_snapshot, eff_cwd, tool_name))
     try:
-        tree_at_dispatch = await asyncio.shield(digest)
+        tree_at_dispatch, manifest, snapshot_error = await asyncio.shield(snapshot)
     except asyncio.CancelledError:
-        # The existing digest subprocess owns a hard deadline and a group sweep.
-        await digest
+        # The snapshot subprocess owns a hard deadline and a group sweep.
+        await snapshot
         raise
     mode_str = "infra" if infra else "read-only"
     live_path, live_fh, stream_fh, run_tag = _open_live_log("infra" if infra else "codex")
@@ -2946,6 +2960,7 @@ async def _run_codex(
         "dispatch_cwd": _get_cwd(),
         "prompt": prompt, "log": str(live_path or ""),
         "tree": tree_at_dispatch,
+        **({"manifest": manifest, "snapshot_error": snapshot_error} if tool_name == "code_review" else {}),
         # A continuation's start carries its thread id (round 6): a crash
         # before the child's thread.started must still leave the claim and
         # any later adoption keyed by the THREAD, not the run.
@@ -3300,6 +3315,8 @@ async def _run_codex(
         prior = _journal_runs().get(run_tag, {})
         if (prior.get("status") == "cancelled" and prior.get("cancelled_by")) or _cancel_requested(run_tag):
             status = "cancelled"
+    # Publish under the terminal claim before the end record becomes visible to collectors.
+    log_note += _publish_review(run_tag, tool_name, status, manifest, snapshot_error)
     if _journal({
         "run": run_tag, "phase": "end", "ts": time.time(), "status": status,
         "returncode": returncode, "attempts": attempt + 1,
@@ -3429,7 +3446,7 @@ async def _run_codex(
             f"{_stderr_diagnostics()}{log_note}"
         )
     else:
-        # status:ok is EARNED by exit 0 (the push gate reads the signature).
+        # status:ok is earned by a completed final answer.
         header = (
             f"[Codex model: {model} | reasoning: {reasoning}"
             f"{_answer_sig(tool_name, 'ok', tree_at_dispatch)}]"
@@ -4612,8 +4629,7 @@ async def _collect_detached(
     reasoning = str(rec.get("reasoning") or "?")
     tool_name = str(rec.get("tool") or "")
     # A record without a dispatch-time digest (pre-1.17.2) must never vouch
-    # for whatever the tree looks like now: stamp `unknown`, which the push
-    # gate parses syntactically and can never render as VERIFIED.
+    # for whatever the tree looks like at collection time.
     tree = str(rec.get("tree") or "") or "unknown"
     start = str(rec.get("pid_start") or "")
     out = Path(str(rec.get("output_file") or ""))
@@ -4863,6 +4879,8 @@ async def _collect_detached_claimed(
             _private(rf, 0o600)
             result_file = str(rf)
     _emit(f"■ adoption finished: status={status} {state.get('usage') or ''}".rstrip())
+    review_note = _publish_review(run, tool_name, status, rec.get("manifest"), rec.get("snapshot_error"),
+                                  rec.get("manifest_file"))
     end_ok = _journal({
         "run": run, "phase": "end", "ts": time.time(), "status": status,
         "returncode": 0 if status == "ok" else 1, "adopted": True,
@@ -4887,6 +4905,7 @@ async def _collect_detached_claimed(
     if end_ok:
         _clear_cancel(run)  # any durable terminal record retires the intent
     log_note = f"\n\n[live log: {live_path}]" if live_path else ""
+    log_note += review_note
     if not end_ok:
         log_note += ("\n[⚠ the adoption's terminal record could not be "
                      "journaled — a later call may re-collect this run]")
